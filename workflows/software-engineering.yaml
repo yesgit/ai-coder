@@ -1,0 +1,59 @@
+id: software-engineering
+name: Software Engineering
+version: 1.0.0
+description: Full local coding task workflow.
+source:
+  type: builtin
+  id: software-engineering
+  version: 1.0.0
+permissions:
+  filesystem:
+    mode: project-only
+  shell:
+    approval_required: true
+  network:
+    enabled: false
+stages:
+  - id: requirements
+    name: Requirements
+    required_outputs:
+      - task_summary
+      - acceptance_criteria
+  - id: code_reading
+    name: Code Reading
+    allowed_tools:
+      - read_file
+      - shell
+    required_outputs:
+      - relevant_files
+      - current_behavior
+  - id: impact_analysis
+    name: Impact Analysis
+    required_outputs:
+      - impact_scope
+      - risks
+  - id: plan
+    name: Plan
+    approval_required: true
+    required_outputs:
+      - implementation_plan
+      - test_plan
+  - id: implementation
+    name: Implementation
+    allowed_tools:
+      - read_file
+      - edit_file
+      - shell
+    gates:
+      - authorized_files_only
+  - id: test
+    name: Test
+    allowed_tools:
+      - shell
+    required_checks:
+      - tests_passed
+  - id: summarize
+    name: Summarize
+    required_outputs:
+      - change_summary
+      - verification_result

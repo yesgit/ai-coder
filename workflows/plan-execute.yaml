@@ -1,0 +1,44 @@
+id: plan-execute
+name: Plan Execute
+version: 1.0.0
+description: General workflow for tasks that should be planned, approved, executed, verified, and summarized.
+source:
+  type: builtin
+  id: plan-execute
+  version: 1.0.0
+permissions:
+  filesystem:
+    mode: project-only
+  shell:
+    approval_required: true
+  network:
+    enabled: false
+stages:
+  - id: understand
+    name: Understand
+    required_outputs:
+      - task_summary
+      - assumptions
+  - id: plan
+    name: Plan
+    approval_required: true
+    required_outputs:
+      - execution_steps
+      - expected_output
+  - id: execute
+    name: Execute
+    allowed_tools:
+      - read_file
+      - edit_file
+      - shell
+    gates:
+      - authorized_files_only
+  - id: verify
+    name: Verify
+    required_checks:
+      - result_verified
+  - id: summarize
+    name: Summarize
+    required_outputs:
+      - final_summary
+      - verification_result

@@ -1,0 +1,61 @@
+import { describe, expect, it } from "vitest";
+import { ClaudeAgentRunner } from "./claudeAgentRunner.js";
+import type { AgentSession, WorkflowTemplate } from "../../shared/types.js";
+
+const workflow: WorkflowTemplate = {
+  id: "software-engineering",
+  name: "Software Engineering",
+  version: "1.0.0",
+  description: "Test",
+  source: { type: "builtin", id: "software-engineering", version: "1.0.0" },
+  permissions: { filesystem: { mode: "project-only" }, shell: { approval_required: true } },
+  stages: [
+    { id: "plan", name: "Plan", approval_required: true },
+    { id: "execute", name: "Execute", allowed_tools: ["read_file", "edit_file", "shell"] }
+  ]
+};
+
+describe("ClaudeAgentRunner", () => {
+  it("waits for stage approval before live or mock execution", async () => {
+    const previousKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "test-key";
+
+    const session: AgentSession = {
+      id: "00000000-0000-4000-8000-000000000000",
+      project_path: "/tmp/project",
+      workflow_id: workflow.id,
+      task_prompt: "Fix the bug",
+      status: "running",
+      current_stage: "plan",
+      messages: [],
+      tool_calls: [],
+      file_changes: [],
+      approvals: [
+        {
+          id: "00000000-0000-4000-8000-000000000001",
+          stage_id: "plan",
+          kind: "stage",
+          status: "pending",
+          message: "Approval required",
+          created_at: new Date().toISOString()
+        }
+      ],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+
+    try {
+      const updated = await new ClaudeAgentRunner().run({ session, workflow });
+
+      expect(updated.status).toBe("waiting_approval");
+      expect(updated.current_stage).toBe("plan");
+      expect(updated.messages.at(-1)?.content).toContain("Waiting for approval");
+    } finally {
+      if (previousKey === undefined) {
+        delete process.env.ANTHROPIC_API_KEY;
+      } else {
+        process.env.ANTHROPIC_API_KEY = previousKey;
+      }
+    }
+  });
+});

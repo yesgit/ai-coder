@@ -1,0 +1,34 @@
+id: code-review
+name: Code Review
+version: 1.0.0
+description: Review local changes and report correctness, security, maintainability, and test risks.
+source:
+  type: builtin
+  id: code-review
+  version: 1.0.0
+permissions:
+  filesystem:
+    mode: project-only
+  shell:
+    approval_required: true
+  network:
+    enabled: false
+stages:
+  - id: collect_context
+    name: Collect Context
+    allowed_tools:
+      - read_file
+      - shell
+    required_outputs:
+      - changed_files
+      - review_scope
+  - id: identify_risks
+    name: Identify Risks
+    required_outputs:
+      - findings
+      - severity
+  - id: report
+    name: Report
+    required_outputs:
+      - review_summary
+      - test_gaps
