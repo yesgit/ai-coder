@@ -17,6 +17,11 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     return result.canceled ? null : authorizedProjects.authorize(result.filePaths[0]);
   });
 
+  ipcMain.handle("agent:get-status", async () => ({
+    mode: process.env.ANTHROPIC_API_KEY ? "live" : "mock",
+    has_api_key: Boolean(process.env.ANTHROPIC_API_KEY)
+  }));
+
   ipcMain.handle("workflows:list", async (_event, projectPath?: string) => {
     const authorizedProjectPath = projectPath ? await authorizedProjects.assertAuthorized(projectPath) : undefined;
     return registry.listWithIssues(authorizedProjectPath);

@@ -219,6 +219,24 @@ textarea {
   font-size: 14px;
 }
 
+.runtime-mode {
+  display: inline-block;
+  margin-left: 8px;
+  border: 1px solid #d8dee8;
+  border-radius: 999px;
+  padding: 2px 8px;
+  background: #f7f9fc;
+  color: #475467;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.runtime-mode.live {
+  border-color: #b7dfd5;
+  background: #eef8f6;
+  color: #146c5f;
+}
+
 .stages {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));

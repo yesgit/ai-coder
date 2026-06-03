@@ -7,6 +7,7 @@ import {
 import { WorkflowEngine } from "../workflows/workflowEngine.js";
 import { buildStageInstructions } from "./workflowPrompt.js";
 import { buildStageAgentInput, createMockStageAgentResult, parseStageAgentResult } from "./stageAgentProtocol.js";
+import { extractClaudeStageOutput, formatClaudeTranscript } from "./claudeMessageAdapter.js";
 
 export interface AgentRunInput {
   session: AgentSession;
@@ -42,7 +43,7 @@ export class ClaudeAgentRunner {
       }
 
       const instructions = buildStageInstructions(stageAgentInput);
-      const chunks: string[] = [];
+      const sdkMessages: unknown[] = [];
       for await (const message of query({
         prompt: `${instructions}\n\nTask:\n${input.session.task_prompt}`,
         options: {
@@ -60,20 +61,26 @@ export class ClaudeAgentRunner {
           }
         }
       } as never) as AsyncIterable<unknown>) {
-        chunks.push(JSON.stringify(message));
+        sdkMessages.push(message);
       }
 
-      const rawContent = chunks.join("\n");
+      const stageOutput = extractClaudeStageOutput(sdkMessages);
+      const transcript = formatClaudeTranscript(sdkMessages);
       input.session.messages.push({
         role: "assistant",
-        content: rawContent,
+        content: transcript,
         created_at: new Date().toISOString()
       });
       if (this.hasPendingToolCall(input.session) || this.hasBlockedToolCall(input.session)) {
         input.session.status = this.resolveInterruptedStatus(input.session);
         return input.session;
       }
-      this.workflowEngine.applyStageResult(input.session, input.workflow, parseStageAgentResult(rawContent));
+      if (stageOutput.error) {
+        input.session.status = "failed";
+        input.session.error = stageOutput.error;
+        return input.session;
+      }
+      this.workflowEngine.applyStageResult(input.session, input.workflow, parseStageAgentResult(stageOutput.resultText || transcript));
       return input.session;
     } catch (error) {
       input.session.status = "failed";

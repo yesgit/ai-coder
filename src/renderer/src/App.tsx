@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type {
   AgentSession,
+  AgentRuntimeStatus,
   ApprovalRecord,
   ReworkRequest,
   StageRun,
@@ -21,6 +22,7 @@ export default function App() {
   const [taskPrompt, setTaskPrompt] = useState("");
   const [sessions, setSessions] = useState<AgentSession[]>([]);
   const [activeSession, setActiveSession] = useState<AgentSession | null>(null);
+  const [runtimeStatus, setRuntimeStatus] = useState<AgentRuntimeStatus | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -30,9 +32,14 @@ export default function App() {
   );
 
   useEffect(() => {
+    void refreshRuntimeStatus();
     void refreshWorkflows();
     void refreshSessions();
   }, []);
+
+  async function refreshRuntimeStatus() {
+    setRuntimeStatus(await window.aiCoder.getAgentRuntimeStatus());
+  }
 
   async function refreshWorkflows(nextProjectPath = projectPath) {
     const result = await window.aiCoder.listWorkflows(nextProjectPath || undefined);
@@ -226,7 +233,10 @@ export default function App() {
         <div className="composer">
           <div>
             <h2>{selectedWorkflow?.name ?? "Select a workflow"}</h2>
-            <p>{selectedWorkflow?.description ?? "Choose a project and workflow to start."}</p>
+            <p>
+              {selectedWorkflow?.description ?? "Choose a project and workflow to start."}
+              {runtimeStatus && <span className={`runtime-mode ${runtimeStatus.mode}`}>{runtimeStatus.mode} mode</span>}
+            </p>
           </div>
           <textarea
             value={taskPrompt}

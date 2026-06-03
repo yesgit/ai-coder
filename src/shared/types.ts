@@ -194,8 +194,14 @@ export interface StartSessionResult {
   session: AgentSession;
 }
 
+export interface AgentRuntimeStatus {
+  mode: "mock" | "live";
+  has_api_key: boolean;
+}
+
 export interface AppApi {
   selectProjectDirectory(): Promise<string | null>;
+  getAgentRuntimeStatus(): Promise<AgentRuntimeStatus>;
   listWorkflows(projectPath?: string): Promise<WorkflowListResult>;
   startSession(input: StartSessionInput): Promise<StartSessionResult>;
   listSessions(): Promise<AgentSession[]>;

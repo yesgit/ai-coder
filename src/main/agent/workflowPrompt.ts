@@ -24,6 +24,8 @@ export function buildStageInstructions(input: StageAgentInput): string {
     "Only read or modify files inside the selected project directory.",
     "Ask for approval before shell commands or file writes when policy requires it.",
     "If the current stage uncovers a need to redo an earlier stage, explain the target stage and reason instead of changing workflow state yourself.",
+    "After any tool use, finish the current stage by returning exactly one JSON object that follows the protocol below.",
+    "Do not include prose before or after the final JSON object.",
     "",
     "Workflow overview:",
     stageLines,
@@ -38,7 +40,7 @@ export function buildStageInstructions(input: StageAgentInput): string {
     `required_outputs: ${requiredOutputs}`,
     `gates: ${gates}`,
     "",
-    "Return one JSON object using this protocol:",
+    "Final JSON protocol:",
     JSON.stringify(
       {
         status: "completed | failed | needs_rework",
