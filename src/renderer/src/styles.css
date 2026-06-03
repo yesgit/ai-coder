@@ -115,6 +115,33 @@ small {
   gap: 8px;
 }
 
+.workflow-issues {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.workflow-issue {
+  display: grid;
+  gap: 4px;
+  border: 1px solid #f4c7c3;
+  border-radius: 8px;
+  background: #fff6f5;
+  padding: 10px;
+}
+
+.workflow-issue strong {
+  color: #b42318;
+}
+
+.workflow-issue span {
+  overflow: hidden;
+  color: #475467;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .workflow,
 .session {
   display: flex;

@@ -39,6 +39,17 @@ export interface WorkflowTemplate {
   stages: WorkflowStage[];
 }
 
+export interface WorkflowLoadIssue {
+  source_type: WorkflowSourceType;
+  path: string;
+  message: string;
+}
+
+export interface WorkflowListResult {
+  workflows: WorkflowTemplate[];
+  issues: WorkflowLoadIssue[];
+}
+
 export type SessionStatus = "created" | "running" | "waiting_approval" | "blocked" | "completed" | "failed";
 
 export interface AgentMessage {
@@ -102,7 +113,7 @@ export interface StartSessionResult {
 
 export interface AppApi {
   selectProjectDirectory(): Promise<string | null>;
-  listWorkflows(projectPath?: string): Promise<WorkflowTemplate[]>;
+  listWorkflows(projectPath?: string): Promise<WorkflowListResult>;
   startSession(input: StartSessionInput): Promise<StartSessionResult>;
   listSessions(): Promise<AgentSession[]>;
   getSession(id: string): Promise<AgentSession | null>;

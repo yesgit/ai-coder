@@ -5,6 +5,7 @@ import type {
   ApprovalRecord,
   ToolCallRecord,
   WorkflowStage,
+  WorkflowLoadIssue,
   WorkflowTemplate
 } from "../../shared/types.js";
 import "./styles.css";
@@ -12,6 +13,7 @@ import "./styles.css";
 export default function App() {
   const [projectPath, setProjectPath] = useState("");
   const [workflows, setWorkflows] = useState<WorkflowTemplate[]>([]);
+  const [workflowIssues, setWorkflowIssues] = useState<WorkflowLoadIssue[]>([]);
   const [selectedWorkflowId, setSelectedWorkflowId] = useState("");
   const [taskPrompt, setTaskPrompt] = useState("");
   const [sessions, setSessions] = useState<AgentSession[]>([]);
@@ -30,9 +32,10 @@ export default function App() {
   }, []);
 
   async function refreshWorkflows(nextProjectPath = projectPath) {
-    const loaded = await window.aiCoder.listWorkflows(nextProjectPath || undefined);
-    setWorkflows(loaded);
-    setSelectedWorkflowId((current: string) => current || loaded[0]?.id || "");
+    const result = await window.aiCoder.listWorkflows(nextProjectPath || undefined);
+    setWorkflows(result.workflows);
+    setWorkflowIssues(result.issues);
+    setSelectedWorkflowId((current: string) => current || result.workflows[0]?.id || "");
   }
 
   async function refreshSessions(preferredSessionId?: string) {
@@ -168,6 +171,17 @@ export default function App() {
               </button>
             ))}
           </div>
+          {workflowIssues.length > 0 && (
+            <div className="workflow-issues">
+              {workflowIssues.map((issue: WorkflowLoadIssue) => (
+                <div key={`${issue.source_type}:${issue.path}`} className="workflow-issue">
+                  <strong>{issue.source_type}</strong>
+                  <span title={issue.path}>{issue.path}</span>
+                  <small>{issue.message}</small>
+                </div>
+              ))}
+            </div>
+          )}
         </section>
 
         <section>

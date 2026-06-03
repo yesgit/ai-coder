@@ -17,7 +17,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
 
   ipcMain.handle("workflows:list", async (_event, projectPath?: string) => {
     const authorizedProjectPath = projectPath ? await authorizedProjects.assertAuthorized(projectPath) : undefined;
-    return registry.list(authorizedProjectPath);
+    return registry.listWithIssues(authorizedProjectPath);
   });
 
   ipcMain.handle("sessions:list", async () => sessions.list());
