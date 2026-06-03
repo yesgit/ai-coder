@@ -77,6 +77,14 @@ export class SessionStore {
     return session;
   }
 
+  async approveToolCall(id: string, toolCallId: string): Promise<AgentSession> {
+    return this.resolveToolCall(id, toolCallId, "approved");
+  }
+
+  async denyToolCall(id: string, toolCallId: string): Promise<AgentSession> {
+    return this.resolveToolCall(id, toolCallId, "denied");
+  }
+
   private async readFile(filePath: string): Promise<AgentSession | null> {
     try {
       const raw = await fs.readFile(filePath, "utf8");
@@ -100,6 +108,27 @@ export class SessionStore {
   private filePath(id: string): string {
     assertSessionId(id);
     return path.join(this.storeDir, `${id}.json`);
+  }
+
+  private async resolveToolCall(
+    id: string,
+    toolCallId: string,
+    status: "approved" | "denied"
+  ): Promise<AgentSession> {
+    assertSessionId(id);
+    const session = await this.get(id);
+    if (!session) {
+      throw new Error(`Session not found: ${id}`);
+    }
+    const toolCall = session.tool_calls.find((item) => item.id === toolCallId && item.status === "pending_approval");
+    if (!toolCall) {
+      throw new Error(`Pending tool call not found: ${toolCallId}`);
+    }
+    toolCall.status = status;
+    toolCall.resolved_at = new Date().toISOString();
+    session.status = status === "approved" ? "running" : "blocked";
+    await this.save(session);
+    return session;
   }
 }
 

@@ -42,6 +42,34 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     return updated;
   });
 
+  ipcMain.handle("sessions:approve-tool-call", async (_event, sessionId: string, toolCallId: string) => {
+    const session = await sessions.approveToolCall(sessionId, toolCallId);
+    await authorizedProjects.assertAuthorized(session.project_path);
+    return session;
+  });
+
+  ipcMain.handle("sessions:deny-tool-call", async (_event, sessionId: string, toolCallId: string) => {
+    const session = await sessions.denyToolCall(sessionId, toolCallId);
+    await authorizedProjects.assertAuthorized(session.project_path);
+    return session;
+  });
+
+  ipcMain.handle("sessions:continue", async (_event, sessionId: string) => {
+    const session = await sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}`);
+    }
+    const projectPath = await authorizedProjects.assertAuthorized(session.project_path);
+    const workflow = await registry.get(session.workflow_id, projectPath);
+    if (!workflow) {
+      throw new Error(`Workflow not found: ${session.workflow_id}`);
+    }
+    session.status = "running";
+    const updated = await runner.run({ session, workflow });
+    await sessions.save(updated);
+    return updated;
+  });
+
   ipcMain.handle("sessions:start", async (_event, input: StartSessionInput) => {
     if (!input.projectPath || !input.workflowId || !input.taskPrompt.trim()) {
       throw new Error("projectPath, workflowId, and taskPrompt are required");

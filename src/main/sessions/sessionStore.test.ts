@@ -59,4 +59,24 @@ describe("SessionStore", () => {
 
     expect(sessions).toHaveLength(1);
   });
+
+  it("approves and denies pending tool calls", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-sessions-"));
+    const store = new SessionStore(dir);
+    const session = await store.create("/tmp/project", workflow, "Fix bug");
+    session.tool_calls.push({
+      id: "tool-1",
+      stage_id: "execute",
+      tool: "Bash",
+      input: { command: "npm test" },
+      status: "pending_approval",
+      created_at: new Date().toISOString()
+    });
+    await store.save(session);
+
+    const approved = await store.approveToolCall(session.id, "tool-1");
+
+    expect(approved.tool_calls[0].status).toBe("approved");
+    expect(approved.status).toBe("running");
+  });
 });

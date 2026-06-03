@@ -33,13 +33,14 @@ function session(): AgentSession {
 }
 
 describe("project policy", () => {
-  it("denies shell commands while shell approval UI is not implemented", async () => {
+  it("creates pending approval for shell commands", async () => {
     const current = session();
 
     const decision = await approveOrDenyToolUse(current, workflow, "Bash", { command: "npm test" }, "tool-1");
 
     expect(decision.allow).toBe(false);
-    expect(current.tool_calls[0].status).toBe("blocked");
+    expect(current.status).toBe("waiting_approval");
+    expect(current.tool_calls[0].status).toBe("pending_approval");
   });
 
   it("denies file paths outside the selected project", async () => {
@@ -51,13 +52,16 @@ describe("project policy", () => {
     expect(current.tool_calls[0].status).toBe("blocked");
   });
 
-  it("denies write tools until explicit file approval is implemented", async () => {
-    const current = session();
+  it("creates pending approval for write tools", async () => {
+    const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-project-"));
+    await fs.mkdir(path.join(projectDir, "src"));
+    const current = { ...session(), project_path: projectDir };
 
     const decision = await approveOrDenyToolUse(current, workflow, "Edit", { file_path: "src/app.ts" }, "tool-3");
 
     expect(decision.allow).toBe(false);
-    expect(current.tool_calls[0].status).toBe("blocked");
+    expect(current.status).toBe("waiting_approval");
+    expect(current.tool_calls[0].status).toBe("pending_approval");
   });
 
   it("denies project symlinks that resolve outside the selected project", async () => {
@@ -71,5 +75,22 @@ describe("project policy", () => {
 
     expect(decision.allow).toBe(false);
     expect(current.tool_calls[0].status).toBe("blocked");
+  });
+
+  it("allows a previously approved matching tool call once", async () => {
+    const current = session();
+    current.tool_calls.push({
+      id: "tool-5",
+      stage_id: "execute",
+      tool: "Bash",
+      input: { command: "npm test" },
+      status: "approved",
+      created_at: new Date().toISOString()
+    });
+
+    const decision = await approveOrDenyToolUse(current, workflow, "Bash", { command: "npm test" }, "tool-5");
+
+    expect(decision.allow).toBe(true);
+    expect(current.tool_calls[0].status).toBe("completed");
   });
 });

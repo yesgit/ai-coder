@@ -54,6 +54,7 @@ export interface ToolCallRecord {
   input: unknown;
   status: "pending_approval" | "approved" | "denied" | "completed" | "blocked";
   created_at: string;
+  resolved_at?: string;
 }
 
 export interface FileChangeRecord {
@@ -106,4 +107,7 @@ export interface AppApi {
   listSessions(): Promise<AgentSession[]>;
   getSession(id: string): Promise<AgentSession | null>;
   approveStage(sessionId: string, stageId: string): Promise<AgentSession>;
+  approveToolCall(sessionId: string, toolCallId: string): Promise<AgentSession>;
+  denyToolCall(sessionId: string, toolCallId: string): Promise<AgentSession>;
+  continueSession(sessionId: string): Promise<AgentSession>;
 }

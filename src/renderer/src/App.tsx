@@ -1,5 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
-import type { AgentMessage, AgentSession, ApprovalRecord, WorkflowStage, WorkflowTemplate } from "../../shared/types.js";
+import type {
+  AgentMessage,
+  AgentSession,
+  ApprovalRecord,
+  ToolCallRecord,
+  WorkflowStage,
+  WorkflowTemplate
+} from "../../shared/types.js";
 import "./styles.css";
 
 export default function App() {
@@ -28,10 +35,13 @@ export default function App() {
     setSelectedWorkflowId((current: string) => current || loaded[0]?.id || "");
   }
 
-  async function refreshSessions() {
+  async function refreshSessions(preferredSessionId?: string) {
     const loaded = await window.aiCoder.listSessions();
     setSessions(loaded);
-    setActiveSession((current) => current ?? loaded[0] ?? null);
+    setActiveSession((current) => {
+      const targetId = preferredSessionId ?? current?.id;
+      return loaded.find((session: AgentSession) => session.id === targetId) ?? loaded[0] ?? null;
+    });
   }
 
   async function chooseProject() {
@@ -54,7 +64,7 @@ export default function App() {
       });
       setActiveSession(result.session);
       setTaskPrompt("");
-      await refreshSessions();
+      await refreshSessions(result.session.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -72,7 +82,49 @@ export default function App() {
     try {
       const updated = await window.aiCoder.approveStage(session.id, pending.stage_id);
       setActiveSession(updated);
-      await refreshSessions();
+      await refreshSessions(updated.id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function approveToolCall(session: AgentSession, toolCall: ToolCallRecord) {
+    setBusy(true);
+    setError("");
+    try {
+      const approved = await window.aiCoder.approveToolCall(session.id, toolCall.id);
+      setActiveSession(approved);
+      await refreshSessions(approved.id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function denyToolCall(session: AgentSession, toolCall: ToolCallRecord) {
+    setBusy(true);
+    setError("");
+    try {
+      const denied = await window.aiCoder.denyToolCall(session.id, toolCall.id);
+      setActiveSession(denied);
+      await refreshSessions(denied.id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function continueSession(session: AgentSession) {
+    setBusy(true);
+    setError("");
+    try {
+      const updated = await window.aiCoder.continueSession(session.id);
+      setActiveSession(updated);
+      await refreshSessions(updated.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -81,6 +133,8 @@ export default function App() {
   }
 
   const canStart = Boolean(projectPath && selectedWorkflowId && taskPrompt.trim() && !busy);
+  const pendingToolCalls = activeSession?.tool_calls.filter((toolCall) => toolCall.status === "pending_approval") ?? [];
+  const approvedToolCalls = activeSession?.tool_calls.filter((toolCall) => toolCall.status === "approved") ?? [];
 
   return (
     <main className="app-shell">
@@ -174,11 +228,41 @@ export default function App() {
                   </p>
                 </div>
                 {activeSession.status === "waiting_approval" && (
-                  <button className="primary" disabled={busy} onClick={() => approvePendingStage(activeSession)}>
-                    Approve Stage
-                  </button>
+                  <div className="session-actions">
+                    {activeSession.approvals.some((approval) => approval.kind === "stage" && approval.status === "pending") && (
+                      <button className="primary" disabled={busy} onClick={() => approvePendingStage(activeSession)}>
+                        Approve Stage
+                      </button>
+                    )}
+                    {approvedToolCalls.length > 0 && (
+                      <button className="secondary" disabled={busy} onClick={() => continueSession(activeSession)}>
+                        Continue
+                      </button>
+                    )}
+                  </div>
                 )}
               </div>
+              {pendingToolCalls.length > 0 && (
+                <div className="tool-approvals">
+                  {pendingToolCalls.map((toolCall: ToolCallRecord) => (
+                    <article key={toolCall.id} className="tool-approval">
+                      <div>
+                        <strong>{toolCall.tool}</strong>
+                        <small>{toolCall.stage_id}</small>
+                      </div>
+                      <pre>{JSON.stringify(toolCall.input, null, 2)}</pre>
+                      <div className="actions">
+                        <button className="primary" disabled={busy} onClick={() => approveToolCall(activeSession, toolCall)}>
+                          Approve
+                        </button>
+                        <button className="secondary" disabled={busy} onClick={() => denyToolCall(activeSession, toolCall)}>
+                          Deny
+                        </button>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              )}
               <div className="messages">
                 {activeSession.messages.map((message: AgentMessage, index: number) => (
                   <article key={`${message.created_at}:${index}`} className={`message ${message.role}`}>

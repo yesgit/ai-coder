@@ -71,15 +71,32 @@ export async function approveOrDenyToolUse(
   toolUseId: string
 ): Promise<{ allow: true; updatedInput: Record<string, unknown> } | { allow: false; message: string }> {
   const now = new Date().toISOString();
+  const existingToolCall = session.tool_calls.find(
+    (toolCall) => toolCall.id === toolUseId && sameToolCall(toolCall, toolName, input)
+  );
+  if (existingToolCall?.status === "approved") {
+    existingToolCall.status = "completed";
+    existingToolCall.resolved_at = now;
+    return { allow: true, updatedInput: input };
+  }
+  if (existingToolCall?.status === "denied") {
+    return { allow: false, message: "Tool call was denied by the user." };
+  }
+  if (existingToolCall?.status === "pending_approval") {
+    return { allow: false, message: "Tool call is waiting for user approval." };
+  }
+
   const record = (status: ToolCallRecord["status"]) => {
-    session.tool_calls.push({
+    const toolCall = {
       id: toolUseId,
       stage_id: session.current_stage,
       tool: toolName,
       input,
       status,
       created_at: now
-    });
+    };
+    session.tool_calls.push(toolCall);
+    return toolCall;
   };
 
   try {
@@ -87,8 +104,9 @@ export async function approveOrDenyToolUse(
       const command = String(input.command ?? "");
       assertCommandAllowed(command);
       if (requiresShellApproval(workflow)) {
-        record("blocked");
-        return { allow: false, message: "Shell commands require explicit approval, which is not implemented yet." };
+        record("pending_approval");
+        session.status = "waiting_approval";
+        return { allow: false, message: "Shell command is waiting for user approval." };
       }
     }
 
@@ -97,8 +115,9 @@ export async function approveOrDenyToolUse(
     }
 
     if (isWriteTool(toolName)) {
-      record("blocked");
-      return { allow: false, message: "File writes require explicit approval, which is not implemented yet." };
+      record("pending_approval");
+      session.status = "waiting_approval";
+      return { allow: false, message: "File write is waiting for user approval." };
     }
 
     record("approved");
@@ -117,6 +136,10 @@ function extractFilePaths(input: Record<string, unknown>): string[] {
 
 function isWriteTool(toolName: string): boolean {
   return toolName === "Edit" || toolName === "MultiEdit" || toolName === "Write" || toolName === "NotebookEdit";
+}
+
+function sameToolCall(toolCall: ToolCallRecord, toolName: string, input: Record<string, unknown>): boolean {
+  return toolCall.tool === toolName && JSON.stringify(toolCall.input) === JSON.stringify(input);
 }
 
 async function resolveExistingPathOrParent(targetPath: string): Promise<string> {

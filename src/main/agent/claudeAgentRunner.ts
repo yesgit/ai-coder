@@ -56,7 +56,7 @@ export class ClaudeAgentRunner {
         content: chunks.join("\n"),
         created_at: new Date().toISOString()
       });
-      input.session.status = this.hasBlockedToolCall(input.session) ? "blocked" : "completed";
+      input.session.status = this.resolveFinalStatus(input.session);
       input.session.current_stage = input.workflow.stages.at(-1)?.id ?? input.session.current_stage;
       return input.session;
     } catch (error) {
@@ -99,5 +99,19 @@ export class ClaudeAgentRunner {
 
   private hasBlockedToolCall(session: AgentSession): boolean {
     return session.tool_calls.some((toolCall) => toolCall.status === "blocked" || toolCall.status === "denied");
+  }
+
+  private hasPendingToolCall(session: AgentSession): boolean {
+    return session.tool_calls.some((toolCall) => toolCall.status === "pending_approval");
+  }
+
+  private resolveFinalStatus(session: AgentSession): AgentSession["status"] {
+    if (this.hasPendingToolCall(session)) {
+      return "waiting_approval";
+    }
+    if (this.hasBlockedToolCall(session)) {
+      return "blocked";
+    }
+    return "completed";
   }
 }

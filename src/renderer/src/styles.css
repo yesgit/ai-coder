@@ -223,6 +223,40 @@ textarea {
   padding-bottom: 14px;
 }
 
+.session-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.tool-approvals {
+  display: grid;
+  gap: 10px;
+  border-bottom: 1px solid #e7ebf0;
+  padding: 14px 0;
+}
+
+.tool-approval {
+  display: grid;
+  gap: 10px;
+  border: 1px solid #f3d18b;
+  border-radius: 8px;
+  background: #fffaf0;
+  padding: 12px;
+}
+
+.tool-approval > div:first-child {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.tool-approval strong {
+  color: #7a4b00;
+}
+
 .messages {
   display: grid;
   gap: 12px;
