@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import type {
   AgentSession,
   ApprovalRecord,
+  ReworkRequest,
+  StageRun,
   ToolCallRecord,
   WorkflowStage,
   WorkflowLoadIssue,
@@ -94,6 +96,20 @@ export default function App() {
     }
   }
 
+  async function approveReworkRequest(session: AgentSession, request: ReworkRequest) {
+    setBusy(true);
+    setError("");
+    try {
+      const updated = await window.aiCoder.approveRework(session.id, request.id);
+      setActiveSession(updated);
+      await refreshSessions(updated.id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function approveToolCall(session: AgentSession, toolCall: ToolCallRecord) {
     setBusy(true);
     setError("");
@@ -139,6 +155,9 @@ export default function App() {
   const canStart = Boolean(projectPath && selectedWorkflowId && taskPrompt.trim() && !busy);
   const pendingToolCalls = activeSession?.tool_calls.filter((toolCall) => toolCall.status === "pending_approval") ?? [];
   const approvedToolCalls = activeSession?.tool_calls.filter((toolCall) => toolCall.status === "approved") ?? [];
+  const stageRuns = activeSession?.stage_runs ?? [];
+  const reworkRequests = activeSession?.rework_requests ?? [];
+  const pendingReworkRequests = reworkRequests.filter((request) => request.status === "pending");
   const timeline = activeSession ? buildSessionTimeline(activeSession) : [];
 
   return (
@@ -278,6 +297,67 @@ export default function App() {
                     </article>
                   ))}
                 </div>
+              )}
+              <div className="run-panels">
+                <section className="run-panel">
+                  <div className="panel-heading">
+                    <h3>Stage Runs</h3>
+                    <small>{stageRuns.length} attempts</small>
+                  </div>
+                  {stageRuns.length > 0 ? (
+                    <div className="stage-run-list">
+                      {stageRuns.map((stageRun: StageRun) => (
+                        <article
+                          key={stageRun.id}
+                          className={stageRun.stage_id === activeSession.current_stage ? "stage-run current" : "stage-run"}
+                        >
+                          <div className="stage-run-title">
+                            <strong>{stageRun.stage_id}</strong>
+                            <span className={`status-pill ${stageRun.status}`}>{stageRun.status}</span>
+                          </div>
+                          <small>attempt {stageRun.attempt}</small>
+                          <p>{stageRun.output_summary ?? stageRun.input_summary}</p>
+                        </article>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="muted">No stage runs recorded.</p>
+                  )}
+                </section>
+
+                <section className="run-panel">
+                  <div className="panel-heading">
+                    <h3>Rework Requests</h3>
+                    <small>{reworkRequests.length} requests</small>
+                  </div>
+                  {reworkRequests.length > 0 ? (
+                    <div className="rework-list">
+                      {reworkRequests.map((request: ReworkRequest) => (
+                        <article key={request.id} className="rework-request">
+                          <div className="stage-run-title">
+                            <strong>
+                              {request.from_stage_id} -&gt; {request.target_stage_id}
+                            </strong>
+                            <span className={`status-pill ${request.status}`}>{request.status}</span>
+                          </div>
+                          <p>{request.reason}</p>
+                          {request.status === "pending" && (
+                            <div className="actions">
+                              <button className="primary" disabled={busy} onClick={() => approveReworkRequest(activeSession, request)}>
+                                Approve Rework
+                              </button>
+                            </div>
+                          )}
+                        </article>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="muted">No rework requests.</p>
+                  )}
+                </section>
+              </div>
+              {pendingReworkRequests.length > 0 && (
+                <div className="pending-banner">{pendingReworkRequests.length} rework request waiting for approval.</div>
               )}
               <div className="timeline">
                 {timeline.map((event: TimelineEvent) => (

@@ -201,6 +201,7 @@ export interface AppApi {
   listSessions(): Promise<AgentSession[]>;
   getSession(id: string): Promise<AgentSession | null>;
   approveStage(sessionId: string, stageId: string): Promise<AgentSession>;
+  approveRework(sessionId: string, requestId: string): Promise<AgentSession>;
   approveToolCall(sessionId: string, toolCallId: string): Promise<AgentSession>;
   denyToolCall(sessionId: string, toolCallId: string): Promise<AgentSession>;
   continueSession(sessionId: string): Promise<AgentSession>;
