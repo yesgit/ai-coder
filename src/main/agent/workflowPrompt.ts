@@ -1,7 +1,7 @@
-import type { AgentSession, StageRun, WorkflowStage, WorkflowTemplate } from "../../shared/types.js";
+import type { StageAgentInput } from "../../shared/types.js";
 
-export function buildStageInstructions(session: AgentSession, workflow: WorkflowTemplate, currentStage: WorkflowStage): string {
-  const stageLines = workflow.stages
+export function buildStageInstructions(input: StageAgentInput): string {
+  const stageLines = input.workflow.stages
     .map((stage, index) => {
       const outputs = stage.required_outputs?.length ? ` outputs=${stage.required_outputs.join(",")}` : "";
       const checks = stage.required_checks?.length ? ` checks=${stage.required_checks.join(",")}` : "";
@@ -10,17 +10,15 @@ export function buildStageInstructions(session: AgentSession, workflow: Workflow
     })
     .join("\n");
 
-  const previousStageLines = (session.stage_runs ?? [])
-    .filter((stageRun) => stageRun.status === "completed")
-    .map(formatStageRunSummary)
+  const previousStageLines = input.previous_stage_summaries
+    .map((summary) => `- ${summary.stage_id} attempt ${summary.attempt}: ${summary.output_summary ?? summary.status}`)
     .join("\n");
-
-  const allowedTools = currentStage.allowed_tools?.length ? currentStage.allowed_tools.join(", ") : "read-only defaults";
-  const requiredOutputs = currentStage.required_outputs?.length ? currentStage.required_outputs.join(", ") : "concise stage summary";
-  const gates = currentStage.gates?.length ? currentStage.gates.join(", ") : "none";
+  const allowedTools = input.allowed_tools.length ? input.allowed_tools.join(", ") : "read-only defaults";
+  const requiredOutputs = input.required_outputs.length ? input.required_outputs.join(", ") : "concise stage summary";
+  const gates = input.gates.length ? input.gates.join(", ") : "none";
 
   return [
-    `You are running inside the "${workflow.name}" workflow.`,
+    `You are running inside the "${input.workflow.name}" workflow.`,
     "The workflow engine controls stage transitions. Complete only the current stage.",
     "You may use the workflow overview and previous stage summaries as context, but do not execute later stages.",
     "Only read or modify files inside the selected project directory.",
@@ -34,14 +32,24 @@ export function buildStageInstructions(session: AgentSession, workflow: Workflow
     previousStageLines || "None",
     "",
     "Current stage:",
-    `id: ${currentStage.id}`,
-    `name: ${currentStage.name}`,
+    `id: ${input.current_stage.id}`,
+    `name: ${input.current_stage.name}`,
     `allowed_tools: ${allowedTools}`,
     `required_outputs: ${requiredOutputs}`,
-    `gates: ${gates}`
+    `gates: ${gates}`,
+    "",
+    "Return one JSON object using this protocol:",
+    JSON.stringify(
+      {
+        status: "completed | failed | needs_rework",
+        output_summary: "Concise summary of this stage result",
+        required_outputs: Object.fromEntries(input.required_outputs.map((name) => [name, `<${name}>`])),
+        rework_target_stage_id: "Only when status is needs_rework",
+        rework_reason: "Only when status is needs_rework",
+        error: "Only when status is failed"
+      },
+      null,
+      2
+    )
   ].join("\n");
-}
-
-function formatStageRunSummary(stageRun: StageRun): string {
-  return `- ${stageRun.stage_id} attempt ${stageRun.attempt}: ${stageRun.output_summary ?? "completed"}`;
 }

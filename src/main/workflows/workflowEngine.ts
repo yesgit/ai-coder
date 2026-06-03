@@ -1,5 +1,13 @@
 import { randomUUID } from "node:crypto";
-import type { AgentSession, ApprovalRecord, ReworkRequest, StageRun, WorkflowStage, WorkflowTemplate } from "../../shared/types.js";
+import type {
+  AgentSession,
+  ApprovalRecord,
+  ReworkRequest,
+  StageAgentResult,
+  StageRun,
+  WorkflowStage,
+  WorkflowTemplate
+} from "../../shared/types.js";
 
 export class WorkflowEngine {
   ensureState(session: AgentSession, workflow: WorkflowTemplate): AgentSession {
@@ -35,6 +43,38 @@ export class WorkflowEngine {
     }
 
     return this.advanceAfterCompletedStage(session, workflow, stageRun.stage_id);
+  }
+
+  applyStageResult(session: AgentSession, workflow: WorkflowTemplate, result: StageAgentResult): AgentSession {
+    this.ensureState(session, workflow);
+    const stageRun = this.getActiveStageRun(session);
+    if (!stageRun) {
+      session.status = "completed";
+      return session;
+    }
+
+    if (result.status === "failed") {
+      return this.failCurrentStage(session, result.error ?? result.output_summary);
+    }
+
+    if (result.status === "needs_rework") {
+      if (!result.rework_target_stage_id || !result.rework_reason) {
+        return this.blockCurrentStage(session, "Rework result requires rework_target_stage_id and rework_reason");
+      }
+      try {
+        return this.requestRework(session, workflow, result.rework_target_stage_id, result.rework_reason);
+      } catch (error) {
+        return this.blockCurrentStage(session, error instanceof Error ? error.message : String(error));
+      }
+    }
+
+    const stage = this.getStage(workflow, stageRun.stage_id);
+    const missingOutputs = (stage?.required_outputs ?? []).filter((name) => !hasRequiredOutput(result, name));
+    if (missingOutputs.length > 0) {
+      return this.blockCurrentStage(session, `Missing required stage outputs: ${missingOutputs.join(", ")}`);
+    }
+
+    return this.completeCurrentStage(session, workflow, result.output_summary);
   }
 
   approveStage(session: AgentSession, workflow: WorkflowTemplate, stageId: string): AgentSession {
@@ -116,6 +156,30 @@ export class WorkflowEngine {
     return [...(session.stage_runs ?? [])]
       .reverse()
       .find((stageRun) => stageRun.status === "running" || stageRun.status === "waiting_approval");
+  }
+
+  private failCurrentStage(session: AgentSession, error: string): AgentSession {
+    const stageRun = this.getActiveStageRun(session);
+    if (stageRun) {
+      stageRun.status = "failed";
+      stageRun.output_summary = error;
+      stageRun.completed_at = new Date().toISOString();
+    }
+    session.status = "failed";
+    session.error = error;
+    return session;
+  }
+
+  private blockCurrentStage(session: AgentSession, reason: string): AgentSession {
+    const stageRun = this.getActiveStageRun(session);
+    if (stageRun) {
+      stageRun.status = "failed";
+      stageRun.output_summary = reason;
+      stageRun.completed_at = new Date().toISOString();
+    }
+    session.status = "blocked";
+    session.error = reason;
+    return session;
   }
 
   private advanceAfterCompletedStage(session: AgentSession, workflow: WorkflowTemplate, completedStageId: string): AgentSession {
@@ -216,4 +280,8 @@ export class WorkflowEngine {
     }
     return index;
   }
+}
+
+function hasRequiredOutput(result: StageAgentResult, name: string): boolean {
+  return Object.hasOwn(result.required_outputs ?? {}, name);
 }

@@ -102,4 +102,77 @@ describe("WorkflowEngine", () => {
     expect(session.stage_runs?.at(-1)).toMatchObject({ stage_id: "plan", attempt: 2, status: "running" });
     expect(session.stage_runs?.some((stageRun) => stageRun.stage_id === "plan" && stageRun.status === "superseded")).toBe(true);
   });
+
+  it("applies a completed stage agent result", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+
+    engine.ensureState(session, workflow);
+    engine.applyStageResult(session, workflow, {
+      status: "completed",
+      output_summary: "Requirements understood"
+    });
+
+    expect(session.current_stage).toBe("plan");
+    expect(session.stage_runs?.[0]).toMatchObject({ stage_id: "understand", status: "completed" });
+  });
+
+  it("blocks a stage agent result missing required outputs", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+    const workflowWithRequiredOutput: WorkflowTemplate = {
+      ...workflow,
+      stages: [{ id: "understand", name: "Understand", required_outputs: ["task_summary"] }]
+    };
+
+    engine.ensureState(session, workflowWithRequiredOutput);
+    engine.applyStageResult(session, workflowWithRequiredOutput, {
+      status: "completed",
+      output_summary: "Done"
+    });
+
+    expect(session.status).toBe("blocked");
+    expect(session.error).toContain("task_summary");
+  });
+
+  it("applies a needs_rework stage agent result", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+
+    engine.ensureState(session, workflow);
+    engine.applyStageResult(session, workflow, { status: "completed", output_summary: "Requirements understood" });
+    engine.applyStageResult(session, workflow, {
+      status: "completed",
+      output_summary: "Implementation plan"
+    });
+    engine.approveStage(session, workflow, "plan");
+    engine.applyStageResult(session, workflow, {
+      status: "needs_rework",
+      output_summary: "Need to revisit plan",
+      rework_target_stage_id: "plan",
+      rework_reason: "Missing API constraint"
+    });
+
+    expect(session.status).toBe("waiting_approval");
+    expect(session.rework_requests?.[0]).toMatchObject({
+      target_stage_id: "plan",
+      status: "pending",
+      reason: "Missing API constraint"
+    });
+  });
+
+  it("marks failed stage agent results as failed", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+
+    engine.ensureState(session, workflow);
+    engine.applyStageResult(session, workflow, {
+      status: "failed",
+      output_summary: "Failed",
+      error: "Agent crashed"
+    });
+
+    expect(session.status).toBe("failed");
+    expect(session.stage_runs?.[0]).toMatchObject({ status: "failed", output_summary: "Agent crashed" });
+  });
 });

@@ -91,6 +91,47 @@ export interface ReworkRequest {
   resolved_at?: string;
 }
 
+export interface StageSummary {
+  stage_id: string;
+  attempt: number;
+  status: StageRunStatus;
+  output_summary?: string;
+}
+
+export interface WorkflowOverviewStage {
+  id: string;
+  name: string;
+  approval_required: boolean;
+  required_outputs: string[];
+  required_checks: string[];
+  gates: string[];
+}
+
+export interface StageAgentInput {
+  workflow: {
+    id: string;
+    name: string;
+    description: string;
+    stages: WorkflowOverviewStage[];
+  };
+  previous_stage_summaries: StageSummary[];
+  current_stage: WorkflowStage;
+  task_prompt: string;
+  project_path: string;
+  allowed_tools: string[];
+  required_outputs: string[];
+  gates: string[];
+}
+
+export interface StageAgentResult {
+  status: "completed" | "failed" | "needs_rework";
+  output_summary: string;
+  required_outputs?: Record<string, unknown>;
+  rework_target_stage_id?: string;
+  rework_reason?: string;
+  error?: string;
+}
+
 export interface AgentMessage {
   role: "user" | "assistant" | "system";
   content: string;

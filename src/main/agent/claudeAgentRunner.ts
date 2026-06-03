@@ -6,6 +6,7 @@ import {
 } from "../security/projectPolicy.js";
 import { WorkflowEngine } from "../workflows/workflowEngine.js";
 import { buildStageInstructions } from "./workflowPrompt.js";
+import { buildStageAgentInput, createMockStageAgentResult, parseStageAgentResult } from "./stageAgentProtocol.js";
 
 export interface AgentRunInput {
   session: AgentSession;
@@ -27,9 +28,10 @@ export class ClaudeAgentRunner {
       input.session.error = `Workflow stage not found: ${input.session.current_stage}`;
       return input.session;
     }
+    const stageAgentInput = buildStageAgentInput(input.session, input.workflow, currentStage);
 
     if (!process.env.ANTHROPIC_API_KEY) {
-      return this.runMock(input, currentStage.name);
+      return this.runMock(input, stageAgentInput);
     }
 
     try {
@@ -39,7 +41,7 @@ export class ClaudeAgentRunner {
         throw new Error("Claude Agent SDK does not expose query()");
       }
 
-      const instructions = buildStageInstructions(input.session, input.workflow, currentStage);
+      const instructions = buildStageInstructions(stageAgentInput);
       const chunks: string[] = [];
       for await (const message of query({
         prompt: `${instructions}\n\nTask:\n${input.session.task_prompt}`,
@@ -61,16 +63,17 @@ export class ClaudeAgentRunner {
         chunks.push(JSON.stringify(message));
       }
 
+      const rawContent = chunks.join("\n");
       input.session.messages.push({
         role: "assistant",
-        content: chunks.join("\n"),
+        content: rawContent,
         created_at: new Date().toISOString()
       });
       if (this.hasPendingToolCall(input.session) || this.hasBlockedToolCall(input.session)) {
         input.session.status = this.resolveInterruptedStatus(input.session);
         return input.session;
       }
-      this.workflowEngine.completeCurrentStage(input.session, input.workflow, summarizeStageOutput(chunks.join("\n")));
+      this.workflowEngine.applyStageResult(input.session, input.workflow, parseStageAgentResult(rawContent));
       return input.session;
     } catch (error) {
       input.session.status = "failed";
@@ -79,14 +82,15 @@ export class ClaudeAgentRunner {
     }
   }
 
-  private runMock(input: AgentRunInput, stageName: string): AgentSession {
-    const content = `Mock stage "${stageName}" completed. Set ANTHROPIC_API_KEY to use Claude Agent SDK.`;
+  private runMock(input: AgentRunInput, stageAgentInput: ReturnType<typeof buildStageAgentInput>): AgentSession {
+    const result = createMockStageAgentResult(stageAgentInput);
+    const content = JSON.stringify(result, null, 2);
     input.session.messages.push({
       role: "assistant",
       content,
       created_at: new Date().toISOString()
     });
-    this.workflowEngine.completeCurrentStage(input.session, input.workflow, content);
+    this.workflowEngine.applyStageResult(input.session, input.workflow, result);
     return input.session;
   }
 
@@ -129,12 +133,4 @@ export class ClaudeAgentRunner {
     }
     return "completed";
   }
-}
-
-function summarizeStageOutput(content: string): string {
-  const normalized = content.replace(/\s+/g, " ").trim();
-  if (normalized.length <= 240) {
-    return normalized;
-  }
-  return `${normalized.slice(0, 237)}...`;
 }
