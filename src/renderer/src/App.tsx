@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
 import type {
-  AgentMessage,
   AgentSession,
   ApprovalRecord,
   ToolCallRecord,
@@ -8,6 +7,8 @@ import type {
   WorkflowLoadIssue,
   WorkflowTemplate
 } from "../../shared/types.js";
+import { buildSessionTimeline } from "./sessionTimeline.js";
+import type { TimelineEvent } from "./sessionTimeline.js";
 import "./styles.css";
 
 export default function App() {
@@ -138,6 +139,7 @@ export default function App() {
   const canStart = Boolean(projectPath && selectedWorkflowId && taskPrompt.trim() && !busy);
   const pendingToolCalls = activeSession?.tool_calls.filter((toolCall) => toolCall.status === "pending_approval") ?? [];
   const approvedToolCalls = activeSession?.tool_calls.filter((toolCall) => toolCall.status === "approved") ?? [];
+  const timeline = activeSession ? buildSessionTimeline(activeSession) : [];
 
   return (
     <main className="app-shell">
@@ -277,14 +279,19 @@ export default function App() {
                   ))}
                 </div>
               )}
-              <div className="messages">
-                {activeSession.messages.map((message: AgentMessage, index: number) => (
-                  <article key={`${message.created_at}:${index}`} className={`message ${message.role}`}>
-                    <strong>{message.role}</strong>
-                    <pre>{message.content}</pre>
+              <div className="timeline">
+                {timeline.map((event: TimelineEvent) => (
+                  <article key={event.id} className={`timeline-item ${event.type}`}>
+                    <div className="timeline-meta">
+                      <time>{formatTimestamp(event.timestamp)}</time>
+                      {event.status && <span className="timeline-status">{event.status}</span>}
+                    </div>
+                    <div className="timeline-body">
+                      <strong>{event.title}</strong>
+                      {event.detail && <pre>{event.detail}</pre>}
+                    </div>
                   </article>
                 ))}
-                {activeSession.error && <div className="error-block">{activeSession.error}</div>}
               </div>
             </>
           ) : (
@@ -294,4 +301,12 @@ export default function App() {
       </section>
     </main>
   );
+}
+
+function formatTimestamp(value: string) {
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  }).format(new Date(value));
 }
