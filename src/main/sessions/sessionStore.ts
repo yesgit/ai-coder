@@ -2,7 +2,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import type { AgentSession, ApprovalRecord, WorkflowTemplate } from "../../shared/types.js";
+import type { AgentSession, WorkflowTemplate } from "../../shared/types.js";
+import { WorkflowEngine } from "../workflows/workflowEngine.js";
 
 export class SessionStore {
   constructor(private readonly storeDir = path.join(os.homedir(), ".ai-coder", "sessions")) {}
@@ -20,19 +21,13 @@ export class SessionStore {
       messages: [{ role: "user", content: taskPrompt, created_at: now }],
       tool_calls: [],
       file_changes: [],
-      approvals: workflow.stages
-        .filter((stage) => stage.approval_required)
-        .map<ApprovalRecord>((stage) => ({
-          id: randomUUID(),
-          stage_id: stage.id,
-          kind: "stage",
-          status: "pending",
-          message: `Approval required before stage: ${stage.name}`,
-          created_at: now
-        })),
+      approvals: [],
+      stage_runs: [],
+      rework_requests: [],
       created_at: now,
       updated_at: now
     };
+    new WorkflowEngine().ensureState(session, workflow);
     await this.save(session);
     return session;
   }
@@ -58,23 +53,6 @@ export class SessionStore {
     await fs.mkdir(this.storeDir, { recursive: true });
     session.updated_at = new Date().toISOString();
     await fs.writeFile(this.filePath(session.id), JSON.stringify(session, null, 2), "utf8");
-  }
-
-  async approveStage(id: string, stageId: string): Promise<AgentSession> {
-    assertSessionId(id);
-    const session = await this.get(id);
-    if (!session) {
-      throw new Error(`Session not found: ${id}`);
-    }
-    const approval = session.approvals.find((item) => item.stage_id === stageId && item.kind === "stage");
-    if (!approval) {
-      throw new Error(`Stage approval not found: ${stageId}`);
-    }
-    approval.status = "approved";
-    approval.resolved_at = new Date().toISOString();
-    session.status = "running";
-    await this.save(session);
-    return session;
   }
 
   async approveToolCall(id: string, toolCallId: string): Promise<AgentSession> {

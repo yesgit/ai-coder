@@ -3,10 +3,12 @@ import type { StartSessionInput } from "../shared/types.js";
 import { ClaudeAgentRunner } from "./agent/claudeAgentRunner.js";
 import { AuthorizedProjects } from "./security/authorizedProjects.js";
 import { SessionStore } from "./sessions/sessionStore.js";
+import { WorkflowEngine } from "./workflows/workflowEngine.js";
 import { WorkflowRegistry } from "./workflows/workflowRegistry.js";
 
 export function registerIpcHandlers(registry: WorkflowRegistry, sessions: SessionStore, runner: ClaudeAgentRunner): void {
   const authorizedProjects = new AuthorizedProjects();
+  const workflowEngine = new WorkflowEngine();
 
   ipcMain.handle("project:select", async () => {
     const result = await dialog.showOpenDialog({
@@ -31,12 +33,16 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
   });
 
   ipcMain.handle("sessions:approve-stage", async (_event, sessionId: string, stageId: string) => {
-    const session = await sessions.approveStage(sessionId, stageId);
+    const session = await sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}`);
+    }
     const projectPath = await authorizedProjects.assertAuthorized(session.project_path);
     const workflow = await registry.get(session.workflow_id, projectPath);
     if (!workflow) {
       throw new Error(`Workflow not found: ${session.workflow_id}`);
     }
+    workflowEngine.approveStage(session, workflow, stageId);
     const updated = await runner.run({ session, workflow });
     await sessions.save(updated);
     return updated;
@@ -64,6 +70,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     if (!workflow) {
       throw new Error(`Workflow not found: ${session.workflow_id}`);
     }
+    workflowEngine.ensureState(session, workflow);
     session.status = "running";
     const updated = await runner.run({ session, workflow });
     await sessions.save(updated);

@@ -314,8 +314,16 @@ textarea {
   background: #b42318;
 }
 
+.timeline-item.stage::before {
+  background: #475467;
+}
+
 .timeline-item.tool::before {
   background: #ad6b00;
+}
+
+.timeline-item.rework::before {
+  background: #7f56d9;
 }
 
 .timeline-meta {

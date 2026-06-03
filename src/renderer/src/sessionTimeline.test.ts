@@ -46,7 +46,9 @@ const session: AgentSession = {
       approved: true,
       created_at: "2026-06-03T01:04:30.000Z"
     }
-  ]
+  ],
+  stage_runs: [],
+  rework_requests: []
 };
 
 describe("buildSessionTimeline", () => {
@@ -79,5 +81,48 @@ describe("buildSessionTimeline", () => {
       detail: "Claude Agent SDK request failed"
     });
     expect(events.at(-1)).toMatchObject({ type: "status", title: "Session failed" });
+  });
+
+  it("includes stage attempts and rework requests", () => {
+    const reworkSession: AgentSession = {
+      ...session,
+      stage_runs: [
+        {
+          id: "stage-run-1",
+          stage_id: "execute",
+          attempt: 1,
+          status: "needs_rework",
+          input_summary: "Implementation plan",
+          rework_reason: "Missing API constraint",
+          started_at: "2026-06-03T01:03:30.000Z",
+          completed_at: "2026-06-03T01:04:45.000Z"
+        },
+        {
+          id: "stage-run-2",
+          stage_id: "plan",
+          attempt: 2,
+          status: "running",
+          input_summary: "Rework requested from execute: Missing API constraint",
+          started_at: "2026-06-03T01:05:30.000Z"
+        }
+      ],
+      rework_requests: [
+        {
+          id: "rework-1",
+          from_stage_id: "execute",
+          target_stage_id: "plan",
+          status: "approved",
+          reason: "Missing API constraint",
+          created_at: "2026-06-03T01:05:00.000Z",
+          resolved_at: "2026-06-03T01:05:20.000Z"
+        }
+      ]
+    };
+
+    const events = buildSessionTimeline(reworkSession);
+
+    expect(events.map((event) => event.title)).toContain("Stage needs rework: execute attempt 1");
+    expect(events.map((event) => event.title)).toContain("Rework requested: execute -> plan");
+    expect(events.map((event) => event.title)).toContain("Stage started: plan attempt 2");
   });
 });

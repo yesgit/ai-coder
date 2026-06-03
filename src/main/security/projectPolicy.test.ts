@@ -12,6 +12,7 @@ const workflow: WorkflowTemplate = {
   description: "Test",
   source: { type: "builtin", id: "software-engineering", version: "1.0.0" },
   permissions: { filesystem: { mode: "project-only" }, shell: { approval_required: true }, network: { enabled: false } },
+  rework: { enabled: false, allowed_targets: [], approval_required: true, invalidate_downstream: true },
   stages: [{ id: "execute", name: "Execute", allowed_tools: ["read_file", "edit_file", "shell"] }]
 };
 

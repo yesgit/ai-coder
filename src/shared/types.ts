@@ -19,6 +19,13 @@ export interface WorkflowPermissions {
   };
 }
 
+export interface WorkflowReworkPolicy {
+  enabled: boolean;
+  allowed_targets: string[];
+  approval_required: boolean;
+  invalidate_downstream: boolean;
+}
+
 export interface WorkflowStage {
   id: string;
   name: string;
@@ -36,6 +43,7 @@ export interface WorkflowTemplate {
   description: string;
   source: WorkflowSource;
   permissions: WorkflowPermissions;
+  rework: WorkflowReworkPolicy;
   stages: WorkflowStage[];
 }
 
@@ -51,6 +59,37 @@ export interface WorkflowListResult {
 }
 
 export type SessionStatus = "created" | "running" | "waiting_approval" | "blocked" | "completed" | "failed";
+
+export type StageRunStatus =
+  | "pending"
+  | "running"
+  | "waiting_approval"
+  | "completed"
+  | "failed"
+  | "needs_rework"
+  | "superseded";
+
+export interface StageRun {
+  id: string;
+  stage_id: string;
+  attempt: number;
+  status: StageRunStatus;
+  input_summary: string;
+  output_summary?: string;
+  started_at: string;
+  completed_at?: string;
+  rework_reason?: string;
+}
+
+export interface ReworkRequest {
+  id: string;
+  from_stage_id: string;
+  target_stage_id: string;
+  status: "pending" | "approved" | "denied";
+  reason: string;
+  created_at: string;
+  resolved_at?: string;
+}
 
 export interface AgentMessage {
   role: "user" | "assistant" | "system";
@@ -78,6 +117,7 @@ export interface FileChangeRecord {
 export interface ApprovalRecord {
   id: string;
   stage_id: string;
+  stage_run_id?: string;
   kind: "stage" | "shell" | "file";
   status: "pending" | "approved" | "denied";
   message: string;
@@ -96,6 +136,8 @@ export interface AgentSession {
   tool_calls: ToolCallRecord[];
   file_changes: FileChangeRecord[];
   approvals: ApprovalRecord[];
+  stage_runs?: StageRun[];
+  rework_requests?: ReworkRequest[];
   created_at: string;
   updated_at: string;
   error?: string;

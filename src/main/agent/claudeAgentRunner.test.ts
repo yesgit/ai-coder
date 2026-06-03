@@ -9,6 +9,7 @@ const workflow: WorkflowTemplate = {
   description: "Test",
   source: { type: "builtin", id: "software-engineering", version: "1.0.0" },
   permissions: { filesystem: { mode: "project-only" }, shell: { approval_required: true } },
+  rework: { enabled: false, allowed_targets: [], approval_required: true, invalidate_downstream: true },
   stages: [
     { id: "plan", name: "Plan", approval_required: true },
     { id: "execute", name: "Execute", allowed_tools: ["read_file", "edit_file", "shell"] }
@@ -40,6 +41,17 @@ describe("ClaudeAgentRunner", () => {
           created_at: new Date().toISOString()
         }
       ],
+      stage_runs: [
+        {
+          id: "00000000-0000-4000-8000-000000000002",
+          stage_id: "plan",
+          attempt: 1,
+          status: "waiting_approval",
+          input_summary: "Initial task",
+          started_at: new Date().toISOString()
+        }
+      ],
+      rework_requests: [],
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString()
     };

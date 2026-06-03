@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { AgentSession, ToolCallRecord, WorkflowTemplate } from "../../shared/types.js";
+import type { AgentSession, ToolCallRecord, WorkflowStage, WorkflowTemplate } from "../../shared/types.js";
 
 const DANGEROUS_COMMANDS = [
   "rm -rf /",
@@ -37,8 +37,8 @@ export function hasPendingStageApproval(session: AgentSession): boolean {
   return session.approvals.some((approval) => approval.kind === "stage" && approval.status === "pending");
 }
 
-export function buildAllowedClaudeTools(workflow: WorkflowTemplate): string[] {
-  const declared = new Set(workflow.stages.flatMap((stage) => stage.allowed_tools ?? []));
+export function buildAllowedClaudeTools(workflow: WorkflowTemplate, stage?: WorkflowStage): string[] {
+  const declared = new Set(stage ? (stage.allowed_tools ?? []) : workflow.stages.flatMap((item) => item.allowed_tools ?? []));
   const tools = new Set<string>(["Read", "Grep", "Glob", "LS"]);
 
   if (declared.has("edit_file")) {

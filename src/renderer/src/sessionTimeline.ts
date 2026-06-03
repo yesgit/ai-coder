@@ -1,6 +1,14 @@
-import type { AgentMessage, AgentSession, ApprovalRecord, FileChangeRecord, ToolCallRecord } from "../../shared/types.js";
+import type {
+  AgentMessage,
+  AgentSession,
+  ApprovalRecord,
+  FileChangeRecord,
+  ReworkRequest,
+  StageRun,
+  ToolCallRecord
+} from "../../shared/types.js";
 
-export type TimelineEventType = "task" | "message" | "approval" | "tool" | "file" | "status" | "error";
+export type TimelineEventType = "task" | "stage" | "message" | "approval" | "tool" | "file" | "rework" | "status" | "error";
 
 export interface TimelineEvent {
   id: string;
@@ -35,6 +43,33 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
       status: message.role,
       sort_order: 10
     });
+  });
+
+  (session.stage_runs ?? []).forEach((stageRun: StageRun) => {
+    events.push({
+      id: `${session.id}:stage:${stageRun.id}:started`,
+      type: "stage",
+      title: `Stage started: ${stageRun.stage_id} attempt ${stageRun.attempt}`,
+      detail: stageRun.input_summary,
+      timestamp: stageRun.started_at,
+      status: stageRun.status,
+      sort_order: 15
+    });
+
+    if (stageRun.completed_at) {
+      events.push({
+        id: `${session.id}:stage:${stageRun.id}:completed`,
+        type: "stage",
+        title:
+          stageRun.status === "needs_rework"
+            ? `Stage needs rework: ${stageRun.stage_id} attempt ${stageRun.attempt}`
+            : `Stage ${stageRun.status}: ${stageRun.stage_id} attempt ${stageRun.attempt}`,
+        detail: stageRun.rework_reason ?? stageRun.output_summary,
+        timestamp: stageRun.completed_at,
+        status: stageRun.status,
+        sort_order: 16
+      });
+    }
   });
 
   session.approvals.forEach((approval: ApprovalRecord) => {
@@ -95,6 +130,30 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
       status: fileChange.approved ? "approved" : "pending",
       sort_order: 40
     });
+  });
+
+  (session.rework_requests ?? []).forEach((request: ReworkRequest) => {
+    events.push({
+      id: `${session.id}:rework:${request.id}:requested`,
+      type: "rework",
+      title: `Rework requested: ${request.from_stage_id} -> ${request.target_stage_id}`,
+      detail: request.reason,
+      timestamp: request.created_at,
+      status: request.status,
+      sort_order: 50
+    });
+
+    if (request.resolved_at) {
+      events.push({
+        id: `${session.id}:rework:${request.id}:resolved`,
+        type: "rework",
+        title: `Rework ${request.status}: ${request.target_stage_id}`,
+        detail: request.reason,
+        timestamp: request.resolved_at,
+        status: request.status,
+        sort_order: 51
+      });
+    }
   });
 
   if (session.error) {

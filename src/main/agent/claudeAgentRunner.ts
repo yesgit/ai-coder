@@ -3,9 +3,9 @@ import {
   approveOrDenyToolUse,
   buildAllowedClaudeTools,
   buildDisallowedClaudeTools,
-  hasPendingStageApproval
 } from "../security/projectPolicy.js";
-import { buildWorkflowInstructions } from "./workflowPrompt.js";
+import { WorkflowEngine } from "../workflows/workflowEngine.js";
+import { buildStageInstructions } from "./workflowPrompt.js";
 
 export interface AgentRunInput {
   session: AgentSession;
@@ -13,13 +13,23 @@ export interface AgentRunInput {
 }
 
 export class ClaudeAgentRunner {
+  private readonly workflowEngine = new WorkflowEngine();
+
   async run(input: AgentRunInput): Promise<AgentSession> {
+    this.workflowEngine.ensureState(input.session, input.workflow);
     if (this.waitForApprovalIfNeeded(input)) {
       return input.session;
     }
 
+    const currentStage = input.workflow.stages.find((stage) => stage.id === input.session.current_stage);
+    if (!currentStage) {
+      input.session.status = "failed";
+      input.session.error = `Workflow stage not found: ${input.session.current_stage}`;
+      return input.session;
+    }
+
     if (!process.env.ANTHROPIC_API_KEY) {
-      return this.runMock(input);
+      return this.runMock(input, currentStage.name);
     }
 
     try {
@@ -29,13 +39,13 @@ export class ClaudeAgentRunner {
         throw new Error("Claude Agent SDK does not expose query()");
       }
 
-      const instructions = buildWorkflowInstructions(input.workflow);
+      const instructions = buildStageInstructions(input.session, input.workflow, currentStage);
       const chunks: string[] = [];
       for await (const message of query({
         prompt: `${instructions}\n\nTask:\n${input.session.task_prompt}`,
         options: {
           cwd: input.session.project_path,
-          tools: buildAllowedClaudeTools(input.workflow),
+          tools: buildAllowedClaudeTools(input.workflow, currentStage),
           disallowedTools: buildDisallowedClaudeTools(input.workflow),
           permissionMode: "dontAsk",
           settingSources: [],
@@ -56,8 +66,11 @@ export class ClaudeAgentRunner {
         content: chunks.join("\n"),
         created_at: new Date().toISOString()
       });
-      input.session.status = this.resolveFinalStatus(input.session);
-      input.session.current_stage = input.workflow.stages.at(-1)?.id ?? input.session.current_stage;
+      if (this.hasPendingToolCall(input.session) || this.hasBlockedToolCall(input.session)) {
+        input.session.status = this.resolveInterruptedStatus(input.session);
+        return input.session;
+      }
+      this.workflowEngine.completeCurrentStage(input.session, input.workflow, summarizeStageOutput(chunks.join("\n")));
       return input.session;
     } catch (error) {
       input.session.status = "failed";
@@ -66,23 +79,25 @@ export class ClaudeAgentRunner {
     }
   }
 
-  private runMock(input: AgentRunInput): AgentSession {
-    input.session.status = "completed";
-    input.session.current_stage = input.workflow.stages.at(-1)?.id ?? input.session.current_stage;
+  private runMock(input: AgentRunInput, stageName: string): AgentSession {
+    const content = `Mock stage "${stageName}" completed. Set ANTHROPIC_API_KEY to use Claude Agent SDK.`;
     input.session.messages.push({
       role: "assistant",
-      content: `Mock run completed with workflow "${input.workflow.name}". Set ANTHROPIC_API_KEY to use Claude Agent SDK.`,
+      content,
       created_at: new Date().toISOString()
     });
+    this.workflowEngine.completeCurrentStage(input.session, input.workflow, content);
     return input.session;
   }
 
   private waitForApprovalIfNeeded(input: AgentRunInput): boolean {
-    if (!hasPendingStageApproval(input.session)) {
+    const approval = input.session.approvals.find(
+      (item) => item.kind === "stage" && item.status === "pending" && item.stage_id === input.session.current_stage
+    );
+    if (!approval) {
       return false;
     }
 
-    const approval = input.session.approvals.find((item) => item.kind === "stage" && item.status === "pending");
     const stage = input.workflow.stages.find((item) => item.id === approval?.stage_id);
     input.session.status = "waiting_approval";
     input.session.current_stage = approval?.stage_id ?? input.session.current_stage;
@@ -105,7 +120,7 @@ export class ClaudeAgentRunner {
     return session.tool_calls.some((toolCall) => toolCall.status === "pending_approval");
   }
 
-  private resolveFinalStatus(session: AgentSession): AgentSession["status"] {
+  private resolveInterruptedStatus(session: AgentSession): AgentSession["status"] {
     if (this.hasPendingToolCall(session)) {
       return "waiting_approval";
     }
@@ -114,4 +129,12 @@ export class ClaudeAgentRunner {
     }
     return "completed";
   }
+}
+
+function summarizeStageOutput(content: string): string {
+  const normalized = content.replace(/\s+/g, " ").trim();
+  if (normalized.length <= 240) {
+    return normalized;
+  }
+  return `${normalized.slice(0, 237)}...`;
 }

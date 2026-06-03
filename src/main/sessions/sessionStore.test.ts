@@ -12,6 +12,7 @@ const workflow: WorkflowTemplate = {
   description: "Test",
   source: { type: "builtin", id: "plan-execute", version: "1.0.0" },
   permissions: { filesystem: { mode: "project-only" }, shell: { approval_required: true } },
+  rework: { enabled: false, allowed_targets: [], approval_required: true, invalidate_downstream: true },
   stages: [
     { id: "plan", name: "Plan", approval_required: true },
     { id: "execute", name: "Execute" }
@@ -19,27 +20,17 @@ const workflow: WorkflowTemplate = {
 };
 
 describe("SessionStore", () => {
-  it("creates sessions with pending approvals for approval stages", async () => {
+  it("creates sessions with the first stage run", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-sessions-"));
     const store = new SessionStore(dir);
 
     const session = await store.create("/tmp/project", workflow, "Fix bug");
 
-    expect(session.status).toBe("created");
+    expect(session.status).toBe("running");
     expect(session.current_stage).toBe("plan");
-    expect(session.approvals).toHaveLength(1);
-    expect(session.approvals[0].status).toBe("pending");
-  });
-
-  it("approves a pending stage", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-sessions-"));
-    const store = new SessionStore(dir);
-    const session = await store.create("/tmp/project", workflow, "Fix bug");
-
-    const updated = await store.approveStage(session.id, "plan");
-
-    expect(updated.approvals[0].status).toBe("approved");
-    expect(updated.status).toBe("running");
+    expect(session.approvals).toHaveLength(0);
+    expect(session.stage_runs).toHaveLength(1);
+    expect(session.stage_runs?.[0]).toMatchObject({ stage_id: "plan", attempt: 1, status: "running" });
   });
 
   it("rejects invalid session ids", async () => {
