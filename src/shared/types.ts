@@ -29,6 +29,7 @@ export interface WorkflowReworkPolicy {
 export interface WorkflowStage {
   id: string;
   name: string;
+  instructions?: string;
   approval_required?: boolean;
   allowed_tools?: string[];
   required_outputs?: string[];

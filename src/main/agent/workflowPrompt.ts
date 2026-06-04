@@ -36,6 +36,7 @@ export function buildStageInstructions(input: StageAgentInput): string {
     "Current stage:",
     `id: ${input.current_stage.id}`,
     `name: ${input.current_stage.name}`,
+    input.current_stage.instructions ? `instructions:\n${input.current_stage.instructions}` : "instructions: none",
     `allowed_tools: ${allowedTools}`,
     `required_outputs: ${requiredOutputs}`,
     `gates: ${gates}`,

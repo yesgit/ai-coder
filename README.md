@@ -17,6 +17,23 @@ Workflows are merged by id in this order, where later sources override earlier o
 2. User workflows from `~/.ai-coder/workflows/*.yaml`
 3. Project workflows from `.ai-coder/workflows/*.yaml`
 
+## Project Onboarding
+
+The built-in `project-onboarding` workflow uses Claude Agent SDK to scan a selected project and
+create or update the project root `CLAUDE.md`.
+
+This is the first project profile format. It deliberately uses Claude Code project memory instead
+of a separate knowledge database so later stage execution can reuse the same context.
+
+The onboarding workflow requires Claude to:
+
+- check whether `CLAUDE.md` already exists before drafting changes
+- preserve valuable existing team rules, architecture notes, commands, and imports
+- add a Compact Summary near the top for context compression and task resumption
+- keep memory focused, structured, and concrete
+- avoid secrets, credentials, generated directories, and long source dumps
+- request file-write approval before creating or updating `CLAUDE.md`
+
 ## Claude Agent SDK
 
 The first implementation includes an adapter boundary in `src/main/agent/claudeAgentRunner.ts`.

@@ -132,6 +132,7 @@ const workflowSchema = z.object({
       z.object({
         id: z.string().min(1),
         name: z.string().min(1),
+        instructions: z.string().optional(),
         approval_required: z.boolean().default(false),
         allowed_tools: stringArraySchema,
         required_outputs: stringArraySchema,
@@ -167,6 +168,7 @@ function normalizeWorkflow(input: unknown, sourceType: WorkflowSourceType, fileP
     stages: workflow.stages.map((stage) => ({
       id: stage.id,
       name: stage.name,
+      instructions: stage.instructions,
       approval_required: stage.approval_required,
       allowed_tools: stage.allowed_tools,
       required_outputs: stage.required_outputs,

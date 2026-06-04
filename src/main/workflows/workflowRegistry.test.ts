@@ -85,4 +85,25 @@ describe("WorkflowRegistry", () => {
     expect(result.workflows).toHaveLength(0);
     expect(result.issues[0].message).toContain("permissions.filesystem.mode");
   });
+
+  it("loads optional stage instructions", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-workflows-"));
+    await fs.writeFile(
+      path.join(dir, "onboarding.yaml"),
+      [
+        "id: project-onboarding",
+        "name: Project Onboarding",
+        "version: 1.0.0",
+        "stages:",
+        "  - id: scan_project",
+        "    name: Scan Project",
+        "    instructions: |",
+        "      Check for an existing CLAUDE.md first."
+      ].join("\n")
+    );
+
+    const workflows = await new WorkflowRegistry(dir).list();
+
+    expect(workflows[0].stages[0].instructions).toContain("CLAUDE.md");
+  });
 });

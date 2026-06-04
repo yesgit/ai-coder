@@ -1,0 +1,93 @@
+id: project-onboarding
+name: Project Onboarding
+version: 1.0.0
+description: Scan the selected project and create or update CLAUDE.md as shared project memory.
+source:
+  type: builtin
+  id: project-onboarding
+  version: 1.0.0
+permissions:
+  filesystem:
+    mode: project-only
+  shell:
+    approval_required: true
+  network:
+    enabled: false
+rework:
+  enabled: true
+  allowed_targets:
+    - scan_project
+    - understand_project
+    - draft_memory
+  approval_required: true
+  invalidate_downstream: true
+stages:
+  - id: scan_project
+    name: Scan Project
+    instructions: |
+      Inspect the project before writing anything. Prefer reading existing project documentation and configuration over guessing.
+      Check for an existing CLAUDE.md in the project root first.
+      If CLAUDE.md exists, read it and preserve valuable team rules, architecture notes, commands, and imports.
+      Read likely sources of truth such as README files, package manifests, lockfiles, tsconfig/vite/electron configs, CI workflows, test directories, and key source entrypoints.
+      Do not read secrets, credentials, generated dependency directories, or large build artifacts.
+    allowed_tools:
+      - read_file
+      - shell
+    required_outputs:
+      - existing_claude_md_status
+      - inspected_files
+      - detected_project_type
+  - id: understand_project
+    name: Understand Project
+    instructions: |
+      Summarize the project for future coding agents. Identify the tech stack, architecture, module boundaries, common commands, test strategy, coding conventions, safety constraints, and known risks.
+      Keep the summary concrete and evidence-based. If a command or convention is uncertain, say so instead of inventing it.
+    required_outputs:
+      - project_overview
+      - tech_stack
+      - architecture_notes
+      - command_notes
+      - safety_notes
+  - id: draft_memory
+    name: Draft CLAUDE.md
+    approval_required: true
+    instructions: |
+      Draft the target CLAUDE.md update before writing the file.
+      The draft must be concise, structured, and suitable as Claude Code project memory.
+      Put a Compact Summary near the top for context compression and task resumption.
+      Include sections for Project Overview, Tech Stack, Architecture, Common Commands, Development Rules, Testing Rules, Safety Rules, Workflow Notes, Known Issues, and Update Policy.
+      Use bullets under descriptive Markdown headings.
+      Use @path/to/file imports only for stable source-of-truth files that should remain visible to Claude Code, such as README.md or package.json.
+      If an existing CLAUDE.md is present, produce an incremental update plan and explicitly state what will be preserved, changed, and added.
+      Do not include secrets, tokens, private credentials, or personal local preferences.
+    required_outputs:
+      - compact_summary
+      - claude_md_draft
+      - preservation_plan
+  - id: write_memory
+    name: Write CLAUDE.md
+    instructions: |
+      Create or update the project root CLAUDE.md using the approved draft.
+      If CLAUDE.md already exists, merge changes carefully instead of replacing the file wholesale.
+      Preserve existing valuable team instructions and imports unless they are clearly obsolete.
+      The final file must remain focused and concise; avoid dumping long source listings or full documentation.
+      File writes require approval through the host application.
+    allowed_tools:
+      - read_file
+      - edit_file
+    gates:
+      - authorized_files_only
+    required_outputs:
+      - claude_md_path
+      - update_summary
+  - id: review
+    name: Review Onboarding
+    instructions: |
+      Review the generated or updated CLAUDE.md against Claude Code memory best practices.
+      Check that the Compact Summary is present, commands are concrete, safety rules are explicit, and existing CLAUDE.md content was respected.
+      Report any remaining uncertainties that a human should confirm.
+    allowed_tools:
+      - read_file
+    required_outputs:
+      - review_summary
+      - human_review_items
