@@ -70,12 +70,19 @@ export default function App() {
 
   async function chooseProject() {
     setError("");
-    const selected = await window.aiCoder.selectProjectDirectory();
-    if (selected) {
-      setProjectPath(selected);
-      setOnboardingOverride(false);
-      await refreshWorkflows(selected);
-      await refreshOnboardingStatus(selected);
+    setBusy(true);
+    try {
+      const selected = await window.aiCoder.selectProjectDirectory();
+      if (selected) {
+        setProjectPath(selected);
+        setOnboardingOverride(false);
+        await refreshWorkflows(selected);
+        await refreshOnboardingStatus(selected);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -209,8 +216,8 @@ export default function App() {
           </div>
         </div>
 
-        <button className="secondary" onClick={chooseProject}>
-          Select Project
+        <button className="secondary" disabled={busy} onClick={chooseProject}>
+          {busy ? "Selecting..." : "Select Project"}
         </button>
         <p className="path" title={projectPath}>
           {projectPath || "No project selected"}

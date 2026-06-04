@@ -1,4 +1,5 @@
-import { dialog, ipcMain } from "electron";
+import { BrowserWindow, dialog, ipcMain } from "electron";
+import type { OpenDialogOptions } from "electron";
 import type { ProjectOnboardingStatus, SessionOnboardingSnapshot, StartSessionInput } from "../shared/types.js";
 import { ClaudeAgentRunner } from "./agent/claudeAgentRunner.js";
 import { getClaudeRuntimeStatus } from "./agent/claudeRuntime.js";
@@ -13,10 +14,10 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
   const workflowEngine = new WorkflowEngine();
   const onboardingStore = new OnboardingStore();
 
-  ipcMain.handle("project:select", async () => {
-    const result = await dialog.showOpenDialog({
-      properties: ["openDirectory"]
-    });
+  ipcMain.handle("project:select", async (event) => {
+    const parentWindow = BrowserWindow.fromWebContents(event.sender) ?? undefined;
+    const options: OpenDialogOptions = { properties: ["openDirectory"] };
+    const result = parentWindow ? await dialog.showOpenDialog(parentWindow, options) : await dialog.showOpenDialog(options);
     return result.canceled ? null : authorizedProjects.authorize(result.filePaths[0]);
   });
 

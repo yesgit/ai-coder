@@ -17,7 +17,7 @@ async function createWindow(): Promise<void> {
     minHeight: 680,
     title: "AI Coder",
     webPreferences: {
-      preload: path.join(__dirname, "preload.js"),
+      preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
       nodeIntegration: false
     }
