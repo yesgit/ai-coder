@@ -2,6 +2,7 @@ import { dialog, ipcMain } from "electron";
 import type { StartSessionInput } from "../shared/types.js";
 import { ClaudeAgentRunner } from "./agent/claudeAgentRunner.js";
 import { getClaudeRuntimeStatus } from "./agent/claudeRuntime.js";
+import { OnboardingStore } from "./onboarding/onboardingStore.js";
 import { AuthorizedProjects } from "./security/authorizedProjects.js";
 import { SessionStore } from "./sessions/sessionStore.js";
 import { WorkflowEngine } from "./workflows/workflowEngine.js";
@@ -10,6 +11,7 @@ import { WorkflowRegistry } from "./workflows/workflowRegistry.js";
 export function registerIpcHandlers(registry: WorkflowRegistry, sessions: SessionStore, runner: ClaudeAgentRunner): void {
   const authorizedProjects = new AuthorizedProjects();
   const workflowEngine = new WorkflowEngine();
+  const onboardingStore = new OnboardingStore();
 
   ipcMain.handle("project:select", async () => {
     const result = await dialog.showOpenDialog({
@@ -19,6 +21,16 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
   });
 
   ipcMain.handle("agent:get-status", async () => getClaudeRuntimeStatus());
+
+  ipcMain.handle("project:onboarding-status", async (_event, projectPath: string) => {
+    const authorizedProjectPath = await authorizedProjects.assertAuthorized(projectPath);
+    return onboardingStore.getStatus(authorizedProjectPath);
+  });
+
+  ipcMain.handle("project:confirm-onboarding", async (_event, projectPath: string) => {
+    const authorizedProjectPath = await authorizedProjects.assertAuthorized(projectPath);
+    return onboardingStore.confirm(authorizedProjectPath);
+  });
 
   ipcMain.handle("workflows:list", async (_event, projectPath?: string) => {
     const authorizedProjectPath = projectPath ? await authorizedProjects.assertAuthorized(projectPath) : undefined;

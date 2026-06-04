@@ -3,6 +3,7 @@ import type {
   AgentSession,
   AgentRuntimeStatus,
   ApprovalRecord,
+  ProjectOnboardingStatus,
   ReworkRequest,
   StageRun,
   ToolCallRecord,
@@ -23,6 +24,7 @@ export default function App() {
   const [sessions, setSessions] = useState<AgentSession[]>([]);
   const [activeSession, setActiveSession] = useState<AgentSession | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<AgentRuntimeStatus | null>(null);
+  const [onboardingStatus, setOnboardingStatus] = useState<ProjectOnboardingStatus | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -48,6 +50,14 @@ export default function App() {
     setSelectedWorkflowId((current: string) => current || result.workflows[0]?.id || "");
   }
 
+  async function refreshOnboardingStatus(nextProjectPath = projectPath) {
+    if (!nextProjectPath) {
+      setOnboardingStatus(null);
+      return;
+    }
+    setOnboardingStatus(await window.aiCoder.getProjectOnboardingStatus(nextProjectPath));
+  }
+
   async function refreshSessions(preferredSessionId?: string) {
     const loaded = await window.aiCoder.listSessions();
     setSessions(loaded);
@@ -63,6 +73,20 @@ export default function App() {
     if (selected) {
       setProjectPath(selected);
       await refreshWorkflows(selected);
+      await refreshOnboardingStatus(selected);
+    }
+  }
+
+  async function confirmOnboarding() {
+    if (!projectPath) return;
+    setBusy(true);
+    setError("");
+    try {
+      setOnboardingStatus(await window.aiCoder.confirmProjectOnboarding(projectPath));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -165,6 +189,8 @@ export default function App() {
   const stageRuns = activeSession?.stage_runs ?? [];
   const reworkRequests = activeSession?.rework_requests ?? [];
   const pendingReworkRequests = reworkRequests.filter((request) => request.status === "pending");
+  const onboardingConfirmed = onboardingStatus?.status === "confirmed";
+  const showOnboardingWarning = Boolean(projectPath && selectedWorkflowId !== "project-onboarding" && !onboardingConfirmed);
   const timeline = activeSession ? buildSessionTimeline(activeSession) : [];
 
   return (
@@ -184,6 +210,22 @@ export default function App() {
         <p className="path" title={projectPath}>
           {projectPath || "No project selected"}
         </p>
+
+        {onboardingStatus && (
+          <section className="onboarding-box">
+            <h2>Onboarding</h2>
+            <div className="onboarding-status-row">
+              <span className={`status-pill ${onboardingStatus.status}`}>{onboardingStatus.status}</span>
+              <small>{onboardingStatus.claude_md_exists ? "CLAUDE.md found" : "CLAUDE.md missing"}</small>
+            </div>
+            {onboardingStatus.confirmed_at && <small>Confirmed {formatTimestamp(onboardingStatus.confirmed_at)}</small>}
+            {onboardingStatus.claude_md_exists && onboardingStatus.status !== "confirmed" && (
+              <button className="secondary" disabled={busy} onClick={confirmOnboarding}>
+                Confirm CLAUDE.md
+              </button>
+            )}
+          </section>
+        )}
 
         <section>
           <h2>Workflow</h2>
@@ -256,6 +298,9 @@ export default function App() {
             </button>
             {error && <span className="error">{error}</span>}
           </div>
+          {showOnboardingWarning && (
+            <div className="admission-warning">Project onboarding is not confirmed. Run Project Onboarding or confirm CLAUDE.md.</div>
+          )}
         </div>
 
         {selectedWorkflow && (

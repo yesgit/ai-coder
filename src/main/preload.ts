@@ -4,6 +4,8 @@ import type { AppApi, StartSessionInput } from "../shared/types.js";
 const api: AppApi = {
   selectProjectDirectory: () => ipcRenderer.invoke("project:select"),
   getAgentRuntimeStatus: () => ipcRenderer.invoke("agent:get-status"),
+  getProjectOnboardingStatus: (projectPath: string) => ipcRenderer.invoke("project:onboarding-status", projectPath),
+  confirmProjectOnboarding: (projectPath: string) => ipcRenderer.invoke("project:confirm-onboarding", projectPath),
   listWorkflows: (projectPath?: string) => ipcRenderer.invoke("workflows:list", projectPath),
   startSession: (input: StartSessionInput) => ipcRenderer.invoke("sessions:start", input),
   listSessions: () => ipcRenderer.invoke("sessions:list"),

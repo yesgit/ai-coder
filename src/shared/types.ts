@@ -203,9 +203,21 @@ export interface AgentRuntimeStatus {
   diagnostics: string[];
 }
 
+export interface ProjectOnboardingStatus {
+  status: "not_started" | "claude_md_exists" | "pending_review" | "confirmed";
+  project_path: string;
+  claude_md_path: string;
+  claude_md_exists: boolean;
+  claude_md_hash?: string;
+  confirmed_at?: string;
+  confirmed_by?: "local-user";
+}
+
 export interface AppApi {
   selectProjectDirectory(): Promise<string | null>;
   getAgentRuntimeStatus(): Promise<AgentRuntimeStatus>;
+  getProjectOnboardingStatus(projectPath: string): Promise<ProjectOnboardingStatus>;
+  confirmProjectOnboarding(projectPath: string): Promise<ProjectOnboardingStatus>;
   listWorkflows(projectPath?: string): Promise<WorkflowListResult>;
   startSession(input: StartSessionInput): Promise<StartSessionResult>;
   listSessions(): Promise<AgentSession[]>;

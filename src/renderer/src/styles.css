@@ -120,6 +120,22 @@ small {
   gap: 8px;
 }
 
+.onboarding-box {
+  display: grid;
+  gap: 8px;
+  border: 1px solid #e2e7ee;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 10px;
+}
+
+.onboarding-status-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
 .workflow-issues {
   display: grid;
   gap: 8px;
@@ -428,10 +444,34 @@ textarea {
 }
 
 .status-pill.failed,
-.status-pill.denied {
+.status-pill.denied,
+.status-pill.not_started {
   border-color: #f6c5bd;
   background: #fff4f2;
   color: #b42318;
+}
+
+.status-pill.claude_md_exists,
+.status-pill.pending_review {
+  border-color: #f3d18b;
+  background: #fffaf0;
+  color: #7a4b00;
+}
+
+.status-pill.confirmed {
+  border-color: #b7dfd5;
+  background: #eef8f6;
+  color: #146c5f;
+}
+
+.admission-warning {
+  border: 1px solid #f3d18b;
+  border-radius: 8px;
+  background: #fffaf0;
+  color: #7a4b00;
+  padding: 10px;
+  font-size: 13px;
+  font-weight: 700;
 }
 
 .pending-banner {

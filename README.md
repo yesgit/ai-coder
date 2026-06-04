@@ -34,6 +34,10 @@ The onboarding workflow requires Claude to:
 - avoid secrets, credentials, generated directories, and long source dumps
 - request file-write approval before creating or updating `CLAUDE.md`
 
+After reviewing `CLAUDE.md`, the user can confirm onboarding in the desktop app. Confirmation is
+stored locally under `~/.ai-coder/onboarding` and is tied to the current `CLAUDE.md` content hash.
+If `CLAUDE.md` changes later, the project returns to pending review.
+
 ## Claude Agent SDK
 
 The first implementation includes an adapter boundary in `src/main/agent/claudeAgentRunner.ts`.
