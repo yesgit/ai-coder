@@ -1,6 +1,7 @@
 import { dialog, ipcMain } from "electron";
 import type { StartSessionInput } from "../shared/types.js";
 import { ClaudeAgentRunner } from "./agent/claudeAgentRunner.js";
+import { getClaudeRuntimeStatus } from "./agent/claudeRuntime.js";
 import { AuthorizedProjects } from "./security/authorizedProjects.js";
 import { SessionStore } from "./sessions/sessionStore.js";
 import { WorkflowEngine } from "./workflows/workflowEngine.js";
@@ -17,10 +18,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     return result.canceled ? null : authorizedProjects.authorize(result.filePaths[0]);
   });
 
-  ipcMain.handle("agent:get-status", async () => ({
-    mode: process.env.ANTHROPIC_API_KEY ? "live" : "mock",
-    has_api_key: Boolean(process.env.ANTHROPIC_API_KEY)
-  }));
+  ipcMain.handle("agent:get-status", async () => getClaudeRuntimeStatus());
 
   ipcMain.handle("workflows:list", async (_event, projectPath?: string) => {
     const authorizedProjectPath = projectPath ? await authorizedProjects.assertAuthorized(projectPath) : undefined;

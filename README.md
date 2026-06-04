@@ -20,5 +20,14 @@ Workflows are merged by id in this order, where later sources override earlier o
 ## Claude Agent SDK
 
 The first implementation includes an adapter boundary in `src/main/agent/claudeAgentRunner.ts`.
-If `ANTHROPIC_API_KEY` is not set, the app runs in deterministic mock mode so the workflow UI,
+The app does not store Anthropic API keys. It reuses Claude Agent SDK / Claude Code authentication
+and settings from the local environment.
+
+Runtime diagnostics report:
+
+- whether the Claude Agent SDK package is available
+- whether a `claude` executable is visible on `PATH`
+- whether `ANTHROPIC_API_KEY` is present in the process environment
+
+If the SDK is unavailable, the app falls back to deterministic mock mode so the workflow UI,
 permissions, gates, and local session recording can be exercised without live model calls.

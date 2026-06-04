@@ -237,6 +237,13 @@ export default function App() {
               {selectedWorkflow?.description ?? "Choose a project and workflow to start."}
               {runtimeStatus && <span className={`runtime-mode ${runtimeStatus.mode}`}>{runtimeStatus.mode} mode</span>}
             </p>
+            {runtimeStatus && (
+              <div className="runtime-diagnostics">
+                <span className={runtimeStatus.sdk_available ? "diagnostic ok" : "diagnostic warn"}>SDK</span>
+                <span className={runtimeStatus.claude_executable_available ? "diagnostic ok" : "diagnostic warn"}>Claude CLI</span>
+                <span className={runtimeStatus.auth_env_available ? "diagnostic ok" : "diagnostic warn"}>Env auth</span>
+              </div>
+            )}
           </div>
           <textarea
             value={taskPrompt}

@@ -196,7 +196,10 @@ export interface StartSessionResult {
 
 export interface AgentRuntimeStatus {
   mode: "mock" | "live";
-  has_api_key: boolean;
+  sdk_available: boolean;
+  claude_executable_available: boolean;
+  auth_env_available: boolean;
+  diagnostics: string[];
 }
 
 export interface AppApi {

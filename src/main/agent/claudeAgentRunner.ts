@@ -8,6 +8,7 @@ import { WorkflowEngine } from "../workflows/workflowEngine.js";
 import { buildStageInstructions } from "./workflowPrompt.js";
 import { buildStageAgentInput, createMockStageAgentResult, parseStageAgentResult } from "./stageAgentProtocol.js";
 import { extractClaudeStageOutput, formatClaudeTranscript } from "./claudeMessageAdapter.js";
+import { shouldUseClaudeSdk } from "./claudeRuntime.js";
 
 export interface AgentRunInput {
   session: AgentSession;
@@ -31,7 +32,7 @@ export class ClaudeAgentRunner {
     }
     const stageAgentInput = buildStageAgentInput(input.session, input.workflow, currentStage);
 
-    if (!process.env.ANTHROPIC_API_KEY) {
+    if (!(await shouldUseClaudeSdk())) {
       return this.runMock(input, stageAgentInput);
     }
 
