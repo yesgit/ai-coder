@@ -1,5 +1,5 @@
 import { dialog, ipcMain } from "electron";
-import type { StartSessionInput } from "../shared/types.js";
+import type { ProjectOnboardingStatus, SessionOnboardingSnapshot, StartSessionInput } from "../shared/types.js";
 import { ClaudeAgentRunner } from "./agent/claudeAgentRunner.js";
 import { getClaudeRuntimeStatus } from "./agent/claudeRuntime.js";
 import { OnboardingStore } from "./onboarding/onboardingStore.js";
@@ -117,10 +117,46 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     if (!workflow) {
       throw new Error(`Workflow not found: ${input.workflowId}`);
     }
-    const session = await sessions.create(projectPath, workflow, input.taskPrompt.trim());
+    const onboardingStatus = await onboardingStore.getStatus(projectPath);
+    enforceOnboardingAdmission(workflow.id, onboardingStatus, Boolean(input.onboardingOverride));
+    const session = await sessions.create(
+      projectPath,
+      workflow,
+      input.taskPrompt.trim(),
+      buildOnboardingSnapshot(onboardingStatus, Boolean(input.onboardingOverride))
+    );
     session.status = "running";
     const updated = await runner.run({ session, workflow });
     await sessions.save(updated);
     return { session: updated };
   });
+}
+
+function enforceOnboardingAdmission(
+  workflowId: string,
+  onboardingStatus: ProjectOnboardingStatus,
+  onboardingOverride: boolean
+): void {
+  if (workflowId === "project-onboarding") {
+    return;
+  }
+  if (onboardingStatus.status === "confirmed") {
+    return;
+  }
+  if (onboardingOverride) {
+    return;
+  }
+  throw new Error("Project onboarding must be confirmed before running development workflows.");
+}
+
+function buildOnboardingSnapshot(
+  onboardingStatus: ProjectOnboardingStatus,
+  onboardingOverride: boolean
+): SessionOnboardingSnapshot {
+  return {
+    status: onboardingStatus.status,
+    claude_md_hash: onboardingStatus.claude_md_hash,
+    override: onboardingOverride,
+    checked_at: new Date().toISOString()
+  };
 }

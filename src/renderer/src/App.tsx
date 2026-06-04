@@ -25,6 +25,7 @@ export default function App() {
   const [activeSession, setActiveSession] = useState<AgentSession | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<AgentRuntimeStatus | null>(null);
   const [onboardingStatus, setOnboardingStatus] = useState<ProjectOnboardingStatus | null>(null);
+  const [onboardingOverride, setOnboardingOverride] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -72,6 +73,7 @@ export default function App() {
     const selected = await window.aiCoder.selectProjectDirectory();
     if (selected) {
       setProjectPath(selected);
+      setOnboardingOverride(false);
       await refreshWorkflows(selected);
       await refreshOnboardingStatus(selected);
     }
@@ -97,7 +99,8 @@ export default function App() {
       const result = await window.aiCoder.startSession({
         projectPath,
         workflowId: selectedWorkflowId,
-        taskPrompt
+        taskPrompt,
+        onboardingOverride
       });
       setActiveSession(result.session);
       setTaskPrompt("");
@@ -183,14 +186,16 @@ export default function App() {
     }
   }
 
-  const canStart = Boolean(projectPath && selectedWorkflowId && taskPrompt.trim() && !busy);
+  const onboardingConfirmed = onboardingStatus?.status === "confirmed";
+  const onboardingRequired = Boolean(projectPath && selectedWorkflowId !== "project-onboarding" && !onboardingConfirmed);
+  const onboardingAdmissionAllowed = !onboardingRequired || onboardingOverride;
+  const canStart = Boolean(projectPath && selectedWorkflowId && taskPrompt.trim() && onboardingAdmissionAllowed && !busy);
   const pendingToolCalls = activeSession?.tool_calls.filter((toolCall) => toolCall.status === "pending_approval") ?? [];
   const approvedToolCalls = activeSession?.tool_calls.filter((toolCall) => toolCall.status === "approved") ?? [];
   const stageRuns = activeSession?.stage_runs ?? [];
   const reworkRequests = activeSession?.rework_requests ?? [];
   const pendingReworkRequests = reworkRequests.filter((request) => request.status === "pending");
-  const onboardingConfirmed = onboardingStatus?.status === "confirmed";
-  const showOnboardingWarning = Boolean(projectPath && selectedWorkflowId !== "project-onboarding" && !onboardingConfirmed);
+  const showOnboardingWarning = onboardingRequired;
   const timeline = activeSession ? buildSessionTimeline(activeSession) : [];
 
   return (
@@ -299,7 +304,17 @@ export default function App() {
             {error && <span className="error">{error}</span>}
           </div>
           {showOnboardingWarning && (
-            <div className="admission-warning">Project onboarding is not confirmed. Run Project Onboarding or confirm CLAUDE.md.</div>
+            <div className="admission-warning">
+              <span>Project onboarding is not confirmed. Run Project Onboarding or confirm CLAUDE.md.</span>
+              <label className="override-option">
+                <input
+                  type="checkbox"
+                  checked={onboardingOverride}
+                  onChange={(event) => setOnboardingOverride(event.target.checked)}
+                />
+                Run without confirmed onboarding
+              </label>
+            </div>
           )}
         </div>
 
@@ -323,6 +338,12 @@ export default function App() {
                   <p>
                     {activeSession.status} · {activeSession.workflow_id} · {activeSession.current_stage}
                   </p>
+                  {activeSession.onboarding && (
+                    <p>
+                      onboarding {activeSession.onboarding.status}
+                      {activeSession.onboarding.override ? " · override" : ""}
+                    </p>
+                  )}
                 </div>
                 {activeSession.status === "waiting_approval" && (
                   <div className="session-actions">

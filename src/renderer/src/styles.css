@@ -465,6 +465,8 @@ textarea {
 }
 
 .admission-warning {
+  display: grid;
+  gap: 8px;
   border: 1px solid #f3d18b;
   border-radius: 8px;
   background: #fffaf0;
@@ -472,6 +474,21 @@ textarea {
   padding: 10px;
   font-size: 13px;
   font-weight: 700;
+}
+
+.override-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #7a4b00;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.override-option input {
+  width: 16px;
+  height: 16px;
+  accent-color: #146c5f;
 }
 
 .pending-banner {

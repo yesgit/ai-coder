@@ -180,15 +180,24 @@ export interface AgentSession {
   approvals: ApprovalRecord[];
   stage_runs?: StageRun[];
   rework_requests?: ReworkRequest[];
+  onboarding?: SessionOnboardingSnapshot;
   created_at: string;
   updated_at: string;
   error?: string;
+}
+
+export interface SessionOnboardingSnapshot {
+  status: ProjectOnboardingStatus["status"];
+  claude_md_hash?: string;
+  override: boolean;
+  checked_at: string;
 }
 
 export interface StartSessionInput {
   projectPath: string;
   workflowId: string;
   taskPrompt: string;
+  onboardingOverride?: boolean;
 }
 
 export interface StartSessionResult {

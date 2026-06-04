@@ -38,6 +38,10 @@ After reviewing `CLAUDE.md`, the user can confirm onboarding in the desktop app.
 stored locally under `~/.ai-coder/onboarding` and is tied to the current `CLAUDE.md` content hash.
 If `CLAUDE.md` changes later, the project returns to pending review.
 
+Development workflows require confirmed onboarding by default. The `project-onboarding` workflow
+is always allowed. Users can explicitly override the gate for local experiments; sessions record
+the onboarding status, `CLAUDE.md` hash, and override flag at start time.
+
 ## Claude Agent SDK
 
 The first implementation includes an adapter boundary in `src/main/agent/claudeAgentRunner.ts`.

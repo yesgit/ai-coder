@@ -33,6 +33,24 @@ describe("SessionStore", () => {
     expect(session.stage_runs?.[0]).toMatchObject({ stage_id: "plan", attempt: 1, status: "running" });
   });
 
+  it("records onboarding admission snapshots", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-sessions-"));
+    const store = new SessionStore(dir);
+
+    const session = await store.create("/tmp/project", workflow, "Fix bug", {
+      status: "pending_review",
+      claude_md_hash: "abc123",
+      override: true,
+      checked_at: new Date().toISOString()
+    });
+
+    expect(session.onboarding).toMatchObject({
+      status: "pending_review",
+      claude_md_hash: "abc123",
+      override: true
+    });
+  });
+
   it("rejects invalid session ids", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-sessions-"));
     const store = new SessionStore(dir);

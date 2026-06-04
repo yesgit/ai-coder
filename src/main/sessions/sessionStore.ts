@@ -2,13 +2,18 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import type { AgentSession, WorkflowTemplate } from "../../shared/types.js";
+import type { AgentSession, SessionOnboardingSnapshot, WorkflowTemplate } from "../../shared/types.js";
 import { WorkflowEngine } from "../workflows/workflowEngine.js";
 
 export class SessionStore {
   constructor(private readonly storeDir = path.join(os.homedir(), ".ai-coder", "sessions")) {}
 
-  async create(projectPath: string, workflow: WorkflowTemplate, taskPrompt: string): Promise<AgentSession> {
+  async create(
+    projectPath: string,
+    workflow: WorkflowTemplate,
+    taskPrompt: string,
+    onboarding?: SessionOnboardingSnapshot
+  ): Promise<AgentSession> {
     const now = new Date().toISOString();
     const firstStage = workflow.stages[0]?.id ?? "start";
     const session: AgentSession = {
@@ -24,6 +29,7 @@ export class SessionStore {
       approvals: [],
       stage_runs: [],
       rework_requests: [],
+      onboarding,
       created_at: now,
       updated_at: now
     };
