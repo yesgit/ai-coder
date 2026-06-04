@@ -42,6 +42,9 @@ Development workflows require confirmed onboarding by default. The `project-onbo
 is always allowed. Users can explicitly override the gate for local experiments; sessions record
 the onboarding status, `CLAUDE.md` hash, and override flag at start time.
 
+See `docs/project-onboarding-smoke-test.md` for a manual end-to-end verification flow using
+`samples/onboarding-target`.
+
 ## Claude Agent SDK
 
 The first implementation includes an adapter boundary in `src/main/agent/claudeAgentRunner.ts`.
