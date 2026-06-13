@@ -70,4 +70,57 @@ describe("ClaudeAgentRunner", () => {
       }
     }
   });
+
+  it("preserves SDK messages when the Claude process exits after an auth error", async () => {
+    async function* query() {
+      yield {
+        type: "assistant",
+        message: { content: [{ type: "text", text: "Invalid API key · Please run /login" }] },
+        error: "authentication_failed"
+      };
+      yield {
+        type: "result",
+        subtype: "success",
+        is_error: true,
+        result: "Invalid API key · Please run /login"
+      };
+      throw new Error("Claude Code process exited with code 1");
+    }
+
+    const session: AgentSession = {
+      id: "00000000-0000-4000-8000-000000000003",
+      project_path: "/tmp/project",
+      workflow_id: workflow.id,
+      task_prompt: "Fix the bug",
+      status: "running",
+      current_stage: "execute",
+      messages: [],
+      tool_calls: [],
+      file_changes: [],
+      approvals: [],
+      stage_runs: [
+        {
+          id: "00000000-0000-4000-8000-000000000004",
+          stage_id: "execute",
+          attempt: 1,
+          status: "running",
+          input_summary: "Approved plan",
+          started_at: new Date().toISOString()
+        }
+      ],
+      rework_requests: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+
+    const updated = await new ClaudeAgentRunner(query).run({ session, workflow });
+
+    expect(updated.status).toBe("failed");
+    expect(updated.error).toContain("Invalid API key");
+    expect(updated.messages.at(-1)?.content).toContain("Invalid API key");
+    expect(updated.stage_runs?.at(-1)).toMatchObject({
+      status: "failed",
+      output_summary: expect.stringContaining("Invalid API key")
+    });
+  });
 });

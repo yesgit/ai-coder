@@ -39,6 +39,28 @@ describe("claude message adapter", () => {
     expect(extractClaudeStageOutput(messages).error).toBe("SDK failed");
   });
 
+  it("extracts error result text from failed SDK runs", () => {
+    const messages = [
+      {
+        type: "assistant",
+        message: { content: [{ type: "text", text: "Invalid API key · Please run /login" }] },
+        error: "authentication_failed"
+      },
+      {
+        type: "result",
+        subtype: "success",
+        is_error: true,
+        result: "Invalid API key · Please run /login"
+      }
+    ];
+
+    expect(extractClaudeStageOutput(messages)).toMatchObject({
+      assistantText: "Invalid API key · Please run /login",
+      resultText: "Invalid API key · Please run /login",
+      error: "authentication_failed\nInvalid API key · Please run /login"
+    });
+  });
+
   it("formats a readable transcript", () => {
     const transcript = formatClaudeTranscript([
       {

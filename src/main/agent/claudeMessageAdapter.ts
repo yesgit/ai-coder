@@ -31,6 +31,9 @@ export function extractClaudeStageOutput(messages: unknown[]): ClaudeStageOutput
       if (typeof message.result === "string" && message.result.trim()) {
         resultText = message.result;
       }
+      if (message.is_error === true && typeof message.result === "string" && message.result.trim()) {
+        errors.push(message.result);
+      }
       if (Array.isArray(message.errors)) {
         errors.push(...message.errors.filter((error): error is string => typeof error === "string"));
       }

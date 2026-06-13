@@ -15,8 +15,12 @@ export interface AgentRunInput {
   workflow: WorkflowTemplate;
 }
 
+type ClaudeQuery = (params: unknown) => AsyncIterable<unknown>;
+
 export class ClaudeAgentRunner {
   private readonly workflowEngine = new WorkflowEngine();
+
+  constructor(private readonly queryOverride?: ClaudeQuery) {}
 
   async run(input: AgentRunInput): Promise<AgentSession> {
     this.workflowEngine.ensureState(input.session, input.workflow);
@@ -36,15 +40,11 @@ export class ClaudeAgentRunner {
       return this.runMock(input, stageAgentInput);
     }
 
+    const sdkMessages: unknown[] = [];
     try {
-      const sdk = await import("@anthropic-ai/claude-agent-sdk");
-      const query = (sdk as { query?: unknown }).query;
-      if (typeof query !== "function") {
-        throw new Error("Claude Agent SDK does not expose query()");
-      }
+      const query = await this.resolveQuery();
 
       const instructions = buildStageInstructions(stageAgentInput);
-      const sdkMessages: unknown[] = [];
       for await (const message of query({
         prompt: `${instructions}\n\nTask:\n${input.session.task_prompt}`,
         options: {
@@ -84,9 +84,7 @@ export class ClaudeAgentRunner {
       this.workflowEngine.applyStageResult(input.session, input.workflow, parseStageAgentResult(stageOutput.resultText || transcript));
       return input.session;
     } catch (error) {
-      input.session.status = "failed";
-      input.session.error = error instanceof Error ? error.message : String(error);
-      return input.session;
+      return this.failFromSdkError(input, sdkMessages, error);
     }
   }
 
@@ -140,5 +138,44 @@ export class ClaudeAgentRunner {
       return "blocked";
     }
     return "completed";
+  }
+
+  private failFromSdkError(input: AgentRunInput, sdkMessages: unknown[], error: unknown): AgentSession {
+    const fallbackError = error instanceof Error ? error.message : String(error);
+    if (sdkMessages.length > 0) {
+      const stageOutput = extractClaudeStageOutput(sdkMessages);
+      const transcript = formatClaudeTranscript(sdkMessages);
+      input.session.messages.push({
+        role: "assistant",
+        content: transcript,
+        created_at: new Date().toISOString()
+      });
+      this.workflowEngine.applyStageResult(input.session, input.workflow, {
+        status: "failed",
+        output_summary: stageOutput.error ?? fallbackError,
+        error: stageOutput.error ?? fallbackError
+      });
+      return input.session;
+    }
+
+    this.workflowEngine.applyStageResult(input.session, input.workflow, {
+      status: "failed",
+      output_summary: fallbackError,
+      error: fallbackError
+    });
+    return input.session;
+  }
+
+  private async resolveQuery(): Promise<ClaudeQuery> {
+    if (this.queryOverride) {
+      return this.queryOverride;
+    }
+
+    const sdk = await import("@anthropic-ai/claude-agent-sdk");
+    const query = (sdk as { query?: unknown }).query;
+    if (typeof query !== "function") {
+      throw new Error("Claude Agent SDK does not expose query()");
+    }
+    return query as ClaudeQuery;
   }
 }
