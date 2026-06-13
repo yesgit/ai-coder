@@ -2,6 +2,10 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { AgentSession, ToolCallRecord, WorkflowStage, WorkflowTemplate } from "../../shared/types.js";
 
+export type ToolUseDecision =
+  | { allow: true; updatedInput: Record<string, unknown> }
+  | { allow: false; message: string; interrupt: boolean };
+
 const DANGEROUS_COMMANDS = [
   "rm -rf /",
   "sudo ",
@@ -69,21 +73,20 @@ export async function approveOrDenyToolUse(
   toolName: string,
   input: Record<string, unknown>,
   toolUseId: string
-): Promise<{ allow: true; updatedInput: Record<string, unknown> } | { allow: false; message: string }> {
+): Promise<ToolUseDecision> {
   const now = new Date().toISOString();
-  const existingToolCall = session.tool_calls.find(
-    (toolCall) => toolCall.id === toolUseId && sameToolCall(toolCall, toolName, input)
-  );
+  const existingToolCall = findExistingToolCall(session, toolName, input, toolUseId);
   if (existingToolCall?.status === "approved") {
     existingToolCall.status = "completed";
     existingToolCall.resolved_at = now;
+    recordFileChangesForTool(session, toolName, input, true, now);
     return { allow: true, updatedInput: input };
   }
   if (existingToolCall?.status === "denied") {
-    return { allow: false, message: "Tool call was denied by the user." };
+    return { allow: false, message: "Tool call was denied by the user.", interrupt: true };
   }
   if (existingToolCall?.status === "pending_approval") {
-    return { allow: false, message: "Tool call is waiting for user approval." };
+    return { allow: false, message: "Tool call is waiting for user approval.", interrupt: true };
   }
 
   const record = (status: ToolCallRecord["status"]) => {
@@ -106,7 +109,7 @@ export async function approveOrDenyToolUse(
       if (requiresShellApproval(workflow)) {
         record("pending_approval");
         session.status = "waiting_approval";
-        return { allow: false, message: "Shell command is waiting for user approval." };
+        return { allow: false, message: "Shell command is waiting for user approval.", interrupt: true };
       }
     }
 
@@ -115,23 +118,29 @@ export async function approveOrDenyToolUse(
     }
 
     if (isWriteTool(toolName)) {
+      recordFileChangesForTool(session, toolName, input, false, now);
       record("pending_approval");
       session.status = "waiting_approval";
-      return { allow: false, message: "File write is waiting for user approval." };
+      return { allow: false, message: "File write is waiting for user approval.", interrupt: true };
     }
 
     record("approved");
     return { allow: true, updatedInput: input };
   } catch (error) {
     record("blocked");
-    return { allow: false, message: error instanceof Error ? error.message : String(error) };
+    return { allow: false, message: error instanceof Error ? error.message : String(error), interrupt: true };
   }
 }
 
 function extractFilePaths(input: Record<string, unknown>): string[] {
-  return ["file_path", "path", "notebook_path"]
+  const directPaths = ["file_path", "path", "notebook_path"]
     .map((key) => input[key])
     .filter((value): value is string => typeof value === "string" && value.length > 0);
+  const edits = Array.isArray(input.edits) ? input.edits : [];
+  const editPaths = edits
+    .map((edit) => (isRecord(edit) ? edit.file_path ?? edit.path : undefined))
+    .filter((value): value is string => typeof value === "string" && value.length > 0);
+  return [...new Set([...directPaths, ...editPaths])];
 }
 
 function isWriteTool(toolName: string): boolean {
@@ -140,6 +149,51 @@ function isWriteTool(toolName: string): boolean {
 
 function sameToolCall(toolCall: ToolCallRecord, toolName: string, input: Record<string, unknown>): boolean {
   return toolCall.tool === toolName && JSON.stringify(toolCall.input) === JSON.stringify(input);
+}
+
+function findExistingToolCall(
+  session: AgentSession,
+  toolName: string,
+  input: Record<string, unknown>,
+  toolUseId: string
+): ToolCallRecord | undefined {
+  return (
+    session.tool_calls.find((toolCall) => toolCall.id === toolUseId && sameToolCall(toolCall, toolName, input)) ??
+    session.tool_calls.find((toolCall) => toolCall.status === "approved" && sameToolCall(toolCall, toolName, input)) ??
+    session.tool_calls.find((toolCall) => toolCall.status === "pending_approval" && sameToolCall(toolCall, toolName, input))
+  );
+}
+
+function recordFileChangesForTool(
+  session: AgentSession,
+  toolName: string,
+  input: Record<string, unknown>,
+  approved: boolean,
+  createdAt: string
+): void {
+  if (!isWriteTool(toolName)) {
+    return;
+  }
+  for (const filePath of extractFilePaths(input)) {
+    const operation = toolName === "Write" ? "create" : "update";
+    const existing = session.file_changes.find(
+      (change) => change.path === filePath && change.operation === operation && change.approved === false
+    );
+    if (existing) {
+      existing.approved = approved;
+      continue;
+    }
+    session.file_changes.push({
+      path: filePath,
+      operation,
+      approved,
+      created_at: createdAt
+    });
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 async function resolveExistingPathOrParent(targetPath: string): Promise<string> {

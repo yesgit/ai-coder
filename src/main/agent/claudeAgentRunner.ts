@@ -58,7 +58,7 @@ export class ClaudeAgentRunner {
             if (decision.allow) {
               return { behavior: "allow", updatedInput: decision.updatedInput };
             }
-            return { behavior: "deny", message: decision.message, interrupt: false };
+            return { behavior: "deny", message: decision.message, interrupt: decision.interrupt };
           }
         }
       } as never) as AsyncIterable<unknown>) {

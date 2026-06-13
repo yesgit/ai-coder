@@ -40,6 +40,7 @@ describe("project policy", () => {
     const decision = await approveOrDenyToolUse(current, workflow, "Bash", { command: "npm test" }, "tool-1");
 
     expect(decision.allow).toBe(false);
+    expect(decision.allow === false ? decision.interrupt : false).toBe(true);
     expect(current.status).toBe("waiting_approval");
     expect(current.tool_calls[0].status).toBe("pending_approval");
   });
@@ -50,6 +51,7 @@ describe("project policy", () => {
     const decision = await approveOrDenyToolUse(current, workflow, "Read", { file_path: "/etc/passwd" }, "tool-2");
 
     expect(decision.allow).toBe(false);
+    expect(decision.allow === false ? decision.interrupt : false).toBe(true);
     expect(current.tool_calls[0].status).toBe("blocked");
   });
 
@@ -63,6 +65,11 @@ describe("project policy", () => {
     expect(decision.allow).toBe(false);
     expect(current.status).toBe("waiting_approval");
     expect(current.tool_calls[0].status).toBe("pending_approval");
+    expect(current.file_changes[0]).toMatchObject({
+      path: "src/app.ts",
+      operation: "update",
+      approved: false
+    });
   });
 
   it("denies project symlinks that resolve outside the selected project", async () => {
@@ -93,5 +100,53 @@ describe("project policy", () => {
 
     expect(decision.allow).toBe(true);
     expect(current.tool_calls[0].status).toBe("completed");
+  });
+
+  it("allows a previously approved matching tool call even when the SDK uses a new tool id", async () => {
+    const current = session();
+    current.tool_calls.push({
+      id: "tool-original",
+      stage_id: "execute",
+      tool: "Bash",
+      input: { command: "npm test" },
+      status: "approved",
+      created_at: new Date().toISOString()
+    });
+
+    const decision = await approveOrDenyToolUse(current, workflow, "Bash", { command: "npm test" }, "tool-retry");
+
+    expect(decision.allow).toBe(true);
+    expect(current.tool_calls[0].status).toBe("completed");
+  });
+
+  it("marks a previously approved write tool as completed and approved in file changes", async () => {
+    const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-project-"));
+    await fs.mkdir(path.join(projectDir, "src"));
+    const current = { ...session(), project_path: projectDir };
+    current.tool_calls.push({
+      id: "tool-write",
+      stage_id: "execute",
+      tool: "Write",
+      input: { file_path: "src/new.ts" },
+      status: "approved",
+      created_at: new Date().toISOString()
+    });
+    current.file_changes.push({
+      path: "src/new.ts",
+      operation: "create",
+      approved: false,
+      created_at: new Date().toISOString()
+    });
+
+    const decision = await approveOrDenyToolUse(current, workflow, "Write", { file_path: "src/new.ts" }, "tool-write");
+
+    expect(decision.allow).toBe(true);
+    expect(current.tool_calls[0].status).toBe("completed");
+    expect(current.file_changes).toHaveLength(1);
+    expect(current.file_changes[0]).toMatchObject({
+      path: "src/new.ts",
+      operation: "create",
+      approved: true
+    });
   });
 });
