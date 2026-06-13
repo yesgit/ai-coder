@@ -7,6 +7,7 @@ import type {
   StageRun,
   ToolCallRecord
 } from "../../shared/types.js";
+import { formatApprovalKind, formatFileOperation, formatRole, formatStageName, formatStatus } from "./labels.js";
 
 export type TimelineEventType = "task" | "stage" | "message" | "approval" | "tool" | "file" | "rework" | "status" | "error";
 
@@ -25,7 +26,7 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
     {
       id: `${session.id}:task`,
       type: "task",
-      title: "Task submitted",
+      title: "任务已提交",
       detail: session.task_prompt,
       timestamp: session.created_at,
       status: session.status,
@@ -37,7 +38,7 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
     events.push({
       id: `${session.id}:message:${index}`,
       type: "message",
-      title: `${capitalize(message.role)} message`,
+      title: `${formatRole(message.role)}消息`,
       detail: message.content,
       timestamp: message.created_at,
       status: message.role,
@@ -49,7 +50,7 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
     events.push({
       id: `${session.id}:stage:${stageRun.id}:started`,
       type: "stage",
-      title: `Stage started: ${stageRun.stage_id} attempt ${stageRun.attempt}`,
+      title: `阶段开始：${formatStageName(stageRun.stage_id)} 第 ${stageRun.attempt} 次尝试`,
       detail: stageRun.input_summary,
       timestamp: stageRun.started_at,
       status: stageRun.status,
@@ -62,8 +63,8 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
         type: "stage",
         title:
           stageRun.status === "needs_rework"
-            ? `Stage needs rework: ${stageRun.stage_id} attempt ${stageRun.attempt}`
-            : `Stage ${stageRun.status}: ${stageRun.stage_id} attempt ${stageRun.attempt}`,
+            ? `阶段需要返工：${formatStageName(stageRun.stage_id)} 第 ${stageRun.attempt} 次尝试`
+            : `阶段${formatStatus(stageRun.status)}：${formatStageName(stageRun.stage_id)} 第 ${stageRun.attempt} 次尝试`,
         detail: stageRun.rework_reason ?? stageRun.output_summary,
         timestamp: stageRun.completed_at,
         status: stageRun.status,
@@ -76,7 +77,7 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
     events.push({
       id: `${session.id}:approval:${approval.id}:requested`,
       type: "approval",
-      title: `${capitalize(approval.kind)} approval requested`,
+      title: `${formatApprovalKind(approval.kind)}审批待处理`,
       detail: approval.message,
       timestamp: approval.created_at,
       status: approval.status,
@@ -87,7 +88,7 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
       events.push({
         id: `${session.id}:approval:${approval.id}:resolved`,
         type: "approval",
-        title: `${capitalize(approval.kind)} approval ${approval.status}`,
+        title: `${formatApprovalKind(approval.kind)}审批${formatStatus(approval.status)}`,
         detail: approval.message,
         timestamp: approval.resolved_at,
         status: approval.status,
@@ -100,7 +101,7 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
     events.push({
       id: `${session.id}:tool:${toolCall.id}:requested`,
       type: "tool",
-      title: `Tool requested: ${toolCall.tool}`,
+      title: `工具请求：${toolCall.tool}`,
       detail: formatJson(toolCall.input),
       timestamp: toolCall.created_at,
       status: toolCall.status,
@@ -111,7 +112,7 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
       events.push({
         id: `${session.id}:tool:${toolCall.id}:resolved`,
         type: "tool",
-        title: `Tool ${toolCall.status}: ${toolCall.tool}`,
+        title: `工具${formatStatus(toolCall.status)}：${toolCall.tool}`,
         detail: formatJson(toolCall.input),
         timestamp: toolCall.resolved_at,
         status: toolCall.status,
@@ -124,7 +125,7 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
     events.push({
       id: `${session.id}:file:${index}`,
       type: "file",
-      title: `File ${fileChange.operation}`,
+      title: `文件${formatFileOperation(fileChange.operation)}`,
       detail: fileChange.path,
       timestamp: fileChange.created_at,
       status: fileChange.approved ? "approved" : "pending",
@@ -136,7 +137,7 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
     events.push({
       id: `${session.id}:rework:${request.id}:requested`,
       type: "rework",
-      title: `Rework requested: ${request.from_stage_id} -> ${request.target_stage_id}`,
+      title: `返工请求：${formatStageName(request.from_stage_id)} -> ${formatStageName(request.target_stage_id)}`,
       detail: request.reason,
       timestamp: request.created_at,
       status: request.status,
@@ -147,7 +148,7 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
       events.push({
         id: `${session.id}:rework:${request.id}:resolved`,
         type: "rework",
-        title: `Rework ${request.status}: ${request.target_stage_id}`,
+        title: `返工${formatStatus(request.status)}：${formatStageName(request.target_stage_id)}`,
         detail: request.reason,
         timestamp: request.resolved_at,
         status: request.status,
@@ -160,7 +161,7 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
     events.push({
       id: `${session.id}:error`,
       type: "error",
-      title: "Session failed",
+      title: "会话失败",
       detail: session.error,
       timestamp: session.updated_at,
       status: "failed",
@@ -171,7 +172,7 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
   events.push({
     id: `${session.id}:status`,
     type: "status",
-    title: `Session ${session.status}`,
+    title: `会话${formatStatus(session.status)}`,
     timestamp: session.updated_at,
     status: session.status,
     sort_order: 100
@@ -182,10 +183,6 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
     if (timeDelta !== 0) return timeDelta;
     return left.sort_order - right.sort_order;
   });
-}
-
-function capitalize(value: string) {
-  return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
 function formatJson(value: unknown) {

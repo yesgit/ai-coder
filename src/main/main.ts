@@ -15,7 +15,7 @@ async function createWindow(): Promise<void> {
     height: 820,
     minWidth: 980,
     minHeight: 680,
-    title: "AI Coder",
+    title: "AI Coder 本地工作流 Agent",
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,

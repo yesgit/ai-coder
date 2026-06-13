@@ -56,13 +56,13 @@ describe("buildSessionTimeline", () => {
     const events = buildSessionTimeline(session);
 
     expect(events.map((event) => event.title)).toEqual([
-      "Task submitted",
-      "Stage approval requested",
-      "Assistant message",
-      "Stage approval approved",
-      "Tool requested: shell",
-      "File update",
-      "Session waiting_approval"
+      "任务已提交",
+      "阶段审批待处理",
+      "助手消息",
+      "阶段审批已批准",
+      "工具请求：shell",
+      "文件更新",
+      "会话等待审批"
     ]);
   });
 
@@ -77,10 +77,10 @@ describe("buildSessionTimeline", () => {
 
     expect(events.at(-2)).toMatchObject({
       type: "error",
-      title: "Session failed",
+      title: "会话失败",
       detail: "Claude Agent SDK request failed"
     });
-    expect(events.at(-1)).toMatchObject({ type: "status", title: "Session failed" });
+    expect(events.at(-1)).toMatchObject({ type: "status", title: "会话失败" });
   });
 
   it("includes stage attempts and rework requests", () => {
@@ -121,8 +121,8 @@ describe("buildSessionTimeline", () => {
 
     const events = buildSessionTimeline(reworkSession);
 
-    expect(events.map((event) => event.title)).toContain("Stage needs rework: execute attempt 1");
-    expect(events.map((event) => event.title)).toContain("Rework requested: execute -> plan");
-    expect(events.map((event) => event.title)).toContain("Stage started: plan attempt 2");
+    expect(events.map((event) => event.title)).toContain("阶段需要返工：执行 第 1 次尝试");
+    expect(events.map((event) => event.title)).toContain("返工请求：执行 -> 计划");
+    expect(events.map((event) => event.title)).toContain("阶段开始：计划 第 2 次尝试");
   });
 });

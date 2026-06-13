@@ -13,6 +13,13 @@ import type {
 } from "../../shared/types.js";
 import { buildSessionTimeline } from "./sessionTimeline.js";
 import type { TimelineEvent } from "./sessionTimeline.js";
+import {
+  formatStageName,
+  formatStatus,
+  formatWorkflowDescription,
+  formatWorkflowName,
+  formatWorkflowSource
+} from "./labels.js";
 import "./styles.css";
 
 export default function App() {
@@ -212,35 +219,35 @@ export default function App() {
           <div className="mark">AI</div>
           <div>
             <h1>AI Coder</h1>
-            <p>Local workflow agent</p>
+            <p>本地工作流 Agent</p>
           </div>
         </div>
 
         <button className="secondary" disabled={busy} onClick={chooseProject}>
-          {busy ? "Selecting..." : "Select Project"}
+          {busy ? "选择中..." : "选择项目"}
         </button>
         <p className="path" title={projectPath}>
-          {projectPath || "No project selected"}
+          {projectPath || "尚未选择项目"}
         </p>
 
         {onboardingStatus && (
           <section className="onboarding-box">
-            <h2>Onboarding</h2>
+            <h2>项目入职</h2>
             <div className="onboarding-status-row">
-              <span className={`status-pill ${onboardingStatus.status}`}>{onboardingStatus.status}</span>
-              <small>{onboardingStatus.claude_md_exists ? "CLAUDE.md found" : "CLAUDE.md missing"}</small>
+              <span className={`status-pill ${onboardingStatus.status}`}>{formatStatus(onboardingStatus.status)}</span>
+              <small>{onboardingStatus.claude_md_exists ? "已找到 CLAUDE.md" : "缺少 CLAUDE.md"}</small>
             </div>
-            {onboardingStatus.confirmed_at && <small>Confirmed {formatTimestamp(onboardingStatus.confirmed_at)}</small>}
+            {onboardingStatus.confirmed_at && <small>确认时间 {formatTimestamp(onboardingStatus.confirmed_at)}</small>}
             {onboardingStatus.claude_md_exists && onboardingStatus.status !== "confirmed" && (
               <button className="secondary" disabled={busy} onClick={confirmOnboarding}>
-                Confirm CLAUDE.md
+                确认 CLAUDE.md
               </button>
             )}
           </section>
         )}
 
         <section>
-          <h2>Workflow</h2>
+          <h2>工作流</h2>
           <div className="workflow-list">
             {workflows.map((workflow) => (
               <button
@@ -248,8 +255,8 @@ export default function App() {
                 className={workflow.id === selectedWorkflowId ? "workflow selected" : "workflow"}
                 onClick={() => setSelectedWorkflowId(workflow.id)}
               >
-                <span>{workflow.name}</span>
-                <small>{workflow.source.type} · v{workflow.version}</small>
+                <span>{formatWorkflowName(workflow.id, workflow.name)}</span>
+                <small>{formatWorkflowSource(workflow.source.type)} · v{workflow.version}</small>
               </button>
             ))}
           </div>
@@ -257,7 +264,7 @@ export default function App() {
             <div className="workflow-issues">
               {workflowIssues.map((issue: WorkflowLoadIssue) => (
                 <div key={`${issue.source_type}:${issue.path}`} className="workflow-issue">
-                  <strong>{issue.source_type}</strong>
+                  <strong>{formatWorkflowSource(issue.source_type)}</strong>
                   <span title={issue.path}>{issue.path}</span>
                   <small>{issue.message}</small>
                 </div>
@@ -267,7 +274,7 @@ export default function App() {
         </section>
 
         <section>
-          <h2>Sessions</h2>
+          <h2>会话</h2>
           <div className="session-list">
             {sessions.map((session) => (
               <button
@@ -276,7 +283,7 @@ export default function App() {
                 onClick={() => setActiveSession(session)}
               >
                 <span>{session.task_prompt}</span>
-                <small>{session.status}</small>
+                <small>{formatStatus(session.status)}</small>
               </button>
             ))}
           </div>
@@ -286,40 +293,42 @@ export default function App() {
       <section className="workspace">
         <div className="composer">
           <div>
-            <h2>{selectedWorkflow?.name ?? "Select a workflow"}</h2>
+            <h2>{selectedWorkflow ? formatWorkflowName(selectedWorkflow.id, selectedWorkflow.name) : "选择工作流"}</h2>
             <p>
-              {selectedWorkflow?.description ?? "Choose a project and workflow to start."}
-              {runtimeStatus && <span className={`runtime-mode ${runtimeStatus.mode}`}>{runtimeStatus.mode} mode</span>}
+              {selectedWorkflow
+                ? formatWorkflowDescription(selectedWorkflow.id, selectedWorkflow.description)
+                : "选择项目和工作流后开始任务。"}
+              {runtimeStatus && <span className={`runtime-mode ${runtimeStatus.mode}`}>{formatStatus(runtimeStatus.mode)}模式</span>}
             </p>
             {runtimeStatus && (
               <div className="runtime-diagnostics">
                 <span className={runtimeStatus.sdk_available ? "diagnostic ok" : "diagnostic warn"}>SDK</span>
-                <span className={runtimeStatus.claude_executable_available ? "diagnostic ok" : "diagnostic warn"}>Claude CLI</span>
-                <span className={runtimeStatus.auth_env_available ? "diagnostic ok" : "diagnostic warn"}>Env auth</span>
+                <span className={runtimeStatus.claude_executable_available ? "diagnostic ok" : "diagnostic warn"}>Claude 命令</span>
+                <span className={runtimeStatus.auth_env_available ? "diagnostic ok" : "diagnostic warn"}>环境认证</span>
               </div>
             )}
           </div>
           <textarea
             value={taskPrompt}
             onChange={(event) => setTaskPrompt(event.target.value)}
-            placeholder="Describe the coding task..."
+            placeholder="描述要执行的编码任务..."
           />
           <div className="actions">
             <button className="primary" disabled={!canStart} onClick={startSession}>
-              {busy ? "Running..." : "Start Agent"}
+              {busy ? "运行中..." : "启动 Agent"}
             </button>
             {error && <span className="error">{error}</span>}
           </div>
           {showOnboardingWarning && (
             <div className="admission-warning">
-              <span>Project onboarding is not confirmed. Run Project Onboarding or confirm CLAUDE.md.</span>
+              <span>项目入职尚未确认。请先运行项目入职，或确认 CLAUDE.md。</span>
               <label className="override-option">
                 <input
                   type="checkbox"
                   checked={onboardingOverride}
                   onChange={(event) => setOnboardingOverride(event.target.checked)}
                 />
-                Run without confirmed onboarding
+                未确认入职也继续运行
               </label>
             </div>
           )}
@@ -329,8 +338,8 @@ export default function App() {
           <div className="stages">
             {selectedWorkflow.stages.map((stage: WorkflowStage) => (
               <div key={stage.id} className="stage">
-                <span>{stage.name}</span>
-                {stage.approval_required && <small>approval</small>}
+                <span>{formatStageName(stage.id, stage.name)}</span>
+                {stage.approval_required && <small>需审批</small>}
               </div>
             ))}
           </div>
@@ -343,12 +352,13 @@ export default function App() {
                 <div>
                   <h2>{activeSession.task_prompt}</h2>
                   <p>
-                    {activeSession.status} · {activeSession.workflow_id} · {activeSession.current_stage}
+                    {formatStatus(activeSession.status)} · {formatWorkflowName(activeSession.workflow_id, activeSession.workflow_id)} ·{" "}
+                    {formatStageName(activeSession.current_stage)}
                   </p>
                   {activeSession.onboarding && (
                     <p>
-                      onboarding {activeSession.onboarding.status}
-                      {activeSession.onboarding.override ? " · override" : ""}
+                      入职状态 {formatStatus(activeSession.onboarding.status)}
+                      {activeSession.onboarding.override ? " · 已跳过门禁" : ""}
                     </p>
                   )}
                 </div>
@@ -356,12 +366,12 @@ export default function App() {
                   <div className="session-actions">
                     {activeSession.approvals.some((approval) => approval.kind === "stage" && approval.status === "pending") && (
                       <button className="primary" disabled={busy} onClick={() => approvePendingStage(activeSession)}>
-                        Approve Stage
+                        批准阶段
                       </button>
                     )}
                     {approvedToolCalls.length > 0 && (
                       <button className="secondary" disabled={busy} onClick={() => continueSession(activeSession)}>
-                        Continue
+                        继续
                       </button>
                     )}
                   </div>
@@ -373,15 +383,15 @@ export default function App() {
                     <article key={toolCall.id} className="tool-approval">
                       <div>
                         <strong>{toolCall.tool}</strong>
-                        <small>{toolCall.stage_id}</small>
+                        <small>{formatStageName(toolCall.stage_id)}</small>
                       </div>
                       <pre>{JSON.stringify(toolCall.input, null, 2)}</pre>
                       <div className="actions">
                         <button className="primary" disabled={busy} onClick={() => approveToolCall(activeSession, toolCall)}>
-                          Approve
+                          批准
                         </button>
                         <button className="secondary" disabled={busy} onClick={() => denyToolCall(activeSession, toolCall)}>
-                          Deny
+                          拒绝
                         </button>
                       </div>
                     </article>
@@ -391,8 +401,8 @@ export default function App() {
               <div className="run-panels">
                 <section className="run-panel">
                   <div className="panel-heading">
-                    <h3>Stage Runs</h3>
-                    <small>{stageRuns.length} attempts</small>
+                    <h3>阶段执行</h3>
+                    <small>{stageRuns.length} 次尝试</small>
                   </div>
                   {stageRuns.length > 0 ? (
                     <div className="stage-run-list">
@@ -402,23 +412,23 @@ export default function App() {
                           className={stageRun.stage_id === activeSession.current_stage ? "stage-run current" : "stage-run"}
                         >
                           <div className="stage-run-title">
-                            <strong>{stageRun.stage_id}</strong>
-                            <span className={`status-pill ${stageRun.status}`}>{stageRun.status}</span>
+                            <strong>{formatStageName(stageRun.stage_id)}</strong>
+                            <span className={`status-pill ${stageRun.status}`}>{formatStatus(stageRun.status)}</span>
                           </div>
-                          <small>attempt {stageRun.attempt}</small>
+                          <small>第 {stageRun.attempt} 次尝试</small>
                           <p>{stageRun.output_summary ?? stageRun.input_summary}</p>
                         </article>
                       ))}
                     </div>
                   ) : (
-                    <p className="muted">No stage runs recorded.</p>
+                    <p className="muted">暂无阶段执行记录。</p>
                   )}
                 </section>
 
                 <section className="run-panel">
                   <div className="panel-heading">
-                    <h3>Rework Requests</h3>
-                    <small>{reworkRequests.length} requests</small>
+                    <h3>返工请求</h3>
+                    <small>{reworkRequests.length} 个请求</small>
                   </div>
                   {reworkRequests.length > 0 ? (
                     <div className="rework-list">
@@ -426,15 +436,15 @@ export default function App() {
                         <article key={request.id} className="rework-request">
                           <div className="stage-run-title">
                             <strong>
-                              {request.from_stage_id} -&gt; {request.target_stage_id}
+                              {formatStageName(request.from_stage_id)} -&gt; {formatStageName(request.target_stage_id)}
                             </strong>
-                            <span className={`status-pill ${request.status}`}>{request.status}</span>
+                            <span className={`status-pill ${request.status}`}>{formatStatus(request.status)}</span>
                           </div>
                           <p>{request.reason}</p>
                           {request.status === "pending" && (
                             <div className="actions">
                               <button className="primary" disabled={busy} onClick={() => approveReworkRequest(activeSession, request)}>
-                                Approve Rework
+                                批准返工
                               </button>
                             </div>
                           )}
@@ -442,19 +452,19 @@ export default function App() {
                       ))}
                     </div>
                   ) : (
-                    <p className="muted">No rework requests.</p>
+                    <p className="muted">暂无返工请求。</p>
                   )}
                 </section>
               </div>
               {pendingReworkRequests.length > 0 && (
-                <div className="pending-banner">{pendingReworkRequests.length} rework request waiting for approval.</div>
+                <div className="pending-banner">{pendingReworkRequests.length} 个返工请求等待审批。</div>
               )}
               <div className="timeline">
                 {timeline.map((event: TimelineEvent) => (
                   <article key={event.id} className={`timeline-item ${event.type}`}>
                     <div className="timeline-meta">
                       <time>{formatTimestamp(event.timestamp)}</time>
-                      {event.status && <span className="timeline-status">{event.status}</span>}
+                      {event.status && <span className="timeline-status">{formatStatus(event.status)}</span>}
                     </div>
                     <div className="timeline-body">
                       <strong>{event.title}</strong>
@@ -465,7 +475,7 @@ export default function App() {
               </div>
             </>
           ) : (
-            <div className="empty">No session yet.</div>
+            <div className="empty">暂无会话。</div>
           )}
         </section>
       </section>
