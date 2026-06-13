@@ -1,7 +1,7 @@
 id: code-review
-name: Code Review
+name: 代码审查
 version: 1.0.0
-description: Review local changes and report correctness, security, maintainability, and test risks.
+description: 审查本地变更，并报告正确性、安全性、可维护性和测试风险。
 source:
   type: builtin
   id: code-review
@@ -15,7 +15,10 @@ permissions:
     enabled: false
 stages:
   - id: collect_context
-    name: Collect Context
+    name: 收集上下文
+    instructions: |
+      用简体中文明确审查范围，并收集与本地变更直接相关的文件、差异和测试上下文。
+      优先关注实际变更，不要展开无关代码。
     allowed_tools:
       - read_file
       - shell
@@ -23,12 +26,18 @@ stages:
       - changed_files
       - review_scope
   - id: identify_risks
-    name: Identify Risks
+    name: 识别风险
+    instructions: |
+      以代码审查视角识别会导致缺陷、回归、安全问题、维护风险或测试缺口的具体问题。
+      每个问题都应有文件位置、影响说明和严重程度；没有发现问题时也要明确说明。
     required_outputs:
       - findings
       - severity
   - id: report
-    name: Report
+    name: 输出审查报告
+    instructions: |
+      用简体中文输出审查结论，优先列出发现的问题，并按严重程度排序。
+      简要说明剩余测试缺口或无法确认的风险，不要把变更摘要放在问题之前。
     required_outputs:
       - review_summary
       - test_gaps

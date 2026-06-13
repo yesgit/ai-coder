@@ -1,7 +1,7 @@
 id: plan-execute
-name: Plan Execute
+name: 计划执行
 version: 1.0.0
-description: General workflow for tasks that should be planned, approved, executed, verified, and summarized.
+description: 适用于需要理解、计划、审批、执行、验证和总结的一般任务工作流。
 source:
   type: builtin
   id: plan-execute
@@ -15,18 +15,27 @@ permissions:
     enabled: false
 stages:
   - id: understand
-    name: Understand
+    name: 理解任务
+    instructions: |
+      用简体中文复述任务目标、背景、约束和当前假设。
+      如果信息不足，请先基于可用上下文做谨慎判断；只有在缺少关键信息会导致错误执行时才要求用户补充。
     required_outputs:
       - task_summary
       - assumptions
   - id: plan
-    name: Plan
+    name: 制定计划
     approval_required: true
+    instructions: |
+      用简体中文给出可执行步骤和预期产出。
+      计划应足够具体，便于审批后直接执行。
     required_outputs:
       - execution_steps
       - expected_output
   - id: execute
-    name: Execute
+    name: 执行
+    instructions: |
+      按批准计划执行任务，并遵守当前项目的文件访问和工具使用限制。
+      如果执行过程中发现计划不再适用，请说明原因并请求返工，而不是擅自扩大范围。
     allowed_tools:
       - read_file
       - edit_file
@@ -34,11 +43,17 @@ stages:
     gates:
       - authorized_files_only
   - id: verify
-    name: Verify
+    name: 验证
+    instructions: |
+      验证执行结果是否满足计划和用户目标。
+      如无法完成验证，请用简体中文说明无法验证的部分、原因和风险。
     required_checks:
       - result_verified
   - id: summarize
-    name: Summarize
+    name: 总结
+    instructions: |
+      用简体中文总结完成情况、验证结果和后续注意事项。
+      不要添加与任务无关的说明。
     required_outputs:
       - final_summary
       - verification_result

@@ -1,7 +1,7 @@
 id: software-engineering
-name: Software Engineering
+name: 软件工程
 version: 1.0.0
-description: Full local coding task workflow.
+description: 完整的本地编码任务工作流。
 source:
   type: builtin
   id: software-engineering
@@ -15,12 +15,18 @@ permissions:
     enabled: false
 stages:
   - id: requirements
-    name: Requirements
+    name: 需求确认
+    instructions: |
+      用简体中文梳理用户请求，明确任务目标、验收标准和任何关键约束。
+      如果需求存在不确定点，请基于现有上下文做保守假设；只有在无法安全推进时才提出需要用户确认的问题。
     required_outputs:
       - task_summary
       - acceptance_criteria
   - id: code_reading
-    name: Code Reading
+    name: 代码阅读
+    instructions: |
+      阅读与任务直接相关的文件，先理解现有实现、调用关系和本地约定，再判断如何修改。
+      优先使用快速搜索定位入口和引用，并记录支撑判断的关键文件。
     allowed_tools:
       - read_file
       - shell
@@ -28,18 +34,27 @@ stages:
       - relevant_files
       - current_behavior
   - id: impact_analysis
-    name: Impact Analysis
+    name: 影响分析
+    instructions: |
+      分析拟修改范围、潜在副作用、兼容性风险和需要验证的行为。
+      保持范围聚焦，不要引入与当前任务无关的重构。
     required_outputs:
       - impact_scope
       - risks
   - id: plan
-    name: Plan
+    name: 计划
     approval_required: true
+    instructions: |
+      给出简洁可执行的实现计划和验证计划。
+      计划应贴合现有代码结构，并说明需要触碰的主要文件或模块。
     required_outputs:
       - implementation_plan
       - test_plan
   - id: implementation
-    name: Implementation
+    name: 实现
+    instructions: |
+      按批准的计划修改代码，遵循项目现有风格和边界。
+      只改完成任务所必需的内容，避免无关格式化或重命名。
     allowed_tools:
       - read_file
       - edit_file
@@ -47,13 +62,19 @@ stages:
     gates:
       - authorized_files_only
   - id: test
-    name: Test
+    name: 测试
+    instructions: |
+      运行与改动风险相匹配的测试、类型检查或构建命令。
+      如果某项验证无法运行，请用简体中文说明原因、影响和剩余风险。
     allowed_tools:
       - shell
     required_checks:
       - tests_passed
   - id: summarize
-    name: Summarize
+    name: 总结
+    instructions: |
+      用简体中文总结实际变更、验证结果和仍需注意的事项。
+      保持简洁，优先说明用户最需要知道的结论。
     required_outputs:
       - change_summary
       - verification_result

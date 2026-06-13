@@ -77,11 +77,50 @@ describe("stage agent protocol", () => {
     expect(result).toEqual({ status: "completed", output_summary: "Plain assistant response" });
   });
 
+  it("parses stage JSON from assistant prose with embedded markdown fences", () => {
+    const result = parseStageAgentResult(`已读取项目文件，现在可以起草方案。
+
+\`\`\`json
+{
+  "status": "completed",
+  "output_summary": "起草阶段完成。",
+  "required_outputs": {
+    "compact_summary": "简要摘要",
+    "claude_md_draft": "# 标题\\n\\n\`\`\`\\n目录树\\n\`\`\`\\n",
+    "preservation_plan": "保留原有规则"
+  }
+}
+\`\`\`
+
+已读取项目文件，现在可以起草方案。
+
+\`\`\`json
+{
+  "status": "completed",
+  "output_summary": "起草阶段完成。",
+  "required_outputs": {
+    "compact_summary": "最终简要摘要",
+    "claude_md_draft": "# 标题\\n\\n\`\`\`\\n目录树\\n\`\`\`\\n",
+    "preservation_plan": "最终保留计划"
+  }
+}
+\`\`\``);
+
+    expect(result).toMatchObject({
+      status: "completed",
+      output_summary: "起草阶段完成。",
+      required_outputs: {
+        compact_summary: "最终简要摘要",
+        preservation_plan: "最终保留计划"
+      }
+    });
+  });
+
   it("creates mock required outputs for required fields", () => {
     const input = buildStageAgentInput(session, workflow, workflow.stages[0]);
 
     expect(createMockStageAgentResult(input).required_outputs).toEqual({
-      implementation_plan: "Mock output for implementation_plan"
+      implementation_plan: "implementation_plan 的 Mock 输出"
     });
   });
 });

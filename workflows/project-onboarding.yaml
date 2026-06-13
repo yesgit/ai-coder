@@ -1,7 +1,7 @@
 id: project-onboarding
-name: Project Onboarding
+name: 项目接入
 version: 1.0.0
-description: Scan the selected project and create or update CLAUDE.md as shared project memory.
+description: 扫描选中的项目，并创建或更新 CLAUDE.md 作为共享项目记忆。
 source:
   type: builtin
   id: project-onboarding
@@ -23,13 +23,13 @@ rework:
   invalidate_downstream: true
 stages:
   - id: scan_project
-    name: Scan Project
+    name: 扫描项目
     instructions: |
-      Inspect the project before writing anything. Prefer reading existing project documentation and configuration over guessing.
-      Check for an existing CLAUDE.md in the project root first.
-      If CLAUDE.md exists, read it and preserve valuable team rules, architecture notes, commands, and imports.
-      Read likely sources of truth such as README files, package manifests, lockfiles, tsconfig/vite/electron configs, CI workflows, test directories, and key source entrypoints.
-      Do not read secrets, credentials, generated dependency directories, or large build artifacts.
+      在写入任何内容之前先检查项目。优先阅读现有项目文档和配置，不要凭空猜测。
+      首先检查项目根目录是否已有 CLAUDE.md。
+      如果 CLAUDE.md 已存在，请阅读它，并保留有价值的团队规则、架构说明、命令和导入引用。
+      阅读可能作为事实来源的文件，例如 README、包清单、锁文件、tsconfig/vite/electron 配置、CI 工作流、测试目录和关键源码入口。
+      不要读取密钥、凭证、生成的依赖目录或大型构建产物。
     allowed_tools:
       - read_file
       - shell
@@ -38,10 +38,10 @@ stages:
       - inspected_files
       - detected_project_type
   - id: understand_project
-    name: Understand Project
+    name: 理解项目
     instructions: |
-      Summarize the project for future coding agents. Identify the tech stack, architecture, module boundaries, common commands, test strategy, coding conventions, safety constraints, and known risks.
-      Keep the summary concrete and evidence-based. If a command or convention is uncertain, say so instead of inventing it.
+      为后续编码代理总结项目。识别技术栈、架构、模块边界、常用命令、测试策略、编码约定、安全约束和已知风险。
+      总结必须具体且基于证据。如果某个命令或约定不确定，请明确说明不确定，不要编造。
     required_outputs:
       - project_overview
       - tech_stack
@@ -49,29 +49,29 @@ stages:
       - command_notes
       - safety_notes
   - id: draft_memory
-    name: Draft CLAUDE.md
+    name: 起草 CLAUDE.md
     approval_required: true
     instructions: |
-      Draft the target CLAUDE.md update before writing the file.
-      The draft must be concise, structured, and suitable as Claude Code project memory.
-      Put a Compact Summary near the top for context compression and task resumption.
-      Include sections for Project Overview, Tech Stack, Architecture, Common Commands, Development Rules, Testing Rules, Safety Rules, Workflow Notes, Known Issues, and Update Policy.
-      Use bullets under descriptive Markdown headings.
-      Use @path/to/file imports only for stable source-of-truth files that should remain visible to Claude Code, such as README.md or package.json.
-      If an existing CLAUDE.md is present, produce an incremental update plan and explicitly state what will be preserved, changed, and added.
-      Do not include secrets, tokens, private credentials, or personal local preferences.
+      在写入文件前，先起草目标 CLAUDE.md 更新内容。
+      草稿必须简洁、有结构，并适合作为 Claude Code 的项目记忆。
+      在靠前位置放置“简要摘要”，用于上下文压缩和任务恢复。
+      包含以下章节：项目概览、技术栈、架构、常用命令、开发规则、测试规则、安全规则、工作流说明、已知问题和更新策略。
+      在描述清晰的 Markdown 标题下使用项目符号。
+      仅对稳定的事实来源文件使用 @path/to/file 导入，例如 README.md 或 package.json，这些文件应长期对 Claude Code 可见。
+      如果已有 CLAUDE.md，请生成增量更新计划，并明确说明会保留、修改和新增哪些内容。
+      不要包含密钥、令牌、私有凭证或个人本地偏好。
     required_outputs:
       - compact_summary
       - claude_md_draft
       - preservation_plan
   - id: write_memory
-    name: Write CLAUDE.md
+    name: 写入 CLAUDE.md
     instructions: |
-      Create or update the project root CLAUDE.md using the approved draft.
-      If CLAUDE.md already exists, merge changes carefully instead of replacing the file wholesale.
-      Preserve existing valuable team instructions and imports unless they are clearly obsolete.
-      The final file must remain focused and concise; avoid dumping long source listings or full documentation.
-      File writes require approval through the host application.
+      使用已批准的草稿创建或更新项目根目录下的 CLAUDE.md。
+      如果 CLAUDE.md 已存在，请谨慎合并变更，不要整文件粗暴替换。
+      除非现有团队指令和导入引用明显过时，否则应予以保留。
+      最终文件必须聚焦且简洁，避免粘贴长篇源码清单或完整文档。
+      文件写入必须通过宿主应用审批。
     allowed_tools:
       - read_file
       - edit_file
@@ -81,11 +81,11 @@ stages:
       - claude_md_path
       - update_summary
   - id: review
-    name: Review Onboarding
+    name: 复核接入结果
     instructions: |
-      Review the generated or updated CLAUDE.md against Claude Code memory best practices.
-      Check that the Compact Summary is present, commands are concrete, safety rules are explicit, and existing CLAUDE.md content was respected.
-      Report any remaining uncertainties that a human should confirm.
+      按照 Claude Code 项目记忆最佳实践复核生成或更新后的 CLAUDE.md。
+      检查是否包含“简要摘要”、命令是否具体、安全规则是否明确，以及已有 CLAUDE.md 内容是否得到尊重。
+      报告仍需人工确认的不确定事项。
     allowed_tools:
       - read_file
     required_outputs:

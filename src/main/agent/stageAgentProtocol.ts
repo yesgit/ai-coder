@@ -65,29 +65,93 @@ export function parseStageAgentResult(rawContent: string): StageAgentResult {
 export function createMockStageAgentResult(input: StageAgentInput): StageAgentResult {
   return {
     status: "completed",
-    output_summary: `Mock stage "${input.current_stage.name}" completed. Set ANTHROPIC_API_KEY to use Claude Agent SDK.`,
-    required_outputs: Object.fromEntries(input.required_outputs.map((name) => [name, `Mock output for ${name}`]))
+    output_summary: `Mock 阶段“${input.current_stage.name}”已完成。设置 ANTHROPIC_API_KEY 后可使用 Claude Agent SDK。`,
+    required_outputs: Object.fromEntries(input.required_outputs.map((name) => [name, `${name} 的 Mock 输出`]))
   };
 }
 
 function parseJsonObject(rawContent: string): Record<string, unknown> | null {
-  const fenced = rawContent.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const candidate = fenced?.[1] ?? rawContent;
+  const direct = parseCandidate(rawContent);
+  if (direct) {
+    return direct;
+  }
+
+  const candidates = extractJsonObjectCandidates(rawContent)
+    .map(parseCandidate)
+    .filter((candidate): candidate is Record<string, unknown> => candidate !== null);
+  const stageResult = findLastStageResultCandidate(candidates);
+  return stageResult ?? candidates.at(-1) ?? null;
+}
+
+function findLastStageResultCandidate(candidates: Record<string, unknown>[]): Record<string, unknown> | undefined {
+  for (let index = candidates.length - 1; index >= 0; index -= 1) {
+    const candidate = candidates[index];
+    if (typeof candidate.status === "string" || typeof candidate.output_summary === "string") {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+function parseCandidate(candidate: string): Record<string, unknown> | null {
   try {
     const parsed = JSON.parse(candidate.trim());
     return isRecord(parsed) ? parsed : null;
   } catch {
-    const objectMatch = candidate.match(/\{[\s\S]*\}/);
-    if (!objectMatch) {
-      return null;
+    return null;
+  }
+}
+
+function extractJsonObjectCandidates(content: string): string[] {
+  const candidates: string[] = [];
+  for (let start = 0; start < content.length; start += 1) {
+    if (content[start] !== "{") {
+      continue;
     }
-    try {
-      const parsed = JSON.parse(objectMatch[0]);
-      return isRecord(parsed) ? parsed : null;
-    } catch {
-      return null;
+    const end = findJsonObjectEnd(content, start);
+    if (end !== -1) {
+      candidates.push(content.slice(start, end + 1));
+      start = end;
     }
   }
+  return candidates;
+}
+
+function findJsonObjectEnd(content: string, start: number): number {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = start; index < content.length; index += 1) {
+    const char = content[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === "\"") {
+      inString = true;
+      continue;
+    }
+    if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return index;
+      }
+      if (depth < 0) {
+        return -1;
+      }
+    }
+  }
+  return -1;
 }
 
 function parseStatus(value: unknown): StageAgentResult["status"] {

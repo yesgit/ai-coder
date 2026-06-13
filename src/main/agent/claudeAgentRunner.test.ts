@@ -120,7 +120,7 @@ describe("ClaudeAgentRunner", () => {
 
       expect(updated.status).toBe("waiting_approval");
       expect(updated.current_stage).toBe("plan");
-      expect(updated.messages.at(-1)?.content).toContain("Waiting for approval");
+      expect(updated.messages.at(-1)?.content).toContain("等待审批");
     } finally {
       if (previousKey === undefined) {
         delete process.env.ANTHROPIC_API_KEY;

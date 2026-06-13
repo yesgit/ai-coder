@@ -68,7 +68,7 @@ export class ClaudeAgentRunner {
       const instructions = buildStageInstructions(stageAgentInput);
       await this.recordProgress(input, "runner", `开始执行阶段：${currentStage.name || currentStage.id}`, "milestone");
       for await (const message of query({
-        prompt: `${instructions}\n\nTask:\n${input.session.task_prompt}`,
+        prompt: `${instructions}\n\n任务：\n${input.session.task_prompt}`,
         options: {
           cwd: input.session.project_path,
           tools: buildAllowedClaudeTools(input.workflow, currentStage),
@@ -140,7 +140,7 @@ export class ClaudeAgentRunner {
     const stage = input.workflow.stages.find((item) => item.id === approval?.stage_id);
     input.session.status = "waiting_approval";
     input.session.current_stage = approval?.stage_id ?? input.session.current_stage;
-    const content = `Prepared workflow plan for "${input.session.task_prompt}". Waiting for approval before ${stage?.name ?? "next stage"}.`;
+    const content = `已为“${input.session.task_prompt}”准备工作流计划。等待审批后继续执行${stage?.name ?? "下一阶段"}。`;
     if (!input.session.messages.some((message) => message.role === "assistant" && message.content === content)) {
       input.session.messages.push({
         role: "assistant",
