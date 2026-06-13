@@ -29,7 +29,7 @@ export default function App() {
   const [selectedWorkflowId, setSelectedWorkflowId] = useState("");
   const [taskPrompt, setTaskPrompt] = useState("");
   const [sessions, setSessions] = useState<AgentSession[]>([]);
-  const [activeSession, setActiveSession] = useState<AgentSession | null>(null);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<AgentRuntimeStatus | null>(null);
   const [onboardingStatus, setOnboardingStatus] = useState<ProjectOnboardingStatus | null>(null);
   const [onboardingOverride, setOnboardingOverride] = useState(false);
@@ -39,6 +39,10 @@ export default function App() {
   const selectedWorkflow = useMemo(
     () => workflows.find((workflow) => workflow.id === selectedWorkflowId) ?? null,
     [selectedWorkflowId, workflows]
+  );
+  const activeSession = useMemo(
+    () => sessions.find((session) => session.id === activeSessionId) ?? sessions[0] ?? null,
+    [activeSessionId, sessions]
   );
 
   useEffect(() => {
@@ -69,10 +73,18 @@ export default function App() {
   async function refreshSessions(preferredSessionId?: string) {
     const loaded = await window.aiCoder.listSessions();
     setSessions(loaded);
-    setActiveSession((current) => {
-      const targetId = preferredSessionId ?? current?.id;
-      return loaded.find((session: AgentSession) => session.id === targetId) ?? loaded[0] ?? null;
+    setActiveSessionId((current) => {
+      const targetId = preferredSessionId ?? current;
+      return loaded.some((session: AgentSession) => session.id === targetId) ? targetId ?? null : loaded[0]?.id ?? null;
     });
+  }
+
+  function upsertSession(session: AgentSession) {
+    setSessions((current) => {
+      const withoutSession = current.filter((item) => item.id !== session.id);
+      return [session, ...withoutSession].sort((left, right) => right.created_at.localeCompare(left.created_at));
+    });
+    setActiveSessionId(session.id);
   }
 
   async function chooseProject() {
@@ -116,7 +128,7 @@ export default function App() {
         taskPrompt,
         onboardingOverride
       });
-      setActiveSession(result.session);
+      upsertSession(result.session);
       setTaskPrompt("");
       await refreshSessions(result.session.id);
     } catch (err) {
@@ -135,7 +147,7 @@ export default function App() {
     setError("");
     try {
       const updated = await window.aiCoder.approveStage(session.id, pending.stage_id);
-      setActiveSession(updated);
+      upsertSession(updated);
       await refreshSessions(updated.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -149,7 +161,7 @@ export default function App() {
     setError("");
     try {
       const updated = await window.aiCoder.approveRework(session.id, request.id);
-      setActiveSession(updated);
+      upsertSession(updated);
       await refreshSessions(updated.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -163,7 +175,7 @@ export default function App() {
     setError("");
     try {
       const approved = await window.aiCoder.approveToolCall(session.id, toolCall.id);
-      setActiveSession(approved);
+      upsertSession(approved);
       await refreshSessions(approved.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -177,7 +189,7 @@ export default function App() {
     setError("");
     try {
       const denied = await window.aiCoder.denyToolCall(session.id, toolCall.id);
-      setActiveSession(denied);
+      upsertSession(denied);
       await refreshSessions(denied.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -191,7 +203,7 @@ export default function App() {
     setError("");
     try {
       const updated = await window.aiCoder.continueSession(session.id);
-      setActiveSession(updated);
+      upsertSession(updated);
       await refreshSessions(updated.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -280,7 +292,7 @@ export default function App() {
               <button
                 key={session.id}
                 className={activeSession?.id === session.id ? "session selected" : "session"}
-                onClick={() => setActiveSession(session)}
+                onClick={() => setActiveSessionId(session.id)}
               >
                 <span>{session.task_prompt}</span>
                 <small>{formatStatus(session.status)}</small>
@@ -345,7 +357,7 @@ export default function App() {
           </div>
         )}
 
-        <section className="session-detail">
+        <section className="session-detail" key={activeSession?.id ?? "empty-session"}>
           {activeSession ? (
             <>
               <div className="session-header">
