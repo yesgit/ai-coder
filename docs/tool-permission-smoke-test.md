@@ -25,9 +25,9 @@ From the repository root:
 npm run dev
 ```
 
-The runtime diagnostics should show live mode when Claude Agent SDK and local Claude Code authentication are available. Mock mode can verify UI state transitions, but it does not exercise the SDK `canUseTool` callback.
+The runtime diagnostics should show live mode when Claude Agent SDK and local Claude Code authentication or provider settings are available. Mock mode can verify UI state transitions, but it does not exercise the SDK `canUseTool` callback.
 
-If the session fails with `Invalid API key · Please run /login`, open Claude Code locally and complete `/login`, then restart the desktop app and re-run this smoke test.
+If the session fails with `Invalid API key · Please run /login`, verify that the same environment can run the local `claude` command with your configured provider, then restart the desktop app and re-run this smoke test.
 
 ## Flow
 

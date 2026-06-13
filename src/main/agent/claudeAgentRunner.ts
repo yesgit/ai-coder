@@ -52,7 +52,7 @@ export class ClaudeAgentRunner {
           tools: buildAllowedClaudeTools(input.workflow, currentStage),
           disallowedTools: buildDisallowedClaudeTools(input.workflow),
           permissionMode: "dontAsk",
-          settingSources: [],
+          settingSources: ["user", "project", "local"],
           canUseTool: async (toolName: string, toolInput: Record<string, unknown>, options: { toolUseID: string }) => {
             const decision = await approveOrDenyToolUse(input.session, input.workflow, toolName, toolInput, options.toolUseID);
             if (decision.allow) {

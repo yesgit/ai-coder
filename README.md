@@ -61,6 +61,10 @@ The first implementation includes an adapter boundary in `src/main/agent/claudeA
 The app does not store Anthropic API keys. It reuses Claude Agent SDK / Claude Code authentication
 and settings from the local environment.
 
+Claude SDK sessions load Claude Code `user`, `project`, and `local` settings. If the local
+`claude` command is configured to use a supported third-party Claude-compatible provider, AI Coder
+will use the same Claude Code configuration when started from an environment that can access it.
+
 Runtime diagnostics report:
 
 - whether the Claude Agent SDK package is available
