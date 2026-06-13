@@ -27,6 +27,7 @@ export class SessionStore {
       tool_calls: [],
       file_changes: [],
       approvals: [],
+      progress_events: [],
       stage_runs: [],
       rework_requests: [],
       onboarding,

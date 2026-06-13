@@ -26,7 +26,11 @@ const STATUS_LABELS: Record<string, string> = {
   pending_review: "待复核",
   confirmed: "已确认",
   mock: "模拟",
-  live: "实时"
+  live: "实时",
+  runner: "执行器",
+  sdk_message: "SDK消息",
+  tool_policy: "工具策略",
+  status: "状态"
 };
 
 const ROLE_LABELS: Record<AgentMessage["role"], string> = {

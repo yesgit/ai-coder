@@ -233,6 +233,7 @@ export default function App() {
   const pendingReworkRequests = reworkRequests.filter((request) => request.status === "pending");
   const showOnboardingWarning = onboardingRequired;
   const timeline = activeSession ? buildSessionTimeline(activeSession) : [];
+  const latestProgress = activeSession?.progress_events?.at(-1);
 
   return (
     <main className="app-shell">
@@ -399,6 +400,15 @@ export default function App() {
                   </div>
                 )}
               </div>
+              <div className={`activity-strip ${activeSession.status}`}>
+                <span className="activity-dot" />
+                <div>
+                  <strong>{buildActivityTitle(activeSession)}</strong>
+                  <small>
+                    {latestProgress?.message ?? "等待下一条运行事件。"} · 最近更新 {formatTimestamp(activeSession.updated_at)}
+                  </small>
+                </div>
+              </div>
               {pendingToolCalls.length > 0 && (
                 <div className="tool-approvals">
                   {pendingToolCalls.map((toolCall: ToolCallRecord) => (
@@ -511,4 +521,23 @@ function formatTimestamp(value: string) {
     minute: "2-digit",
     second: "2-digit"
   }).format(new Date(value));
+}
+
+function buildActivityTitle(session: AgentSession) {
+  if (session.status === "running") {
+    return `正在执行：${formatStageName(session.current_stage)}`;
+  }
+  if (session.status === "waiting_approval") {
+    return "等待人工审批";
+  }
+  if (session.status === "blocked") {
+    return "执行已被门禁拦截";
+  }
+  if (session.status === "failed") {
+    return "执行失败";
+  }
+  if (session.status === "completed") {
+    return "执行完成";
+  }
+  return "等待启动";
 }

@@ -17,6 +17,65 @@ const workflow: WorkflowTemplate = {
 };
 
 describe("ClaudeAgentRunner", () => {
+  it("continues into the next running stage until an approval gate is reached", async () => {
+    const multiStageWorkflow: WorkflowTemplate = {
+      ...workflow,
+      stages: [
+        { id: "requirements", name: "Requirements" },
+        { id: "plan", name: "Plan", approval_required: true },
+        { id: "execute", name: "Execute" }
+      ]
+    };
+    let calls = 0;
+    async function* query() {
+      calls += 1;
+      yield {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: JSON.stringify({
+          status: "completed",
+          output_summary: calls === 1 ? "Requirements understood" : "Implementation plan"
+        })
+      };
+    }
+
+    const session: AgentSession = {
+      id: "00000000-0000-4000-8000-000000000010",
+      project_path: "/tmp/project",
+      workflow_id: workflow.id,
+      task_prompt: "Fix the bug",
+      status: "running",
+      current_stage: "requirements",
+      messages: [],
+      tool_calls: [],
+      file_changes: [],
+      approvals: [],
+      stage_runs: [
+        {
+          id: "00000000-0000-4000-8000-000000000011",
+          stage_id: "requirements",
+          attempt: 1,
+          status: "running",
+          input_summary: "Initial task",
+          started_at: new Date().toISOString()
+        }
+      ],
+      rework_requests: [],
+      progress_events: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+
+    const updated = await new ClaudeAgentRunner(query).run({ session, workflow: multiStageWorkflow });
+
+    expect(calls).toBe(2);
+    expect(updated.status).toBe("waiting_approval");
+    expect(updated.current_stage).toBe("plan");
+    expect(updated.stage_runs?.[0]).toMatchObject({ stage_id: "requirements", status: "completed" });
+    expect(updated.stage_runs?.at(-1)).toMatchObject({ stage_id: "plan", status: "waiting_approval" });
+  });
+
   it("waits for stage approval before live or mock execution", async () => {
     const previousKey = process.env.ANTHROPIC_API_KEY;
     process.env.ANTHROPIC_API_KEY = "test-key";

@@ -125,4 +125,29 @@ describe("buildSessionTimeline", () => {
     expect(events.map((event) => event.title)).toContain("返工请求：执行 -> 计划");
     expect(events.map((event) => event.title)).toContain("阶段开始：计划 第 2 次尝试");
   });
+
+  it("keeps transient progress out of the timeline", () => {
+    const events = buildSessionTimeline({
+      ...session,
+      progress_events: [
+        {
+          id: "progress-1",
+          type: "sdk_message",
+          message: "收到 Claude SDK 消息：assistant",
+          visibility: "transient",
+          created_at: "2026-06-03T01:04:10.000Z"
+        },
+        {
+          id: "progress-2",
+          type: "runner",
+          message: "开始执行阶段：Plan",
+          visibility: "milestone",
+          created_at: "2026-06-03T01:04:20.000Z"
+        }
+      ]
+    });
+
+    expect(events.map((event) => event.detail)).not.toContain("收到 Claude SDK 消息：assistant");
+    expect(events.map((event) => event.detail)).toContain("开始执行阶段：Plan");
+  });
 });

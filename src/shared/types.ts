@@ -156,6 +156,14 @@ export interface FileChangeRecord {
   created_at: string;
 }
 
+export interface SessionProgressEvent {
+  id: string;
+  type: "runner" | "sdk_message" | "tool_policy" | "status";
+  message: string;
+  visibility: "transient" | "milestone";
+  created_at: string;
+}
+
 export interface ApprovalRecord {
   id: string;
   stage_id: string;
@@ -178,6 +186,7 @@ export interface AgentSession {
   tool_calls: ToolCallRecord[];
   file_changes: FileChangeRecord[];
   approvals: ApprovalRecord[];
+  progress_events?: SessionProgressEvent[];
   stage_runs?: StageRun[];
   rework_requests?: ReworkRequest[];
   onboarding?: SessionOnboardingSnapshot;

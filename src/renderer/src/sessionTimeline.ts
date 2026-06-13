@@ -4,6 +4,7 @@ import type {
   ApprovalRecord,
   FileChangeRecord,
   ReworkRequest,
+  SessionProgressEvent,
   StageRun,
   ToolCallRecord
 } from "../../shared/types.js";
@@ -71,6 +72,18 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
         sort_order: 16
       });
     }
+  });
+
+  (session.progress_events ?? []).filter(isMilestoneProgress).forEach((progress: SessionProgressEvent) => {
+    events.push({
+      id: `${session.id}:progress:${progress.id}`,
+      type: "status",
+      title: "运行进度",
+      detail: progress.message,
+      timestamp: progress.created_at,
+      status: progress.type,
+      sort_order: 18
+    });
   });
 
   session.approvals.forEach((approval: ApprovalRecord) => {
@@ -183,6 +196,10 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
     if (timeDelta !== 0) return timeDelta;
     return left.sort_order - right.sort_order;
   });
+}
+
+function isMilestoneProgress(progress: SessionProgressEvent): boolean {
+  return !("visibility" in progress) || progress.visibility === "milestone";
 }
 
 function formatJson(value: unknown) {

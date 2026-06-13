@@ -59,9 +59,10 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
       throw new Error(`Workflow not found: ${session.workflow_id}`);
     }
     workflowEngine.approveStage(session, workflow, stageId);
-    const updated = await runner.run({ session, workflow });
-    await sessions.save(updated);
-    return updated;
+    session.status = "running";
+    await sessions.save(session);
+    runSessionInBackground(runner, sessions, session, workflow);
+    return session;
   });
 
   ipcMain.handle("sessions:approve-rework", async (_event, sessionId: string, requestId: string) => {
@@ -75,9 +76,10 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
       throw new Error(`Workflow not found: ${session.workflow_id}`);
     }
     workflowEngine.approveRework(session, workflow, requestId);
-    const updated = await runner.run({ session, workflow });
-    await sessions.save(updated);
-    return updated;
+    session.status = "running";
+    await sessions.save(session);
+    runSessionInBackground(runner, sessions, session, workflow);
+    return session;
   });
 
   ipcMain.handle("sessions:approve-tool-call", async (_event, sessionId: string, toolCallId: string) => {
@@ -104,9 +106,9 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     }
     workflowEngine.ensureState(session, workflow);
     session.status = "running";
-    const updated = await runner.run({ session, workflow });
-    await sessions.save(updated);
-    return updated;
+    await sessions.save(session);
+    runSessionInBackground(runner, sessions, session, workflow);
+    return session;
   });
 
   ipcMain.handle("sessions:start", async (_event, input: StartSessionInput) => {
@@ -128,16 +130,31 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     );
     session.status = "running";
     await sessions.save(session);
-    void runner
-      .run({ session, workflow })
-      .then((updated) => sessions.save(updated))
-      .catch(async (error) => {
-        session.status = "failed";
-        session.error = error instanceof Error ? error.message : String(error);
-        await sessions.save(session);
-      });
+    runSessionInBackground(runner, sessions, session, workflow);
     return { session };
   });
+}
+
+function runSessionInBackground(
+  runner: ClaudeAgentRunner,
+  sessions: SessionStore,
+  session: Awaited<ReturnType<SessionStore["create"]>>,
+  workflow: NonNullable<Awaited<ReturnType<WorkflowRegistry["get"]>>>
+): void {
+  void runner
+    .run({
+      session,
+      workflow,
+      onProgress: async (updated) => {
+        await sessions.save(updated);
+      }
+    })
+    .then((updated) => sessions.save(updated))
+    .catch(async (error) => {
+      session.status = "failed";
+      session.error = error instanceof Error ? error.message : String(error);
+      await sessions.save(session);
+    });
 }
 
 function enforceOnboardingAdmission(
