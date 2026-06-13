@@ -45,6 +45,16 @@ the onboarding status, `CLAUDE.md` hash, and override flag at start time.
 See `docs/project-onboarding-smoke-test.md` for a manual end-to-end verification flow using
 `samples/onboarding-target`.
 
+## Tool Permission Smoke Test
+
+Use `docs/tool-permission-smoke-test.md` with `samples/tool-permission-target` to verify the live
+Claude Agent SDK permission loop:
+
+- shell commands pause for user approval
+- file edits pause for user approval and record `file_changes`
+- paths outside the selected project are blocked
+- approved tool calls can continue the session
+
 ## Claude Agent SDK
 
 The first implementation includes an adapter boundary in `src/main/agent/claudeAgentRunner.ts`.
