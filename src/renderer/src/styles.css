@@ -293,15 +293,86 @@ textarea {
   min-height: 46px;
   align-items: center;
   justify-content: space-between;
+  gap: 10px;
   border: 1px solid #dce3ea;
   border-radius: 8px;
   background: #ffffff;
   padding: 10px;
 }
 
+.stage.current {
+  border-color: #146c5f;
+  background: #f2fbf8;
+}
+
+.stage.completed {
+  border-color: #b7dfd5;
+}
+
+.stage.running {
+  border-color: #146c5f;
+}
+
+.stage.waiting_approval,
+.stage.needs_rework {
+  border-color: #f3d18b;
+  background: #fffaf0;
+}
+
+.stage.failed {
+  border-color: #f6c5bd;
+  background: #fff4f2;
+}
+
+.stage > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
 .stage span {
   overflow-wrap: anywhere;
   font-weight: 700;
+}
+
+.stage small {
+  overflow-wrap: anywhere;
+}
+
+.stage-indicator {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 auto;
+  border: 2px solid #c7d0dc;
+  border-radius: 999px;
+  background: #ffffff;
+}
+
+.stage-indicator.running {
+  border-color: #146c5f;
+  background: #146c5f;
+  animation: activity-pulse 1.2s ease-in-out infinite;
+}
+
+.stage-indicator.completed {
+  border-color: #146c5f;
+  background: #146c5f;
+}
+
+.stage-indicator.waiting_approval,
+.stage-indicator.needs_rework {
+  border-color: #ad6b00;
+  background: #ad6b00;
+}
+
+.stage-indicator.failed {
+  border-color: #b42318;
+  background: #b42318;
+}
+
+.stage-indicator.superseded {
+  border-color: #98a2b3;
+  background: #98a2b3;
 }
 
 .session-detail {
@@ -507,11 +578,17 @@ textarea {
 }
 
 .status-pill.failed,
-.status-pill.denied,
-.status-pill.not_started {
+.status-pill.denied {
   border-color: #f6c5bd;
   background: #fff4f2;
   color: #b42318;
+}
+
+.status-pill.not_started,
+.status-pill.superseded {
+  border-color: #d8dee8;
+  background: #f7f9fc;
+  color: #475467;
 }
 
 .status-pill.claude_md_exists,

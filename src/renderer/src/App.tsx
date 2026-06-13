@@ -7,12 +7,12 @@ import type {
   ReworkRequest,
   StageRun,
   ToolCallRecord,
-  WorkflowStage,
   WorkflowLoadIssue,
   WorkflowTemplate
 } from "../../shared/types.js";
 import { buildSessionTimeline } from "./sessionTimeline.js";
 import type { TimelineEvent } from "./sessionTimeline.js";
+import { buildWorkflowStageDisplays } from "./workflowStageStatus.js";
 import {
   formatStageName,
   formatStatus,
@@ -231,6 +231,9 @@ export default function App() {
   const stageRuns = activeSession?.stage_runs ?? [];
   const reworkRequests = activeSession?.rework_requests ?? [];
   const pendingReworkRequests = reworkRequests.filter((request) => request.status === "pending");
+  const workflowStageDisplays = selectedWorkflow
+    ? buildWorkflowStageDisplays(selectedWorkflow.stages, activeSession, selectedWorkflow.id)
+    : [];
   const showOnboardingWarning = onboardingRequired;
   const timeline = activeSession ? buildSessionTimeline(activeSession) : [];
   const latestProgress = activeSession?.progress_events?.at(-1);
@@ -359,10 +362,17 @@ export default function App() {
 
         {selectedWorkflow && (
           <div className="stages">
-            {selectedWorkflow.stages.map((stage: WorkflowStage) => (
-              <div key={stage.id} className="stage">
-                <span>{formatStageName(stage.id, stage.name)}</span>
-                {stage.approval_required && <small>需审批</small>}
+            {workflowStageDisplays.map(({ stage, status, attempt, isCurrent }) => (
+              <div key={stage.id} className={`stage ${status}${isCurrent ? " current" : ""}`}>
+                <div>
+                  <span>{formatStageName(stage.id, stage.name)}</span>
+                  <small>
+                    {formatStatus(status)}
+                    {attempt ? ` · 第 ${attempt} 次` : ""}
+                    {stage.approval_required ? " · 需审批" : ""}
+                  </small>
+                </div>
+                <span className={`stage-indicator ${status}`} aria-label={formatStatus(status)} />
               </div>
             ))}
           </div>
