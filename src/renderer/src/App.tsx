@@ -51,6 +51,16 @@ export default function App() {
     void refreshSessions();
   }, []);
 
+  useEffect(() => {
+    if (!activeSession || activeSession.status !== "running") {
+      return;
+    }
+    const interval = window.setInterval(() => {
+      void refreshSessions(activeSession.id);
+    }, 1500);
+    return () => window.clearInterval(interval);
+  }, [activeSession?.id, activeSession?.status]);
+
   async function refreshRuntimeStatus() {
     setRuntimeStatus(await window.aiCoder.getAgentRuntimeStatus());
   }

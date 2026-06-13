@@ -127,9 +127,16 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
       buildOnboardingSnapshot(onboardingStatus, Boolean(input.onboardingOverride))
     );
     session.status = "running";
-    const updated = await runner.run({ session, workflow });
-    await sessions.save(updated);
-    return { session: updated };
+    await sessions.save(session);
+    void runner
+      .run({ session, workflow })
+      .then((updated) => sessions.save(updated))
+      .catch(async (error) => {
+        session.status = "failed";
+        session.error = error instanceof Error ? error.message : String(error);
+        await sessions.save(session);
+      });
+    return { session };
   });
 }
 
