@@ -12,6 +12,7 @@ import type {
 } from "../../shared/types.js";
 import { buildSessionTimeline } from "./sessionTimeline.js";
 import type { TimelineEvent } from "./sessionTimeline.js";
+import { getVisibleSessions, resolveActiveSessionId } from "./sessionSelection.js";
 import { buildWorkflowStageDisplays } from "./workflowStageStatus.js";
 import {
   formatStageName,
@@ -40,9 +41,18 @@ export default function App() {
     () => workflows.find((workflow) => workflow.id === selectedWorkflowId) ?? null,
     [selectedWorkflowId, workflows]
   );
+  const visibleSessions = useMemo(() => getVisibleSessions(sessions, projectPath), [projectPath, sessions]);
   const activeSession = useMemo(
-    () => sessions.find((session) => session.id === activeSessionId) ?? sessions[0] ?? null,
-    [activeSessionId, sessions]
+    () => visibleSessions.find((session) => session.id === activeSessionId) ?? null,
+    [activeSessionId, visibleSessions]
+  );
+  const runningVisibleSessionIds = useMemo(
+    () =>
+      visibleSessions
+        .filter((session) => session.status === "running")
+        .map((session) => session.id)
+        .join(":"),
+    [visibleSessions]
   );
 
   useEffect(() => {
@@ -52,24 +62,28 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!activeSession || activeSession.status !== "running") {
+    if (!runningVisibleSessionIds) {
       return;
     }
     const interval = window.setInterval(() => {
-      void refreshSessions(activeSession.id);
+      void refreshSessions(activeSessionId ?? undefined);
     }, 1500);
     return () => window.clearInterval(interval);
-  }, [activeSession?.id, activeSession?.status]);
+  }, [activeSessionId, runningVisibleSessionIds]);
 
   async function refreshRuntimeStatus() {
     setRuntimeStatus(await window.aiCoder.getAgentRuntimeStatus());
   }
 
-  async function refreshWorkflows(nextProjectPath = projectPath) {
+  async function refreshWorkflows(nextProjectPath = projectPath, preferredWorkflowId = selectedWorkflowId) {
     const result = await window.aiCoder.listWorkflows(nextProjectPath || undefined);
+    const nextWorkflowId = result.workflows.some((workflow: WorkflowTemplate) => workflow.id === preferredWorkflowId)
+      ? preferredWorkflowId
+      : result.workflows[0]?.id || "";
     setWorkflows(result.workflows);
     setWorkflowIssues(result.issues);
-    setSelectedWorkflowId((current: string) => current || result.workflows[0]?.id || "");
+    setSelectedWorkflowId(nextWorkflowId);
+    return { ...result, selectedWorkflowId: nextWorkflowId };
   }
 
   async function refreshOnboardingStatus(nextProjectPath = projectPath) {
@@ -80,12 +94,20 @@ export default function App() {
     setOnboardingStatus(await window.aiCoder.getProjectOnboardingStatus(nextProjectPath));
   }
 
-  async function refreshSessions(preferredSessionId?: string) {
+  async function refreshSessions(
+    preferredSessionId?: string,
+    options: { projectPath?: string; workflowId?: string; preferLatestForWorkflow?: boolean } = {}
+  ) {
     const loaded = await window.aiCoder.listSessions();
     setSessions(loaded);
     setActiveSessionId((current) => {
-      const targetId = preferredSessionId ?? current;
-      return loaded.some((session: AgentSession) => session.id === targetId) ? targetId ?? null : loaded[0]?.id ?? null;
+      return resolveActiveSessionId(loaded, {
+        currentSessionId: current,
+        preferredSessionId,
+        projectPath: options.projectPath ?? projectPath,
+        workflowId: options.workflowId ?? selectedWorkflowId,
+        preferLatestForWorkflow: options.preferLatestForWorkflow
+      });
     });
   }
 
@@ -105,13 +127,35 @@ export default function App() {
       if (selected) {
         setProjectPath(selected);
         setOnboardingOverride(false);
-        await refreshWorkflows(selected);
+        const workflowResult = await refreshWorkflows(selected);
         await refreshOnboardingStatus(selected);
+        await refreshSessions(undefined, {
+          projectPath: selected,
+          workflowId: workflowResult.selectedWorkflowId,
+          preferLatestForWorkflow: true
+        });
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function selectWorkflow(workflowId: string) {
+    setSelectedWorkflowId(workflowId);
+    setError("");
+    await refreshSessions(undefined, {
+      workflowId,
+      projectPath,
+      preferLatestForWorkflow: true
+    });
+  }
+
+  function selectSession(session: AgentSession) {
+    setActiveSessionId(session.id);
+    if (session.workflow_id !== selectedWorkflowId && workflows.some((workflow) => workflow.id === session.workflow_id)) {
+      setSelectedWorkflowId(session.workflow_id);
     }
   }
 
@@ -279,7 +323,7 @@ export default function App() {
               <button
                 key={`${workflow.source.type}:${workflow.id}`}
                 className={workflow.id === selectedWorkflowId ? "workflow selected" : "workflow"}
-                onClick={() => setSelectedWorkflowId(workflow.id)}
+                onClick={() => void selectWorkflow(workflow.id)}
               >
                 <span>{formatWorkflowName(workflow.id, workflow.name)}</span>
                 <small>{formatWorkflowSource(workflow.source.type)} · v{workflow.version}</small>
@@ -302,11 +346,11 @@ export default function App() {
         <section>
           <h2>会话</h2>
           <div className="session-list">
-            {sessions.map((session) => (
+            {visibleSessions.map((session) => (
               <button
                 key={session.id}
                 className={activeSession?.id === session.id ? "session selected" : "session"}
-                onClick={() => setActiveSessionId(session.id)}
+                onClick={() => selectSession(session)}
               >
                 <span>{session.task_prompt}</span>
                 <small>{formatStatus(session.status)}</small>
