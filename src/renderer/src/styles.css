@@ -120,6 +120,12 @@ small {
   gap: 8px;
 }
 
+.nav-empty {
+  margin-top: 8px;
+  color: #667085;
+  font-size: 13px;
+}
+
 .onboarding-box {
   display: grid;
   gap: 8px;
@@ -721,9 +727,82 @@ pre {
   white-space: pre-wrap;
 }
 
-.empty {
+.empty-state {
   display: grid;
   min-height: 220px;
+  align-content: center;
+  justify-items: center;
+  gap: 10px;
   place-items: center;
+  text-align: center;
+}
+
+.empty-state h3 {
+  color: #344054;
+}
+
+.empty-state p {
+  max-width: 360px;
   color: #667085;
+  font-size: 14px;
+}
+
+@media (max-width: 920px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    border-right: 0;
+    border-bottom: 1px solid #dde2e8;
+  }
+
+  .workspace {
+    padding: 18px;
+  }
+
+  .run-panels {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 620px) {
+  .sidebar,
+  .workspace {
+    padding: 14px;
+  }
+
+  .composer,
+  .session-detail {
+    padding: 14px;
+  }
+
+  .actions,
+  .session-header,
+  .tool-approval > div:first-child,
+  .panel-heading,
+  .stage-run-title {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .primary,
+  .secondary {
+    width: 100%;
+  }
+
+  .stages {
+    grid-template-columns: 1fr;
+  }
+
+  .timeline-item {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+
+  .timeline-meta {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+  }
 }

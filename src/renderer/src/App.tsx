@@ -302,15 +302,15 @@ export default function App() {
 
         {onboardingStatus && (
           <section className="onboarding-box">
-            <h2>项目入职</h2>
+            <h2>项目画像</h2>
             <div className="onboarding-status-row">
               <span className={`status-pill ${onboardingStatus.status}`}>{formatStatus(onboardingStatus.status)}</span>
-              <small>{onboardingStatus.claude_md_exists ? "已找到 CLAUDE.md" : "缺少 CLAUDE.md"}</small>
+              <small>{onboardingStatus.claude_md_exists ? "已找到项目画像入口" : "缺少项目画像入口"}</small>
             </div>
             {onboardingStatus.confirmed_at && <small>确认时间 {formatTimestamp(onboardingStatus.confirmed_at)}</small>}
             {onboardingStatus.claude_md_exists && onboardingStatus.status !== "confirmed" && (
               <button className="secondary" disabled={busy} onClick={confirmOnboarding}>
-                确认 CLAUDE.md
+                确认项目画像
               </button>
             )}
           </section>
@@ -330,6 +330,9 @@ export default function App() {
               </button>
             ))}
           </div>
+          {workflows.length === 0 && (
+            <p className="nav-empty">{projectPath ? "未找到可用工作流。" : "选择项目后加载工作流。"}</p>
+          )}
           {workflowIssues.length > 0 && (
             <div className="workflow-issues">
               {workflowIssues.map((issue: WorkflowLoadIssue) => (
@@ -357,6 +360,7 @@ export default function App() {
               </button>
             ))}
           </div>
+          {visibleSessions.length === 0 && <p className="nav-empty">暂无当前项目会话。</p>}
         </section>
       </aside>
 
@@ -367,7 +371,9 @@ export default function App() {
             <p>
               {selectedWorkflow
                 ? formatWorkflowDescription(selectedWorkflow.id, selectedWorkflow.description)
-                : "选择项目和工作流后开始任务。"}
+                : projectPath
+                  ? "选择工作流后开始任务。"
+                  : "选择项目后开始任务。"}
               {runtimeStatus && <span className={`runtime-mode ${runtimeStatus.mode}`}>{formatStatus(runtimeStatus.mode)}模式</span>}
             </p>
             {runtimeStatus && (
@@ -391,7 +397,7 @@ export default function App() {
           </div>
           {showOnboardingWarning && (
             <div className="admission-warning">
-              <span>项目入职尚未确认。请先运行项目入职，或确认 CLAUDE.md。</span>
+              <span>项目画像尚未确认。请先运行项目画像，或确认已有画像入口。</span>
               <label className="override-option">
                 <input
                   type="checkbox"
@@ -561,7 +567,15 @@ export default function App() {
               </div>
             </>
           ) : (
-            <div className="empty">暂无会话。</div>
+            <div className="empty-state">
+              <h3>{projectPath ? "暂无当前项目会话" : "尚未选择项目"}</h3>
+              <p>{projectPath ? "选择工作流并提交任务后，运行状态会显示在这里。" : "选择一个项目后，工作流和会话会显示在这里。"}</p>
+              {!projectPath && (
+                <button className="secondary" disabled={busy} onClick={chooseProject}>
+                  选择项目
+                </button>
+              )}
+            </div>
           )}
         </section>
       </section>

@@ -72,8 +72,8 @@ const WORKFLOW_LABELS: Record<string, { name: string; description?: string }> = 
     description: "读取本地变更，识别正确性、安全性、可维护性和测试风险。"
   },
   "project-onboarding": {
-    name: "项目入职",
-    description: "扫描当前项目，创建或更新 CLAUDE.md 作为共享项目记忆。"
+    name: "项目画像",
+    description: "扫描当前项目，创建或增量更新 Claude 项目画像，包括 CLAUDE.md、rules、skills 和团队设置建议。"
   }
 };
 
@@ -93,8 +93,8 @@ const STAGE_LABELS: Record<string, string> = {
   report: "报告",
   scan_project: "扫描项目",
   understand_project: "理解项目",
-  draft_memory: "起草 CLAUDE.md",
-  write_memory: "写入 CLAUDE.md",
+  draft_memory: "起草项目画像",
+  write_memory: "写入项目画像",
   review: "复核"
 };
 
