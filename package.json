@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "author": {
+    "name": "AI Coder",
+    "email": "aicoder@example.com"
+  },
   "description": "Desktop AI coding agent with pluggable local workflows.",
   "main": "dist/main/main.js",
   "scripts": {
@@ -11,7 +15,31 @@
     "build": "tsc -p tsconfig.main.json && vite build",
     "start": "electron .",
     "test": "vitest run",
+    "pack:linux": "npm run build && electron-builder --linux",
     "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "build": {
+    "appId": "com.aicoder.desktop",
+    "productName": "AI Coder",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "workflows/*.yaml"
+    ],
+    "extraResources": [
+      {
+        "from": "workflows",
+        "to": "workflows",
+        "filter": ["*.yaml"]
+      }
+    ],
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "category": "Development",
+      "icon": null
+    }
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.1.0",
@@ -28,6 +56,7 @@
     "concurrently": "^9.2.0",
     "cross-env": "^10.0.0",
     "electron": "^42.3.2",
+    "electron-builder": "^26.15.3",
     "typescript": "^5.9.0",
     "vite": "^7.0.0",
     "vitest": "^4.1.8",

@@ -9,6 +9,24 @@ import { WorkflowRegistry } from "./workflows/workflowRegistry.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Ensure PATH includes common node locations for AppImage
+function setupEnvironment(): void {
+  const nodePaths = [
+    "/usr/bin",
+    "/usr/local/bin",
+    "/snap/bin",
+    "/home/linuxbrew/.linuxbrew/bin",
+    process.env.HOME ? path.join(process.env.HOME, ".nvm", "current", "bin") : "",
+    process.env.HOME ? path.join(process.env.HOME, ".fnm", "bin") : ""
+  ].filter(Boolean);
+
+  const currentPath = process.env.PATH || "";
+  const newPath = [...nodePaths, ...currentPath.split(":").filter(Boolean)].join(":");
+  process.env.PATH = newPath;
+}
+
+setupEnvironment();
+
 async function createWindow(): Promise<void> {
   const window = new BrowserWindow({
     width: 1280,
