@@ -379,8 +379,8 @@ export default function App() {
             {runtimeStatus && (
               <div className="runtime-diagnostics">
                 <span className={runtimeStatus.sdk_available ? "diagnostic ok" : "diagnostic warn"}>SDK</span>
-                <span className={runtimeStatus.claude_executable_available ? "diagnostic ok" : "diagnostic warn"}>Claude 命令</span>
-                <span className={runtimeStatus.auth_env_available ? "diagnostic ok" : "diagnostic warn"}>环境认证</span>
+                <span className={runtimeStatus.node_runtime_available ? "diagnostic ok" : "diagnostic warn"}>Node 运行时</span>
+                <span className={runtimeStatus.auth_env_available ? "diagnostic ok" : "diagnostic warn"}>Claude 凭据</span>
               </div>
             )}
           </div>

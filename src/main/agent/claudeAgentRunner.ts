@@ -9,7 +9,7 @@ import { WorkflowEngine } from "../workflows/workflowEngine.js";
 import { buildStageInstructions } from "./workflowPrompt.js";
 import { buildStageAgentInput, createMockStageAgentResult, parseStageAgentResult } from "./stageAgentProtocol.js";
 import { extractClaudeStageOutput, formatClaudeTranscript } from "./claudeMessageAdapter.js";
-import { shouldUseClaudeSdk } from "./claudeRuntime.js";
+import { resolveNodeExecutable, shouldUseClaudeSdk } from "./claudeRuntime.js";
 
 export interface AgentRunInput {
   session: AgentSession;
@@ -67,10 +67,14 @@ export class ClaudeAgentRunner {
 
       const instructions = buildStageInstructions(stageAgentInput);
       await this.recordProgress(input, "runner", `开始执行阶段：${currentStage.name || currentStage.id}`, "milestone");
+      const nodeInfo = await resolveNodeExecutable();
+      const sdkEnv = nodeInfo?.env ? { ...process.env, ...nodeInfo.env } : undefined;
       for await (const message of query({
         prompt: `${instructions}\n\n任务：\n${input.session.task_prompt}`,
         options: {
           cwd: input.session.project_path,
+          executable: nodeInfo?.command ?? undefined,
+          env: sdkEnv,
           tools: buildAllowedClaudeTools(input.workflow, currentStage),
           disallowedTools: buildDisallowedClaudeTools(input.workflow),
           permissionMode: "dontAsk",

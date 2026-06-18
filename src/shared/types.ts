@@ -216,7 +216,7 @@ export interface StartSessionResult {
 export interface AgentRuntimeStatus {
   mode: "mock" | "live";
   sdk_available: boolean;
-  claude_executable_available: boolean;
+  node_runtime_available: boolean;
   auth_env_available: boolean;
   diagnostics: string[];
 }
