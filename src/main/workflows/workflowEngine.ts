@@ -71,7 +71,12 @@ export class WorkflowEngine {
     const stage = this.getStage(workflow, stageRun.stage_id);
     const missingOutputs = (stage?.required_outputs ?? []).filter((name) => !hasRequiredOutput(result, name));
     if (missingOutputs.length > 0) {
-      return this.blockCurrentStage(session, `Missing required stage outputs: ${missingOutputs.join(", ")}`);
+      const maxRetry = stage?.auto_retry_limit ?? 0;
+      const currentAttempt = this.getStageAttempt(session, stageRun.stage_id);
+      if (currentAttempt <= maxRetry) {
+        return this.retryCurrentStage(session, workflow, `Missing required outputs: ${missingOutputs.join(", ")}`);
+      }
+      return this.blockCurrentStage(session, `Missing required outputs after ${currentAttempt} attempts: ${missingOutputs.join(", ")}`);
     }
 
     return this.completeCurrentStage(session, workflow, result.output_summary);
@@ -231,6 +236,26 @@ export class WorkflowEngine {
     session.status = "blocked";
     session.error = reason;
     return session;
+  }
+
+  private retryCurrentStage(session: AgentSession, workflow: WorkflowTemplate, reason: string): AgentSession {
+    const stageRun = this.getActiveStageRun(session);
+    if (!stageRun) {
+      return session;
+    }
+
+    stageRun.status = "running";
+    stageRun.retry_reason = reason;
+    stageRun.attempt = (stageRun.attempt ?? 1) + 1;
+    session.status = "running";
+    session.error = reason;
+    return session;
+  }
+
+  private getStageAttempt(session: AgentSession, stageId: string): number {
+    const runs = (session.stage_runs ?? []).filter((run) => run.stage_id === stageId);
+    if (runs.length === 0) return 0;
+    return Math.max(...runs.map((run) => run.attempt ?? 1));
   }
 
   private advanceAfterCompletedStage(session: AgentSession, workflow: WorkflowTemplate, completedStageId: string): AgentSession {

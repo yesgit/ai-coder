@@ -132,7 +132,7 @@ describe("WorkflowEngine", () => {
     });
 
     expect(session.status).toBe("blocked");
-    expect(session.error).toContain("task_summary");
+    expect(session.error).toContain("Missing required outputs after 1 attempts");
   });
 
   it("applies a needs_rework stage agent result", () => {
@@ -236,5 +236,67 @@ describe("WorkflowEngine", () => {
     expect(session.status).toBe("running");
     expect(session.stage_runs).toHaveLength(2);
     expect(session.stage_runs?.[1].input_summary).toBe("Resume retry");
+  });
+
+  it("auto-retries when missing required outputs and attempt count is below limit", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+    const workflowWithRetry: WorkflowTemplate = {
+      ...workflow,
+      stages: [{ id: "understand", name: "Understand", required_outputs: ["task_summary"], auto_retry_limit: 2 }]
+    };
+
+    engine.ensureState(session, workflowWithRetry);
+    engine.applyStageResult(session, workflowWithRetry, {
+      status: "completed",
+      output_summary: "Done"
+    });
+
+    // 第一次重试：attempt=2，应该继续 running
+    expect(session.status).toBe("running");
+    expect(session.stage_runs?.[0]).toMatchObject({ stage_id: "understand", attempt: 2, status: "running", retry_reason: expect.stringContaining("Missing required outputs") });
+    expect(session.error).toContain("Missing required outputs");
+  });
+
+  it("blocks after exceeding auto-retry limit for missing outputs", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+    const workflowWithRetry: WorkflowTemplate = {
+      ...workflow,
+      stages: [{ id: "understand", name: "Understand", required_outputs: ["task_summary"], auto_retry_limit: 1 }]
+    };
+
+    engine.ensureState(session, workflowWithRetry);
+    // 第一次尝试：missing output，触发重试（attempt=2）
+    engine.applyStageResult(session, workflowWithRetry, {
+      status: "completed",
+      output_summary: "Done"
+    });
+    // 第二次尝试：仍然 missing output，应该 block（因为 auto_retry_limit=1）
+    engine.applyStageResult(session, workflowWithRetry, {
+      status: "completed",
+      output_summary: "Done"
+    });
+
+    expect(session.status).toBe("blocked");
+    expect(session.error).toContain("Missing required outputs after 2 attempts");
+  });
+
+  it("blocks immediately when stage has no auto_retry_limit", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+    const workflowWithoutRetry: WorkflowTemplate = {
+      ...workflow,
+      stages: [{ id: "understand", name: "Understand", required_outputs: ["task_summary"] }]
+    };
+
+    engine.ensureState(session, workflowWithoutRetry);
+    engine.applyStageResult(session, workflowWithoutRetry, {
+      status: "completed",
+      output_summary: "Done"
+    });
+
+    expect(session.status).toBe("blocked");
+    expect(session.error).toContain("Missing required outputs after 1 attempts");
   });
 });

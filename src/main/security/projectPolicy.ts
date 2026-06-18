@@ -41,6 +41,12 @@ export function hasPendingStageApproval(session: AgentSession): boolean {
   return session.approvals.some((approval) => approval.kind === "stage" && approval.status === "pending");
 }
 
+export function hasStageApproval(session: AgentSession, stageId: string): boolean {
+  return session.approvals.some(
+    (approval) => approval.kind === "stage" && approval.stage_id === stageId && approval.status === "approved"
+  );
+}
+
 export function buildAllowedClaudeTools(workflow: WorkflowTemplate, stage?: WorkflowStage): string[] {
   const declared = new Set(stage ? (stage.allowed_tools ?? []) : workflow.stages.flatMap((item) => item.allowed_tools ?? []));
   const tools = new Set<string>(["Read", "Grep", "Glob", "LS"]);
@@ -87,6 +93,25 @@ export async function approveOrDenyToolUse(
   }
   if (existingToolCall?.status === "pending_approval") {
     return { allow: false, message: "Tool call is waiting for user approval.", interrupt: true };
+  }
+
+  // 如果阶段已获得授权，自动允许该阶段声明的工具
+  const currentStage = workflow.stages.find((s) => s.id === session.current_stage);
+  if (currentStage?.approval_required && hasStageApproval(session, currentStage.id)) {
+    if (isWriteTool(toolName) && currentStage.allowed_tools?.includes("edit_file")) {
+      const toolCall: ToolCallRecord = {
+        id: toolUseId,
+        stage_id: session.current_stage,
+        tool: toolName,
+        input,
+        status: "approved",
+        created_at: now,
+        resolved_at: now
+      };
+      session.tool_calls.push(toolCall);
+      recordFileChangesForTool(session, toolName, input, true, now);
+      return { allow: true, updatedInput: input };
+    }
   }
 
   const record = (status: ToolCallRecord["status"]) => {

@@ -65,6 +65,31 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     return session;
   });
 
+  ipcMain.handle("sessions:authorize-stage", async (_event, sessionId: string, stageId: string) => {
+    const session = await sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}`);
+    }
+    const projectPath = await authorizedProjects.assertAuthorized(session.project_path);
+    // 查找待处理的阶段授权
+    const approval = session.approvals.find(
+      (item) => item.kind === "stage" && item.stage_id === stageId && item.status === "pending"
+    );
+    if (!approval) {
+      throw new Error(`Pending stage authorization not found for stage: ${stageId}`);
+    }
+    approval.status = "approved";
+    approval.resolved_at = new Date().toISOString();
+    session.status = "running";
+    await sessions.save(session);
+    // 继续执行会话
+    const workflow = await registry.get(session.workflow_id, projectPath);
+    if (workflow) {
+      runSessionInBackground(runner, sessions, session, workflow);
+    }
+    return session;
+  });
+
   ipcMain.handle("sessions:approve-rework", async (_event, sessionId: string, requestId: string) => {
     const session = await sessions.get(sessionId);
     if (!session) {

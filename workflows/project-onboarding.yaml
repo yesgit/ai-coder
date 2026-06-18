@@ -102,6 +102,8 @@ stages:
       - incremental_update_plan
   - id: write_memory
     name: 写入 Claude 项目画像
+    approval_required: true
+    auto_retry_limit: 2
     instructions: |
       使用已批准的草稿创建或更新 Claude Code 项目画像资产。
       像修改共享团队文档一样谨慎处理已有内容：先保护有价值信息，再补充更准确、更可执行的内容。

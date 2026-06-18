@@ -70,6 +70,25 @@ export class SessionStore {
     return this.resolveToolCall(id, toolCallId, "denied");
   }
 
+  async approveStage(id: string, stageId: string): Promise<AgentSession> {
+    assertSessionId(id);
+    const session = await this.get(id);
+    if (!session) {
+      throw new Error(`Session not found: ${id}`);
+    }
+    const approval = session.approvals.find(
+      (item) => item.kind === "stage" && item.stage_id === stageId && item.status === "pending"
+    );
+    if (!approval) {
+      throw new Error(`Pending stage approval not found: ${stageId}`);
+    }
+    approval.status = "approved";
+    approval.resolved_at = new Date().toISOString();
+    session.status = "running";
+    await this.save(session);
+    return session;
+  }
+
   private async readFile(filePath: string): Promise<AgentSession | null> {
     try {
       const raw = await fs.readFile(filePath, "utf8");

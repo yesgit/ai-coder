@@ -5,9 +5,25 @@ export function buildStageAgentInput(
   workflow: WorkflowTemplate,
   currentStage: WorkflowStage
 ): StageAgentInput {
+  const currentStageRun = [...(session.stage_runs ?? [])]
+    .reverse()
+    .find((stageRun) => stageRun.stage_id === currentStage.id && (stageRun.status === "running" || stageRun.status === "waiting_approval"));
+
   const priorFailed = [...(session.stage_runs ?? [])]
     .reverse()
     .find((stageRun) => stageRun.stage_id === currentStage.id && stageRun.status === "failed");
+
+  const retryContext = currentStageRun?.retry_reason
+    ? {
+        previous_attempt: currentStageRun.attempt,
+        output_summary: currentStageRun.retry_reason
+      }
+    : priorFailed
+      ? {
+          previous_attempt: priorFailed.attempt,
+          output_summary: priorFailed.output_summary ?? ""
+        }
+      : undefined;
 
   return {
     workflow: {
@@ -37,12 +53,7 @@ export function buildStageAgentInput(
     allowed_tools: currentStage.allowed_tools ?? [],
     required_outputs: currentStage.required_outputs ?? [],
     gates: currentStage.gates ?? [],
-    retry_context: priorFailed
-      ? {
-          previous_attempt: priorFailed.attempt,
-          output_summary: priorFailed.output_summary ?? ""
-        }
-      : undefined
+    retry_context: retryContext
   };
 }
 

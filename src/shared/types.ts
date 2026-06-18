@@ -35,6 +35,7 @@ export interface WorkflowStage {
   required_outputs?: string[];
   required_checks?: string[];
   gates?: string[];
+  auto_retry_limit?: number;
 }
 
 export interface WorkflowTemplate {
@@ -87,6 +88,7 @@ export interface StageRun {
   started_at: string;
   completed_at?: string;
   rework_reason?: string;
+  retry_reason?: string;
 }
 
 export interface ReworkRequest {
@@ -254,6 +256,7 @@ export interface AppApi {
   listSessions(): Promise<AgentSession[]>;
   getSession(id: string): Promise<AgentSession | null>;
   approveStage(sessionId: string, stageId: string): Promise<AgentSession>;
+  authorizeStage(sessionId: string, stageId: string): Promise<AgentSession>;
   approveRework(sessionId: string, requestId: string): Promise<AgentSession>;
   approveToolCall(sessionId: string, toolCallId: string): Promise<AgentSession>;
   denyToolCall(sessionId: string, toolCallId: string): Promise<AgentSession>;

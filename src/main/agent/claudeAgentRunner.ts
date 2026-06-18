@@ -54,6 +54,13 @@ export class ClaudeAgentRunner {
       input.session.error = `Workflow stage not found: ${input.session.current_stage}`;
       return input.session;
     }
+
+    // 检查阶段是否需要预先授权（仅针对需要写权限的阶段，如 write_memory）
+    // 只有当阶段配置了 approval_required 且包含 edit_file 工具时，才需要在开始前授权
+    if (currentStage.approval_required && currentStage.allowed_tools?.includes("edit_file") && !this.hasStageApproval(input.session, currentStage.id)) {
+      return this.requestStageApprovalIfNeeded(input, currentStage);
+    }
+
     const stageAgentInput = buildStageAgentInput(input.session, input.workflow, currentStage);
 
     if (!(await shouldUseClaudeSdk())) {
@@ -144,7 +151,7 @@ export class ClaudeAgentRunner {
     const stage = input.workflow.stages.find((item) => item.id === approval?.stage_id);
     input.session.status = "waiting_approval";
     input.session.current_stage = approval?.stage_id ?? input.session.current_stage;
-    const content = `已为“${input.session.task_prompt}”准备工作流计划。等待审批后继续执行${stage?.name ?? "下一阶段"}。`;
+    const content = `已为"${input.session.task_prompt}"准备工作流计划。等待审批后继续执行${stage?.name ?? "下一阶段"}。`;
     if (!input.session.messages.some((message) => message.role === "assistant" && message.content === content)) {
       input.session.messages.push({
         role: "assistant",
@@ -153,6 +160,42 @@ export class ClaudeAgentRunner {
       });
     }
     return true;
+  }
+
+  private hasStageApproval(session: AgentSession, stageId: string): boolean {
+    return session.approvals.some(
+      (approval) => approval.kind === "stage" && approval.stage_id === stageId && approval.status === "approved"
+    );
+  }
+
+  private requestStageApprovalIfNeeded(input: AgentRunInput, stage: WorkflowStage): AgentSession {
+    const existing = input.session.approvals.find(
+      (approval) => approval.kind === "stage" && approval.stage_id === stage.id && approval.status === "pending"
+    );
+    if (existing) {
+      input.session.status = "waiting_approval";
+      return input.session;
+    }
+
+    const approval = {
+      id: randomUUID(),
+      stage_id: stage.id,
+      kind: "stage" as const,
+      status: "pending" as const,
+      message: `阶段"${stage.name}"需要授权才能继续执行。该阶段需要使用文件编辑工具，请确认是否允许。`,
+      created_at: new Date().toISOString()
+    };
+    input.session.approvals.push(approval);
+    input.session.status = "waiting_approval";
+
+    const content = `阶段"${stage.name}"需要授权才能继续执行。该阶段将使用文件编辑工具写入项目文件，请审批。`;
+    input.session.messages.push({
+      role: "assistant",
+      content,
+      created_at: new Date().toISOString()
+    });
+
+    return input.session;
   }
 
   private async recordProgress(
