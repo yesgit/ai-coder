@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import ReactMarkdown from "react-markdown";
 import type {
   AgentSession,
   AgentRuntimeStatus,
@@ -538,7 +539,9 @@ export default function App() {
                         <strong>{toolCall.tool}</strong>
                         <small>{formatStageName(toolCall.stage_id)}</small>
                       </div>
-                      <pre>{JSON.stringify(toolCall.input, null, 2)}</pre>
+                      <div className="markdown-content">
+                        <ReactMarkdown>{`\`\`\`json\n${JSON.stringify(toolCall.input, null, 2)}\n\`\`\``}</ReactMarkdown>
+                      </div>
                       <div className="actions">
                         <button className="primary" disabled={busy} onClick={() => approveToolCall(activeSession, toolCall)}>
                           批准
@@ -569,7 +572,9 @@ export default function App() {
                             <span className={`status-pill ${stageRun.status}`}>{formatStatus(stageRun.status)}</span>
                           </div>
                           <small>第 {stageRun.attempt} 次尝试</small>
-                          <p>{stageRun.output_summary ?? stageRun.input_summary}</p>
+                          <p className="markdown-content">
+                            <ReactMarkdown>{stageRun.output_summary ?? stageRun.input_summary}</ReactMarkdown>
+                          </p>
                         </article>
                       ))}
                     </div>
@@ -593,7 +598,9 @@ export default function App() {
                             </strong>
                             <span className={`status-pill ${request.status}`}>{formatStatus(request.status)}</span>
                           </div>
-                          <p>{request.reason}</p>
+                          <p className="markdown-content">
+                            <ReactMarkdown>{request.reason}</ReactMarkdown>
+                          </p>
                           {request.status === "pending" && (
                             <div className="actions">
                               <button className="primary" disabled={busy} onClick={() => approveReworkRequest(activeSession, request)}>
@@ -621,7 +628,11 @@ export default function App() {
                     </div>
                     <div className="timeline-body">
                       <strong>{event.title}</strong>
-                      {event.detail && <pre>{event.detail}</pre>}
+                      {event.detail && (
+                        <div className="markdown-content">
+                          <ReactMarkdown>{event.detail}</ReactMarkdown>
+                        </div>
+                      )}
                     </div>
                   </article>
                 ))}
