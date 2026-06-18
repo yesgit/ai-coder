@@ -152,6 +152,57 @@ export class WorkflowEngine {
     return this.applyRework(session, workflow, request);
   }
 
+  resumeFromFailedStage(session: AgentSession, workflow: WorkflowTemplate): AgentSession {
+    this.ensureState(session, workflow);
+
+    let targetStageId: string | undefined;
+    const activeRun = this.getActiveStageRun(session);
+    if (activeRun) {
+      activeRun.status = "superseded";
+      activeRun.completed_at = new Date().toISOString();
+      targetStageId = activeRun.stage_id;
+    } else {
+      const failedRun = [...(session.stage_runs ?? [])]
+        .reverse()
+        .find((stageRun) => stageRun.status === "failed");
+      if (!failedRun) {
+        throw new Error("No stage to resume from");
+      }
+      targetStageId = failedRun.stage_id;
+    }
+
+    const stage = this.getStage(workflow, targetStageId);
+    if (!stage) {
+      throw new Error(`Workflow stage not found: ${targetStageId}`);
+    }
+
+    const inputSummary = this.buildResumeInputSummary(session, workflow, targetStageId);
+    session.error = undefined;
+    this.startStage(session, workflow, stage, inputSummary);
+    return session;
+  }
+
+  private buildResumeInputSummary(
+    session: AgentSession,
+    workflow: WorkflowTemplate,
+    targetStageId: string
+  ): string {
+    const targetIndex = this.stageIndex(workflow, targetStageId);
+    for (let index = targetIndex - 1; index >= 0; index -= 1) {
+      const priorStageId = workflow.stages[index]?.id;
+      if (!priorStageId) {
+        continue;
+      }
+      const priorCompleted = [...(session.stage_runs ?? [])]
+        .reverse()
+        .find((stageRun) => stageRun.stage_id === priorStageId && stageRun.status === "completed");
+      if (priorCompleted?.output_summary) {
+        return priorCompleted.output_summary;
+      }
+    }
+    return "Resume retry";
+  }
+
   getActiveStageRun(session: AgentSession): StageRun | undefined {
     return [...(session.stage_runs ?? [])]
       .reverse()

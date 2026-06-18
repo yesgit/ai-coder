@@ -175,4 +175,66 @@ describe("WorkflowEngine", () => {
     expect(session.status).toBe("failed");
     expect(session.stage_runs?.[0]).toMatchObject({ status: "failed", output_summary: "Agent crashed" });
   });
+
+  it("resumes from a failed stage with a new attempt", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+
+    engine.ensureState(session, workflow);
+    engine.applyStageResult(session, workflow, {
+      status: "failed",
+      output_summary: "Failed",
+      error: "Agent crashed"
+    });
+
+    expect(session.status).toBe("failed");
+    expect(session.stage_runs).toHaveLength(1);
+
+    engine.resumeFromFailedStage(session, workflow);
+
+    expect(session.status).toBe("running");
+    expect(session.error).toBeUndefined();
+    expect(session.stage_runs).toHaveLength(2);
+    expect(session.stage_runs?.[0]).toMatchObject({ stage_id: "understand", attempt: 1, status: "failed" });
+    expect(session.stage_runs?.[1]).toMatchObject({ stage_id: "understand", attempt: 2, status: "running" });
+  });
+
+  it("resumes from an interrupted session by marking active run superseded", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+
+    engine.ensureState(session, workflow);
+    // Simulate an interrupted session: stage is still running but app crashed
+    const activeRun = session.stage_runs?.[0];
+    if (activeRun) {
+      activeRun.status = "running";
+    }
+    session.status = "interrupted";
+
+    engine.resumeFromFailedStage(session, workflow);
+
+    expect(session.status).toBe("running");
+    expect(session.stage_runs).toHaveLength(2);
+    expect(session.stage_runs?.[0]).toMatchObject({ stage_id: "understand", attempt: 1, status: "superseded" });
+    expect(session.stage_runs?.[1]).toMatchObject({ stage_id: "understand", attempt: 2, status: "running" });
+  });
+
+  it("builds correct inputSummary when resuming from first stage", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+
+    // 从第一个阶段失败后恢复，inputSummary 应该是 "Resume retry"（没有更早的已完成阶段）
+    engine.ensureState(session, workflow);
+    engine.applyStageResult(session, workflow, {
+      status: "failed",
+      output_summary: "Failed",
+      error: "Agent crashed"
+    });
+
+    engine.resumeFromFailedStage(session, workflow);
+
+    expect(session.status).toBe("running");
+    expect(session.stage_runs).toHaveLength(2);
+    expect(session.stage_runs?.[1].input_summary).toBe("Resume retry");
+  });
 });

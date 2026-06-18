@@ -15,7 +15,8 @@ const api: AppApi = {
   approveToolCall: (sessionId: string, toolCallId: string) =>
     ipcRenderer.invoke("sessions:approve-tool-call", sessionId, toolCallId),
   denyToolCall: (sessionId: string, toolCallId: string) => ipcRenderer.invoke("sessions:deny-tool-call", sessionId, toolCallId),
-  continueSession: (sessionId: string) => ipcRenderer.invoke("sessions:continue", sessionId)
+  continueSession: (sessionId: string) => ipcRenderer.invoke("sessions:continue", sessionId),
+  resumeSession: (sessionId: string) => ipcRenderer.invoke("sessions:resume", sessionId)
 };
 
 contextBridge.exposeInMainWorld("aiCoder", api);

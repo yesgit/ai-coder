@@ -438,7 +438,8 @@ textarea {
 }
 
 .activity-strip.failed .activity-dot,
-.activity-strip.blocked .activity-dot {
+.activity-strip.blocked .activity-dot,
+.activity-strip.interrupted .activity-dot {
   background: #b42318;
 }
 
@@ -584,6 +585,8 @@ textarea {
 }
 
 .status-pill.failed,
+.status-pill.blocked,
+.status-pill.interrupted,
 .status-pill.denied {
   border-color: #f6c5bd;
   background: #fff4f2;

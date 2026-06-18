@@ -13,6 +13,16 @@ export function buildStageInstructions(input: StageAgentInput): string {
   const previousStageLines = input.previous_stage_summaries
     .map((summary) => `- ${summary.stage_id} attempt ${summary.attempt}: ${summary.output_summary ?? summary.status}`)
     .join("\n");
+
+  const retrySection = input.retry_context
+    ? [
+        "",
+        `本次为当前阶段的重试（上次为第 ${input.retry_context.previous_attempt} 次尝试）：`,
+        `- 上次失败原因/总结：${input.retry_context.output_summary}`,
+        "请认真分析失败原因，避免重复同样的错误，优先采取与上次不同的策略或更小的改动。"
+      ].join("\n")
+    : "";
+
   const allowedTools = input.allowed_tools.length ? input.allowed_tools.join(", ") : "read-only defaults";
   const requiredOutputs = input.required_outputs.length ? input.required_outputs.join(", ") : "concise stage summary";
   const gates = input.gates.length ? input.gates.join(", ") : "none";
@@ -42,6 +52,7 @@ export function buildStageInstructions(input: StageAgentInput): string {
     "",
     "此前阶段摘要：",
     previousStageLines || "无",
+    retrySection,
     "",
     "当前阶段：",
     `id: ${input.current_stage.id}`,

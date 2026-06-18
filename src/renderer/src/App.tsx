@@ -266,6 +266,20 @@ export default function App() {
     }
   }
 
+  async function resumeSession(session: AgentSession) {
+    setBusy(true);
+    setError("");
+    try {
+      const updated = await window.aiCoder.resumeSession(session.id);
+      upsertSession(updated);
+      await refreshSessions(updated.id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const onboardingConfirmed = onboardingStatus?.status === "confirmed";
   const onboardingRequired = Boolean(projectPath && selectedWorkflowId !== "project-onboarding" && !onboardingConfirmed);
   const onboardingAdmissionAllowed = !onboardingRequired || onboardingOverride;
@@ -445,16 +459,36 @@ export default function App() {
                     </p>
                   )}
                 </div>
-                {activeSession.status === "waiting_approval" && (
+                {(activeSession.status === "waiting_approval" ||
+                  activeSession.status === "failed" ||
+                  activeSession.status === "blocked" ||
+                  activeSession.status === "interrupted") && (
                   <div className="session-actions">
-                    {activeSession.approvals.some((approval) => approval.kind === "stage" && approval.status === "pending") && (
-                      <button className="primary" disabled={busy} onClick={() => approvePendingStage(activeSession)}>
-                        批准阶段
-                      </button>
+                    {activeSession.status === "waiting_approval" && (
+                      <>
+                        {activeSession.approvals.some(
+                          (approval) => approval.kind === "stage" && approval.status === "pending"
+                        ) && (
+                          <button className="primary" disabled={busy} onClick={() => approvePendingStage(activeSession)}>
+                            批准阶段
+                          </button>
+                        )}
+                        {approvedToolCalls.length > 0 && (
+                          <button
+                            className="secondary"
+                            disabled={busy}
+                            onClick={() => continueSession(activeSession)}
+                          >
+                            继续
+                          </button>
+                        )}
+                      </>
                     )}
-                    {approvedToolCalls.length > 0 && (
-                      <button className="secondary" disabled={busy} onClick={() => continueSession(activeSession)}>
-                        继续
+                    {(activeSession.status === "failed" ||
+                      activeSession.status === "blocked" ||
+                      activeSession.status === "interrupted") && (
+                      <button className="primary" disabled={busy} onClick={() => resumeSession(activeSession)}>
+                        断点恢复
                       </button>
                     )}
                   </div>

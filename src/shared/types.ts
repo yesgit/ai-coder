@@ -59,7 +59,14 @@ export interface WorkflowListResult {
   issues: WorkflowLoadIssue[];
 }
 
-export type SessionStatus = "created" | "running" | "waiting_approval" | "blocked" | "completed" | "failed";
+export type SessionStatus =
+  | "created"
+  | "running"
+  | "waiting_approval"
+  | "blocked"
+  | "completed"
+  | "failed"
+  | "interrupted";
 
 export type StageRunStatus =
   | "pending"
@@ -108,6 +115,11 @@ export interface WorkflowOverviewStage {
   gates: string[];
 }
 
+export interface StageRetryContext {
+  previous_attempt: number;
+  output_summary: string;
+}
+
 export interface StageAgentInput {
   workflow: {
     id: string;
@@ -122,6 +134,7 @@ export interface StageAgentInput {
   allowed_tools: string[];
   required_outputs: string[];
   gates: string[];
+  retry_context?: StageRetryContext;
 }
 
 export interface StageAgentResult {
@@ -245,4 +258,5 @@ export interface AppApi {
   approveToolCall(sessionId: string, toolCallId: string): Promise<AgentSession>;
   denyToolCall(sessionId: string, toolCallId: string): Promise<AgentSession>;
   continueSession(sessionId: string): Promise<AgentSession>;
+  resumeSession(sessionId: string): Promise<AgentSession>;
 }

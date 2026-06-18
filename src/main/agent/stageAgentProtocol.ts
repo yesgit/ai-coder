@@ -5,6 +5,10 @@ export function buildStageAgentInput(
   workflow: WorkflowTemplate,
   currentStage: WorkflowStage
 ): StageAgentInput {
+  const priorFailed = [...(session.stage_runs ?? [])]
+    .reverse()
+    .find((stageRun) => stageRun.stage_id === currentStage.id && stageRun.status === "failed");
+
   return {
     workflow: {
       id: workflow.id,
@@ -32,7 +36,13 @@ export function buildStageAgentInput(
     project_path: session.project_path,
     allowed_tools: currentStage.allowed_tools ?? [],
     required_outputs: currentStage.required_outputs ?? [],
-    gates: currentStage.gates ?? []
+    gates: currentStage.gates ?? [],
+    retry_context: priorFailed
+      ? {
+          previous_attempt: priorFailed.attempt,
+          output_summary: priorFailed.output_summary ?? ""
+        }
+      : undefined
   };
 }
 

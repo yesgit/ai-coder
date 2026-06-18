@@ -111,6 +111,25 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     return session;
   });
 
+  ipcMain.handle("sessions:resume", async (_event, sessionId: string) => {
+    const session = await sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}`);
+    }
+    if (session.status !== "failed" && session.status !== "blocked" && session.status !== "interrupted") {
+      throw new Error(`Session is not resumable: ${session.status}`);
+    }
+    const projectPath = await authorizedProjects.assertAuthorized(session.project_path);
+    const workflow = await registry.get(session.workflow_id, projectPath);
+    if (!workflow) {
+      throw new Error(`Workflow not found: ${session.workflow_id}`);
+    }
+    workflowEngine.resumeFromFailedStage(session, workflow);
+    await sessions.save(session);
+    runSessionInBackground(runner, sessions, session, workflow);
+    return session;
+  });
+
   ipcMain.handle("sessions:start", async (_event, input: StartSessionInput) => {
     if (!input.projectPath || !input.workflowId || !input.taskPrompt.trim()) {
       throw new Error("projectPath, workflowId, and taskPrompt are required");

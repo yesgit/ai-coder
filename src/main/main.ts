@@ -77,11 +77,36 @@ const builtinWorkflowDir = app.isPackaged
   ? path.join(process.resourcesPath, "workflows")
   : path.join(app.getAppPath(), "workflows");
 
-registerIpcHandlers(new WorkflowRegistry(builtinWorkflowDir), new SessionStore(), new ClaudeAgentRunner());
+const sessions = new SessionStore();
+
+registerIpcHandlers(new WorkflowRegistry(builtinWorkflowDir), sessions, new ClaudeAgentRunner());
+
+/**
+ * 应用启动时把磁盘上仍然停留在 running / waiting_approval 的会话标为 interrupted。
+ * 这些会话原先的 runner 已随上次进程退出而消失，再没人推进；标记后会在渲染端
+ * 暴露「断点恢复」按钮，点击会走 sessions:resume 起一次新的 attempt。
+ */
+async function reconcileInterruptedSessions(store: SessionStore): Promise<void> {
+  try {
+    const all = await store.list();
+    await Promise.all(
+      all
+        .filter((session) => session.status === "running" || session.status === "waiting_approval")
+        .map(async (session) => {
+          session.status = "interrupted";
+          await store.save(session);
+        })
+    );
+  } catch (error) {
+    // Reconcile 不应阻塞启动；仅打印
+    console.warn("Failed to reconcile interrupted sessions:", error);
+  }
+}
 
 app.whenReady().then(async () => {
   // Run PATH discovery in parallel with the first window — never block startup.
   void setupEnvironment();
+  await reconcileInterruptedSessions(sessions);
   await createWindow();
 });
 

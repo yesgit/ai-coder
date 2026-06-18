@@ -15,6 +15,7 @@ const STATUS_LABELS: Record<string, string> = {
   blocked: "已阻断",
   completed: "已完成",
   failed: "失败",
+  interrupted: "已中断",
   pending: "待处理",
   approved: "已批准",
   denied: "已拒绝",
