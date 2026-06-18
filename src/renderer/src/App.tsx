@@ -154,6 +154,18 @@ export default function App() {
 
   function selectSession(session: AgentSession) {
     setActiveSessionId(session.id);
+    // 自动切换到会话所属的项目
+    if (session.project_path !== projectPath) {
+      setProjectPath(session.project_path);
+      // 项目切换后，重新加载工作流列表和会话列表
+      refreshWorkflows(session.project_path).then((workflowResult) => {
+        void refreshSessions(undefined, {
+          projectPath: session.project_path,
+          workflowId: workflowResult.selectedWorkflowId,
+          preferLatestForWorkflow: false
+        });
+      });
+    }
     if (session.workflow_id !== selectedWorkflowId && workflows.some((workflow) => workflow.id === session.workflow_id)) {
       setSelectedWorkflowId(session.workflow_id);
     }
