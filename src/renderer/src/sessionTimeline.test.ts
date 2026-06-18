@@ -150,4 +150,38 @@ describe("buildSessionTimeline", () => {
     expect(events.map((event) => event.detail)).not.toContain("收到 Claude SDK 消息：assistant");
     expect(events.map((event) => event.detail)).toContain("开始执行阶段：Plan");
   });
+
+  it("filters out empty or placeholder assistant messages", () => {
+    const events = buildSessionTimeline({
+      ...session,
+      messages: [
+        {
+          role: "assistant",
+          content: "",
+          created_at: "2026-06-03T01:01:00.000Z"
+        },
+        {
+          role: "assistant",
+          content: "(no content)",
+          created_at: "2026-06-03T01:01:30.000Z"
+        },
+        {
+          role: "assistant",
+          content: "收到 Claude SDK 消息：assistant",
+          created_at: "2026-06-03T01:02:00.000Z"
+        },
+        {
+          role: "assistant",
+          content: "Valid message with actual content",
+          created_at: "2026-06-03T01:02:30.000Z"
+        }
+      ]
+    });
+
+    const details = events.filter((e) => e.type === "message").map((e) => e.detail);
+    expect(details).not.toContain("");
+    expect(details).not.toContain("(no content)");
+    expect(details).not.toContain("收到 Claude SDK 消息：assistant");
+    expect(details).toContain("Valid message with actual content");
+  });
 });

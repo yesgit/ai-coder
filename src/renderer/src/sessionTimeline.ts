@@ -36,6 +36,11 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
   ];
 
   session.messages.forEach((message: AgentMessage, index: number) => {
+    // 跳过空内容或占位符内容的消息
+    const content = message.content?.trim();
+    if (!content || content === "(no content)" || content.startsWith("收到 Claude SDK 消息：")) {
+      return;
+    }
     events.push({
       id: `${session.id}:message:${index}`,
       type: "message",
