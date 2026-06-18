@@ -177,6 +177,29 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     runSessionInBackground(runner, sessions, session, workflow);
     return { session };
   });
+
+  ipcMain.handle("sessions:send-message", async (_event, sessionId: string, message: string) => {
+    const session = await sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}`);
+    }
+    const projectPath = await authorizedProjects.assertAuthorized(session.project_path);
+    const workflow = await registry.get(session.workflow_id, projectPath);
+    if (!workflow) {
+      throw new Error(`Workflow not found: ${session.workflow_id}`);
+    }
+    // 添加用户消息到会话
+    session.messages.push({
+      role: "user",
+      content: message.trim(),
+      created_at: new Date().toISOString()
+    });
+    // 将会话状态改为 running，触发新一轮执行
+    session.status = "running";
+    await sessions.save(session);
+    runSessionInBackground(runner, sessions, session, workflow);
+    return session;
+  });
 }
 
 function runSessionInBackground(

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { AgentSession, SessionProgressEvent, WorkflowTemplate } from "../../shared/types.js";
+import type { AgentSession, SessionProgressEvent, WorkflowStage, WorkflowTemplate } from "../../shared/types.js";
 import {
   approveOrDenyToolUse,
   buildAllowedClaudeTools,

@@ -809,3 +809,34 @@ pre {
     align-items: center;
   }
 }
+
+/* 聊天输入框样式 */
+.chat-input-box {
+  margin-top: 16px;
+  padding: 16px;
+  border: 1px solid #dde2e8;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.chat-input-box textarea {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid #c5cbd1;
+  border-radius: 6px;
+  resize: vertical;
+  font-family: inherit;
+  font-size: 14px;
+}
+
+.chat-input-box textarea:focus {
+  outline: none;
+  border-color: #0066cc;
+  box-shadow: 0 0 0 2px rgba(0, 102, 204, 0.2);
+}
+
+.chat-input-box .actions {
+  margin-top: 10px;
+  display: flex;
+  justify-content: flex-end;
+}

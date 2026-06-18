@@ -11,12 +11,14 @@ const api: AppApi = {
   listSessions: () => ipcRenderer.invoke("sessions:list"),
   getSession: (id: string) => ipcRenderer.invoke("sessions:get", id),
   approveStage: (sessionId: string, stageId: string) => ipcRenderer.invoke("sessions:approve-stage", sessionId, stageId),
+  authorizeStage: (sessionId: string, stageId: string) => ipcRenderer.invoke("sessions:authorize-stage", sessionId, stageId),
   approveRework: (sessionId: string, requestId: string) => ipcRenderer.invoke("sessions:approve-rework", sessionId, requestId),
   approveToolCall: (sessionId: string, toolCallId: string) =>
     ipcRenderer.invoke("sessions:approve-tool-call", sessionId, toolCallId),
   denyToolCall: (sessionId: string, toolCallId: string) => ipcRenderer.invoke("sessions:deny-tool-call", sessionId, toolCallId),
   continueSession: (sessionId: string) => ipcRenderer.invoke("sessions:continue", sessionId),
-  resumeSession: (sessionId: string) => ipcRenderer.invoke("sessions:resume", sessionId)
+  resumeSession: (sessionId: string) => ipcRenderer.invoke("sessions:resume", sessionId),
+  sendMessage: (sessionId: string, message: string) => ipcRenderer.invoke("sessions:send-message", sessionId, message)
 };
 
 contextBridge.exposeInMainWorld("aiCoder", api);

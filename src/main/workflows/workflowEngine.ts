@@ -262,6 +262,11 @@ export class WorkflowEngine {
     const completedIndex = workflow.stages.findIndex((stage) => stage.id === completedStageId);
     const nextStage = workflow.stages[completedIndex + 1];
     if (!nextStage) {
+      // 没有下一阶段时，检查是否是单阶段工作流（如闲聊）—— 如果是则重启该阶段
+      if (workflow.stages.length === 1) {
+        this.startStage(session, workflow, workflow.stages[0], this.buildInputSummary(session, completedStageId));
+        return session;
+      }
       session.status = "completed";
       session.current_stage = completedStageId;
       return session;

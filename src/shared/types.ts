@@ -262,4 +262,5 @@ export interface AppApi {
   denyToolCall(sessionId: string, toolCallId: string): Promise<AgentSession>;
   continueSession(sessionId: string): Promise<AgentSession>;
   resumeSession(sessionId: string): Promise<AgentSession>;
+  sendMessage(sessionId: string, message: string): Promise<AgentSession>;
 }

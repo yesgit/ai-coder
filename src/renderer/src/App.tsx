@@ -36,6 +36,7 @@ export default function App() {
   const [onboardingOverride, setOnboardingOverride] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [chatInput, setChatInput] = useState("");
 
   const selectedWorkflow = useMemo(
     () => workflows.find((workflow) => workflow.id === selectedWorkflowId) ?? null,
@@ -283,6 +284,20 @@ export default function App() {
     setError("");
     try {
       const updated = await window.aiCoder.resumeSession(session.id);
+      upsertSession(updated);
+      await refreshSessions(updated.id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function sendMessage(session: AgentSession, message: string) {
+    setBusy(true);
+    setError("");
+    try {
+      const updated = await window.aiCoder.sendMessage(session.id, message);
       upsertSession(updated);
       await refreshSessions(updated.id);
     } catch (err) {
@@ -611,6 +626,31 @@ export default function App() {
                   </article>
                 ))}
               </div>
+              {/* 闲聊工作流或会话已完成时显示继续对话输入框 */}
+              {(activeSession?.workflow_id === "chat" || activeSession?.status === "completed") && (
+                <div className="chat-input-box">
+                  <textarea
+                    value={chatInput}
+                    onChange={(event) => setChatInput(event.target.value)}
+                    placeholder="输入消息继续对话..."
+                    rows={2}
+                  />
+                  <div className="actions">
+                    <button
+                      className="primary"
+                      disabled={!chatInput.trim() || busy}
+                      onClick={() => {
+                        if (activeSession && chatInput.trim()) {
+                          void sendMessage(activeSession, chatInput.trim());
+                          setChatInput("");
+                        }
+                      }}
+                    >
+                      发送
+                    </button>
+                  </div>
+                </div>
+              )}
             </>
           ) : (
             <div className="empty-state">
