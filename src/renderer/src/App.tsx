@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
+import type { Components } from "react-markdown";
 import type {
   AgentSession,
   AgentRuntimeStatus,
@@ -540,7 +541,7 @@ export default function App() {
                         <small>{formatStageName(toolCall.stage_id)}</small>
                       </div>
                       <div className="markdown-content">
-                        <ReactMarkdown>{`\`\`\`json\n${JSON.stringify(toolCall.input, null, 2)}\n\`\`\``}</ReactMarkdown>
+                        <MarkdownContent>{`\`\`\`json\n${JSON.stringify(toolCall.input, null, 2)}\n\`\`\``}</MarkdownContent>
                       </div>
                       <div className="actions">
                         <button className="primary" disabled={busy} onClick={() => approveToolCall(activeSession, toolCall)}>
@@ -573,7 +574,7 @@ export default function App() {
                           </div>
                           <small>第 {stageRun.attempt} 次尝试</small>
                           <p className="markdown-content">
-                            <ReactMarkdown>{stageRun.output_summary ?? stageRun.input_summary}</ReactMarkdown>
+                            <MarkdownContent>{stageRun.output_summary ?? stageRun.input_summary}</MarkdownContent>
                           </p>
                         </article>
                       ))}
@@ -599,7 +600,7 @@ export default function App() {
                             <span className={`status-pill ${request.status}`}>{formatStatus(request.status)}</span>
                           </div>
                           <p className="markdown-content">
-                            <ReactMarkdown>{request.reason}</ReactMarkdown>
+                            <MarkdownContent>{request.reason}</MarkdownContent>
                           </p>
                           {request.status === "pending" && (
                             <div className="actions">
@@ -629,9 +630,7 @@ export default function App() {
                     <div className="timeline-body">
                       <strong>{event.title}</strong>
                       {event.detail && (
-                        <div className="markdown-content">
-                          <ReactMarkdown>{event.detail}</ReactMarkdown>
-                        </div>
+                        <MarkdownContent>{event.detail}</MarkdownContent>
                       )}
                     </div>
                   </article>
@@ -705,4 +704,119 @@ function buildActivityTitle(session: AgentSession) {
     return "执行完成";
   }
   return "等待启动";
+}
+
+/** 渲染 JSON 值：字符串值用 Markdown 渲染，对象/数组递归展开 */
+function JsonValue({ value }: { value: unknown }) {
+  if (value === null || value === undefined) {
+    return <span className="json-null">null</span>;
+  }
+  if (typeof value === "boolean") {
+    return <span className="json-bool">{String(value)}</span>;
+  }
+  if (typeof value === "number") {
+    return <span className="json-number">{String(value)}</span>;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    // 包含 Markdown 标记的字符串用 Markdown 渲染
+    if (hasMarkdown(trimmed)) {
+      return (
+        <div className="markdown-content json-markdown-value">
+          <ReactMarkdown>{trimmed}</ReactMarkdown>
+        </div>
+      );
+    }
+    return <span className="json-string">{value}</span>;
+  }
+  if (Array.isArray(value)) {
+    return (
+      <div className="json-array">
+        {value.map((item, index) => (
+          <div key={index} className="json-array-item">
+            <JsonValue value={item} />
+          </div>
+        ))}
+      </div>
+    );
+  }
+  if (typeof value === "object") {
+    return <JsonObject value={value as Record<string, unknown>} />;
+  }
+  return <span>{String(value)}</span>;
+}
+
+/** 渲染 JSON 对象为 key-value 表格 */
+function JsonObject({ value }: { value: Record<string, unknown> }) {
+  const entries = Object.entries(value);
+  return (
+    <div className="json-object">
+      {entries.map(([key, val]) => (
+        <div key={key} className="json-entry">
+          <span className="json-key">{key}</span>
+          <span className="json-colon">:</span>
+          <span className="json-value">
+            <JsonValue value={val} />
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** 判断字符串是否包含 Markdown 标记 */
+function hasMarkdown(text: string): boolean {
+  return /[*_~`#>|[\-]{2,}/.test(text) || text.includes("\n");
+}
+
+/** 自定义 Markdown 组件：JSON 代码块用美化渲染 */
+const markdownComponents: Components = {
+  code({ className, children, ...props }) {
+    const language = className?.replace("language-", "");
+    const text = String(children).replace(/\n$/, "");
+
+    // JSON 代码块：解析并美化渲染
+    if (language === "json") {
+      try {
+        const parsed = JSON.parse(text);
+        return (
+          <div className="json-prettified">
+            <JsonValue value={parsed} />
+          </div>
+        );
+      } catch {
+        // JSON 解析失败，回退到普通代码块
+      }
+    }
+
+    // 非代码块内的内联 code
+    if (!className) {
+      return (
+        <code className={className} {...props}>
+          {children}
+        </code>
+      );
+    }
+
+    // 其他语言的代码块
+    return (
+      <pre>
+        <code className={className} {...props}>
+          {children}
+        </code>
+      </pre>
+    );
+  },
+  pre({ children }) {
+    return <>{children}</>;
+  }
+};
+
+/** 统一的 Markdown 渲染组件 */
+function MarkdownContent({ children }: { children: string }) {
+  return (
+    <div className="markdown-content">
+      <ReactMarkdown components={markdownComponents}>{children}</ReactMarkdown>
+    </div>
+  );
 }
