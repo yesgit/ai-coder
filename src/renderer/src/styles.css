@@ -1004,13 +1004,17 @@ pre {
 
 .json-array {
   display: grid;
-  gap: 4px;
+  gap: 8px;
   padding-left: 16px;
   border-left: 2px solid #e1e7ef;
 }
 
 .json-array-item {
   min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid #e1e7ef;
+  border-radius: 4px;
+  background: #ffffff;
 }
 
 .json-markdown-value {
