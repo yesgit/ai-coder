@@ -27,6 +27,20 @@ export function buildStageInstructions(input: StageAgentInput): string {
   const requiredOutputs = input.required_outputs.length ? input.required_outputs.join(", ") : "concise stage summary";
   const gates = input.gates.length ? input.gates.join(", ") : "none";
 
+  const messageHistory = input.recent_messages
+    .filter((m) => (m.content?.trim() && m.content !== "(no content)" && !m.content.startsWith("收到 Claude SDK 消息：")) || m.attachments?.length)
+    .map((m) => {
+      const roleLabel = m.role === "user" ? "用户" : m.role === "assistant" ? "助手" : "系统";
+      let text = `[${roleLabel}]: ${m.content || "(附带附件)"}`;
+      if (m.attachments?.length) {
+        text += "\n附件: " + m.attachments.map((a) =>
+          a.type === "image" ? `[图片: ${a.display_name}]` : `[文件: ${a.display_name}]`
+        ).join(", ");
+      }
+      return text;
+    })
+    .join("\n\n");
+
   return [
     `你正在执行「${input.workflow.name}」工作流。`,
     "请始终使用简体中文回答，包括阶段总结、问题说明、审批请求和最终 JSON 中的自然语言内容。",
@@ -74,6 +88,9 @@ export function buildStageInstructions(input: StageAgentInput): string {
       },
       null,
       2
-    )
+    ),
+    "",
+    "对话历史：",
+    messageHistory || "无"
   ].join("\n");
 }

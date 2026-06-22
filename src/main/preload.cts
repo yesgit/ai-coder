@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { AppApi, StartSessionInput } from "../shared/types.js";
+import type { AppApi, Attachment, StartSessionInput } from "../shared/types.js";
 
 const api: AppApi = {
   selectProjectDirectory: () => ipcRenderer.invoke("project:select"),
@@ -18,7 +18,12 @@ const api: AppApi = {
   denyToolCall: (sessionId: string, toolCallId: string) => ipcRenderer.invoke("sessions:deny-tool-call", sessionId, toolCallId),
   continueSession: (sessionId: string) => ipcRenderer.invoke("sessions:continue", sessionId),
   resumeSession: (sessionId: string) => ipcRenderer.invoke("sessions:resume", sessionId),
-  sendMessage: (sessionId: string, message: string) => ipcRenderer.invoke("sessions:send-message", sessionId, message)
+  sendMessage: (sessionId: string, message: string, attachments?: Attachment[]) =>
+    ipcRenderer.invoke("sessions:send-message", sessionId, message, attachments),
+  listProjectFiles: (projectPath: string, query?: string) =>
+    ipcRenderer.invoke("project:list-files", projectPath, query),
+  readProjectFile: (projectPath: string, filePath: string) =>
+    ipcRenderer.invoke("project:read-file", projectPath, filePath)
 };
 
 contextBridge.exposeInMainWorld("aiCoder", api);

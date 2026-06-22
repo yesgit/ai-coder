@@ -137,6 +137,7 @@ export interface StageAgentInput {
   required_outputs: string[];
   gates: string[];
   retry_context?: StageRetryContext;
+  recent_messages: AgentMessage[];
 }
 
 export interface StageAgentResult {
@@ -148,10 +149,26 @@ export interface StageAgentResult {
   error?: string;
 }
 
+export interface FileRefAttachment {
+  type: "file_ref";
+  path: string;
+  display_name: string;
+}
+
+export interface ImageAttachment {
+  type: "image";
+  data_base64: string;
+  media_type: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+  display_name: string;
+}
+
+export type Attachment = FileRefAttachment | ImageAttachment;
+
 export interface AgentMessage {
   role: "user" | "assistant" | "system";
   content: string;
   created_at: string;
+  attachments?: Attachment[];
 }
 
 export interface ToolCallRecord {
@@ -222,6 +239,7 @@ export interface StartSessionInput {
   workflowId: string;
   taskPrompt: string;
   onboardingOverride?: boolean;
+  attachments?: Attachment[];
 }
 
 export interface StartSessionResult {
@@ -262,5 +280,7 @@ export interface AppApi {
   denyToolCall(sessionId: string, toolCallId: string): Promise<AgentSession>;
   continueSession(sessionId: string): Promise<AgentSession>;
   resumeSession(sessionId: string): Promise<AgentSession>;
-  sendMessage(sessionId: string, message: string): Promise<AgentSession>;
+  sendMessage(sessionId: string, message: string, attachments?: Attachment[]): Promise<AgentSession>;
+  listProjectFiles(projectPath: string, query?: string): Promise<string[]>;
+  readProjectFile(projectPath: string, filePath: string): Promise<string>;
 }

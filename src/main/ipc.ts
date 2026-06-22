@@ -1,6 +1,9 @@
+import { randomUUID } from "node:crypto";
+import { readdir, readFile, mkdir, writeFile, stat } from "node:fs/promises";
+import { join, resolve, relative, extname, basename, sep } from "node:path";
 import { BrowserWindow, dialog, ipcMain } from "electron";
 import type { OpenDialogOptions } from "electron";
-import type { ProjectOnboardingStatus, SessionOnboardingSnapshot, StartSessionInput } from "../shared/types.js";
+import type { Attachment, ProjectOnboardingStatus, SessionOnboardingSnapshot, StartSessionInput } from "../shared/types.js";
 import { ClaudeAgentRunner } from "./agent/claudeAgentRunner.js";
 import { getClaudeRuntimeStatus } from "./agent/claudeRuntime.js";
 import { OnboardingStore } from "./onboarding/onboardingStore.js";
@@ -166,11 +169,25 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     }
     const onboardingStatus = await onboardingStore.getStatus(projectPath);
     enforceOnboardingAdmission(workflow.id, onboardingStatus, Boolean(input.onboardingOverride));
+    // 处理附件：校验 + 图片保存到磁盘，转为文件引用
+    let processedAttachments = input.attachments;
+    if (input.attachments?.length) {
+      const validMediaTypes = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+      for (const att of input.attachments) {
+        if (att.type === "image" && !validMediaTypes.has(att.media_type)) {
+          throw new Error(`不支持的图片类型: ${att.media_type}`);
+        }
+      }
+      if (input.attachments.some((a) => a.type === "image")) {
+        processedAttachments = await saveImageAttachments(input.attachments, projectPath);
+      }
+    }
     const session = await sessions.create(
       projectPath,
       workflow,
       input.taskPrompt.trim(),
-      buildOnboardingSnapshot(onboardingStatus, Boolean(input.onboardingOverride))
+      buildOnboardingSnapshot(onboardingStatus, Boolean(input.onboardingOverride)),
+      processedAttachments
     );
     session.status = "running";
     await sessions.save(session);
@@ -178,7 +195,47 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     return { session };
   });
 
-  ipcMain.handle("sessions:send-message", async (_event, sessionId: string, message: string) => {
+  ipcMain.handle("project:list-files", async (_event, projectPath: string, query?: string) => {
+    const authorizedProjectPath = await authorizedProjects.assertAuthorized(projectPath);
+    const ignoreDirs = new Set(["node_modules", ".git", "dist", ".ai-coder", "__pycache__", ".next", ".nuxt", "build", "out"]);
+    const ignoreExts = new Set([".pyc", ".map", ".lock"]);
+    const MAX_RESULTS = 50;
+    const results: string[] = [];
+    try {
+      const entries = await readdir(authorizedProjectPath, { recursive: true });
+      for (const entry of entries) {
+        if (typeof entry !== "string") continue;
+        const parts = entry.split(/[/\\]/);
+        if (parts.some((p) => ignoreDirs.has(p) || p.startsWith("."))) continue;
+        if (ignoreExts.has(extname(entry))) continue;
+        if (query && !basename(entry).toLowerCase().includes(query.toLowerCase())) continue;
+        results.push(entry);
+        if (results.length >= MAX_RESULTS) break;
+      }
+    } catch {
+      // 目录不可读时返回空列表
+    }
+    return results;
+  });
+
+  ipcMain.handle("project:read-file", async (_event, projectPath: string, filePath: string) => {
+    const authorizedProjectPath = await authorizedProjects.assertAuthorized(projectPath);
+    const absolutePath = resolve(authorizedProjectPath, filePath);
+    // 路径遍历防护：先检查 resolve 后的路径
+    if (!absolutePath.startsWith(resolve(authorizedProjectPath) + sep) && absolutePath !== resolve(authorizedProjectPath)) {
+      throw new Error("文件路径超出项目目录范围");
+    }
+    // 使用 stat 获取文件大小，避免读取超大文件
+    const fileStat = await stat(absolutePath);
+    const MAX_FILE_SIZE = 500 * 1024; // 500KB
+    if (fileStat.size > MAX_FILE_SIZE) {
+      throw new Error(`文件过大（${Math.round(fileStat.size / 1024)}KB），上限 500KB`);
+    }
+    const content = await readFile(absolutePath, "utf-8");
+    return content;
+  });
+
+  ipcMain.handle("sessions:send-message", async (_event, sessionId: string, message: string, attachments?: Attachment[]) => {
     const session = await sessions.get(sessionId);
     if (!session) {
       throw new Error(`Session not found: ${sessionId}`);
@@ -188,11 +245,25 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     if (!workflow) {
       throw new Error(`Workflow not found: ${session.workflow_id}`);
     }
+    // 处理附件：校验 + 图片保存到磁盘，转为文件引用
+    let processedAttachments = attachments;
+    if (attachments?.length) {
+      const validMediaTypes = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+      for (const att of attachments) {
+        if (att.type === "image" && !validMediaTypes.has(att.media_type)) {
+          throw new Error(`不支持的图片类型: ${att.media_type}`);
+        }
+      }
+      if (attachments.some((a) => a.type === "image")) {
+        processedAttachments = await saveImageAttachments(attachments, session.project_path);
+      }
+    }
     // 添加用户消息到会话
     session.messages.push({
       role: "user",
       content: message.trim(),
-      created_at: new Date().toISOString()
+      created_at: new Date().toISOString(),
+      attachments: processedAttachments
     });
     // 将会话状态改为 running，触发新一轮执行
     session.status = "running";
@@ -251,4 +322,28 @@ function buildOnboardingSnapshot(
     override: onboardingOverride,
     checked_at: new Date().toISOString()
   };
+}
+
+async function saveImageAttachments(attachments: Attachment[], projectPath: string): Promise<Attachment[]> {
+  const uploadsDir = join(projectPath, ".ai-coder", "uploads");
+  await mkdir(uploadsDir, { recursive: true });
+  const result: Attachment[] = [];
+  for (const att of attachments) {
+    if (att.type === "image") {
+      const id = randomUUID();
+      const ext = att.media_type.split("/")[1] || "png";
+      const fileName = `${id}.${ext}`;
+      const filePath = join(uploadsDir, fileName);
+      const buffer = Buffer.from(att.data_base64, "base64");
+      await writeFile(filePath, buffer);
+      result.push({
+        type: "file_ref",
+        path: relative(projectPath, filePath),
+        display_name: att.display_name
+      });
+    } else {
+      result.push(att);
+    }
+  }
+  return result;
 }

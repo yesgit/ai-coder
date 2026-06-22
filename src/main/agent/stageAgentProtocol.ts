@@ -53,7 +53,8 @@ export function buildStageAgentInput(
     allowed_tools: currentStage.allowed_tools ?? [],
     required_outputs: currentStage.required_outputs ?? [],
     gates: currentStage.gates ?? [],
-    retry_context: retryContext
+    retry_context: retryContext,
+    recent_messages: session.messages.slice(-20)
   };
 }
 

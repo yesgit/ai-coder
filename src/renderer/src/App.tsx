@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import type {
   AgentSession,
   AgentRuntimeStatus,
   ApprovalRecord,
+  Attachment,
   ProjectOnboardingStatus,
   ReworkRequest,
   StageRun,
@@ -39,6 +40,15 @@ export default function App() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [chatInput, setChatInput] = useState("");
+  const [chatAttachments, setChatAttachments] = useState<Attachment[]>([]);
+  const [taskAttachments, setTaskAttachments] = useState<Attachment[]>([]);
+  const [showFileMention, setShowFileMention] = useState(false);
+  const [fileMentionQuery, setFileMentionQuery] = useState("");
+  const [fileMentionResults, setFileMentionResults] = useState<string[]>([]);
+  const [mentionTarget, setMentionTarget] = useState<"task" | "chat">("chat");
+  const [dragOverTarget, setDragOverTarget] = useState<"task" | "chat" | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const taskFileInputRef = useRef<HTMLInputElement>(null);
 
   const selectedWorkflow = useMemo(
     () => workflows.find((workflow) => workflow.id === selectedWorkflowId) ?? null,
@@ -195,10 +205,12 @@ export default function App() {
         projectPath,
         workflowId: selectedWorkflowId,
         taskPrompt,
-        onboardingOverride
+        onboardingOverride,
+        attachments: taskAttachments.length > 0 ? taskAttachments : undefined
       });
       upsertSession(result.session);
       setTaskPrompt("");
+      setTaskAttachments([]);
       await refreshSessions(result.session.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -295,11 +307,11 @@ export default function App() {
     }
   }
 
-  async function sendMessage(session: AgentSession, message: string) {
+  async function sendMessage(session: AgentSession, message: string, attachments?: Attachment[]) {
     setBusy(true);
     setError("");
     try {
-      const updated = await window.aiCoder.sendMessage(session.id, message);
+      const updated = await window.aiCoder.sendMessage(session.id, message, attachments);
       upsertSession(updated);
       await refreshSessions(updated.id);
     } catch (err) {
@@ -307,6 +319,178 @@ export default function App() {
     } finally {
       setBusy(false);
     }
+  }
+
+  // @文件提及搜索
+  useEffect(() => {
+    if (!showFileMention || !projectPath) return;
+    const timer = setTimeout(() => {
+      void window.aiCoder.listProjectFiles(projectPath, fileMentionQuery).then(setFileMentionResults);
+    }, 200);
+    return () => clearTimeout(timer);
+  }, [showFileMention, fileMentionQuery, projectPath]);
+
+  function handlePaste(e: React.ClipboardEvent, target: "task" | "chat") {
+    const items = e.clipboardData.items;
+    const imageItems: DataTransferItem[] = [];
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].type.startsWith("image/")) {
+        imageItems.push(items[i]);
+      }
+    }
+    if (imageItems.length === 0) return;
+    e.preventDefault();
+    const setAttachments = target === "chat" ? setChatAttachments : setTaskAttachments;
+    const MAX_IMAGE_SIZE = 5 * 1024 * 1024; // 5MB
+    for (const item of imageItems) {
+      const file = item.getAsFile();
+      if (!file) continue;
+      if (file.size > MAX_IMAGE_SIZE) {
+        setError(`图片 ${file.name} 过大（${Math.round(file.size / 1024)}KB），上限 5MB`);
+        continue;
+      }
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = reader.result as string;
+        const base64 = dataUrl.split(",")[1];
+        const mediaType = item.type as "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+        setAttachments((prev) => [
+          ...prev,
+          { type: "image", data_base64: base64, media_type: mediaType, display_name: file.name || "pasted-image.png" }
+        ]);
+      };
+      reader.readAsDataURL(file);
+    }
+  }
+
+  function handleDrop(e: React.DragEvent, target: "task" | "chat") {
+    e.preventDefault();
+    setDragOverTarget(null);
+    const files = Array.from(e.dataTransfer.files);
+    if (files.length === 0) return;
+    const setAttachments = target === "chat" ? setChatAttachments : setTaskAttachments;
+    for (const file of files) {
+      if (file.type.startsWith("image/")) {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const dataUrl = reader.result as string;
+          const base64 = dataUrl.split(",")[1];
+          const mediaType = file.type as "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+          setAttachments((prev) => [
+            ...prev,
+            { type: "image", data_base64: base64, media_type: mediaType, display_name: file.name }
+          ]);
+        };
+        reader.readAsDataURL(file);
+      } else {
+        // 非图片文件：读取内容并作为 base64 上传
+        const reader = new FileReader();
+        reader.onload = () => {
+          const base64 = (reader.result as string).split(",")[1];
+          setAttachments((prev) => [
+            ...prev,
+            { type: "image", data_base64: base64, media_type: "image/png" as const, display_name: file.name }
+          ]);
+        };
+        reader.readAsDataURL(file);
+      }
+    }
+  }
+
+  function handleDragOver(e: React.DragEvent, target: "task" | "chat") {
+    e.preventDefault();
+    setDragOverTarget(target);
+  }
+
+  function handleDragLeave(_e: React.DragEvent, target: "task" | "chat") {
+    setDragOverTarget((prev) => prev === target ? null : prev);
+  }
+
+  function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>, target: "task" | "chat") {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+    const setAttachments = target === "chat" ? setChatAttachments : setTaskAttachments;
+    const MAX_IMAGE_SIZE = 5 * 1024 * 1024; // 5MB
+    for (const file of Array.from(files)) {
+      if (file.type.startsWith("image/")) {
+        if (file.size > MAX_IMAGE_SIZE) {
+          setError(`图片 ${file.name} 过大（${Math.round(file.size / 1024)}KB），上限 5MB`);
+          continue;
+        }
+        const reader = new FileReader();
+        reader.onload = () => {
+          const dataUrl = reader.result as string;
+          const base64 = dataUrl.split(",")[1];
+          const mediaType = file.type as "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+          setAttachments((prev) => [
+            ...prev,
+            { type: "image", data_base64: base64, media_type: mediaType, display_name: file.name }
+          ]);
+        };
+        reader.readAsDataURL(file);
+      } else {
+        // 非图片文件：读取内容并上传
+        const reader = new FileReader();
+        reader.onload = () => {
+          const base64 = (reader.result as string).split(",")[1];
+          setAttachments((prev) => [
+            ...prev,
+            { type: "image", data_base64: base64, media_type: "image/png" as const, display_name: file.name }
+          ]);
+        };
+        reader.readAsDataURL(file);
+      }
+    }
+    e.target.value = "";
+  }
+
+  function handleTextareaChange(value: string, target: "task" | "chat", cursorPosition?: number) {
+    if (target === "chat") {
+      setChatInput(value);
+    } else {
+      setTaskPrompt(value);
+    }
+    // 检测 @ 模式触发文件提及
+    if (!projectPath) return;
+    const cursorPos = cursorPosition ?? value.length;
+    const textBeforeCursor = value.slice(0, cursorPos);
+    const atIndex = textBeforeCursor.lastIndexOf("@");
+    if (atIndex === -1 || (atIndex > 0 && textBeforeCursor[atIndex - 1] !== " " && textBeforeCursor[atIndex - 1] !== "\n")) {
+      setShowFileMention(false);
+      setFileMentionResults([]);
+      return;
+    }
+    const query = textBeforeCursor.slice(atIndex + 1);
+    if (query.includes(" ") || query.includes("\n")) {
+      setShowFileMention(false);
+      setFileMentionResults([]);
+      return;
+    }
+    setMentionTarget(target);
+    setFileMentionQuery(query);
+    setShowFileMention(true);
+  }
+
+  function selectFileMention(filePath: string, target: "task" | "chat") {
+    const setAttachments = target === "chat" ? setChatAttachments : setTaskAttachments;
+    setAttachments((prev) => [
+      ...prev,
+      { type: "file_ref", path: filePath, display_name: filePath.split(/[/\\]/).pop() || filePath }
+    ]);
+    // 将 @query 替换为 @filePath
+    const currentValue = target === "chat" ? chatInput : taskPrompt;
+    const setter = target === "chat" ? setChatInput : setTaskPrompt;
+    const lastAtIndex = currentValue.lastIndexOf("@");
+    if (lastAtIndex !== -1) {
+      setter(currentValue.slice(0, lastAtIndex) + `@${filePath} ` + currentValue.slice(lastAtIndex).replace(/@[\S]*/, ""));
+    }
+    setShowFileMention(false);
+    setFileMentionResults([]);
+  }
+
+  function removeAttachment(target: "task" | "chat", index: number) {
+    const setAttachments = target === "chat" ? setChatAttachments : setTaskAttachments;
+    setAttachments((prev) => prev.filter((_, i) => i !== index));
   }
 
   const onboardingConfirmed = onboardingStatus?.status === "confirmed";
@@ -408,7 +592,10 @@ export default function App() {
       </aside>
 
       <section className="workspace">
-        <div className="composer">
+        <div className={`composer${dragOverTarget === "task" ? " drag-over" : ""}`}
+          onDragOver={(e) => handleDragOver(e, "task")}
+          onDragLeave={(e) => handleDragLeave(e, "task")}
+          onDrop={(e) => handleDrop(e, "task")}>
           <div>
             <h2>{selectedWorkflow ? formatWorkflowName(selectedWorkflow.id, selectedWorkflow.name) : "选择工作流"}</h2>
             <p>
@@ -427,17 +614,36 @@ export default function App() {
               </div>
             )}
           </div>
+          {taskAttachments.length > 0 && (
+            <div className="attachment-strip">
+              {taskAttachments.map((att, i) => (
+                <div key={att.type === "image" ? `img-${att.data_base64.slice(0, 16)}` : `ref-${att.path}`} className="attachment-chip">
+                  {att.type === "image" ? (
+                    <img src={`data:${att.media_type};base64,${att.data_base64}`} alt={att.display_name} className="attachment-thumb" />
+                  ) : (
+                    <span className="attachment-file-icon">📄</span>
+                  )}
+                  <span className="attachment-name">{att.display_name}</span>
+                  <button className="attachment-remove" onClick={() => removeAttachment("task", i)}>×</button>
+                </div>
+              ))}
+            </div>
+          )}
           <textarea
             value={taskPrompt}
-            onChange={(event) => setTaskPrompt(event.target.value)}
-            placeholder="描述要执行的编码任务..."
+            onChange={(event) => handleTextareaChange(event.target.value, "task", event.target.selectionStart ?? undefined)}
+            onPaste={(e) => handlePaste(e, "task")}
+            placeholder="描述要执行的编码任务... (可粘贴图片、拖入文件、@引用项目文件)"
           />
           <div className="actions">
+            <button className="icon-btn" title="添加附件" onClick={() => taskFileInputRef.current?.click()}>📎</button>
             <button className="primary" disabled={!canStart} onClick={startSession}>
               {busy ? "运行中..." : "启动 Agent"}
             </button>
             {error && <span className="error">{error}</span>}
           </div>
+          <input type="file" ref={taskFileInputRef} style={{ display: "none" }} multiple
+            onChange={(e) => handleFileSelect(e, "task")} />
           {showOnboardingWarning && (
             <div className="admission-warning">
               <span>项目画像尚未确认。请先运行项目画像，或确认已有画像入口。</span>
@@ -638,27 +844,59 @@ export default function App() {
               </div>
               {/* 闲聊工作流或会话已完成时显示继续对话输入框 */}
               {(activeSession?.workflow_id === "chat" || activeSession?.status === "completed") && (
-                <div className="chat-input-box">
+                <div className={`chat-input-box${dragOverTarget === "chat" ? " drag-over" : ""}`}
+                  onDragOver={(e) => handleDragOver(e, "chat")}
+                  onDragLeave={(e) => handleDragLeave(e, "chat")}
+                  onDrop={(e) => handleDrop(e, "chat")}>
+                  {chatAttachments.length > 0 && (
+                    <div className="attachment-strip">
+                      {chatAttachments.map((att, i) => (
+                        <div key={att.type === "image" ? `img-${att.data_base64.slice(0, 16)}` : `ref-${att.path}`} className="attachment-chip">
+                          {att.type === "image" ? (
+                            <img src={`data:${att.media_type};base64,${att.data_base64}`} alt={att.display_name} className="attachment-thumb" />
+                          ) : (
+                            <span className="attachment-file-icon">📄</span>
+                          )}
+                          <span className="attachment-name">{att.display_name}</span>
+                          <button className="attachment-remove" onClick={() => removeAttachment("chat", i)}>×</button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                   <textarea
                     value={chatInput}
-                    onChange={(event) => setChatInput(event.target.value)}
-                    placeholder="输入消息继续对话..."
+                    onChange={(event) => handleTextareaChange(event.target.value, "chat", event.target.selectionStart ?? undefined)}
+                    onPaste={(e) => handlePaste(e, "chat")}
+                    placeholder="输入消息继续对话... (可粘贴图片、拖入文件、@引用项目文件)"
                     rows={2}
                   />
+                  {showFileMention && fileMentionResults.length > 0 && (
+                    <div className="file-mention-dropdown">
+                      {fileMentionResults.map((filePath) => (
+                        <button key={filePath} className="file-mention-item" onClick={() => selectFileMention(filePath, mentionTarget)}>
+                          {filePath}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                   <div className="actions">
+                    <button className="icon-btn" title="添加附件" onClick={() => fileInputRef.current?.click()}>📎</button>
                     <button
                       className="primary"
-                      disabled={!chatInput.trim() || busy}
+                      disabled={(!chatInput.trim() && chatAttachments.length === 0) || busy}
                       onClick={() => {
-                        if (activeSession && chatInput.trim()) {
-                          void sendMessage(activeSession, chatInput.trim());
+                        if (activeSession && (chatInput.trim() || chatAttachments.length > 0)) {
+                          void sendMessage(activeSession, chatInput.trim(), chatAttachments.length > 0 ? chatAttachments : undefined);
                           setChatInput("");
+                          setChatAttachments([]);
                         }
                       }}
                     >
                       发送
                     </button>
                   </div>
+                  <input type="file" ref={fileInputRef} style={{ display: "none" }} multiple
+                    onChange={(e) => handleFileSelect(e, "chat")} />
                 </div>
               )}
             </>

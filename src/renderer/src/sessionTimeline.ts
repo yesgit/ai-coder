@@ -41,11 +41,16 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
     if (!content || content === "(no content)" || content.startsWith("收到 Claude SDK 消息：")) {
       return;
     }
+    const attachmentDetail = message.attachments?.length
+      ? "\n\n" + message.attachments.map((a) =>
+          a.type === "image" ? `![${a.display_name}](图片)` : `[文件: ${a.display_name}]`
+        ).join("\n")
+      : undefined;
     events.push({
       id: `${session.id}:message:${index}`,
       type: "message",
-      title: `${formatRole(message.role)}消息`,
-      detail: message.content,
+      title: `${formatRole(message.role)}消息${message.attachments?.length ? ` (${message.attachments.length} 个附件)` : ""}`,
+      detail: content + (attachmentDetail ?? ""),
       timestamp: message.created_at,
       status: message.role,
       sort_order: 10

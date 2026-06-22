@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import type { AgentSession, SessionOnboardingSnapshot, WorkflowTemplate } from "../../shared/types.js";
+import type { AgentSession, Attachment, SessionOnboardingSnapshot, WorkflowTemplate } from "../../shared/types.js";
 import { WorkflowEngine } from "../workflows/workflowEngine.js";
 
 export class SessionStore {
@@ -12,7 +12,8 @@ export class SessionStore {
     projectPath: string,
     workflow: WorkflowTemplate,
     taskPrompt: string,
-    onboarding?: SessionOnboardingSnapshot
+    onboarding?: SessionOnboardingSnapshot,
+    attachments?: Attachment[]
   ): Promise<AgentSession> {
     const now = new Date().toISOString();
     const firstStage = workflow.stages[0]?.id ?? "start";
@@ -23,7 +24,7 @@ export class SessionStore {
       task_prompt: taskPrompt,
       status: "created",
       current_stage: firstStage,
-      messages: [{ role: "user", content: taskPrompt, created_at: now }],
+      messages: [{ role: "user", content: taskPrompt, created_at: now, attachments }],
       tool_calls: [],
       file_changes: [],
       approvals: [],

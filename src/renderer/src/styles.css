@@ -812,6 +812,7 @@ pre {
 
 /* 聊天输入框样式 */
 .chat-input-box {
+  position: relative;
   margin-top: 16px;
   padding: 16px;
   border: 1px solid #dde2e8;
@@ -839,6 +840,123 @@ pre {
   margin-top: 10px;
   display: flex;
   justify-content: flex-end;
+  gap: 8px;
+  align-items: center;
+}
+
+/* 附件预览条 */
+.attachment-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.attachment-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #dde2e8;
+  border-radius: 6px;
+  background: #f7f9fc;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+.attachment-thumb {
+  width: 32px;
+  height: 32px;
+  object-fit: cover;
+  border-radius: 4px;
+}
+
+.attachment-file-icon {
+  font-size: 16px;
+  line-height: 1;
+}
+
+.attachment-name {
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #475467;
+}
+
+.attachment-remove {
+  border: 0;
+  background: transparent;
+  color: #98a2b3;
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.attachment-remove:hover {
+  color: #b42318;
+}
+
+/* 拖拽覆盖效果 */
+.chat-input-box.drag-over,
+.composer.drag-over {
+  border-color: #146c5f;
+  background: #eef8f6;
+}
+
+/* @文件提及下拉框 */
+.file-mention-dropdown {
+  position: absolute;
+  bottom: 100%;
+  left: 16px;
+  right: 16px;
+  max-height: 200px;
+  overflow-y: auto;
+  border: 1px solid #dde2e8;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+  z-index: 10;
+  margin-bottom: 4px;
+}
+
+.file-mention-item {
+  display: block;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  padding: 8px 12px;
+  text-align: left;
+  font-size: 13px;
+  color: #344054;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.file-mention-item:hover {
+  background: #eef8f6;
+}
+
+/* 附件按钮 */
+.icon-btn {
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  padding: 4px 8px;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.icon-btn:hover {
+  opacity: 0.7;
+}
+
+/* 图片内联预览 (时间线) */
+.timeline-body img.attachment-inline-image {
+  max-width: 100%;
+  max-height: 200px;
+  border-radius: 6px;
+  margin-top: 8px;
 }
 
 /* Markdown 内容样式 */

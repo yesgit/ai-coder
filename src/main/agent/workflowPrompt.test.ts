@@ -32,7 +32,8 @@ describe("buildStageInstructions", () => {
       project_path: "/tmp/project",
       allowed_tools: [],
       required_outputs: ["claude_md_draft"],
-      gates: []
+      gates: [],
+      recent_messages: []
     };
 
     const prompt = buildStageInstructions(input);
