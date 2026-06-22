@@ -33,7 +33,8 @@ describe("buildStageInstructions", () => {
       allowed_tools: [],
       required_outputs: ["claude_md_draft"],
       gates: [],
-      recent_messages: []
+      recent_messages: [],
+      human_qa_history: []
     };
 
     const prompt = buildStageInstructions(input);

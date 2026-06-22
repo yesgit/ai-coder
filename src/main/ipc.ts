@@ -169,14 +169,51 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     }
     const aborted = runner.abort(sessionId);
     if (!aborted) {
-      // 兜底：runner 没有进行中的 controller（比如运行已结束但 status 未更新），直接改状态
       session.status = "interrupted";
       await sessions.save(session);
     }
-    // runner.abort 触发的状态改写发生在 runCurrentStage 的 catch 中，并通过 onProgress 保存
-    // 重新读取最新状态返回给前端
     const refreshed = await sessions.get(sessionId);
     return refreshed ?? session;
+  });
+
+  ipcMain.handle("sessions:answer-human-question", async (_event, sessionId: string, questionId: string, answer: string | string[]) => {
+    const session = await sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}`);
+    }
+    const projectPath = await authorizedProjects.assertAuthorized(session.project_path);
+    const workflow = await registry.get(session.workflow_id, projectPath);
+    if (!workflow) {
+      throw new Error(`Workflow not found: ${session.workflow_id}`);
+    }
+    const question = (session.pending_human_questions ?? []).find(
+      (q) => q.id === questionId && q.status === "pending"
+    );
+    if (!question) {
+      throw new Error(`Pending human question not found: ${questionId}`);
+    }
+    // 校验答案与类型匹配
+    if (question.question_type === "multi") {
+      if (!Array.isArray(answer)) throw new Error("多选问题需要数组答案");
+    } else {
+      if (typeof answer !== "string") throw new Error("单选/文本问题需要字符串答案");
+    }
+    question.status = "answered";
+    question.answer = answer;
+    question.resolved_at = new Date().toISOString();
+
+    // 所有 pending 问题已答完 + 没有其他待审批 → 恢复运行
+    const stillPendingQuestion = (session.pending_human_questions ?? []).some((q) => q.status === "pending");
+    const hasPendingToolApproval = session.tool_calls.some((t) => t.status === "pending_approval");
+    const hasPendingStageApproval = session.approvals.some((a) => a.kind === "stage" && a.status === "pending");
+    if (!stillPendingQuestion && !hasPendingToolApproval && !hasPendingStageApproval) {
+      session.status = "running";
+      await sessions.save(session);
+      runSessionInBackground(runner, sessions, session, workflow);
+    } else {
+      await sessions.save(session);
+    }
+    return session;
   });
 
   ipcMain.handle("sessions:start", async (_event, input: StartSessionInput) => {

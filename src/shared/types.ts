@@ -138,6 +138,7 @@ export interface StageAgentInput {
   gates: string[];
   retry_context?: StageRetryContext;
   recent_messages: AgentMessage[];
+  human_qa_history: HumanQuestion[];
 }
 
 export interface StageAgentResult {
@@ -169,6 +170,23 @@ export interface AgentMessage {
   content: string;
   created_at: string;
   attachments?: Attachment[];
+}
+
+export interface HumanQuestionOption {
+  value: string;
+  label: string;
+}
+
+export interface HumanQuestion {
+  id: string;
+  stage_id: string;
+  question: string;
+  question_type: "single" | "multi" | "text";
+  options?: HumanQuestionOption[];
+  status: "pending" | "answered" | "cancelled";
+  answer?: string | string[];
+  created_at: string;
+  resolved_at?: string;
 }
 
 export interface ToolCallRecord {
@@ -221,6 +239,7 @@ export interface AgentSession {
   progress_events?: SessionProgressEvent[];
   stage_runs?: StageRun[];
   rework_requests?: ReworkRequest[];
+  pending_human_questions?: HumanQuestion[];
   onboarding?: SessionOnboardingSnapshot;
   created_at: string;
   updated_at: string;
@@ -281,6 +300,7 @@ export interface AppApi {
   continueSession(sessionId: string): Promise<AgentSession>;
   resumeSession(sessionId: string): Promise<AgentSession>;
   abortSession(sessionId: string): Promise<AgentSession>;
+  answerHumanQuestion(sessionId: string, questionId: string, answer: string | string[]): Promise<AgentSession>;
   sendMessage(sessionId: string, message: string, attachments?: Attachment[]): Promise<AgentSession>;
   listProjectFiles(projectPath: string, query?: string): Promise<string[]>;
   readProjectFile(projectPath: string, filePath: string): Promise<string>;

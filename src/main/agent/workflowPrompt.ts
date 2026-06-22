@@ -43,6 +43,13 @@ export function buildStageInstructions(input: StageAgentInput): string {
     })
     .join("\n\n");
 
+  const humanQaHistory = (input.human_qa_history ?? [])
+    .map((q) => {
+      const answer = Array.isArray(q.answer) ? q.answer.join(", ") : (q.answer ?? "");
+      return `- 问：${q.question}\n  类型：${q.question_type}\n  答：${answer}`;
+    })
+    .join("\n");
+
   return [
     `你正在执行「${input.workflow.name}」工作流。`,
     "请始终使用简体中文回答，包括阶段总结、问题说明、审批请求和最终 JSON 中的自然语言内容。",
@@ -91,6 +98,15 @@ export function buildStageInstructions(input: StageAgentInput): string {
       null,
       2
     ),
+    "",
+    "可用扩展工具：",
+    "- mcp__ai_coder__ask_human(question: string, type: \"single\"|\"multi\"|\"text\", options?: [{value,label}])",
+    "  向用户提问并暂停执行。single/multi 时 options 必填。仅在你确实需要用户的偏好、选择或缺失信息时使用，不要因为可以求助就回避自己应该做的判断。",
+    "  调用该工具后工作流会暂停；用户回答后下一轮指令的\"人类问答历史\"部分会包含答案。",
+    "",
+    "人类问答历史（你之前向用户提的问题及回答）：",
+    humanQaHistory || "无",
+    "请基于这些答案继续推进；不要重复已经回答过的问题。",
     "",
     "对话历史：",
     messageHistory || "无"

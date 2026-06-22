@@ -54,7 +54,8 @@ export function buildStageAgentInput(
     required_outputs: currentStage.required_outputs ?? [],
     gates: currentStage.gates ?? [],
     retry_context: retryContext,
-    recent_messages: session.messages.slice(-20)
+    recent_messages: session.messages.slice(-20),
+    human_qa_history: (session.pending_human_questions ?? []).filter((q) => q.status === "answered")
   };
 }
 

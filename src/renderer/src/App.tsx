@@ -6,6 +6,7 @@ import type {
   AgentRuntimeStatus,
   ApprovalRecord,
   Attachment,
+  HumanQuestion,
   ProjectOnboardingStatus,
   ReworkRequest,
   StageRun,
@@ -49,6 +50,7 @@ export default function App() {
   const [dragOverTarget, setDragOverTarget] = useState<"task" | "chat" | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const taskFileInputRef = useRef<HTMLInputElement>(null);
+  const [questionAnswers, setQuestionAnswers] = useState<Record<string, string | string[]>>({});
 
   const selectedWorkflow = useMemo(
     () => workflows.find((workflow) => workflow.id === selectedWorkflowId) ?? null,
@@ -321,6 +323,25 @@ export default function App() {
     }
   }
 
+  async function answerHumanQuestion(session: AgentSession, questionId: string, answer: string | string[]) {
+    setBusy(true);
+    setError("");
+    try {
+      const updated = await window.aiCoder.answerHumanQuestion(session.id, questionId, answer);
+      upsertSession(updated);
+      await refreshSessions(updated.id);
+      setQuestionAnswers((prev) => {
+        const next = { ...prev };
+        delete next[questionId];
+        return next;
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function sendMessage(session: AgentSession, message: string, attachments?: Attachment[]) {
     setBusy(true);
     setError("");
@@ -496,6 +517,7 @@ export default function App() {
   const onboardingAdmissionAllowed = !onboardingRequired || onboardingOverride;
   const canStart = Boolean(projectPath && selectedWorkflowId && taskPrompt.trim() && onboardingAdmissionAllowed && !busy);
   const pendingToolCalls = activeSession?.tool_calls.filter((toolCall) => toolCall.status === "pending_approval") ?? [];
+  const pendingHumanQuestions = activeSession?.pending_human_questions?.filter((q) => q.status === "pending") ?? [];
   const approvedToolCalls = activeSession?.tool_calls.filter((toolCall) => toolCall.status === "approved") ?? [];
   const stageRuns = activeSession?.stage_runs ?? [];
   const reworkRequests = activeSession?.rework_requests ?? [];
@@ -763,6 +785,94 @@ export default function App() {
                       </div>
                     </article>
                   ))}
+                </div>
+              )}
+              {pendingHumanQuestions.length > 0 && (
+                <div className="human-questions">
+                  {pendingHumanQuestions.map((q: HumanQuestion) => {
+                    const currentAnswer = questionAnswers[q.id];
+                    const isValid =
+                      q.question_type === "multi"
+                        ? Array.isArray(currentAnswer) && currentAnswer.length > 0
+                        : typeof currentAnswer === "string" && currentAnswer.trim().length > 0;
+                    return (
+                      <article key={q.id} className="human-question">
+                        <div className="question-header">
+                          <strong>助手提问</strong>
+                          <small>
+                            {q.question_type === "single" ? "单选" : q.question_type === "multi" ? "多选" : "文本"}
+                            {" · "}
+                            {formatStageName(q.stage_id)}
+                          </small>
+                        </div>
+                        <div className="question-body">
+                          <MarkdownContent>{q.question}</MarkdownContent>
+                        </div>
+                        {q.question_type === "single" && q.options && (
+                          <div className="question-options">
+                            {q.options.map((opt) => (
+                              <label key={opt.value} className="question-option">
+                                <input
+                                  type="radio"
+                                  name={q.id}
+                                  checked={currentAnswer === opt.value}
+                                  onChange={() => setQuestionAnswers((prev) => ({ ...prev, [q.id]: opt.value }))}
+                                />
+                                <span>{opt.label}</span>
+                              </label>
+                            ))}
+                          </div>
+                        )}
+                        {q.question_type === "multi" && q.options && (
+                          <div className="question-options">
+                            {q.options.map((opt) => {
+                              const arr = Array.isArray(currentAnswer) ? currentAnswer : [];
+                              const checked = arr.includes(opt.value);
+                              return (
+                                <label key={opt.value} className="question-option">
+                                  <input
+                                    type="checkbox"
+                                    checked={checked}
+                                    onChange={(event) => {
+                                      const next = event.target.checked
+                                        ? [...arr, opt.value]
+                                        : arr.filter((v) => v !== opt.value);
+                                      setQuestionAnswers((prev) => ({ ...prev, [q.id]: next }));
+                                    }}
+                                  />
+                                  <span>{opt.label}</span>
+                                </label>
+                              );
+                            })}
+                          </div>
+                        )}
+                        {q.question_type === "text" && (
+                          <textarea
+                            className="question-textarea"
+                            rows={3}
+                            value={typeof currentAnswer === "string" ? currentAnswer : ""}
+                            onChange={(event) => setQuestionAnswers((prev) => ({ ...prev, [q.id]: event.target.value }))}
+                            placeholder="输入你的回答..."
+                          />
+                        )}
+                        <div className="actions">
+                          <button
+                            className="primary"
+                            disabled={busy || !isValid}
+                            onClick={() => {
+                              const ans =
+                                q.question_type === "multi"
+                                  ? (currentAnswer as string[])
+                                  : ((currentAnswer as string) || "").trim();
+                              void answerHumanQuestion(activeSession, q.id, ans);
+                            }}
+                          >
+                            提交回答
+                          </button>
+                        </div>
+                      </article>
+                    );
+                  })}
                 </div>
               )}
               <div className="run-panels">

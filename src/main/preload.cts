@@ -19,6 +19,8 @@ const api: AppApi = {
   continueSession: (sessionId: string) => ipcRenderer.invoke("sessions:continue", sessionId),
   resumeSession: (sessionId: string) => ipcRenderer.invoke("sessions:resume", sessionId),
   abortSession: (sessionId: string) => ipcRenderer.invoke("sessions:abort", sessionId),
+  answerHumanQuestion: (sessionId: string, questionId: string, answer: string | string[]) =>
+    ipcRenderer.invoke("sessions:answer-human-question", sessionId, questionId, answer),
   sendMessage: (sessionId: string, message: string, attachments?: Attachment[]) =>
     ipcRenderer.invoke("sessions:send-message", sessionId, message, attachments),
   listProjectFiles: (projectPath: string, query?: string) =>

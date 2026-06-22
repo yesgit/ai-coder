@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { AgentSession, SessionProgressEvent, WorkflowStage, WorkflowTemplate } from "../../shared/types.js";
+import type { AgentSession, HumanQuestion, HumanQuestionOption, SessionProgressEvent, WorkflowStage, WorkflowTemplate } from "../../shared/types.js";
 import {
   approveOrDenyToolUse,
   buildAllowedClaudeTools,
@@ -23,6 +23,7 @@ export class ClaudeAgentRunner {
   private readonly workflowEngine = new WorkflowEngine();
   private readonly maxStageIterations = 50;
   private readonly abortControllers = new Map<string, AbortController>();
+  private mcpServerCache: unknown | null = null;
 
   constructor(private readonly queryOverride?: ClaudeQuery) {}
 
@@ -84,6 +85,7 @@ export class ClaudeAgentRunner {
     this.abortControllers.set(input.session.id, abortController);
     try {
       const query = await this.resolveQuery();
+      const mcpServer = await this.resolveMcpServer();
 
       const instructions = buildStageInstructions(stageAgentInput);
       await this.recordProgress(input, "runner", `开始执行阶段：${currentStage.name || currentStage.id}`, "milestone");
@@ -96,11 +98,25 @@ export class ClaudeAgentRunner {
           executable: nodeInfo?.command ?? undefined,
           env: sdkEnv,
           abortController,
+          mcpServers: mcpServer ? { ai_coder: mcpServer } : undefined,
           tools: buildAllowedClaudeTools(input.workflow, currentStage),
           disallowedTools: buildDisallowedClaudeTools(input.workflow),
           permissionMode: "dontAsk",
           settingSources: ["user", "project", "local"],
           canUseTool: async (toolName: string, toolInput: Record<string, unknown>, options: { toolUseID: string }) => {
+            // 拦截 ask_human：作为 HumanQuestion 挂起，等待用户回答后继续
+            if (toolName === "mcp__ai_coder__ask_human") {
+              const question = this.buildHumanQuestion(input.session, toolInput, options.toolUseID);
+              if (question) {
+                input.session.pending_human_questions = [
+                  ...(input.session.pending_human_questions ?? []),
+                  question
+                ];
+                await this.recordProgress(input, "tool_policy", `等待用户回答：${question.question.slice(0, 60)}`, "milestone");
+                return { behavior: "deny", message: "等待用户回答，已暂停执行", interrupt: true };
+              }
+              return { behavior: "deny", message: "ask_human 工具输入格式错误", interrupt: true };
+            }
             const decision = await approveOrDenyToolUse(input.session, input.workflow, toolName, toolInput, options.toolUseID);
             await this.recordProgress(input, "tool_policy", this.describeToolDecision(toolName, decision.allow), "milestone");
             if (decision.allow) {
@@ -121,7 +137,7 @@ export class ClaudeAgentRunner {
         content: transcript,
         created_at: new Date().toISOString()
       });
-      if (this.hasPendingToolCall(input.session) || this.hasBlockedToolCall(input.session)) {
+      if (this.hasPendingToolCall(input.session) || this.hasBlockedToolCall(input.session) || this.hasPendingHumanQuestion(input.session)) {
         input.session.status = this.resolveInterruptedStatus(input.session);
         await this.recordProgress(input, "status", `阶段已中断：${input.session.status}`, "milestone");
         return input.session;
@@ -268,8 +284,43 @@ export class ClaudeAgentRunner {
     return session.tool_calls.some((toolCall) => toolCall.status === "pending_approval");
   }
 
+  private buildHumanQuestion(session: AgentSession, toolInput: Record<string, unknown>, toolUseID: string): HumanQuestion | null {
+    const question = typeof toolInput.question === "string" ? toolInput.question.trim() : "";
+    const type = toolInput.type;
+    if (!question || (type !== "single" && type !== "multi" && type !== "text")) {
+      return null;
+    }
+    let options: HumanQuestionOption[] | undefined;
+    if ((type === "single" || type === "multi") && Array.isArray(toolInput.options)) {
+      options = toolInput.options
+        .map((item) => {
+          if (item && typeof item === "object" && "value" in item && "label" in item) {
+            const value = String((item as { value: unknown }).value);
+            const label = String((item as { label: unknown }).label);
+            return value && label ? { value, label } : null;
+          }
+          return null;
+        })
+        .filter((item): item is HumanQuestionOption => item !== null);
+      if (!options || options.length === 0) return null;
+    }
+    return {
+      id: toolUseID,
+      stage_id: session.current_stage,
+      question,
+      question_type: type,
+      options,
+      status: "pending",
+      created_at: new Date().toISOString()
+    };
+  }
+
+  private hasPendingHumanQuestion(session: AgentSession): boolean {
+    return (session.pending_human_questions ?? []).some((q) => q.status === "pending");
+  }
+
   private resolveInterruptedStatus(session: AgentSession): AgentSession["status"] {
-    if (this.hasPendingToolCall(session)) {
+    if (this.hasPendingToolCall(session) || this.hasPendingHumanQuestion(session)) {
       return "waiting_approval";
     }
     if (this.hasBlockedToolCall(session)) {
@@ -315,6 +366,41 @@ export class ClaudeAgentRunner {
       throw new Error("Claude Agent SDK does not expose query()");
     }
     return query as ClaudeQuery;
+  }
+
+  private async resolveMcpServer(): Promise<unknown | null> {
+    if (this.mcpServerCache) return this.mcpServerCache;
+    try {
+      const sdk = await import("@anthropic-ai/claude-agent-sdk");
+      const createSdkMcpServer = (sdk as { createSdkMcpServer?: unknown }).createSdkMcpServer;
+      const tool = (sdk as { tool?: unknown }).tool;
+      const { z } = await import("zod");
+      if (typeof createSdkMcpServer !== "function" || typeof tool !== "function") {
+        return null;
+      }
+      const askHumanTool = (tool as (
+        name: string,
+        description: string,
+        schema: Record<string, unknown>,
+        handler: (...args: unknown[]) => Promise<unknown>
+      ) => unknown)(
+        "ask_human",
+        "向用户提问并暂停执行等待回答。type=single 单选、multi 多选、text 自由文本。options 仅 single/multi 时必填。提问后工作流会暂停；用户回答会通过下一轮指令以问答历史的形式返回。",
+        {
+          question: z.string().describe("问题文本，支持 Markdown"),
+          type: z.enum(["single", "multi", "text"]).describe("问题类型"),
+          options: z.array(z.object({ value: z.string(), label: z.string() })).optional().describe("single/multi 时必填")
+        },
+        async () => ({ content: [{ type: "text", text: "(intercepted by host)" }] })
+      );
+      this.mcpServerCache = (createSdkMcpServer as (opts: { name: string; tools: unknown[] }) => unknown)({
+        name: "ai_coder",
+        tools: [askHumanTool]
+      });
+      return this.mcpServerCache;
+    } catch {
+      return null;
+    }
   }
 }
 
