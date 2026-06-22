@@ -247,6 +247,8 @@ export interface AgentSession {
   stage_runs?: StageRun[];
   rework_requests?: ReworkRequest[];
   pending_human_questions?: HumanQuestion[];
+  /** 用户批准过的项目外只读路径（realpath）。仅 Read/Grep/Glob/LS 命中时放行。 */
+  approved_external_paths?: string[];
   onboarding?: SessionOnboardingSnapshot;
   created_at: string;
   updated_at: string;
@@ -309,6 +311,7 @@ export interface AppApi {
   abortSession(sessionId: string): Promise<AgentSession>;
   answerHumanQuestion(sessionId: string, questionId: string, answer: string | string[]): Promise<AgentSession>;
   sendMessage(sessionId: string, message: string, attachments?: Attachment[]): Promise<AgentSession>;
+  deleteSession(sessionId: string): Promise<void>;
   listProjectFiles(projectPath: string, query?: string): Promise<string[]>;
   readProjectFile(projectPath: string, filePath: string): Promise<string>;
 }

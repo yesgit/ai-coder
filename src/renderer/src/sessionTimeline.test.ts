@@ -55,14 +55,15 @@ describe("buildSessionTimeline", () => {
   it("merges session records into chronological timeline events", () => {
     const events = buildSessionTimeline(session);
 
+    // 倒序排列：需要用户操作的事件（待审批工具）优先，然后是其他事件按时间戳倒序
     expect(events.map((event) => event.title)).toEqual([
-      "任务已提交",
-      "阶段审批待处理",
-      "助手消息",
-      "阶段审批已批准",
-      "工具请求：shell",
-      "文件更新",
-      "会话等待审批"
+      "工具请求：shell", // pending_approval，needs_user_action=true，优先显示
+      "会话等待审批", // sort_order=100，时间戳最新 (01:05:00)
+      "文件更新", // approved=true，needs_user_action=false，时间戳 (01:04:30)
+      "阶段审批已批准", // resolved_at (01:03:00)
+      "助手消息", // 时间戳 (01:02:00)
+      "阶段审批待处理", // created_at (01:01:00)
+      "任务已提交" // 时间戳最早 (01:00:00)
     ]);
   });
 
@@ -183,5 +184,41 @@ describe("buildSessionTimeline", () => {
     expect(details).not.toContain("(no content)");
     expect(details).not.toContain("收到 Claude SDK 消息：assistant");
     expect(details).toContain("Valid message with actual content");
+  });
+
+  it("prioritizes pending approvals and human questions at the top", () => {
+    const events = buildSessionTimeline({
+      ...session,
+      approvals: [
+        {
+          id: "approval-pending",
+          stage_id: "plan",
+          kind: "stage",
+          status: "pending",
+          message: "Awaiting stage approval",
+          created_at: "2026-06-03T01:01:00.000Z"
+        }
+      ],
+      pending_human_questions: [
+        {
+          id: "question-1",
+          stage_id: "execute",
+          question: "Which testing framework should be used?",
+          question_type: "single",
+          options: [
+            { value: "jest", label: "Jest" },
+            { value: "vitest", label: "Vitest" }
+          ],
+          status: "pending",
+          created_at: "2026-06-03T01:03:00.000Z"
+        }
+      ]
+    });
+
+    // 所有 pending 事件显示在最上面，pending 事件内部按时间戳倒序
+    const titles = events.map((e) => e.title);
+    expect(titles[0]).toBe("工具请求：shell"); // pending_approval, 时间戳最新 (01:04:00)
+    expect(titles[1]).toBe("助手提问待回答"); // pending human question, 时间戳 (01:03:00)
+    expect(titles[2]).toBe("阶段审批待处理"); // pending approval, 时间戳最早 (01:01:00)
   });
 });

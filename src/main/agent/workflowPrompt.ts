@@ -33,7 +33,7 @@ export function buildStageInstructions(input: StageAgentInput): string {
       const roleLabel = m.role === "user" ? "用户" : m.role === "assistant" ? "助手" : "系统";
       let text = `[${roleLabel}]: ${m.content || "(附带附件)"}`;
       if (m.attachments?.length) {
-        text += "\n附件（项目相对路径；PDF/图片可直接用 Read 工具读取，文本文件也用 Read，二进制可用 Bash 处理）:\n" + m.attachments.map((a) => {
+        text += "\n附件（项目相对路径；图片用 Read 工具读取，文本文件也用 Read，二进制可用 Bash 处理。PDF 已自动拆页为多个 PNG，display_name 形如 “xxx.pdf · 第 N 页 / 共 M 页”，按需 Read 关心的页码即可）:\n" + m.attachments.map((a) => {
           if (a.type === "image") {
             return `- [图片] ${a.display_name}（内联 base64，未保存到磁盘）`;
           }
@@ -63,7 +63,7 @@ export function buildStageInstructions(input: StageAgentInput): string {
     "工作流引擎负责控制阶段流转。你只需要完成当前阶段。",
     "你可以参考工作流概览和此前阶段摘要，但不要执行后续阶段。",
     "严格遵守当前阶段的阶段指令、allowed_tools、required_outputs 和 gates；如果它们与用户任务冲突，请说明冲突并请求返工。",
-    "只能读取或修改已选择项目目录内的文件。",
+    "只能修改已选择项目目录内的文件。读取项目外文件需要发起 Read，宿主会请求用户审批（用户批准后该路径在本会话内不再询问）。",
     "不要编造文件内容、命令结果、测试结果或项目规则；不确定时明确说明不确定，并尽量用允许的工具核实。",
     "面对不确定性时，先寻找低成本证据；如果仍不确定，说明最可能的解释、采用的保守假设和可能影响。",
     "避免过度工程：选择能满足验收标准、符合现有代码风格且风险最小的方案。",

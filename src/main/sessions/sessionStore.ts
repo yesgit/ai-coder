@@ -135,6 +135,19 @@ export class SessionStore {
     await this.save(session);
     return session;
   }
+
+  async delete(id: string): Promise<void> {
+    assertSessionId(id);
+    const filePath = this.filePath(id);
+    try {
+      await fs.unlink(filePath);
+    } catch (error) {
+      if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
+        throw new Error(`Session not found: ${id}`);
+      }
+      throw error;
+    }
+  }
 }
 
 function isAgentSession(session: AgentSession | null): session is AgentSession {

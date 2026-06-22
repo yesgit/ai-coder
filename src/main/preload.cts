@@ -23,6 +23,7 @@ const api: AppApi = {
     ipcRenderer.invoke("sessions:answer-human-question", sessionId, questionId, answer),
   sendMessage: (sessionId: string, message: string, attachments?: Attachment[]) =>
     ipcRenderer.invoke("sessions:send-message", sessionId, message, attachments),
+  deleteSession: (sessionId: string) => ipcRenderer.invoke("sessions:delete", sessionId),
   listProjectFiles: (projectPath: string, query?: string) =>
     ipcRenderer.invoke("project:list-files", projectPath, query),
   readProjectFile: (projectPath: string, filePath: string) =>

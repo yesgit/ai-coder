@@ -16,13 +16,25 @@ const DANGEROUS_COMMANDS = [
 ];
 
 export async function assertPathInsideProject(projectPath: string, targetPath: string): Promise<void> {
+  const status = await checkPathInsideProject(projectPath, targetPath);
+  if (!status.inside) {
+    throw new Error(`Blocked path outside project: ${targetPath}`);
+  }
+}
+
+/**
+ * 路径是否落在项目目录内（解析过 symlink）。返回 realpath 用于审批存档。
+ */
+export async function checkPathInsideProject(
+  projectPath: string,
+  targetPath: string
+): Promise<{ inside: boolean; realTarget: string }> {
   const resolvedProject = await fs.realpath(path.resolve(projectPath));
   const resolvedTarget = path.isAbsolute(targetPath) ? path.resolve(targetPath) : path.resolve(projectPath, targetPath);
   const realTarget = await resolveExistingPathOrParent(resolvedTarget);
   const relative = path.relative(resolvedProject, realTarget);
-  if (relative.startsWith("..") || path.isAbsolute(relative)) {
-    throw new Error(`Blocked path outside project: ${targetPath}`);
-  }
+  const inside = !relative.startsWith("..") && !path.isAbsolute(relative);
+  return { inside, realTarget };
 }
 
 export function requiresShellApproval(workflow: WorkflowTemplate): boolean {
@@ -86,6 +98,7 @@ export async function approveOrDenyToolUse(
     existingToolCall.status = "completed";
     existingToolCall.resolved_at = now;
     recordFileChangesForTool(session, toolName, input, true, now);
+    await rememberApprovedExternalReads(session, toolName, input);
     return { allow: true, updatedInput: input };
   }
   if (existingToolCall?.status === "denied") {
@@ -139,7 +152,24 @@ export async function approveOrDenyToolUse(
     }
 
     for (const filePath of extractFilePaths(input)) {
-      await assertPathInsideProject(session.project_path, filePath);
+      const { inside, realTarget } = await checkPathInsideProject(session.project_path, filePath);
+      if (inside) continue;
+
+      // 项目外路径：写工具仍硬阻断；只读工具走"按 session 缓存的"用户审批
+      if (!isReadOnlyFileTool(toolName)) {
+        throw new Error(`Blocked path outside project: ${filePath}`);
+      }
+      const approvedExternal = session.approved_external_paths ?? [];
+      if (approvedExternal.includes(realTarget)) {
+        continue;
+      }
+      record("pending_approval");
+      session.status = "waiting_approval";
+      return {
+        allow: false,
+        message: `Read access outside project is waiting for user approval: ${filePath}`,
+        interrupt: true
+      };
     }
 
     if (isWriteTool(toolName)) {
@@ -170,6 +200,12 @@ function extractFilePaths(input: Record<string, unknown>): string[] {
 
 function isWriteTool(toolName: string): boolean {
   return toolName === "Edit" || toolName === "MultiEdit" || toolName === "Write" || toolName === "NotebookEdit";
+}
+
+const READ_ONLY_FILE_TOOLS = new Set(["Read", "Grep", "Glob", "LS", "NotebookRead"]);
+
+function isReadOnlyFileTool(toolName: string): boolean {
+  return READ_ONLY_FILE_TOOLS.has(toolName);
 }
 
 function sameToolCall(toolCall: ToolCallRecord, toolName: string, input: Record<string, unknown>): boolean {
@@ -219,6 +255,34 @@ function recordFileChangesForTool(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+/**
+ * 当一个只读工具调用从 approved 转为 completed 时，把它涉及的项目外路径
+ * 记录到 session.approved_external_paths，使同 session 内的后续 Read 免再次审批。
+ * 写工具不会走到这里（它们的项目外路径在主流程里已被硬阻断）。
+ */
+async function rememberApprovedExternalReads(
+  session: AgentSession,
+  toolName: string,
+  input: Record<string, unknown>
+): Promise<void> {
+  if (!isReadOnlyFileTool(toolName)) return;
+  const paths = extractFilePaths(input);
+  if (paths.length === 0) return;
+  const approved = new Set(session.approved_external_paths ?? []);
+  for (const filePath of paths) {
+    try {
+      const { inside, realTarget } = await checkPathInsideProject(session.project_path, filePath);
+      if (inside) continue;
+      approved.add(realTarget);
+    } catch {
+      // 路径无法解析（消失等）：保守不记录
+    }
+  }
+  if (approved.size > 0) {
+    session.approved_external_paths = [...approved];
+  }
 }
 
 async function resolveExistingPathOrParent(targetPath: string): Promise<string> {

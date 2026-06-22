@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readdir, readFile, mkdir, writeFile, stat, realpath } from "node:fs/promises";
 import { join, resolve, relative, extname, basename, sep } from "node:path";
+import { pdfToImages } from "./pdfToImages.js";
 import { BrowserWindow, dialog, ipcMain } from "electron";
 import type { OpenDialogOptions } from "electron";
 import type { Attachment, ProjectOnboardingStatus, SessionOnboardingSnapshot, StartSessionInput } from "../shared/types.js";
@@ -361,6 +362,16 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     runSessionInBackground(runner, sessions, session, workflow);
     return session;
   });
+
+  ipcMain.handle("sessions:delete", async (_event, sessionId: string) => {
+    const session = await sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}`);
+    }
+    await authorizedProjects.assertAuthorized(session.project_path);
+    await sessions.delete(sessionId);
+    return { success: true, deletedSessionId: sessionId };
+  });
 }
 
 function runSessionInBackground(
@@ -422,15 +433,54 @@ async function saveBinaryAttachments(attachments: Attachment[], projectPath: str
   for (const att of attachments) {
     if (att.type === "image" || att.type === "file_upload") {
       const safeDisplayName = sanitizeDisplayName(att.display_name);
+      const buffer = Buffer.from(att.data_base64, "base64");
+      if (buffer.byteLength > MAX_BINARY_BYTES) {
+        throw new Error(`附件过大（${Math.round(buffer.byteLength / 1024 / 1024)}MB），上限 ${MAX_BINARY_BYTES / 1024 / 1024}MB`);
+      }
+
+      // PDF 特殊处理：拆页渲染为 PNG，作为多条 file_ref 附件返回。
+      // GLM/vLLM 后端不支持 Anthropic 的 document content block；image 块可以。
+      // 模型用 Read 工具读取每页 PNG，SDK 会自动以 image block 透传给后端。
+      if (att.type === "file_upload" && att.media_type === "application/pdf") {
+        const id = randomUUID();
+        const pdfFileName = `${id}.pdf`;
+        const pdfPath = join(uploadsDir, pdfFileName);
+        await writeFile(pdfPath, buffer);
+
+        let pages;
+        try {
+          pages = await pdfToImages(buffer, { dpi: 150, maxPages: 50 });
+        } catch (error) {
+          // 渲染失败：上传整体失败。原 PDF 已落盘，但不作为附件返回 ——
+          // 当前后端（GLM/vLLM）拿到 PDF 原文件也无法处理，给一条会失败的附件比
+          // 直接报错更迷惑。
+          throw new Error(
+            `PDF 渲染失败 (${safeDisplayName}): ${error instanceof Error ? error.message : String(error)}`
+          );
+        }
+
+        const pageDir = join(uploadsDir, id);
+        await mkdir(pageDir, { recursive: true });
+        const totalPages = pages.length;
+        const pad = String(totalPages).length;
+        for (const page of pages) {
+          const pageName = `page-${String(page.page).padStart(pad, "0")}.png`;
+          const pagePath = join(pageDir, pageName);
+          await writeFile(pagePath, page.png);
+          result.push({
+            type: "file_ref",
+            path: relative(projectPath, pagePath),
+            display_name: `${safeDisplayName} · 第 ${page.page} 页 / 共 ${totalPages} 页`
+          });
+        }
+        continue;
+      }
+
       const id = randomUUID();
       const rawExt = att.media_type.split("/")[1]?.split("+")[0] || (att.type === "image" ? "png" : "bin");
       const ext = /^[a-z0-9]+$/i.test(rawExt) ? rawExt.toLowerCase() : (att.type === "image" ? "png" : "bin");
       const fileName = `${id}.${ext}`;
       const filePath = join(uploadsDir, fileName);
-      const buffer = Buffer.from(att.data_base64, "base64");
-      if (buffer.byteLength > MAX_BINARY_BYTES) {
-        throw new Error(`附件过大（${Math.round(buffer.byteLength / 1024 / 1024)}MB），上限 ${MAX_BINARY_BYTES / 1024 / 1024}MB`);
-      }
       await writeFile(filePath, buffer);
       result.push({
         type: "file_ref",

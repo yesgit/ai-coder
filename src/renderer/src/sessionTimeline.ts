@@ -3,6 +3,7 @@ import type {
   AgentSession,
   ApprovalRecord,
   FileChangeRecord,
+  HumanQuestion,
   ReworkRequest,
   SessionProgressEvent,
   StageRun,
@@ -20,6 +21,8 @@ export interface TimelineEvent {
   timestamp: string;
   status?: string;
   sort_order: number;
+  /** 是否需要用户处理（待审批/待回答）— 这类事件优先显示在最上面 */
+  needs_user_action?: boolean;
 }
 
 export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
@@ -113,6 +116,7 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
   });
 
   session.approvals.forEach((approval: ApprovalRecord) => {
+    const isPending = approval.status === "pending";
     events.push({
       id: `${session.id}:approval:${approval.id}:requested`,
       type: "approval",
@@ -120,7 +124,8 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
       detail: approval.message,
       timestamp: approval.created_at,
       status: approval.status,
-      sort_order: 20
+      sort_order: 20,
+      needs_user_action: isPending
     });
 
     if (approval.resolved_at) {
@@ -131,12 +136,14 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
         detail: approval.message,
         timestamp: approval.resolved_at,
         status: approval.status,
-        sort_order: 21
+        sort_order: 21,
+        needs_user_action: false
       });
     }
   });
 
   session.tool_calls.forEach((toolCall: ToolCallRecord) => {
+    const isPending = toolCall.status === "pending_approval";
     events.push({
       id: `${session.id}:tool:${toolCall.id}:requested`,
       type: "tool",
@@ -144,7 +151,8 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
       detail: formatJson(toolCall.input),
       timestamp: toolCall.created_at,
       status: toolCall.status,
-      sort_order: 30
+      sort_order: 30,
+      needs_user_action: isPending
     });
 
     if (toolCall.resolved_at) {
@@ -155,12 +163,14 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
         detail: formatJson(toolCall.input),
         timestamp: toolCall.resolved_at,
         status: toolCall.status,
-        sort_order: 31
+        sort_order: 31,
+        needs_user_action: false
       });
     }
   });
 
   session.file_changes.forEach((fileChange: FileChangeRecord, index: number) => {
+    const isPending = !fileChange.approved;
     events.push({
       id: `${session.id}:file:${index}`,
       type: "file",
@@ -168,11 +178,13 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
       detail: fileChange.path,
       timestamp: fileChange.created_at,
       status: fileChange.approved ? "approved" : "pending",
-      sort_order: 40
+      sort_order: 40,
+      needs_user_action: isPending
     });
   });
 
   (session.rework_requests ?? []).forEach((request: ReworkRequest) => {
+    const isPending = request.status === "pending";
     events.push({
       id: `${session.id}:rework:${request.id}:requested`,
       type: "rework",
@@ -180,7 +192,8 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
       detail: request.reason,
       timestamp: request.created_at,
       status: request.status,
-      sort_order: 50
+      sort_order: 50,
+      needs_user_action: isPending
     });
 
     if (request.resolved_at) {
@@ -191,7 +204,24 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
         detail: request.reason,
         timestamp: request.resolved_at,
         status: request.status,
-        sort_order: 51
+        sort_order: 51,
+        needs_user_action: false
+      });
+    }
+  });
+
+  (session.pending_human_questions ?? []).forEach((question: HumanQuestion) => {
+    const isPending = question.status === "pending";
+    if (isPending) {
+      events.push({
+        id: `${session.id}:human-question:${question.id}`,
+        type: "message",
+        title: `助手提问待回答`,
+        detail: question.question,
+        timestamp: question.created_at,
+        status: "pending",
+        sort_order: 25,
+        needs_user_action: true
       });
     }
   });
@@ -218,9 +248,13 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
   });
 
   return events.sort((left, right) => {
-    const timeDelta = Date.parse(left.timestamp) - Date.parse(right.timestamp);
+    // 需要用户操作的事件（待审批/待回答）优先显示在最上面
+    if (left.needs_user_action && !right.needs_user_action) return -1;
+    if (right.needs_user_action && !left.needs_user_action) return 1;
+    // 同类事件内按时间戳倒序（最新的在前）
+    const timeDelta = Date.parse(right.timestamp) - Date.parse(left.timestamp);
     if (timeDelta !== 0) return timeDelta;
-    return left.sort_order - right.sort_order;
+    return right.sort_order - left.sort_order;
   });
 }
 

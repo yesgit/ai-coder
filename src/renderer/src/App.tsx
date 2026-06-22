@@ -51,6 +51,7 @@ export default function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const taskFileInputRef = useRef<HTMLInputElement>(null);
   const [questionAnswers, setQuestionAnswers] = useState<Record<string, string | string[]>>({});
+  const [timelineLimit, setTimelineLimit] = useState(50); // 默认只显示最近 50 条事件
 
   // 切换 session 时清空草稿答案，避免不同 session 间的串味
   useEffect(() => {
@@ -126,7 +127,7 @@ export default function App() {
     }
     const interval = window.setInterval(() => {
       void refreshSessions(activeSessionId ?? undefined);
-    }, 1500);
+    }, 3000); // 3 秒轮询间隔，避免过于频繁
     return () => window.clearInterval(interval);
   }, [activeSessionId, runningVisibleSessionIds]);
 
@@ -400,6 +401,23 @@ export default function App() {
     }
   }
 
+  async function deleteSession(session: AgentSession) {
+    setBusy(true);
+    setError("");
+    try {
+      await window.aiCoder.deleteSession(session.id);
+      // 删除后刷新会话列表，如果删除的是当前会话，则清空选中状态
+      setSessions((current) => current.filter((s) => s.id !== session.id));
+      if (activeSessionId === session.id) {
+        setActiveSessionId(null);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   // @文件提及搜索
   useEffect(() => {
     if (!showFileMention || !projectPath) return;
@@ -585,13 +603,22 @@ export default function App() {
   const approvedToolCalls = activeSession?.tool_calls.filter((toolCall) => toolCall.status === "approved") ?? [];
   const stageRuns = activeSession?.stage_runs ?? [];
   const reworkRequests = activeSession?.rework_requests ?? [];
-  const pendingReworkRequests = reworkRequests.filter((request) => request.status === "pending");
-  const workflowStageDisplays = selectedWorkflow
-    ? buildWorkflowStageDisplays(selectedWorkflow.stages, activeSession, selectedWorkflow.id)
-    : [];
-  const showOnboardingWarning = onboardingRequired;
-  const timeline = activeSession ? buildSessionTimeline(activeSession) : [];
+  const pendingReworkRequests = useMemo(
+    () => reworkRequests.filter((request) => request.status === "pending"),
+    [reworkRequests]
+  );
+  const workflowStageDisplays = useMemo(
+    () => (selectedWorkflow ? buildWorkflowStageDisplays(selectedWorkflow.stages, activeSession, selectedWorkflow.id) : []),
+    [selectedWorkflow, activeSession]
+  );
+  const timelineAll = useMemo(
+    () => (activeSession ? buildSessionTimeline(activeSession) : []),
+    [activeSession]
+  );
+  const timeline = useMemo(() => timelineAll.slice(0, timelineLimit), [timelineAll, timelineLimit]);
+  const showMoreTimeline = timelineAll.length > timelineLimit;
   const latestProgress = activeSession?.progress_events?.at(-1);
+  const showOnboardingWarning = onboardingRequired;
 
   return (
     <main className="app-shell">
@@ -661,14 +688,27 @@ export default function App() {
           <h2>会话</h2>
           <div className="session-list">
             {visibleSessions.map((session) => (
-              <button
-                key={session.id}
-                className={activeSession?.id === session.id ? "session selected" : "session"}
-                onClick={() => selectSession(session)}
-              >
-                <span>{session.task_prompt}</span>
-                <small>{formatStatus(session.status)}</small>
-              </button>
+              <div key={session.id} className="session-item">
+                <button
+                  className={activeSession?.id === session.id ? "session selected" : "session"}
+                  onClick={() => selectSession(session)}
+                >
+                  <span>{session.task_prompt}</span>
+                  <small>{formatStatus(session.status)}</small>
+                </button>
+                <button
+                  className="session-delete"
+                  title="删除会话"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (confirm(`确定要删除会话 "${session.task_prompt}" 吗？`)) {
+                      void deleteSession(session);
+                    }
+                  }}
+                >
+                  ×
+                </button>
+              </div>
             ))}
           </div>
           {visibleSessions.length === 0 && <p className="nav-empty">暂无当前项目会话。</p>}
@@ -1029,6 +1069,13 @@ export default function App() {
                   </article>
                 ))}
               </div>
+              {showMoreTimeline && (
+                <div className="timeline-more">
+                  <button className="secondary" onClick={() => setTimelineLimit((n) => n + 50)}>
+                    加载更多（显示更多 50 条）
+                  </button>
+                </div>
+              )}
               {/* 闲聊工作流或会话已完成时显示继续对话输入框 */}
               {(activeSession?.workflow_id === "chat" || activeSession?.status === "completed") && (
                 <div className={`chat-input-box${dragOverTarget === "chat" ? " drag-over" : ""}`}
