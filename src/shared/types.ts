@@ -158,7 +158,7 @@ export interface FileRefAttachment {
 export interface ImageAttachment {
   type: "image";
   data_base64: string;
-  media_type: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+  media_type: string;
   display_name: string;
 }
 

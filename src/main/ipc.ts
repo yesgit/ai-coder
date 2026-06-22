@@ -172,9 +172,9 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     // 处理附件：校验 + 图片保存到磁盘，转为文件引用
     let processedAttachments = input.attachments;
     if (input.attachments?.length) {
-      const validMediaTypes = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+      const imageMediaTypePattern = /^image\/[a-z0-9.+-]+$/i;
       for (const att of input.attachments) {
-        if (att.type === "image" && !validMediaTypes.has(att.media_type)) {
+        if (att.type === "image" && !imageMediaTypePattern.test(att.media_type)) {
           throw new Error(`不支持的图片类型: ${att.media_type}`);
         }
       }
@@ -248,9 +248,9 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     // 处理附件：校验 + 图片保存到磁盘，转为文件引用
     let processedAttachments = attachments;
     if (attachments?.length) {
-      const validMediaTypes = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+      const imageMediaTypePattern = /^image\/[a-z0-9.+-]+$/i;
       for (const att of attachments) {
-        if (att.type === "image" && !validMediaTypes.has(att.media_type)) {
+        if (att.type === "image" && !imageMediaTypePattern.test(att.media_type)) {
           throw new Error(`不支持的图片类型: ${att.media_type}`);
         }
       }
@@ -331,7 +331,9 @@ async function saveImageAttachments(attachments: Attachment[], projectPath: stri
   for (const att of attachments) {
     if (att.type === "image") {
       const id = randomUUID();
-      const ext = att.media_type.split("/")[1] || "png";
+      // 仅取扩展名安全字符
+      const rawExt = att.media_type.split("/")[1] || "png";
+      const ext = /^[a-z0-9]+$/i.test(rawExt) ? rawExt : "png";
       const fileName = `${id}.${ext}`;
       const filePath = join(uploadsDir, fileName);
       const buffer = Buffer.from(att.data_base64, "base64");

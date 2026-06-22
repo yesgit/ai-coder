@@ -353,7 +353,7 @@ export default function App() {
       reader.onload = () => {
         const dataUrl = reader.result as string;
         const base64 = dataUrl.split(",")[1];
-        const mediaType = item.type as "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+        const mediaType = item.type || "image/png";
         setAttachments((prev) => [
           ...prev,
           { type: "image", data_base64: base64, media_type: mediaType, display_name: file.name || "pasted-image.png" }
@@ -375,7 +375,7 @@ export default function App() {
         reader.onload = () => {
           const dataUrl = reader.result as string;
           const base64 = dataUrl.split(",")[1];
-          const mediaType = file.type as "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+          const mediaType = file.type || "image/png";
           setAttachments((prev) => [
             ...prev,
             { type: "image", data_base64: base64, media_type: mediaType, display_name: file.name }
@@ -383,16 +383,8 @@ export default function App() {
         };
         reader.readAsDataURL(file);
       } else {
-        // 非图片文件：读取内容并作为 base64 上传
-        const reader = new FileReader();
-        reader.onload = () => {
-          const base64 = (reader.result as string).split(",")[1];
-          setAttachments((prev) => [
-            ...prev,
-            { type: "image", data_base64: base64, media_type: "image/png" as const, display_name: file.name }
-          ]);
-        };
-        reader.readAsDataURL(file);
+        // 非图片文件：暂不支持，提示用户使用 @ 引用项目内文件
+        setError(`暂不支持非图片文件 ${file.name}，请使用 @ 引用项目内文件`);
       }
     }
   }
@@ -421,7 +413,7 @@ export default function App() {
         reader.onload = () => {
           const dataUrl = reader.result as string;
           const base64 = dataUrl.split(",")[1];
-          const mediaType = file.type as "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+          const mediaType = file.type || "image/png";
           setAttachments((prev) => [
             ...prev,
             { type: "image", data_base64: base64, media_type: mediaType, display_name: file.name }
@@ -429,16 +421,8 @@ export default function App() {
         };
         reader.readAsDataURL(file);
       } else {
-        // 非图片文件：读取内容并上传
-        const reader = new FileReader();
-        reader.onload = () => {
-          const base64 = (reader.result as string).split(",")[1];
-          setAttachments((prev) => [
-            ...prev,
-            { type: "image", data_base64: base64, media_type: "image/png" as const, display_name: file.name }
-          ]);
-        };
-        reader.readAsDataURL(file);
+        // 非图片文件：暂不支持
+        setError(`暂不支持非图片文件 ${file.name}，请使用 @ 引用项目内文件`);
       }
     }
     e.target.value = "";
