@@ -2,10 +2,18 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import type { AgentSession, Attachment, SessionOnboardingSnapshot, WorkflowTemplate } from "../../shared/types.js";
+import type { AgentSession, Attachment, SessionOnboardingSnapshot, SessionRoutingSnapshot, WorkflowTemplate } from "../../shared/types.js";
+import { summarizeSessionTitle } from "../../shared/sessionTitle.js";
 import { WorkflowEngine } from "../workflows/workflowEngine.js";
 
 export class SessionStore {
+  private readonly writeChains = new Map<string, Promise<void>>();
+  private readonly organizationOverrides = new Map<
+    string,
+    { pinned_at?: string | null; archived_at?: string | null }
+  >();
+  private readonly deletedSessionIds = new Set<string>();
+
   constructor(private readonly storeDir = path.join(os.homedir(), ".ai-coder", "sessions")) {}
 
   async create(
@@ -13,7 +21,8 @@ export class SessionStore {
     workflow: WorkflowTemplate,
     taskPrompt: string,
     onboarding?: SessionOnboardingSnapshot,
-    attachments?: Attachment[]
+    attachments?: Attachment[],
+    routing?: SessionRoutingSnapshot
   ): Promise<AgentSession> {
     const now = new Date().toISOString();
     const firstStage = workflow.stages[0]?.id ?? "start";
@@ -21,6 +30,7 @@ export class SessionStore {
       id: randomUUID(),
       project_path: projectPath,
       workflow_id: workflow.id,
+      title: summarizeSessionTitle(taskPrompt),
       task_prompt: taskPrompt,
       status: "created",
       current_stage: firstStage,
@@ -32,6 +42,7 @@ export class SessionStore {
       stage_runs: [],
       rework_requests: [],
       onboarding,
+      routing,
       created_at: now,
       updated_at: now
     };
@@ -58,9 +69,11 @@ export class SessionStore {
 
   async save(session: AgentSession): Promise<void> {
     assertSessionId(session.id);
-    await fs.mkdir(this.storeDir, { recursive: true });
-    session.updated_at = new Date().toISOString();
-    await fs.writeFile(this.filePath(session.id), JSON.stringify(session, null, 2), "utf8");
+    await this.enqueueWrite(session.id, async () => {
+      if (this.deletedSessionIds.has(session.id)) return;
+      this.applyOrganizationOverrides(session);
+      await this.writeSessionFile(session);
+    });
   }
 
   async approveToolCall(id: string, toolCallId: string): Promise<AgentSession> {
@@ -69,6 +82,14 @@ export class SessionStore {
 
   async denyToolCall(id: string, toolCallId: string): Promise<AgentSession> {
     return this.resolveToolCall(id, toolCallId, "denied");
+  }
+
+  async setPinned(id: string, pinned: boolean): Promise<AgentSession> {
+    return this.updateSessionFlag(id, "pinned_at", pinned);
+  }
+
+  async setArchived(id: string, archived: boolean): Promise<AgentSession> {
+    return this.updateSessionFlag(id, "archived_at", archived);
   }
 
   async approveStage(id: string, stageId: string): Promise<AgentSession> {
@@ -136,16 +157,71 @@ export class SessionStore {
     return session;
   }
 
+  private async updateSessionFlag(
+    id: string,
+    field: "pinned_at" | "archived_at",
+    enabled: boolean
+  ): Promise<AgentSession> {
+    assertSessionId(id);
+    return this.enqueueWrite(id, async () => {
+      if (this.deletedSessionIds.has(id)) throw new Error(`Session not found: ${id}`);
+      const session = await this.readFile(this.filePath(id));
+      if (!session) throw new Error(`Session not found: ${id}`);
+      const value = enabled ? new Date().toISOString() : null;
+      this.organizationOverrides.set(id, {
+        ...this.organizationOverrides.get(id),
+        [field]: value
+      });
+      if (value) session[field] = value;
+      else delete session[field];
+      await this.writeSessionFile(session);
+      return session;
+    });
+  }
+
   async delete(id: string): Promise<void> {
     assertSessionId(id);
-    const filePath = this.filePath(id);
-    try {
-      await fs.unlink(filePath);
-    } catch (error) {
-      if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
-        throw new Error(`Session not found: ${id}`);
+    await this.enqueueWrite(id, async () => {
+      const filePath = this.filePath(id);
+      try {
+        await fs.unlink(filePath);
+        this.deletedSessionIds.add(id);
+        this.organizationOverrides.delete(id);
+      } catch (error) {
+        if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
+          throw new Error(`Session not found: ${id}`);
+        }
+        throw error;
       }
-      throw error;
+    });
+  }
+
+  private applyOrganizationOverrides(session: AgentSession): void {
+    const overrides = this.organizationOverrides.get(session.id);
+    if (!overrides) return;
+    for (const field of ["pinned_at", "archived_at"] as const) {
+      if (!Object.prototype.hasOwnProperty.call(overrides, field)) continue;
+      const value = overrides[field];
+      if (value) session[field] = value;
+      else delete session[field];
+    }
+  }
+
+  private async writeSessionFile(session: AgentSession): Promise<void> {
+    await fs.mkdir(this.storeDir, { recursive: true });
+    session.updated_at = new Date().toISOString();
+    await fs.writeFile(this.filePath(session.id), JSON.stringify(session, null, 2), "utf8");
+  }
+
+  private async enqueueWrite<T>(id: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.writeChains.get(id) ?? Promise.resolve();
+    const result = previous.catch(() => undefined).then(operation);
+    const tail = result.then(() => undefined, () => undefined);
+    this.writeChains.set(id, tail);
+    try {
+      return await result;
+    } finally {
+      if (this.writeChains.get(id) === tail) this.writeChains.delete(id);
     }
   }
 }

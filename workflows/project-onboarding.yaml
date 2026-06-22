@@ -6,6 +6,17 @@ source:
   type: builtin
   id: project-onboarding
   version: 1.0.0
+routing:
+  enabled: true
+  auto_start: true
+  keywords:
+    - 项目接入
+    - 项目画像
+    - CLAUDE.md
+    - 初始化项目
+  examples:
+    - 扫描这个项目并生成 CLAUDE.md
+    - 更新项目画像和 Claude Code 配置
 permissions:
   filesystem:
     mode: project-only

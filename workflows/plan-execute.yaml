@@ -6,6 +6,16 @@ source:
   type: builtin
   id: plan-execute
   version: 1.0.0
+routing:
+  enabled: true
+  auto_start: true
+  keywords:
+    - 制定计划
+    - 规划任务
+    - 分析方案
+  examples:
+    - 先分析需求并制定执行计划
+    - 帮我规划这个复杂任务的实施步骤
 permissions:
   filesystem:
     mode: project-only

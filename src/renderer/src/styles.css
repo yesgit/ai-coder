@@ -14,7 +14,8 @@ body {
 }
 
 button,
-textarea {
+textarea,
+select {
   font: inherit;
 }
 
@@ -30,8 +31,12 @@ button:disabled {
 
 .app-shell {
   display: grid;
-  grid-template-columns: 320px 1fr;
+  grid-template-columns: 1fr;
   min-height: 100vh;
+}
+
+.app-shell.history-open {
+  grid-template-columns: minmax(360px, 420px) minmax(0, 1fr);
 }
 
 .sidebar {
@@ -41,6 +46,43 @@ button:disabled {
   border-right: 1px solid #dde2e8;
   background: #ffffff;
   padding: 22px;
+}
+
+.sidebar-heading,
+.topbar,
+.topbar-actions,
+.workflow-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.sidebar-heading-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.icon-btn.active {
+  background: #dfe8f2;
+  color: #146c5f;
+}
+
+.topbar {
+  flex-wrap: wrap;
+}
+
+.topbar-actions {
+  flex-wrap: wrap;
+}
+
+.management-page {
+  display: grid;
+  gap: 18px;
+  min-height: 100vh;
+  align-content: start;
+  padding: 24px;
 }
 
 .brand {
@@ -120,6 +162,65 @@ small {
   gap: 8px;
 }
 
+.project-session-tree {
+  display: grid;
+  gap: 8px;
+}
+
+.project-group {
+  display: grid;
+  gap: 5px;
+}
+
+.project-group-header {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  border-radius: 7px;
+  background: transparent;
+  padding: 8px 7px;
+  color: #475467;
+  text-align: left;
+}
+
+.project-group-header:hover,
+.project-group.current > .project-group-header {
+  background: #edf1f7;
+  color: #182026;
+}
+
+.project-chevron {
+  color: #98a2b3;
+  font-size: 18px;
+  line-height: 1;
+  text-align: center;
+}
+
+.project-name {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-group-header small {
+  min-width: 20px;
+  border-radius: 999px;
+  background: #ffffff;
+  padding: 2px 6px;
+  text-align: center;
+}
+
+.project-group .session-list {
+  margin-left: 13px;
+  padding-left: 10px;
+  border-left: 1px solid #e2e7ee;
+}
+
 .nav-empty {
   margin-top: 8px;
   color: #667085;
@@ -186,8 +287,80 @@ small {
 
 .session-item {
   display: flex;
+  min-width: 0;
+  position: relative;
   align-items: stretch;
   gap: 6px;
+}
+
+.session-menu-trigger {
+  width: 28px;
+  height: 28px;
+  align-self: center;
+  flex: 0 0 auto;
+  border-radius: 6px;
+  background: transparent;
+  color: #667085;
+  font-size: 12px;
+  letter-spacing: -1px;
+  opacity: 0;
+}
+
+.session-item:hover .session-menu-trigger,
+.session-menu-trigger:focus {
+  opacity: 1;
+}
+
+.session-menu-trigger:hover {
+  background: #e9edf3;
+}
+
+.session-action-menu {
+  display: grid;
+  position: absolute;
+  z-index: 20;
+  top: 48px;
+  right: 0;
+  min-width: 132px;
+  overflow: hidden;
+  border: 1px solid #d7dde5;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 5px;
+  box-shadow: 0 10px 24px rgba(16, 24, 40, 0.14);
+}
+
+.session-action-menu button {
+  border-radius: 6px;
+  background: transparent;
+  padding: 8px 10px;
+  color: #344054;
+  text-align: left;
+}
+
+.session-action-menu button:hover {
+  background: #f2f4f7;
+}
+
+.session-action-menu button.destructive {
+  color: #b42318;
+}
+
+.session {
+  width: 100%;
+  min-height: 72px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.project-group .session {
+  min-height: 62px;
+  border-color: transparent;
+  background: transparent;
+}
+
+.project-group .session:hover {
+  background: #f5f7fa;
 }
 
 .session-delete {
@@ -229,6 +402,13 @@ small {
   white-space: nowrap;
 }
 
+.session span {
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+  text-overflow: clip;
+  white-space: normal;
+}
+
 .workspace {
   display: flex;
   min-width: 0;
@@ -249,6 +429,89 @@ small {
   display: grid;
   gap: 14px;
   position: relative;
+}
+
+.workflow-picker {
+  display: grid;
+  grid-template-columns: auto minmax(220px, 360px);
+  align-items: center;
+  justify-content: start;
+  gap: 10px;
+  color: #475467;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+select {
+  min-height: 38px;
+  border: 1px solid #d7dde5;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 8px 10px;
+  color: #182026;
+}
+
+.routing-confirmation {
+  display: grid;
+  gap: 8px;
+  border: 1px solid #f3d18b;
+  border-radius: 8px;
+  background: #fffaf0;
+  padding: 12px;
+}
+
+.workflow-catalog {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 14px;
+}
+
+.workflow-card {
+  display: grid;
+  gap: 12px;
+  border: 1px solid #dde2e8;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 16px;
+}
+
+.workflow-card-header {
+  align-items: flex-start;
+}
+
+.routing-badges,
+.stage-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.stage-list span {
+  border-radius: 999px;
+  background: #edf1f7;
+  padding: 4px 9px;
+  color: #475467;
+  font-size: 12px;
+}
+
+.onboarding-box.compact {
+  grid-template-columns: minmax(180px, 1fr) auto;
+  align-items: center;
+}
+
+@media (max-width: 820px) {
+  .app-shell.history-open {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    border-right: 0;
+    border-bottom: 1px solid #dde2e8;
+  }
+
+  .session-menu-trigger {
+    opacity: 1;
+  }
 }
 
 textarea {

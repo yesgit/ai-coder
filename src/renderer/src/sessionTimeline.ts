@@ -38,6 +38,18 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
     }
   ];
 
+  if (session.routing) {
+    events.push({
+      id: `${session.id}:routing`,
+      type: "status",
+      title: `工作流已${session.routing.requested_mode === "auto" ? "自动选择" : "手动指定"}`,
+      detail: session.routing.reason,
+      timestamp: session.created_at,
+      status: session.routing.method,
+      sort_order: 1
+    });
+  }
+
   // 找到"最后一条有意义的助手消息" — 该会话仅显示最终回答
   // 中间过程通过 stage_runs / progress_events 体现，避免重复
   let lastAssistantIndex = -1;

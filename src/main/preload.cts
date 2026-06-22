@@ -1,12 +1,14 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { AppApi, Attachment, StartSessionInput } from "../shared/types.js";
+import type { AppApi, Attachment, ResolveWorkflowInput, StartSessionInput } from "../shared/types.js";
 
 const api: AppApi = {
   selectProjectDirectory: () => ipcRenderer.invoke("project:select"),
+  authorizeSessionProject: (projectPath: string) => ipcRenderer.invoke("project:authorize-session-project", projectPath),
   getAgentRuntimeStatus: () => ipcRenderer.invoke("agent:get-status"),
   getProjectOnboardingStatus: (projectPath: string) => ipcRenderer.invoke("project:onboarding-status", projectPath),
   confirmProjectOnboarding: (projectPath: string) => ipcRenderer.invoke("project:confirm-onboarding", projectPath),
   listWorkflows: (projectPath?: string) => ipcRenderer.invoke("workflows:list", projectPath),
+  resolveWorkflow: (input: ResolveWorkflowInput) => ipcRenderer.invoke("workflows:resolve", input),
   startSession: (input: StartSessionInput) => ipcRenderer.invoke("sessions:start", input),
   listSessions: () => ipcRenderer.invoke("sessions:list"),
   getSession: (id: string) => ipcRenderer.invoke("sessions:get", id),
@@ -23,6 +25,8 @@ const api: AppApi = {
     ipcRenderer.invoke("sessions:answer-human-question", sessionId, questionId, answer),
   sendMessage: (sessionId: string, message: string, attachments?: Attachment[]) =>
     ipcRenderer.invoke("sessions:send-message", sessionId, message, attachments),
+  setSessionPinned: (sessionId: string, pinned: boolean) => ipcRenderer.invoke("sessions:set-pinned", sessionId, pinned),
+  setSessionArchived: (sessionId: string, archived: boolean) => ipcRenderer.invoke("sessions:set-archived", sessionId, archived),
   deleteSession: (sessionId: string) => ipcRenderer.invoke("sessions:delete", sessionId),
   listProjectFiles: (projectPath: string, query?: string) =>
     ipcRenderer.invoke("project:list-files", projectPath, query),

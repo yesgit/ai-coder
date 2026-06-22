@@ -6,6 +6,17 @@ source:
   type: builtin
   id: software-engineering
   version: 1.0.0
+routing:
+  enabled: true
+  auto_start: true
+  keywords:
+    - 修复 bug
+    - 实现功能
+    - 修改代码
+    - 重构代码
+  examples:
+    - 修复登录页面的崩溃问题并补测试
+    - 实现新的 API 并验证构建
 permissions:
   filesystem:
     mode: project-only

@@ -6,6 +6,17 @@ source:
   type: builtin
   id: code-review
   version: 1.0.0
+routing:
+  enabled: true
+  auto_start: true
+  keywords:
+    - 代码审查
+    - 审查代码
+    - review diff
+    - review code
+  examples:
+    - 审查当前分支的修改并指出风险
+    - review this diff for correctness
 permissions:
   filesystem:
     mode: project-only

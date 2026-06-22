@@ -12,11 +12,14 @@ import type {
   StageRun,
   ToolCallRecord,
   WorkflowLoadIssue,
+  WorkflowRoutingDecision,
+  SessionRoutingSnapshot,
   WorkflowTemplate
 } from "../../shared/types.js";
 import { buildSessionTimeline } from "./sessionTimeline.js";
 import type { TimelineEvent } from "./sessionTimeline.js";
-import { getVisibleSessions, resolveActiveSessionId } from "./sessionSelection.js";
+import { summarizeSessionTitle } from "../../shared/sessionTitle.js";
+import { getVisibleSessions, groupSessionsByProject, resolveActiveSessionId } from "./sessionSelection.js";
 import { buildWorkflowStageDisplays } from "./workflowStageStatus.js";
 import {
   formatStageName,
@@ -31,7 +34,14 @@ export default function App() {
   const [projectPath, setProjectPath] = useState("");
   const [workflows, setWorkflows] = useState<WorkflowTemplate[]>([]);
   const [workflowIssues, setWorkflowIssues] = useState<WorkflowLoadIssue[]>([]);
-  const [selectedWorkflowId, setSelectedWorkflowId] = useState("");
+  const [taskWorkflowId, setTaskWorkflowId] = useState("");
+  const [pendingRouting, setPendingRouting] = useState<WorkflowRoutingDecision | null>(null);
+  const [confirmationWorkflowId, setConfirmationWorkflowId] = useState("");
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [expandedProjectPaths, setExpandedProjectPaths] = useState<Set<string>>(() => new Set());
+  const [showArchivedSessions, setShowArchivedSessions] = useState(false);
+  const [openSessionMenuId, setOpenSessionMenuId] = useState<string | null>(null);
+  const [page, setPage] = useState<"tasks" | "workflows">("tasks");
   const [taskPrompt, setTaskPrompt] = useState("");
   const [sessions, setSessions] = useState<AgentSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
@@ -97,14 +107,34 @@ export default function App() {
     });
   }
 
-  const selectedWorkflow = useMemo(
-    () => workflows.find((workflow) => workflow.id === selectedWorkflowId) ?? null,
-    [selectedWorkflowId, workflows]
+  const taskWorkflow = useMemo(
+    () => workflows.find((workflow) => workflow.id === taskWorkflowId) ?? null,
+    [taskWorkflowId, workflows]
   );
-  const visibleSessions = useMemo(() => getVisibleSessions(sessions, projectPath), [projectPath, sessions]);
+  const visibleSessions = useMemo(
+    () =>
+      projectPath
+        ? getVisibleSessions(sessions, projectPath).filter((session) =>
+            showArchivedSessions ? Boolean(session.archived_at) : !session.archived_at
+          )
+        : [],
+    [projectPath, sessions, showArchivedSessions]
+  );
+  const sessionGroups = useMemo(
+    () =>
+      groupSessionsByProject(
+        sessions.filter((session) => (showArchivedSessions ? Boolean(session.archived_at) : !session.archived_at)),
+        projectPath
+      ),
+    [projectPath, sessions, showArchivedSessions]
+  );
   const activeSession = useMemo(
     () => visibleSessions.find((session) => session.id === activeSessionId) ?? null,
     [activeSessionId, visibleSessions]
+  );
+  const activeWorkflow = useMemo(
+    () => workflows.find((workflow) => workflow.id === activeSession?.workflow_id) ?? null,
+    [activeSession?.workflow_id, workflows]
   );
   const runningVisibleSessionIds = useMemo(
     () =>
@@ -129,20 +159,20 @@ export default function App() {
       void refreshSessions(activeSessionId ?? undefined);
     }, 3000); // 3 秒轮询间隔，避免过于频繁
     return () => window.clearInterval(interval);
-  }, [activeSessionId, runningVisibleSessionIds]);
+  }, [activeSessionId, runningVisibleSessionIds, showArchivedSessions]);
 
   async function refreshRuntimeStatus() {
     setRuntimeStatus(await window.aiCoder.getAgentRuntimeStatus());
   }
 
-  async function refreshWorkflows(nextProjectPath = projectPath, preferredWorkflowId = selectedWorkflowId) {
+  async function refreshWorkflows(nextProjectPath = projectPath, preferredWorkflowId = taskWorkflowId) {
     const result = await window.aiCoder.listWorkflows(nextProjectPath || undefined);
     const nextWorkflowId = result.workflows.some((workflow: WorkflowTemplate) => workflow.id === preferredWorkflowId)
       ? preferredWorkflowId
-      : result.workflows[0]?.id || "";
+      : "";
     setWorkflows(result.workflows);
     setWorkflowIssues(result.issues);
-    setSelectedWorkflowId(nextWorkflowId);
+    setTaskWorkflowId(nextWorkflowId);
     return { ...result, selectedWorkflowId: nextWorkflowId };
   }
 
@@ -158,14 +188,23 @@ export default function App() {
     preferredSessionId?: string,
     options: { projectPath?: string; workflowId?: string; preferLatestForWorkflow?: boolean } = {}
   ) {
-    const loaded = await window.aiCoder.listSessions();
+    const loaded: AgentSession[] = await window.aiCoder.listSessions();
     setSessions(loaded);
+    const focusedProjectPath = options.projectPath || projectPath || loaded[0]?.project_path;
+    if (focusedProjectPath) {
+      setExpandedProjectPaths((current) => new Set([...current, focusedProjectPath]));
+    }
     setActiveSessionId((current) => {
-      return resolveActiveSessionId(loaded, {
+      const targetProjectPath = options.projectPath || projectPath;
+      if (!targetProjectPath) return null;
+      const selectableSessions = loaded.filter((session) =>
+        showArchivedSessions ? Boolean(session.archived_at) : !session.archived_at
+      );
+      return resolveActiveSessionId(selectableSessions, {
         currentSessionId: current,
         preferredSessionId,
-        projectPath: options.projectPath ?? projectPath,
-        workflowId: options.workflowId ?? selectedWorkflowId,
+        projectPath: targetProjectPath,
+        workflowId: options.workflowId,
         preferLatestForWorkflow: options.preferLatestForWorkflow
       });
     });
@@ -187,11 +226,13 @@ export default function App() {
       if (selected) {
         setProjectPath(selected);
         setOnboardingOverride(false);
-        const workflowResult = await refreshWorkflows(selected);
+        setPendingRouting(null);
+        setConfirmationWorkflowId("");
+        setExpandedProjectPaths((current) => new Set([...current, selected]));
+        await refreshWorkflows(selected);
         await refreshOnboardingStatus(selected);
         await refreshSessions(undefined, {
           projectPath: selected,
-          workflowId: workflowResult.selectedWorkflowId,
           preferLatestForWorkflow: true
         });
       }
@@ -202,33 +243,36 @@ export default function App() {
     }
   }
 
-  async function selectWorkflow(workflowId: string) {
-    setSelectedWorkflowId(workflowId);
+  async function selectSession(session: AgentSession) {
+    if (session.project_path === projectPath) {
+      setActiveSessionId(session.id);
+      return;
+    }
+    setBusy(true);
     setError("");
-    await refreshSessions(undefined, {
-      workflowId,
-      projectPath,
-      preferLatestForWorkflow: true
-    });
+    try {
+      const authorizedPath = await window.aiCoder.authorizeSessionProject(session.project_path);
+      setProjectPath(authorizedPath);
+      setOnboardingOverride(false);
+      setPendingRouting(null);
+      setExpandedProjectPaths((current) => new Set([...current, authorizedPath]));
+      await refreshWorkflows(authorizedPath);
+      await refreshOnboardingStatus(authorizedPath);
+      await refreshSessions(session.id, { projectPath: authorizedPath, preferLatestForWorkflow: false });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
   }
 
-  function selectSession(session: AgentSession) {
-    setActiveSessionId(session.id);
-    // 自动切换到会话所属的项目
-    if (session.project_path !== projectPath) {
-      setProjectPath(session.project_path);
-      // 项目切换后，重新加载工作流列表和会话列表
-      refreshWorkflows(session.project_path).then((workflowResult) => {
-        void refreshSessions(undefined, {
-          projectPath: session.project_path,
-          workflowId: workflowResult.selectedWorkflowId,
-          preferLatestForWorkflow: false
-        });
-      });
-    }
-    if (session.workflow_id !== selectedWorkflowId && workflows.some((workflow) => workflow.id === session.workflow_id)) {
-      setSelectedWorkflowId(session.workflow_id);
-    }
+  function toggleProjectGroup(groupProjectPath: string) {
+    setExpandedProjectPaths((current) => {
+      const next = new Set(current);
+      if (next.has(groupProjectPath)) next.delete(groupProjectPath);
+      else next.add(groupProjectPath);
+      return next;
+    });
   }
 
   async function confirmOnboarding() {
@@ -248,17 +292,49 @@ export default function App() {
     setError("");
     setBusy(true);
     try {
-      const result = await window.aiCoder.startSession({
-        projectPath,
-        workflowId: selectedWorkflowId,
-        taskPrompt,
-        onboardingOverride,
-        attachments: taskAttachments.length > 0 ? taskAttachments : undefined
-      });
-      upsertSession(result.session);
-      setTaskPrompt("");
-      setTaskAttachments([]);
-      await refreshSessions(result.session.id);
+      if (taskWorkflowId) {
+        await createSession(taskWorkflowId);
+      } else {
+        const decision = await window.aiCoder.resolveWorkflow({ projectPath, taskPrompt });
+        if (decision.status !== "selected" || !decision.recommended_workflow_id) {
+          setPendingRouting(decision);
+          setConfirmationWorkflowId(decision.recommended_workflow_id ?? workflows[0]?.id ?? "");
+          return;
+        }
+        await createSession(decision.recommended_workflow_id, buildRoutingSnapshot(decision, decision.recommended_workflow_id, "none"));
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function createSession(workflowId: string, routing?: SessionRoutingSnapshot) {
+    const result = await window.aiCoder.startSession({
+      projectPath,
+      workflowId,
+      taskPrompt,
+      onboardingOverride,
+      attachments: taskAttachments.length > 0 ? taskAttachments : undefined,
+      routing
+    });
+    upsertSession(result.session);
+    setTaskPrompt("");
+    setTaskAttachments([]);
+    setTaskWorkflowId("");
+    setPendingRouting(null);
+    setConfirmationWorkflowId("");
+    await refreshSessions(result.session.id);
+  }
+
+  async function confirmPendingRouting() {
+    if (!pendingRouting || !confirmationWorkflowId) return;
+    setError("");
+    setBusy(true);
+    try {
+      const action = confirmationWorkflowId === pendingRouting.recommended_workflow_id ? "confirmed" : "overridden";
+      await createSession(confirmationWorkflowId, buildRoutingSnapshot(pendingRouting, confirmationWorkflowId, action));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -405,12 +481,38 @@ export default function App() {
     setBusy(true);
     setError("");
     try {
+      if (session.project_path !== projectPath) {
+        await window.aiCoder.authorizeSessionProject(session.project_path);
+      }
       await window.aiCoder.deleteSession(session.id);
       // 删除后刷新会话列表，如果删除的是当前会话，则清空选中状态
       setSessions((current) => current.filter((s) => s.id !== session.id));
       if (activeSessionId === session.id) {
         setActiveSessionId(null);
       }
+      setOpenSessionMenuId(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function updateSessionOrganization(session: AgentSession, action: "pin" | "archive") {
+    setBusy(true);
+    setError("");
+    try {
+      if (session.project_path !== projectPath) {
+        await window.aiCoder.authorizeSessionProject(session.project_path);
+      }
+      const updated = action === "pin"
+        ? await window.aiCoder.setSessionPinned(session.id, !session.pinned_at)
+        : await window.aiCoder.setSessionArchived(session.id, !session.archived_at);
+      setSessions((current) => current.map((item) => (item.id === updated.id ? updated : item)));
+      if (action === "archive" && !session.archived_at && activeSessionId === session.id) {
+        setActiveSessionId(null);
+      }
+      setOpenSessionMenuId(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -595,9 +697,9 @@ export default function App() {
   }
 
   const onboardingConfirmed = onboardingStatus?.status === "confirmed";
-  const onboardingRequired = Boolean(projectPath && selectedWorkflowId !== "project-onboarding" && !onboardingConfirmed);
-  const onboardingAdmissionAllowed = !onboardingRequired || onboardingOverride;
-  const canStart = Boolean(projectPath && selectedWorkflowId && taskPrompt.trim() && onboardingAdmissionAllowed && !busy);
+  const onboardingRequired = Boolean(projectPath && taskWorkflowId !== "project-onboarding" && !onboardingConfirmed);
+  const onboardingAdmissionAllowed = !taskWorkflowId || !onboardingRequired || onboardingOverride;
+  const canStart = Boolean(projectPath && taskPrompt.trim() && onboardingAdmissionAllowed && !busy);
   const pendingToolCalls = activeSession?.tool_calls.filter((toolCall) => toolCall.status === "pending_approval") ?? [];
   const pendingHumanQuestions = activeSession?.pending_human_questions?.filter((q) => q.status === "pending") ?? [];
   const approvedToolCalls = activeSession?.tool_calls.filter((toolCall) => toolCall.status === "approved") ?? [];
@@ -608,8 +710,8 @@ export default function App() {
     [reworkRequests]
   );
   const workflowStageDisplays = useMemo(
-    () => (selectedWorkflow ? buildWorkflowStageDisplays(selectedWorkflow.stages, activeSession, selectedWorkflow.id) : []),
-    [selectedWorkflow, activeSession]
+    () => (activeWorkflow ? buildWorkflowStageDisplays(activeWorkflow.stages, activeSession, activeWorkflow.id) : []),
+    [activeWorkflow, activeSession]
   );
   const timelineAll = useMemo(
     () => (activeSession ? buildSessionTimeline(activeSession) : []),
@@ -620,113 +722,120 @@ export default function App() {
   const latestProgress = activeSession?.progress_events?.at(-1);
   const showOnboardingWarning = onboardingRequired;
 
-  return (
-    <main className="app-shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="mark">AI</div>
-          <div>
-            <h1>AI Coder</h1>
-            <p>本地工作流 Agent</p>
+  if (page === "workflows") {
+    return (
+      <main className="management-page">
+        <header className="topbar">
+          <div className="brand"><div className="mark">AI</div><div><h1>工作流管理</h1><p>查看当前项目可用的工作流</p></div></div>
+          <div className="topbar-actions">
+            <button className="secondary" onClick={() => setPage("tasks")}>返回任务</button>
+            <button className="secondary" disabled={busy} onClick={chooseProject}>选择项目</button>
           </div>
-        </div>
-
-        <button className="secondary" disabled={busy} onClick={chooseProject}>
-          {busy ? "选择中..." : "选择项目"}
-        </button>
-        <p className="path" title={projectPath}>
-          {projectPath || "尚未选择项目"}
-        </p>
-
-        {onboardingStatus && (
-          <section className="onboarding-box">
-            <h2>项目画像</h2>
-            <div className="onboarding-status-row">
-              <span className={`status-pill ${onboardingStatus.status}`}>{formatStatus(onboardingStatus.status)}</span>
-              <small>{onboardingStatus.claude_md_exists ? "已找到项目画像入口" : "缺少项目画像入口"}</small>
-            </div>
-            {onboardingStatus.confirmed_at && <small>确认时间 {formatTimestamp(onboardingStatus.confirmed_at)}</small>}
-            {onboardingStatus.claude_md_exists && onboardingStatus.status !== "confirmed" && (
-              <button className="secondary" disabled={busy} onClick={confirmOnboarding}>
-                确认项目画像
-              </button>
-            )}
-          </section>
-        )}
-
-        <section>
-          <h2>工作流</h2>
-          <div className="workflow-list">
-            {workflows.map((workflow) => (
-              <button
-                key={`${workflow.source.type}:${workflow.id}`}
-                className={workflow.id === selectedWorkflowId ? "workflow selected" : "workflow"}
-                onClick={() => void selectWorkflow(workflow.id)}
-              >
-                <span>{formatWorkflowName(workflow.id, workflow.name)}</span>
+        </header>
+        <p className="path" title={projectPath}>{projectPath || "尚未选择项目"}</p>
+        <section className="workflow-catalog">
+          {workflows.map((workflow) => (
+            <article className="workflow-card" key={`${workflow.source.type}:${workflow.id}`}>
+              <div className="workflow-card-header">
+                <div><h2>{formatWorkflowName(workflow.id, workflow.name)}</h2><p>{formatWorkflowDescription(workflow.id, workflow.description)}</p></div>
                 <small>{formatWorkflowSource(workflow.source.type)} · v{workflow.version}</small>
-              </button>
-            ))}
-          </div>
-          {workflows.length === 0 && (
-            <p className="nav-empty">{projectPath ? "未找到可用工作流。" : "选择项目后加载工作流。"}</p>
-          )}
-          {workflowIssues.length > 0 && (
-            <div className="workflow-issues">
-              {workflowIssues.map((issue: WorkflowLoadIssue) => (
-                <div key={`${issue.source_type}:${issue.path}`} className="workflow-issue">
-                  <strong>{formatWorkflowSource(issue.source_type)}</strong>
-                  <span title={issue.path}>{issue.path}</span>
-                  <small>{issue.message}</small>
-                </div>
-              ))}
-            </div>
-          )}
-        </section>
-
-        <section>
-          <h2>会话</h2>
-          <div className="session-list">
-            {visibleSessions.map((session) => (
-              <div key={session.id} className="session-item">
-                <button
-                  className={activeSession?.id === session.id ? "session selected" : "session"}
-                  onClick={() => selectSession(session)}
-                >
-                  <span>{session.task_prompt}</span>
-                  <small>{formatStatus(session.status)}</small>
-                </button>
-                <button
-                  className="session-delete"
-                  title="删除会话"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    if (confirm(`确定要删除会话 "${session.task_prompt}" 吗？`)) {
-                      void deleteSession(session);
-                    }
-                  }}
-                >
-                  ×
-                </button>
               </div>
-            ))}
-          </div>
-          {visibleSessions.length === 0 && <p className="nav-empty">暂无当前项目会话。</p>}
+              <div className="routing-badges">
+                <span className={workflow.routing?.enabled ? "diagnostic ok" : "diagnostic warn"}>自动候选：{workflow.routing?.enabled ? "是" : "否"}</span>
+                <span className={workflow.routing?.auto_start ? "diagnostic ok" : "diagnostic warn"}>允许直启：{workflow.routing?.auto_start ? "是" : "否"}</span>
+              </div>
+              <div className="stage-list">{workflow.stages.map((stage) => <span key={stage.id}>{stage.name}</span>)}</div>
+            </article>
+          ))}
+          {workflows.length === 0 && <p className="nav-empty">{projectPath ? "未找到可用工作流。" : "选择项目后加载工作流。"}</p>}
         </section>
-      </aside>
+        {workflowIssues.length > 0 && <section className="workflow-issues">{workflowIssues.map((issue) => (
+          <div key={`${issue.source_type}:${issue.path}`} className="workflow-issue"><strong>{formatWorkflowSource(issue.source_type)}</strong><span>{issue.path}</span><small>{issue.message}</small></div>
+        ))}</section>}
+      </main>
+    );
+  }
+
+  return (
+    <main className={`app-shell${historyOpen ? " history-open" : ""}`}>
+      {historyOpen && <aside className="sidebar">
+        <section>
+          <div className="sidebar-heading">
+            <h2>{showArchivedSessions ? "已归档" : "项目与会话"}</h2>
+            <div className="sidebar-heading-actions">
+              <button className={`icon-btn${showArchivedSessions ? " active" : ""}`} title={showArchivedSessions ? "返回会话" : "查看归档"} onClick={() => { setShowArchivedSessions((show) => !show); setOpenSessionMenuId(null); }}>▣</button>
+              <button className="icon-btn" title="关闭侧栏" onClick={() => setHistoryOpen(false)}>×</button>
+            </div>
+          </div>
+          <div className="project-session-tree">
+            {sessionGroups.map((group) => {
+              const expanded = expandedProjectPaths.has(group.projectPath);
+              return <section className={`project-group${group.projectPath === projectPath ? " current" : ""}`} key={group.projectPath}>
+                <button className="project-group-header" title={group.projectPath} onClick={() => toggleProjectGroup(group.projectPath)}>
+                  <span className="project-chevron">{expanded ? "⌄" : "›"}</span>
+                  <span className="project-name">{group.projectName}</span>
+                  <small>{group.sessions.length}</small>
+                </button>
+                {expanded && <div className="session-list">
+                  {group.sessions.map((session) => (
+                    <div key={session.id} className="session-item">
+                      <button
+                        className={activeSession?.id === session.id ? "session selected" : "session"}
+                        onClick={() => void selectSession(session)}
+                      >
+                        <span title={session.task_prompt}>{session.title ?? summarizeSessionTitle(session.task_prompt)}</span>
+                        <small>{session.pinned_at ? "已置顶 · " : ""}{formatStatus(session.status)}</small>
+                      </button>
+                      <button
+                        className="session-menu-trigger"
+                        title="更多操作"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setOpenSessionMenuId((current) => current === session.id ? null : session.id);
+                        }}
+                      >•••</button>
+                      {openSessionMenuId === session.id && <div className="session-action-menu" onClick={(event) => event.stopPropagation()}>
+                        <button onClick={() => void updateSessionOrganization(session, "pin")}>{session.pinned_at ? "取消置顶" : "置顶"}</button>
+                        <button onClick={() => void updateSessionOrganization(session, "archive")}>{session.archived_at ? "取消归档" : "归档"}</button>
+                        <button className="destructive" onClick={() => {
+                          if (confirm(`确定要删除会话 "${session.title ?? summarizeSessionTitle(session.task_prompt)}" 吗？`)) void deleteSession(session);
+                        }}>删除</button>
+                      </div>}
+                    </div>
+                  ))}
+                </div>}
+              </section>;
+            })}
+          </div>
+          {sessionGroups.length === 0 && <p className="nav-empty">{showArchivedSessions ? "暂无已归档会话。" : "暂无会话历史。"}</p>}
+        </section>
+      </aside>}
 
       <section className="workspace">
+        <header className="topbar">
+          <div className="brand"><div className="mark">AI</div><div><h1>AI Coder</h1><p>本地工作流 Agent</p></div></div>
+          <div className="topbar-actions">
+            <button className="secondary" onClick={() => setHistoryOpen((open) => !open)}>会话历史</button>
+            <button className="secondary" onClick={() => setPage("workflows")}>工作流管理</button>
+            <button className="secondary" disabled={busy} onClick={chooseProject}>{busy ? "选择中..." : "选择项目"}</button>
+          </div>
+        </header>
+        <p className="path" title={projectPath}>{projectPath || "尚未选择项目"}</p>
+        {onboardingStatus && <section className="onboarding-box compact">
+          <div className="onboarding-status-row"><strong>项目画像</strong><span className={`status-pill ${onboardingStatus.status}`}>{formatStatus(onboardingStatus.status)}</span></div>
+          {onboardingStatus.claude_md_exists && onboardingStatus.status !== "confirmed" && <button className="secondary" disabled={busy} onClick={confirmOnboarding}>确认项目画像</button>}
+        </section>}
         <div className={`composer${dragOverTarget === "task" ? " drag-over" : ""}`}
           onDragOver={(e) => handleDragOver(e, "task")}
           onDragLeave={(e) => handleDragLeave(e, "task")}
           onDrop={(e) => handleDrop(e, "task")}>
           <div>
-            <h2>{selectedWorkflow ? formatWorkflowName(selectedWorkflow.id, selectedWorkflow.name) : "选择工作流"}</h2>
+            <h2>{taskWorkflow ? formatWorkflowName(taskWorkflow.id, taskWorkflow.name) : "自动选择工作流"}</h2>
             <p>
-              {selectedWorkflow
-                ? formatWorkflowDescription(selectedWorkflow.id, selectedWorkflow.description)
+              {taskWorkflow
+                ? formatWorkflowDescription(taskWorkflow.id, taskWorkflow.description)
                 : projectPath
-                  ? "选择工作流后开始任务。"
+                  ? "系统会根据任务意图选择已启用自动路由的工作流。"
                   : "选择项目后开始任务。"}
               {runtimeStatus && <span className={`runtime-mode ${runtimeStatus.mode}`}>{formatStatus(runtimeStatus.mode)}模式</span>}
             </p>
@@ -738,6 +847,12 @@ export default function App() {
               </div>
             )}
           </div>
+          <label className="workflow-picker">工作流
+            <select value={taskWorkflowId} onChange={(event) => { setTaskWorkflowId(event.target.value); setPendingRouting(null); }}>
+              <option value="">自动选择</option>
+              {workflows.map((workflow) => <option key={`${workflow.source.type}:${workflow.id}`} value={workflow.id}>{formatWorkflowName(workflow.id, workflow.name)} · {formatWorkflowSource(workflow.source.type)}</option>)}
+            </select>
+          </label>
           {taskAttachments.length > 0 && (
             <div className="attachment-strip">
               {taskAttachments.map((att, i) => (
@@ -755,7 +870,10 @@ export default function App() {
           )}
           <textarea
             value={taskPrompt}
-            onChange={(event) => handleTextareaChange(event.target.value, "task", event.target.selectionStart ?? undefined)}
+            onChange={(event) => {
+              setPendingRouting(null);
+              handleTextareaChange(event.target.value, "task", event.target.selectionStart ?? undefined);
+            }}
             onPaste={(e) => handlePaste(e, "task")}
             placeholder="描述要执行的编码任务... (可粘贴图片、拖入文件、@引用项目文件)"
           />
@@ -777,6 +895,12 @@ export default function App() {
           </div>
           <input type="file" ref={taskFileInputRef} style={{ display: "none" }} multiple
             onChange={(e) => handleFileSelect(e, "task")} />
+          {pendingRouting && <div className="routing-confirmation">
+            <strong>{pendingRouting.status === "no_candidates" ? "请选择工作流" : "确认推荐的工作流"}</strong>
+            <p>{pendingRouting.reason}</p>
+            {pendingRouting.candidates.length > 0 && <small>{pendingRouting.candidates.map((candidate) => `${candidate.name} ${Math.round(candidate.score * 100)}%`).join(" · ")}</small>}
+            <div className="actions"><select value={confirmationWorkflowId} onChange={(event) => setConfirmationWorkflowId(event.target.value)}>{workflows.map((workflow) => <option key={workflow.id} value={workflow.id}>{formatWorkflowName(workflow.id, workflow.name)}</option>)}</select><button className="primary" disabled={!confirmationWorkflowId || busy} onClick={() => void confirmPendingRouting()}>确认并启动</button><button className="secondary" onClick={() => setPendingRouting(null)}>取消</button></div>
+          </div>}
           {showOnboardingWarning && (
             <div className="admission-warning">
               <span>项目画像尚未确认。请先运行项目画像，或确认已有画像入口。</span>
@@ -792,7 +916,7 @@ export default function App() {
           )}
         </div>
 
-        {selectedWorkflow && (
+        {activeWorkflow && (
           <div className="stages">
             {workflowStageDisplays.map(({ stage, status, attempt, isCurrent }) => (
               <div key={stage.id} className={`stage ${status}${isCurrent ? " current" : ""}`}>
@@ -820,6 +944,7 @@ export default function App() {
                     {formatStatus(activeSession.status)} · {formatWorkflowName(activeSession.workflow_id, activeSession.workflow_id)} ·{" "}
                     {formatStageName(activeSession.current_stage)}
                   </p>
+                  {activeSession.routing && <p>选择原因：{activeSession.routing.reason}</p>}
                   {activeSession.onboarding && (
                     <p>
                       入职状态 {formatStatus(activeSession.onboarding.status)}
@@ -1159,6 +1284,25 @@ function attachmentKey(att: { type: string; data_base64?: string; path?: string 
     return `ref-${att.path}`;
   }
   return `att-${index}`;
+}
+
+function buildRoutingSnapshot(
+  decision: WorkflowRoutingDecision,
+  finalWorkflowId: string,
+  userAction: SessionRoutingSnapshot["user_action"]
+): SessionRoutingSnapshot {
+  return {
+    requested_mode: "auto",
+    method: decision.method,
+    candidates: decision.candidates.slice(0, 3),
+    recommended_workflow_id: decision.recommended_workflow_id,
+    final_workflow_id: finalWorkflowId,
+    user_action: userAction,
+    reason:
+      userAction === "overridden"
+        ? `${decision.reason} 用户改选了其他工作流。`
+        : decision.reason
+  };
 }
 
 function formatTimestamp(value: string) {

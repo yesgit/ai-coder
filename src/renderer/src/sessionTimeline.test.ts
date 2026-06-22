@@ -76,12 +76,12 @@ describe("buildSessionTimeline", () => {
 
     const events = buildSessionTimeline(failedSession);
 
-    expect(events.at(-2)).toMatchObject({
+    expect(events.find((event) => event.type === "error")).toMatchObject({
       type: "error",
       title: "会话失败",
       detail: "Claude Agent SDK request failed"
     });
-    expect(events.at(-1)).toMatchObject({ type: "status", title: "会话失败" });
+    expect(events.find((event) => event.id === `${session.id}:status`)).toMatchObject({ type: "status", title: "会话失败" });
   });
 
   it("includes stage attempts and rework requests", () => {

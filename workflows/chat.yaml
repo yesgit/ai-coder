@@ -6,6 +6,17 @@ source:
   type: builtin
   id: chat
   version: 1.0.0
+routing:
+  enabled: true
+  auto_start: true
+  keywords:
+    - 你好
+    - 嗨
+    - 谢谢
+    - hello
+  examples:
+    - 你好，聊聊今天的开发安排
+    - 谢谢你的帮助
 permissions:
   filesystem:
     mode: project-only

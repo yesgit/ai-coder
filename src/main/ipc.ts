@@ -4,7 +4,7 @@ import { join, resolve, relative, extname, basename, sep } from "node:path";
 import { pdfToImages } from "./pdfToImages.js";
 import { BrowserWindow, dialog, ipcMain } from "electron";
 import type { OpenDialogOptions } from "electron";
-import type { Attachment, ProjectOnboardingStatus, SessionOnboardingSnapshot, StartSessionInput } from "../shared/types.js";
+import type { Attachment, ProjectOnboardingStatus, ResolveWorkflowInput, SessionOnboardingSnapshot, SessionRoutingSnapshot, StartSessionInput } from "../shared/types.js";
 import { ClaudeAgentRunner } from "./agent/claudeAgentRunner.js";
 import { getClaudeRuntimeStatus } from "./agent/claudeRuntime.js";
 import { OnboardingStore } from "./onboarding/onboardingStore.js";
@@ -12,17 +12,42 @@ import { AuthorizedProjects } from "./security/authorizedProjects.js";
 import { SessionStore } from "./sessions/sessionStore.js";
 import { WorkflowEngine } from "./workflows/workflowEngine.js";
 import { WorkflowRegistry } from "./workflows/workflowRegistry.js";
+import { WorkflowRouter } from "./workflows/workflowRouter.js";
 
 export function registerIpcHandlers(registry: WorkflowRegistry, sessions: SessionStore, runner: ClaudeAgentRunner): void {
   const authorizedProjects = new AuthorizedProjects();
   const workflowEngine = new WorkflowEngine();
   const onboardingStore = new OnboardingStore();
+  const workflowRouter = new WorkflowRouter();
 
   ipcMain.handle("project:select", async (event) => {
     const parentWindow = BrowserWindow.fromWebContents(event.sender) ?? undefined;
     const options: OpenDialogOptions = { properties: ["openDirectory"] };
     const result = parentWindow ? await dialog.showOpenDialog(parentWindow, options) : await dialog.showOpenDialog(options);
     return result.canceled ? null : authorizedProjects.authorize(result.filePaths[0]);
+  });
+
+  ipcMain.handle("project:authorize-session-project", async (event, projectPath: string) => {
+    const knownProject = (await sessions.list()).some((session) => session.project_path === projectPath);
+    if (!knownProject) {
+      throw new Error(`Project is not referenced by session history: ${projectPath}`);
+    }
+    try {
+      return await authorizedProjects.assertAuthorized(projectPath);
+    } catch {
+      const parentWindow = BrowserWindow.fromWebContents(event.sender) ?? undefined;
+      const options: OpenDialogOptions = {
+        properties: ["openDirectory"],
+        defaultPath: projectPath,
+        title: "重新授权历史项目",
+        buttonLabel: "授权项目"
+      };
+      const result = parentWindow ? await dialog.showOpenDialog(parentWindow, options) : await dialog.showOpenDialog(options);
+      if (result.canceled || !result.filePaths[0]) {
+        throw new Error("Project authorization was cancelled.");
+      }
+      return authorizedProjects.authorizeMatching(projectPath, result.filePaths[0]);
+    }
   });
 
   ipcMain.handle("agent:get-status", async () => getClaudeRuntimeStatus());
@@ -40,6 +65,15 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
   ipcMain.handle("workflows:list", async (_event, projectPath?: string) => {
     const authorizedProjectPath = projectPath ? await authorizedProjects.assertAuthorized(projectPath) : undefined;
     return registry.listWithIssues(authorizedProjectPath);
+  });
+
+  ipcMain.handle("workflows:resolve", async (_event, input: ResolveWorkflowInput) => {
+    if (!input?.projectPath || !input.taskPrompt?.trim()) {
+      throw new Error("projectPath and taskPrompt are required");
+    }
+    const projectPath = await authorizedProjects.assertAuthorized(input.projectPath);
+    const workflows = await registry.list(projectPath);
+    return workflowRouter.resolve(input.taskPrompt.trim(), workflows, projectPath);
   });
 
   ipcMain.handle("sessions:list", async () => sessions.list());
@@ -271,7 +305,8 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
       workflow,
       input.taskPrompt.trim(),
       buildOnboardingSnapshot(onboardingStatus, Boolean(input.onboardingOverride)),
-      processedAttachments
+      processedAttachments,
+      normalizeRoutingSnapshot(input)
     );
     session.status = "running";
     await sessions.save(session);
@@ -372,6 +407,20 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     await sessions.delete(sessionId);
     return { success: true, deletedSessionId: sessionId };
   });
+
+  ipcMain.handle("sessions:set-pinned", async (_event, sessionId: string, pinned: boolean) => {
+    const session = await sessions.get(sessionId);
+    if (!session) throw new Error(`Session not found: ${sessionId}`);
+    await authorizedProjects.assertAuthorized(session.project_path);
+    return sessions.setPinned(sessionId, Boolean(pinned));
+  });
+
+  ipcMain.handle("sessions:set-archived", async (_event, sessionId: string, archived: boolean) => {
+    const session = await sessions.get(sessionId);
+    if (!session) throw new Error(`Session not found: ${sessionId}`);
+    await authorizedProjects.assertAuthorized(session.project_path);
+    return sessions.setArchived(sessionId, Boolean(archived));
+  });
 }
 
 function runSessionInBackground(
@@ -394,6 +443,25 @@ function runSessionInBackground(
       session.error = error instanceof Error ? error.message : String(error);
       await sessions.save(session);
     });
+}
+
+function normalizeRoutingSnapshot(input: StartSessionInput): SessionRoutingSnapshot {
+  if (input.routing?.final_workflow_id === input.workflowId) {
+    return {
+      ...input.routing,
+      candidates: input.routing.candidates.slice(0, 3),
+      final_workflow_id: input.workflowId
+    };
+  }
+  return {
+    requested_mode: "manual",
+    method: "manual",
+    candidates: [],
+    recommended_workflow_id: input.workflowId,
+    final_workflow_id: input.workflowId,
+    user_action: "none",
+    reason: "用户手动指定工作流。"
+  };
 }
 
 function enforceOnboardingAdmission(

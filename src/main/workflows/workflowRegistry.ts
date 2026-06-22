@@ -127,6 +127,14 @@ const workflowSchema = z.object({
       approval_required: true,
       invalidate_downstream: true
     }),
+  routing: z
+    .object({
+      enabled: z.boolean().default(false),
+      auto_start: z.boolean().default(false),
+      keywords: stringArraySchema,
+      examples: stringArraySchema
+    })
+    .default({ enabled: false, auto_start: false, keywords: [], examples: [] }),
   stages: z
     .array(
       z.object({
@@ -165,6 +173,7 @@ function normalizeWorkflow(input: unknown, sourceType: WorkflowSourceType, fileP
     },
     permissions: workflow.permissions,
     rework: workflow.rework,
+    routing: workflow.routing,
     stages: workflow.stages.map((stage) => ({
       id: stage.id,
       name: stage.name,

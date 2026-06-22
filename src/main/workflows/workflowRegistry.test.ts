@@ -24,6 +24,29 @@ describe("WorkflowRegistry", () => {
 
     expect(workflows).toHaveLength(1);
     expect(workflows[0].source.type).toBe("builtin");
+    expect(workflows[0].routing).toEqual({ enabled: false, auto_start: false, keywords: [], examples: [] });
+  });
+
+  it("loads explicit routing metadata", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-workflows-"));
+    await fs.writeFile(
+      path.join(dir, "review.yaml"),
+      [
+        "id: review",
+        "name: Review",
+        "version: 1.0.0",
+        "routing:",
+        "  enabled: true",
+        "  auto_start: true",
+        "  keywords: [review]",
+        "  examples: [review this diff]",
+        "stages:",
+        "  - id: review",
+        "    name: Review"
+      ].join("\n")
+    );
+    const [loaded] = await new WorkflowRegistry(dir).list();
+    expect(loaded.routing).toEqual({ enabled: true, auto_start: true, keywords: ["review"], examples: ["review this diff"] });
   });
 
   it("lets project workflows override builtin workflows by id", async () => {
@@ -84,6 +107,17 @@ describe("WorkflowRegistry", () => {
 
     expect(result.workflows).toHaveLength(0);
     expect(result.issues[0].message).toContain("permissions.filesystem.mode");
+  });
+
+  it("rejects invalid routing values", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-workflows-"));
+    await fs.writeFile(
+      path.join(dir, "invalid.yaml"),
+      ["id: invalid", "name: Invalid", "version: 1.0.0", "routing:", "  enabled: yes", "stages:", "  - id: run", "    name: Run"].join("\n")
+    );
+    const result = await new WorkflowRegistry(dir).listWithIssues();
+    expect(result.workflows).toHaveLength(0);
+    expect(result.issues[0].message).toContain("routing.enabled");
   });
 
   it("loads optional stage instructions", async () => {

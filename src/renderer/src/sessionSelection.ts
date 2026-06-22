@@ -8,6 +8,41 @@ export interface SessionSelectionOptions {
   preferLatestForWorkflow?: boolean;
 }
 
+export interface SessionProjectGroup {
+  projectPath: string;
+  projectName: string;
+  sessions: AgentSession[];
+  latestUpdatedAt: string;
+}
+
+export function groupSessionsByProject(sessions: AgentSession[], currentProjectPath?: string): SessionProjectGroup[] {
+  const groups = new Map<string, AgentSession[]>();
+  for (const session of sessions) {
+    groups.set(session.project_path, [...(groups.get(session.project_path) ?? []), session]);
+  }
+  return [...groups.entries()]
+    .map(([projectPath, projectSessions]) => {
+      const sorted = [...projectSessions].sort((left, right) => {
+        if (Boolean(left.pinned_at) !== Boolean(right.pinned_at)) return left.pinned_at ? -1 : 1;
+        return right.updated_at.localeCompare(left.updated_at);
+      });
+      return {
+        projectPath,
+        projectName: projectPath.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || projectPath,
+        sessions: sorted,
+        latestUpdatedAt: projectSessions.reduce(
+          (latest, session) => (session.updated_at > latest ? session.updated_at : latest),
+          ""
+        )
+      };
+    })
+    .sort((left, right) => {
+      if (left.projectPath === currentProjectPath) return -1;
+      if (right.projectPath === currentProjectPath) return 1;
+      return right.latestUpdatedAt.localeCompare(left.latestUpdatedAt);
+    });
+}
+
 export function getVisibleSessions(sessions: AgentSession[], projectPath?: string): AgentSession[] {
   if (!projectPath) {
     return sessions;

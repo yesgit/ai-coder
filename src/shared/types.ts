@@ -26,6 +26,13 @@ export interface WorkflowReworkPolicy {
   invalidate_downstream: boolean;
 }
 
+export interface WorkflowRoutingConfig {
+  enabled: boolean;
+  auto_start: boolean;
+  keywords: string[];
+  examples: string[];
+}
+
 export interface WorkflowStage {
   id: string;
   name: string;
@@ -46,6 +53,7 @@ export interface WorkflowTemplate {
   source: WorkflowSource;
   permissions: WorkflowPermissions;
   rework: WorkflowReworkPolicy;
+  routing?: WorkflowRoutingConfig;
   stages: WorkflowStage[];
 }
 
@@ -236,6 +244,7 @@ export interface AgentSession {
   id: string;
   project_path: string;
   workflow_id: string;
+  title?: string;
   task_prompt: string;
   status: SessionStatus;
   current_stage: string;
@@ -250,9 +259,43 @@ export interface AgentSession {
   /** 用户批准过的项目外只读路径（realpath）。仅 Read/Grep/Glob/LS 命中时放行。 */
   approved_external_paths?: string[];
   onboarding?: SessionOnboardingSnapshot;
+  routing?: SessionRoutingSnapshot;
+  pinned_at?: string;
+  archived_at?: string;
   created_at: string;
   updated_at: string;
   error?: string;
+}
+
+export interface WorkflowRoutingCandidate {
+  workflow_id: string;
+  name: string;
+  score: number;
+}
+
+export type WorkflowRoutingMethod = "rule" | "model" | "none" | "manual";
+
+export interface WorkflowRoutingDecision {
+  status: "selected" | "needs_confirmation" | "no_candidates";
+  method: WorkflowRoutingMethod;
+  recommended_workflow_id?: string;
+  candidates: WorkflowRoutingCandidate[];
+  reason: string;
+}
+
+export interface SessionRoutingSnapshot {
+  requested_mode: "auto" | "manual";
+  method: WorkflowRoutingMethod;
+  candidates: WorkflowRoutingCandidate[];
+  recommended_workflow_id?: string;
+  final_workflow_id: string;
+  user_action: "none" | "confirmed" | "overridden";
+  reason: string;
+}
+
+export interface ResolveWorkflowInput {
+  projectPath: string;
+  taskPrompt: string;
 }
 
 export interface SessionOnboardingSnapshot {
@@ -268,6 +311,7 @@ export interface StartSessionInput {
   taskPrompt: string;
   onboardingOverride?: boolean;
   attachments?: Attachment[];
+  routing?: SessionRoutingSnapshot;
 }
 
 export interface StartSessionResult {
@@ -294,10 +338,12 @@ export interface ProjectOnboardingStatus {
 
 export interface AppApi {
   selectProjectDirectory(): Promise<string | null>;
+  authorizeSessionProject(projectPath: string): Promise<string>;
   getAgentRuntimeStatus(): Promise<AgentRuntimeStatus>;
   getProjectOnboardingStatus(projectPath: string): Promise<ProjectOnboardingStatus>;
   confirmProjectOnboarding(projectPath: string): Promise<ProjectOnboardingStatus>;
   listWorkflows(projectPath?: string): Promise<WorkflowListResult>;
+  resolveWorkflow(input: ResolveWorkflowInput): Promise<WorkflowRoutingDecision>;
   startSession(input: StartSessionInput): Promise<StartSessionResult>;
   listSessions(): Promise<AgentSession[]>;
   getSession(id: string): Promise<AgentSession | null>;
@@ -311,6 +357,8 @@ export interface AppApi {
   abortSession(sessionId: string): Promise<AgentSession>;
   answerHumanQuestion(sessionId: string, questionId: string, answer: string | string[]): Promise<AgentSession>;
   sendMessage(sessionId: string, message: string, attachments?: Attachment[]): Promise<AgentSession>;
+  setSessionPinned(sessionId: string, pinned: boolean): Promise<AgentSession>;
+  setSessionArchived(sessionId: string, archived: boolean): Promise<AgentSession>;
   deleteSession(sessionId: string): Promise<void>;
   listProjectFiles(projectPath: string, query?: string): Promise<string[]>;
   readProjectFile(projectPath: string, filePath: string): Promise<string>;
