@@ -35,10 +35,24 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
     }
   ];
 
+  // 找到"最后一条有意义的助手消息" — 该会话仅显示最终回答
+  // 中间过程通过 stage_runs / progress_events 体现，避免重复
+  let lastAssistantIndex = -1;
+  session.messages.forEach((message: AgentMessage, index: number) => {
+    if (message.role !== "assistant") return;
+    const content = message.content?.trim() ?? "";
+    if (!content || content === "(no content)" || content.startsWith("收到 Claude SDK 消息：")) return;
+    lastAssistantIndex = index;
+  });
+
   session.messages.forEach((message: AgentMessage, index: number) => {
     // 跳过空内容或占位符内容的消息
     const content = message.content?.trim();
     if (!content || content === "(no content)" || content.startsWith("收到 Claude SDK 消息：")) {
+      return;
+    }
+    // 助手消息：仅保留最后一条有意义的回答，避免中间过程与最终结果重复
+    if (message.role === "assistant" && index !== lastAssistantIndex) {
       return;
     }
     const attachmentDetail = message.attachments?.length
