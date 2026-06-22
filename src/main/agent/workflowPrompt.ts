@@ -33,11 +33,15 @@ export function buildStageInstructions(input: StageAgentInput): string {
       const roleLabel = m.role === "user" ? "用户" : m.role === "assistant" ? "助手" : "系统";
       let text = `[${roleLabel}]: ${m.content || "(附带附件)"}`;
       if (m.attachments?.length) {
-        text += "\n附件（项目相对路径，可用 Read 工具读取）:\n" + m.attachments.map((a) =>
-          a.type === "image"
-            ? `- [图片] ${a.display_name}（内联 base64，未保存到磁盘）`
-            : `- [文件] ${a.path}（显示名: ${a.display_name}）`
-        ).join("\n");
+        text += "\n附件（项目相对路径；PDF/图片可直接用 Read 工具读取，文本文件也用 Read，二进制可用 Bash 处理）:\n" + m.attachments.map((a) => {
+          if (a.type === "image") {
+            return `- [图片] ${a.display_name}（内联 base64，未保存到磁盘）`;
+          }
+          if (a.type === "file_ref") {
+            return `- [文件] ${a.path}（显示名: ${a.display_name}）`;
+          }
+          return `- [文件] ${a.display_name}（未落盘）`;
+        }).join("\n");
       }
       return text;
     })

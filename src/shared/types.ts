@@ -163,7 +163,14 @@ export interface ImageAttachment {
   display_name: string;
 }
 
-export type Attachment = FileRefAttachment | ImageAttachment;
+export interface FileUploadAttachment {
+  type: "file_upload";        // 待落盘的二进制文件（如 PDF、文档）
+  data_base64: string;
+  media_type: string;
+  display_name: string;
+}
+
+export type Attachment = FileRefAttachment | ImageAttachment | FileUploadAttachment;
 
 export interface AgentMessage {
   role: "user" | "assistant" | "system";

@@ -52,6 +52,45 @@ export default function App() {
   const taskFileInputRef = useRef<HTMLInputElement>(null);
   const [questionAnswers, setQuestionAnswers] = useState<Record<string, string | string[]>>({});
 
+  // 可上传的非图片二进制文件 MIME 与扩展名（PDF、文档、表格等）
+  const UPLOADABLE_MIME = new Set([
+    "application/pdf",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/zip"
+  ]);
+  const UPLOADABLE_EXT = /\.(pdf|docx?|xlsx?|pptx?|zip|csv|txt|md|rtf)$/i;
+  const MAX_UPLOAD_SIZE = 20 * 1024 * 1024; // 20MB
+
+  function isUploadable(file: File): boolean {
+    return UPLOADABLE_MIME.has(file.type) || UPLOADABLE_EXT.test(file.name);
+  }
+
+  function guessMediaType(file: File): string {
+    if (file.type) return file.type;
+    const ext = file.name.toLowerCase().match(/\.([a-z0-9]+)$/)?.[1];
+    if (ext === "pdf") return "application/pdf";
+    if (ext === "txt" || ext === "md") return "text/plain";
+    if (ext === "csv") return "text/csv";
+    return "application/octet-stream";
+  }
+
+  function readFileAsBase64(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = reader.result as string;
+        resolve(dataUrl.split(",")[1] ?? "");
+      };
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(file);
+    });
+  }
+
   const selectedWorkflow = useMemo(
     () => workflows.find((workflow) => workflow.id === selectedWorkflowId) ?? null,
     [selectedWorkflowId, workflows]
@@ -417,9 +456,19 @@ export default function App() {
           ]);
         };
         reader.readAsDataURL(file);
+      } else if (isUploadable(file)) {
+        if (file.size > MAX_UPLOAD_SIZE) {
+          setError(`文件 ${file.name} 过大（${Math.round(file.size / 1024)}KB），上限 ${MAX_UPLOAD_SIZE / 1024 / 1024}MB`);
+          continue;
+        }
+        void readFileAsBase64(file).then((base64) => {
+          setAttachments((prev) => [
+            ...prev,
+            { type: "file_upload", data_base64: base64, media_type: guessMediaType(file), display_name: file.name }
+          ]);
+        });
       } else {
-        // 非图片文件：暂不支持，提示用户使用 @ 引用项目内文件
-        setError(`暂不支持非图片文件 ${file.name}，请使用 @ 引用项目内文件`);
+        setError(`不支持的文件类型：${file.name}`);
       }
     }
   }
@@ -455,9 +504,19 @@ export default function App() {
           ]);
         };
         reader.readAsDataURL(file);
+      } else if (isUploadable(file)) {
+        if (file.size > MAX_UPLOAD_SIZE) {
+          setError(`文件 ${file.name} 过大（${Math.round(file.size / 1024)}KB），上限 ${MAX_UPLOAD_SIZE / 1024 / 1024}MB`);
+          continue;
+        }
+        void readFileAsBase64(file).then((base64) => {
+          setAttachments((prev) => [
+            ...prev,
+            { type: "file_upload", data_base64: base64, media_type: guessMediaType(file), display_name: file.name }
+          ]);
+        });
       } else {
-        // 非图片文件：暂不支持
-        setError(`暂不支持非图片文件 ${file.name}，请使用 @ 引用项目内文件`);
+        setError(`不支持的文件类型：${file.name}`);
       }
     }
     e.target.value = "";
@@ -637,7 +696,7 @@ export default function App() {
           {taskAttachments.length > 0 && (
             <div className="attachment-strip">
               {taskAttachments.map((att, i) => (
-                <div key={att.type === "image" ? `img-${att.data_base64.slice(0, 16)}` : `ref-${att.path}`} className="attachment-chip">
+                <div key={attachmentKey(att, i)} className="attachment-chip">
                   {att.type === "image" ? (
                     <img src={`data:${att.media_type};base64,${att.data_base64}`} alt={att.display_name} className="attachment-thumb" />
                   ) : (
@@ -965,7 +1024,7 @@ export default function App() {
                   {chatAttachments.length > 0 && (
                     <div className="attachment-strip">
                       {chatAttachments.map((att, i) => (
-                        <div key={att.type === "image" ? `img-${att.data_base64.slice(0, 16)}` : `ref-${att.path}`} className="attachment-chip">
+                        <div key={attachmentKey(att, i)} className="attachment-chip">
                           {att.type === "image" ? (
                             <img src={`data:${att.media_type};base64,${att.data_base64}`} alt={att.display_name} className="attachment-thumb" />
                           ) : (
@@ -1029,6 +1088,16 @@ export default function App() {
       </section>
     </main>
   );
+}
+
+function attachmentKey(att: { type: string; data_base64?: string; path?: string }, index: number): string {
+  if (att.type === "image" && att.data_base64) {
+    return `img-${att.data_base64.slice(0, 16)}`;
+  }
+  if (att.path) {
+    return `ref-${att.path}`;
+  }
+  return `att-${index}`;
 }
 
 function formatTimestamp(value: string) {

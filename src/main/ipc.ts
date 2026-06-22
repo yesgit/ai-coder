@@ -227,17 +227,17 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     }
     const onboardingStatus = await onboardingStore.getStatus(projectPath);
     enforceOnboardingAdmission(workflow.id, onboardingStatus, Boolean(input.onboardingOverride));
-    // 处理附件：校验 + 图片保存到磁盘，转为文件引用
+    // 处理附件：校验 + 图片/文件保存到磁盘，转为文件引用
     let processedAttachments = input.attachments;
     if (input.attachments?.length) {
-      const imageMediaTypePattern = /^image\/[a-z0-9.+-]+$/i;
+      const mediaTypePattern = /^[a-z0-9.+-]+\/[a-z0-9.+-]+$/i;
       for (const att of input.attachments) {
-        if (att.type === "image" && !imageMediaTypePattern.test(att.media_type)) {
-          throw new Error(`不支持的图片类型: ${att.media_type}`);
+        if ((att.type === "image" || att.type === "file_upload") && !mediaTypePattern.test(att.media_type)) {
+          throw new Error(`不支持的媒体类型: ${att.media_type}`);
         }
       }
-      if (input.attachments.some((a) => a.type === "image")) {
-        processedAttachments = await saveImageAttachments(input.attachments, projectPath);
+      if (input.attachments.some((a) => a.type === "image" || a.type === "file_upload")) {
+        processedAttachments = await saveBinaryAttachments(input.attachments, projectPath);
       }
     }
     const session = await sessions.create(
@@ -306,14 +306,14 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     // 处理附件：校验 + 图片保存到磁盘，转为文件引用
     let processedAttachments = attachments;
     if (attachments?.length) {
-      const imageMediaTypePattern = /^image\/[a-z0-9.+-]+$/i;
+      const mediaTypePattern = /^[a-z0-9.+-]+\/[a-z0-9.+-]+$/i;
       for (const att of attachments) {
-        if (att.type === "image" && !imageMediaTypePattern.test(att.media_type)) {
-          throw new Error(`不支持的图片类型: ${att.media_type}`);
+        if ((att.type === "image" || att.type === "file_upload") && !mediaTypePattern.test(att.media_type)) {
+          throw new Error(`不支持的媒体类型: ${att.media_type}`);
         }
       }
-      if (attachments.some((a) => a.type === "image")) {
-        processedAttachments = await saveImageAttachments(attachments, session.project_path);
+      if (attachments.some((a) => a.type === "image" || a.type === "file_upload")) {
+        processedAttachments = await saveBinaryAttachments(attachments, session.project_path);
       }
     }
     // 添加用户消息到会话
@@ -382,16 +382,16 @@ function buildOnboardingSnapshot(
   };
 }
 
-async function saveImageAttachments(attachments: Attachment[], projectPath: string): Promise<Attachment[]> {
+async function saveBinaryAttachments(attachments: Attachment[], projectPath: string): Promise<Attachment[]> {
   const uploadsDir = join(projectPath, ".ai-coder", "uploads");
   await mkdir(uploadsDir, { recursive: true });
   const result: Attachment[] = [];
   for (const att of attachments) {
-    if (att.type === "image") {
+    if (att.type === "image" || att.type === "file_upload") {
       const id = randomUUID();
-      // 仅取扩展名安全字符
-      const rawExt = att.media_type.split("/")[1] || "png";
-      const ext = /^[a-z0-9]+$/i.test(rawExt) ? rawExt : "png";
+      // 从 media_type 推扩展名，仅保留安全字符
+      const rawExt = att.media_type.split("/")[1]?.split("+")[0] || (att.type === "image" ? "png" : "bin");
+      const ext = /^[a-z0-9]+$/i.test(rawExt) ? rawExt.toLowerCase() : (att.type === "image" ? "png" : "bin");
       const fileName = `${id}.${ext}`;
       const filePath = join(uploadsDir, fileName);
       const buffer = Buffer.from(att.data_base64, "base64");
