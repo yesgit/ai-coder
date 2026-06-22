@@ -55,9 +55,11 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
     if (message.role === "assistant" && index !== lastAssistantIndex) {
       return;
     }
+    // display_name 用户可控，需转义 markdown 元字符避免被解析为链接
+    const escapeMd = (s: string) => s.replace(/[\\`*_{}\[\]()#+\-.!|<>]/g, "\\$&");
     const attachmentDetail = message.attachments?.length
       ? "\n\n" + message.attachments.map((a) =>
-          a.type === "image" ? `![${a.display_name}](图片)` : `[文件: ${a.display_name}]`
+          a.type === "image" ? `[图片: ${escapeMd(a.display_name)}]` : `[文件: ${escapeMd(a.display_name)}]`
         ).join("\n")
       : undefined;
     events.push({

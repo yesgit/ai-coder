@@ -220,6 +220,7 @@ small {
 .composer {
   display: grid;
   gap: 14px;
+  position: relative;
 }
 
 textarea {

@@ -115,7 +115,11 @@ export class ClaudeAgentRunner {
                 await this.recordProgress(input, "tool_policy", `等待用户回答：${question.question.slice(0, 60)}`, "milestone");
                 return { behavior: "deny", message: "等待用户回答，已暂停执行", interrupt: true };
               }
-              return { behavior: "deny", message: "ask_human 工具输入格式错误", interrupt: true };
+              // 工具输入非法：明确标记会话失败，避免被当作正常完成
+              input.session.status = "failed";
+              input.session.error = "ask_human 工具输入格式错误（缺少 question / type / options）";
+              await this.recordProgress(input, "status", input.session.error, "milestone");
+              return { behavior: "deny", message: input.session.error, interrupt: true };
             }
             const decision = await approveOrDenyToolUse(input.session, input.workflow, toolName, toolInput, options.toolUseID);
             await this.recordProgress(input, "tool_policy", this.describeToolDecision(toolName, decision.allow), "milestone");
@@ -128,6 +132,22 @@ export class ClaudeAgentRunner {
       } as never) as AsyncIterable<unknown>) {
         sdkMessages.push(message);
         await this.recordProgress(input, "sdk_message", this.describeSdkMessage(message), "transient");
+      }
+
+      // 若 abort 信号触发但 SDK 是优雅退出而不抛错，仍需走中止路径
+      if (abortController.signal.aborted) {
+        if (sdkMessages.length > 0) {
+          const transcript = formatClaudeTranscript(sdkMessages);
+          input.session.messages.push({
+            role: "assistant",
+            content: transcript,
+            created_at: new Date().toISOString()
+          });
+        }
+        input.session.status = this.resolveInterruptedStatus(input.session);
+        if (input.session.status === "completed") input.session.status = "interrupted";
+        await this.recordProgress(input, "status", "已由用户手动中止。", "milestone");
+        return input.session;
       }
 
       const stageOutput = extractClaudeStageOutput(sdkMessages);
@@ -152,7 +172,7 @@ export class ClaudeAgentRunner {
       await this.recordProgress(input, "status", `阶段已完成：${currentStage.name || currentStage.id}`, "milestone");
       return input.session;
     } catch (error) {
-      // 用户主动中止：标记为 interrupted，保留已写入的消息和工具调用
+      // 用户主动中止：保留已写入的消息和工具调用，根据是否有未决问题决定终态
       if (abortController.signal.aborted || isAbortError(error)) {
         if (sdkMessages.length > 0) {
           const transcript = formatClaudeTranscript(sdkMessages);
@@ -162,7 +182,8 @@ export class ClaudeAgentRunner {
             created_at: new Date().toISOString()
           });
         }
-        input.session.status = "interrupted";
+        const resolved = this.resolveInterruptedStatus(input.session);
+        input.session.status = resolved === "completed" ? "interrupted" : resolved;
         await this.recordProgress(input, "status", "已由用户手动中止。", "milestone");
         return input.session;
       }
@@ -407,6 +428,5 @@ export class ClaudeAgentRunner {
 function isAbortError(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
   const name = (error as { name?: unknown }).name;
-  const message = (error as { message?: unknown }).message;
-  return name === "AbortError" || (typeof message === "string" && /abort/i.test(message));
+  return name === "AbortError";
 }

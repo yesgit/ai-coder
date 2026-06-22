@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readdir, readFile, mkdir, writeFile, stat } from "node:fs/promises";
+import { readdir, readFile, mkdir, writeFile, stat, realpath } from "node:fs/promises";
 import { join, resolve, relative, extname, basename, sep } from "node:path";
 import { BrowserWindow, dialog, ipcMain } from "electron";
 import type { OpenDialogOptions } from "electron";
@@ -168,10 +168,18 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
       throw new Error(`Session is not running: ${session.status}`);
     }
     const aborted = runner.abort(sessionId);
+    // 取消所有待回答的人类问题，防止 abort 后用户提交答案重新激活
+    const now = new Date().toISOString();
+    for (const q of session.pending_human_questions ?? []) {
+      if (q.status === "pending") {
+        q.status = "cancelled";
+        q.resolved_at = now;
+      }
+    }
     if (!aborted) {
       session.status = "interrupted";
-      await sessions.save(session);
     }
+    await sessions.save(session);
     const refreshed = await sessions.get(sessionId);
     return refreshed ?? session;
   });
@@ -186,17 +194,34 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     if (!workflow) {
       throw new Error(`Workflow not found: ${session.workflow_id}`);
     }
+    // 会话必须处于等待审批状态才能回答问题
+    if (session.status !== "waiting_approval") {
+      throw new Error(`Session is not waiting for input: ${session.status}`);
+    }
     const question = (session.pending_human_questions ?? []).find(
       (q) => q.id === questionId && q.status === "pending"
     );
     if (!question) {
       throw new Error(`Pending human question not found: ${questionId}`);
     }
-    // 校验答案与类型匹配
+    // 校验答案与类型匹配 + 选项合法性
+    const MAX_ANSWER_LEN = 2000;
     if (question.question_type === "multi") {
       if (!Array.isArray(answer)) throw new Error("多选问题需要数组答案");
+      if (!answer.every((v) => typeof v === "string" && v.length <= MAX_ANSWER_LEN)) {
+        throw new Error("多选答案元素必须为字符串且长度合法");
+      }
+      const validValues = new Set((question.options ?? []).map((o) => o.value));
+      if (!answer.every((v) => validValues.has(v))) {
+        throw new Error("答案包含未列出的选项");
+      }
+    } else if (question.question_type === "single") {
+      if (typeof answer !== "string") throw new Error("单选问题需要字符串答案");
+      const validValues = new Set((question.options ?? []).map((o) => o.value));
+      if (!validValues.has(answer)) throw new Error("答案不在选项列表中");
     } else {
-      if (typeof answer !== "string") throw new Error("单选/文本问题需要字符串答案");
+      if (typeof answer !== "string") throw new Error("文本问题需要字符串答案");
+      if (answer.length > MAX_ANSWER_LEN) throw new Error(`回答过长，上限 ${MAX_ANSWER_LEN} 字符`);
     }
     question.status = "answered";
     question.answer = answer;
@@ -279,17 +304,24 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
   ipcMain.handle("project:read-file", async (_event, projectPath: string, filePath: string) => {
     const authorizedProjectPath = await authorizedProjects.assertAuthorized(projectPath);
     const absolutePath = resolve(authorizedProjectPath, filePath);
-    // 路径遍历防护：先检查 resolve 后的路径
-    if (!absolutePath.startsWith(resolve(authorizedProjectPath) + sep) && absolutePath !== resolve(authorizedProjectPath)) {
+    const projectRoot = resolve(authorizedProjectPath);
+    // 路径遍历防护：先做字符串前缀检查
+    if (!absolutePath.startsWith(projectRoot + sep) && absolutePath !== projectRoot) {
       throw new Error("文件路径超出项目目录范围");
     }
+    // 跟随符号链接后再次校验，防止项目内 symlink 指向项目外
+    const realRoot = await realpath(projectRoot);
+    const realPath = await realpath(absolutePath);
+    if (!realPath.startsWith(realRoot + sep) && realPath !== realRoot) {
+      throw new Error("文件路径超出项目目录范围（符号链接指向项目外）");
+    }
     // 使用 stat 获取文件大小，避免读取超大文件
-    const fileStat = await stat(absolutePath);
+    const fileStat = await stat(realPath);
     const MAX_FILE_SIZE = 500 * 1024; // 500KB
     if (fileStat.size > MAX_FILE_SIZE) {
       throw new Error(`文件过大（${Math.round(fileStat.size / 1024)}KB），上限 500KB`);
     }
-    const content = await readFile(absolutePath, "utf-8");
+    const content = await readFile(realPath, "utf-8");
     return content;
   });
 
@@ -385,25 +417,36 @@ function buildOnboardingSnapshot(
 async function saveBinaryAttachments(attachments: Attachment[], projectPath: string): Promise<Attachment[]> {
   const uploadsDir = join(projectPath, ".ai-coder", "uploads");
   await mkdir(uploadsDir, { recursive: true });
+  const MAX_BINARY_BYTES = 30 * 1024 * 1024; // 30MB 单文件上限
   const result: Attachment[] = [];
   for (const att of attachments) {
     if (att.type === "image" || att.type === "file_upload") {
+      const safeDisplayName = sanitizeDisplayName(att.display_name);
       const id = randomUUID();
-      // 从 media_type 推扩展名，仅保留安全字符
       const rawExt = att.media_type.split("/")[1]?.split("+")[0] || (att.type === "image" ? "png" : "bin");
       const ext = /^[a-z0-9]+$/i.test(rawExt) ? rawExt.toLowerCase() : (att.type === "image" ? "png" : "bin");
       const fileName = `${id}.${ext}`;
       const filePath = join(uploadsDir, fileName);
       const buffer = Buffer.from(att.data_base64, "base64");
+      if (buffer.byteLength > MAX_BINARY_BYTES) {
+        throw new Error(`附件过大（${Math.round(buffer.byteLength / 1024 / 1024)}MB），上限 ${MAX_BINARY_BYTES / 1024 / 1024}MB`);
+      }
       await writeFile(filePath, buffer);
       result.push({
         type: "file_ref",
         path: relative(projectPath, filePath),
-        display_name: att.display_name
+        display_name: safeDisplayName
       });
     } else {
       result.push(att);
     }
   }
   return result;
+}
+
+function sanitizeDisplayName(raw: string | undefined): string {
+  if (!raw) return "untitled";
+  // 剥离控制字符 + 限长，防止 prompt 注入
+  const stripped = raw.replace(/[\u0000-\u001f\u007f]/g, " ").trim();
+  return (stripped.slice(0, 200) || "untitled");
 }

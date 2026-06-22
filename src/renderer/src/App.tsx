@@ -52,6 +52,11 @@ export default function App() {
   const taskFileInputRef = useRef<HTMLInputElement>(null);
   const [questionAnswers, setQuestionAnswers] = useState<Record<string, string | string[]>>({});
 
+  // 切换 session 时清空草稿答案，避免不同 session 间的串味
+  useEffect(() => {
+    setQuestionAnswers({});
+  }, [activeSessionId]);
+
   // 可上传的非图片二进制文件 MIME 与扩展名（PDF、文档、表格等）
   const UPLOADABLE_MIME = new Set([
     "application/pdf",
@@ -714,6 +719,15 @@ export default function App() {
             onPaste={(e) => handlePaste(e, "task")}
             placeholder="描述要执行的编码任务... (可粘贴图片、拖入文件、@引用项目文件)"
           />
+          {showFileMention && mentionTarget === "task" && fileMentionResults.length > 0 && (
+            <div className="file-mention-dropdown">
+              {fileMentionResults.map((filePath) => (
+                <button key={filePath} className="file-mention-item" onClick={() => selectFileMention(filePath, "task")}>
+                  {filePath}
+                </button>
+              ))}
+            </div>
+          )}
           <div className="actions">
             <button className="icon-btn" title="添加附件" onClick={() => taskFileInputRef.current?.click()}>📎</button>
             <button className="primary" disabled={!canStart} onClick={startSession}>
@@ -1043,10 +1057,10 @@ export default function App() {
                     placeholder="输入消息继续对话... (可粘贴图片、拖入文件、@引用项目文件)"
                     rows={2}
                   />
-                  {showFileMention && fileMentionResults.length > 0 && (
+                  {showFileMention && mentionTarget === "chat" && fileMentionResults.length > 0 && (
                     <div className="file-mention-dropdown">
                       {fileMentionResults.map((filePath) => (
-                        <button key={filePath} className="file-mention-item" onClick={() => selectFileMention(filePath, mentionTarget)}>
+                        <button key={filePath} className="file-mention-item" onClick={() => selectFileMention(filePath, "chat")}>
                           {filePath}
                         </button>
                       ))}
