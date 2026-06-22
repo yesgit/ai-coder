@@ -22,8 +22,19 @@ type ClaudeQuery = (params: unknown) => AsyncIterable<unknown>;
 export class ClaudeAgentRunner {
   private readonly workflowEngine = new WorkflowEngine();
   private readonly maxStageIterations = 50;
+  private readonly abortControllers = new Map<string, AbortController>();
 
   constructor(private readonly queryOverride?: ClaudeQuery) {}
+
+  abort(sessionId: string): boolean {
+    const controller = this.abortControllers.get(sessionId);
+    if (!controller) {
+      return false;
+    }
+    this.abortControllers.delete(sessionId);
+    controller.abort();
+    return true;
+  }
 
   async run(input: AgentRunInput): Promise<AgentSession> {
     for (let iteration = 0; iteration < this.maxStageIterations; iteration += 1) {
@@ -69,6 +80,8 @@ export class ClaudeAgentRunner {
     }
 
     const sdkMessages: unknown[] = [];
+    const abortController = new AbortController();
+    this.abortControllers.set(input.session.id, abortController);
     try {
       const query = await this.resolveQuery();
 
@@ -82,6 +95,7 @@ export class ClaudeAgentRunner {
           cwd: input.session.project_path,
           executable: nodeInfo?.command ?? undefined,
           env: sdkEnv,
+          abortController,
           tools: buildAllowedClaudeTools(input.workflow, currentStage),
           disallowedTools: buildDisallowedClaudeTools(input.workflow),
           permissionMode: "dontAsk",
@@ -122,9 +136,28 @@ export class ClaudeAgentRunner {
       await this.recordProgress(input, "status", `阶段已完成：${currentStage.name || currentStage.id}`, "milestone");
       return input.session;
     } catch (error) {
+      // 用户主动中止：标记为 interrupted，保留已写入的消息和工具调用
+      if (abortController.signal.aborted || isAbortError(error)) {
+        if (sdkMessages.length > 0) {
+          const transcript = formatClaudeTranscript(sdkMessages);
+          input.session.messages.push({
+            role: "assistant",
+            content: transcript,
+            created_at: new Date().toISOString()
+          });
+        }
+        input.session.status = "interrupted";
+        await this.recordProgress(input, "status", "已由用户手动中止。", "milestone");
+        return input.session;
+      }
       const failed = this.failFromSdkError(input, sdkMessages, error);
       await this.recordProgress(input, "status", "Claude Agent SDK 调用失败。", "milestone");
       return failed;
+    } finally {
+      // 仅当 map 中的 controller 仍是本次创建的才删除，避免竞争条件
+      if (this.abortControllers.get(input.session.id) === abortController) {
+        this.abortControllers.delete(input.session.id);
+      }
     }
   }
 
@@ -283,4 +316,11 @@ export class ClaudeAgentRunner {
     }
     return query as ClaudeQuery;
   }
+}
+
+function isAbortError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const name = (error as { name?: unknown }).name;
+  const message = (error as { message?: unknown }).message;
+  return name === "AbortError" || (typeof message === "string" && /abort/i.test(message));
 }

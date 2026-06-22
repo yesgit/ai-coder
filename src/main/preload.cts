@@ -18,6 +18,7 @@ const api: AppApi = {
   denyToolCall: (sessionId: string, toolCallId: string) => ipcRenderer.invoke("sessions:deny-tool-call", sessionId, toolCallId),
   continueSession: (sessionId: string) => ipcRenderer.invoke("sessions:continue", sessionId),
   resumeSession: (sessionId: string) => ipcRenderer.invoke("sessions:resume", sessionId),
+  abortSession: (sessionId: string) => ipcRenderer.invoke("sessions:abort", sessionId),
   sendMessage: (sessionId: string, message: string, attachments?: Attachment[]) =>
     ipcRenderer.invoke("sessions:send-message", sessionId, message, attachments),
   listProjectFiles: (projectPath: string, query?: string) =>

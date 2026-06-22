@@ -158,6 +158,27 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     return session;
   });
 
+  ipcMain.handle("sessions:abort", async (_event, sessionId: string) => {
+    const session = await sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}`);
+    }
+    await authorizedProjects.assertAuthorized(session.project_path);
+    if (session.status !== "running" && session.status !== "waiting_approval") {
+      throw new Error(`Session is not running: ${session.status}`);
+    }
+    const aborted = runner.abort(sessionId);
+    if (!aborted) {
+      // 兜底：runner 没有进行中的 controller（比如运行已结束但 status 未更新），直接改状态
+      session.status = "interrupted";
+      await sessions.save(session);
+    }
+    // runner.abort 触发的状态改写发生在 runCurrentStage 的 catch 中，并通过 onProgress 保存
+    // 重新读取最新状态返回给前端
+    const refreshed = await sessions.get(sessionId);
+    return refreshed ?? session;
+  });
+
   ipcMain.handle("sessions:start", async (_event, input: StartSessionInput) => {
     if (!input.projectPath || !input.workflowId || !input.taskPrompt.trim()) {
       throw new Error("projectPath, workflowId, and taskPrompt are required");

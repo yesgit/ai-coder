@@ -307,6 +307,20 @@ export default function App() {
     }
   }
 
+  async function abortSession(session: AgentSession) {
+    setBusy(true);
+    setError("");
+    try {
+      const updated = await window.aiCoder.abortSession(session.id);
+      upsertSession(updated);
+      await refreshSessions(updated.id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function sendMessage(session: AgentSession, message: string, attachments?: Attachment[]) {
     setBusy(true);
     setError("");
@@ -678,11 +692,17 @@ export default function App() {
                     </p>
                   )}
                 </div>
-                {(activeSession.status === "waiting_approval" ||
+                {(activeSession.status === "running" ||
+                  activeSession.status === "waiting_approval" ||
                   activeSession.status === "failed" ||
                   activeSession.status === "blocked" ||
                   activeSession.status === "interrupted") && (
                   <div className="session-actions">
+                    {(activeSession.status === "running" || activeSession.status === "waiting_approval") && (
+                      <button className="secondary" disabled={busy} onClick={() => abortSession(activeSession)}>
+                        停止
+                      </button>
+                    )}
                     {activeSession.status === "waiting_approval" && (
                       <>
                         {activeSession.approvals.some(

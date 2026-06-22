@@ -280,6 +280,7 @@ export interface AppApi {
   denyToolCall(sessionId: string, toolCallId: string): Promise<AgentSession>;
   continueSession(sessionId: string): Promise<AgentSession>;
   resumeSession(sessionId: string): Promise<AgentSession>;
+  abortSession(sessionId: string): Promise<AgentSession>;
   sendMessage(sessionId: string, message: string, attachments?: Attachment[]): Promise<AgentSession>;
   listProjectFiles(projectPath: string, query?: string): Promise<string[]>;
   readProjectFile(projectPath: string, filePath: string): Promise<string>;
