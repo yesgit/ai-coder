@@ -402,7 +402,7 @@ export class ClaudeAgentRunner {
       });
     }
     // 记录详细错误到进度事件
-    void this.recordProgress(input, "error", errorDetails, "milestone");
+    void this.recordProgress(input, "status", errorDetails, "milestone");
     return input.session;
   }
 
