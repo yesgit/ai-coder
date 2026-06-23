@@ -367,6 +367,16 @@ export class ClaudeAgentRunner {
 
   private failFromSdkError(input: AgentRunInput, sdkMessages: unknown[], error: unknown): AgentSession {
     const fallbackError = error instanceof Error ? error.message : String(error);
+    // 收集详细的诊断信息
+    const errorDetails = [
+      `错误：${fallbackError}`,
+      `SDK 消息数：${sdkMessages.length}`,
+      `会话 ID: ${input.session.id}`,
+      `阶段：${input.session.current_stage}`,
+      `项目路径：${input.session.project_path}`,
+      `Node 可执行文件：${JSON.stringify(input)}`.slice(0, 200) // 限制长度
+    ].join('\n');
+
     if (sdkMessages.length > 0) {
       const stageOutput = extractClaudeStageOutput(sdkMessages);
       const transcript = formatClaudeTranscript(sdkMessages);
@@ -383,14 +393,16 @@ export class ClaudeAgentRunner {
         output_summary: stageOutput.error ?? fallbackError,
         error: stageOutput.error ?? fallbackError
       });
-      return input.session;
+    } else {
+      // SDK 调用失败且没有消息，记录详细错误
+      this.workflowEngine.applyStageResult(input.session, input.workflow, {
+        status: "failed",
+        output_summary: `Claude SDK 调用失败：${fallbackError}`,
+        error: errorDetails
+      });
     }
-
-    this.workflowEngine.applyStageResult(input.session, input.workflow, {
-      status: "failed",
-      output_summary: fallbackError,
-      error: fallbackError
-    });
+    // 记录详细错误到进度事件
+    void this.recordProgress(input, "error", errorDetails, "milestone");
     return input.session;
   }
 
