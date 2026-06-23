@@ -444,6 +444,20 @@ export default function App() {
     }
   }
 
+  async function restartSession(session: AgentSession) {
+    setBusy(true);
+    setError("");
+    try {
+      const updated = await window.aiCoder.restartSession(session.id);
+      upsertSession(updated);
+      await refreshSessions(updated.id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function answerHumanQuestion(session: AgentSession, questionId: string, answer: string | string[]) {
     setBusy(true);
     setError("");
@@ -990,6 +1004,19 @@ export default function App() {
                         断点恢复
                       </button>
                     )}
+                    {/* 重新开始任务：从第一个阶段重新执行 */}
+                    <button
+                      className="secondary"
+                      disabled={busy}
+                      onClick={() => {
+                        if (confirm(`确定要重新开始任务 "${activeSession.task_prompt}" 吗？这将清空当前的执行进度并从第一个阶段重新开始。`)) {
+                          void restartSession(activeSession);
+                        }
+                      }}
+                      title="从工作流的第一个阶段重新开始执行"
+                    >
+                      重新开始
+                    </button>
                   </div>
                 )}
               </div>

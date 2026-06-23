@@ -209,7 +209,7 @@ export interface ToolCallRecord {
   stage_id: string;
   tool: string;
   input: unknown;
-  status: "pending_approval" | "approved" | "denied" | "completed" | "blocked";
+  status: "pending_approval" | "approved" | "denied" | "completed" | "blocked" | "cancelled";
   created_at: string;
   resolved_at?: string;
 }
@@ -355,6 +355,7 @@ export interface AppApi {
   continueSession(sessionId: string): Promise<AgentSession>;
   resumeSession(sessionId: string): Promise<AgentSession>;
   abortSession(sessionId: string): Promise<AgentSession>;
+  restartSession(sessionId: string): Promise<AgentSession>;
   answerHumanQuestion(sessionId: string, questionId: string, answer: string | string[]): Promise<AgentSession>;
   sendMessage(sessionId: string, message: string, attachments?: Attachment[]): Promise<AgentSession>;
   setSessionPinned(sessionId: string, pinned: boolean): Promise<AgentSession>;

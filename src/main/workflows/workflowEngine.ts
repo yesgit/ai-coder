@@ -187,6 +187,29 @@ export class WorkflowEngine {
     return session;
   }
 
+  restartFromBeginning(session: AgentSession, workflow: WorkflowTemplate): AgentSession {
+    this.ensureState(session, workflow);
+
+    // 将所有现有的阶段运行标记为 superseded
+    for (const stageRun of session.stage_runs ?? []) {
+      if (stageRun.status === "running" || stageRun.status === "waiting_approval") {
+        stageRun.status = "superseded";
+        stageRun.completed_at = new Date().toISOString();
+      }
+    }
+
+    // 从第一个阶段重新开始
+    const firstStage = workflow.stages[0];
+    if (!firstStage) {
+      throw new Error("Workflow has no stages");
+    }
+
+    session.error = undefined;
+    session.status = "running";
+    this.startStage(session, workflow, firstStage, session.task_prompt);
+    return session;
+  }
+
   private buildResumeInputSummary(
     session: AgentSession,
     workflow: WorkflowTemplate,

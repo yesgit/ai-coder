@@ -219,6 +219,38 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     return refreshed ?? session;
   });
 
+  ipcMain.handle("sessions:restart", async (_event, sessionId: string) => {
+    const session = await sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}`);
+    }
+    const projectPath = await authorizedProjects.assertAuthorized(session.project_path);
+    const workflow = await registry.get(session.workflow_id, projectPath);
+    if (!workflow) {
+      throw new Error(`Workflow not found: ${session.workflow_id}`);
+    }
+    // 取消所有待回答的人类问题
+    const now = new Date().toISOString();
+    for (const q of session.pending_human_questions ?? []) {
+      if (q.status === "pending") {
+        q.status = "cancelled";
+        q.resolved_at = now;
+      }
+    }
+    // 取消所有待审批的工具调用
+    for (const t of session.tool_calls ?? []) {
+      if (t.status === "pending_approval") {
+        t.status = "cancelled";
+        t.resolved_at = now;
+      }
+    }
+    // 重新开始任务
+    workflowEngine.restartFromBeginning(session, workflow);
+    await sessions.save(session);
+    runSessionInBackground(runner, sessions, session, workflow);
+    return session;
+  });
+
   ipcMain.handle("sessions:answer-human-question", async (_event, sessionId: string, questionId: string, answer: string | string[]) => {
     const session = await sessions.get(sessionId);
     if (!session) {
