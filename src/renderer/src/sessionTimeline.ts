@@ -70,6 +70,16 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
     if (message.role === "assistant" && index !== lastAssistantIndex) {
       return;
     }
+    // 尝试格式化 JSON 内容，使其更易读
+    let formattedContent = content;
+    try {
+      if (content.startsWith('{') || content.startsWith('[')) {
+        const parsed = JSON.parse(content);
+        formattedContent = '```json\n' + JSON.stringify(parsed, null, 2) + '\n```';
+      }
+    } catch {
+      // 不是 JSON，保持原样
+    }
     // display_name 用户可控，需转义 markdown 元字符避免被解析为链接
     const escapeMd = (s: string) => s.replace(/[\\`*_{}\[\]()#+\-.!|<>]/g, "\\$&");
     const attachmentDetail = message.attachments?.length
@@ -81,7 +91,7 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
       id: `${session.id}:message:${index}`,
       type: "message",
       title: `${formatRole(message.role)}消息${message.attachments?.length ? ` (${message.attachments.length} 个附件)` : ""}`,
-      detail: content + (attachmentDetail ?? ""),
+      detail: formattedContent + (attachmentDetail ?? ""),
       timestamp: message.created_at,
       status: message.role,
       sort_order: 10
