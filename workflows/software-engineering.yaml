@@ -27,9 +27,10 @@ permissions:
 rework:
   enabled: true
   allowed_targets:
-    - requirements
-    - plan
-    - impact_analysis
+    - requirements      # 需求不明确时返工
+    - code_reading      # 需要重新阅读代码时
+    - impact_analysis   # 影响分析不完整时
+    - plan              # 计划需要调整时
   approval_required: true
   invalidate_downstream: true
 stages:
