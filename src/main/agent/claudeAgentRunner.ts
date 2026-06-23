@@ -138,11 +138,14 @@ export class ClaudeAgentRunner {
       if (abortController.signal.aborted) {
         if (sdkMessages.length > 0) {
           const transcript = formatClaudeTranscript(sdkMessages);
-          input.session.messages.push({
-            role: "assistant",
-            content: transcript,
-            created_at: new Date().toISOString()
-          });
+          // 仅当 transcript 非空时才写入消息，避免 (no content) 占位内容
+          if (transcript.trim() && transcript !== "(no content)" && !transcript.startsWith("收到 Claude SDK 消息：")) {
+            input.session.messages.push({
+              role: "assistant",
+              content: transcript,
+              created_at: new Date().toISOString()
+            });
+          }
         }
         input.session.status = this.resolveInterruptedStatus(input.session);
         if (input.session.status === "completed") input.session.status = "interrupted";
@@ -152,11 +155,14 @@ export class ClaudeAgentRunner {
 
       const stageOutput = extractClaudeStageOutput(sdkMessages);
       const transcript = formatClaudeTranscript(sdkMessages);
-      input.session.messages.push({
-        role: "assistant",
-        content: transcript,
-        created_at: new Date().toISOString()
-      });
+      // 仅当 transcript 非空时才写入消息，避免 (no content) 占位内容
+      if (transcript.trim() && transcript !== "(no content)" && !transcript.startsWith("收到 Claude SDK 消息：")) {
+        input.session.messages.push({
+          role: "assistant",
+          content: transcript,
+          created_at: new Date().toISOString()
+        });
+      }
       if (this.hasPendingToolCall(input.session) || this.hasBlockedToolCall(input.session) || this.hasPendingHumanQuestion(input.session)) {
         input.session.status = this.resolveInterruptedStatus(input.session);
         await this.recordProgress(input, "status", `阶段已中断：${input.session.status}`, "milestone");
@@ -169,6 +175,11 @@ export class ClaudeAgentRunner {
         return input.session;
       }
       this.workflowEngine.applyStageResult(input.session, input.workflow, parseStageAgentResult(stageOutput.resultText || transcript));
+      // 如果阶段完成后需要审批（waiting_approval），则立即返回，让前端显示审批弹窗
+      if (input.session.status === "waiting_approval") {
+        await this.recordProgress(input, "status", `阶段已完成，等待审批：${currentStage.name || currentStage.id}`, "milestone");
+        return input.session;
+      }
       await this.recordProgress(input, "status", `阶段已完成：${currentStage.name || currentStage.id}`, "milestone");
       return input.session;
     } catch (error) {
@@ -176,11 +187,14 @@ export class ClaudeAgentRunner {
       if (abortController.signal.aborted || isAbortError(error)) {
         if (sdkMessages.length > 0) {
           const transcript = formatClaudeTranscript(sdkMessages);
-          input.session.messages.push({
-            role: "assistant",
-            content: transcript,
-            created_at: new Date().toISOString()
-          });
+          // 仅当 transcript 非空时才写入消息，避免 (no content) 占位内容
+          if (transcript.trim() && transcript !== "(no content)" && !transcript.startsWith("收到 Claude SDK 消息：")) {
+            input.session.messages.push({
+              role: "assistant",
+              content: transcript,
+              created_at: new Date().toISOString()
+            });
+          }
         }
         const resolved = this.resolveInterruptedStatus(input.session);
         input.session.status = resolved === "completed" ? "interrupted" : resolved;
@@ -201,9 +215,10 @@ export class ClaudeAgentRunner {
   private runMock(input: AgentRunInput, stageAgentInput: ReturnType<typeof buildStageAgentInput>): AgentSession {
     const result = createMockStageAgentResult(stageAgentInput);
     const content = JSON.stringify(result, null, 2);
+    // Mock 模式下写入阶段结果摘要，而不是原始 JSON
     input.session.messages.push({
       role: "assistant",
-      content,
+      content: result.output_summary,
       created_at: new Date().toISOString()
     });
     this.workflowEngine.applyStageResult(input.session, input.workflow, result);
@@ -355,11 +370,14 @@ export class ClaudeAgentRunner {
     if (sdkMessages.length > 0) {
       const stageOutput = extractClaudeStageOutput(sdkMessages);
       const transcript = formatClaudeTranscript(sdkMessages);
-      input.session.messages.push({
-        role: "assistant",
-        content: transcript,
-        created_at: new Date().toISOString()
-      });
+      // 仅当 transcript 非空时才写入消息，避免 (no content) 占位内容
+      if (transcript.trim() && transcript !== "(no content)" && !transcript.startsWith("收到 Claude SDK 消息：")) {
+        input.session.messages.push({
+          role: "assistant",
+          content: transcript,
+          created_at: new Date().toISOString()
+        });
+      }
       this.workflowEngine.applyStageResult(input.session, input.workflow, {
         status: "failed",
         output_summary: stageOutput.error ?? fallbackError,

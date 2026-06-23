@@ -108,22 +108,35 @@ export async function approveOrDenyToolUse(
     return { allow: false, message: "Tool call is waiting for user approval.", interrupt: true };
   }
 
-  // 如果阶段已获得授权，自动允许该阶段声明的工具
+  // 如果当前阶段声明了允许的工具，自动允许这些工具的调用
+  // 对于需要阶段审批的阶段（approval_required=true），只有在阶段已获批准后才行
+  // 对于不需要阶段审批的阶段（如 implementation），直接允许声明的工具
   const currentStage = workflow.stages.find((s) => s.id === session.current_stage);
-  if (currentStage?.approval_required && hasStageApproval(session, currentStage.id)) {
-    if (isWriteTool(toolName) && currentStage.allowed_tools?.includes("edit_file")) {
-      const toolCall: ToolCallRecord = {
-        id: toolUseId,
-        stage_id: session.current_stage,
-        tool: toolName,
-        input,
-        status: "approved",
-        created_at: now,
-        resolved_at: now
-      };
-      session.tool_calls.push(toolCall);
-      recordFileChangesForTool(session, toolName, input, true, now);
-      return { allow: true, updatedInput: input };
+  if (currentStage) {
+    const stageAllowsCurrentTool =
+      (isWriteTool(toolName) && currentStage.allowed_tools?.includes("edit_file")) ||
+      (toolName === "Bash" && currentStage.allowed_tools?.includes("shell")) ||
+      (isReadOnlyFileTool(toolName) && (currentStage.allowed_tools?.includes("read_file") || currentStage.allowed_tools?.includes("edit_file")));
+
+    if (stageAllowsCurrentTool) {
+      // 需要阶段审批的阶段：检查是否已获批准
+      const needsStageApproval = currentStage.approval_required && !hasStageApproval(session, currentStage.id);
+      if (!needsStageApproval) {
+        // 自动允许该阶段声明的工具
+        const toolCall: ToolCallRecord = {
+          id: toolUseId,
+          stage_id: session.current_stage,
+          tool: toolName,
+          input,
+          status: "approved",
+          created_at: now,
+          resolved_at: now
+        };
+        session.tool_calls.push(toolCall);
+        recordFileChangesForTool(session, toolName, input, true, now);
+        await rememberApprovedExternalReads(session, toolName, input);
+        return { allow: true, updatedInput: input };
+      }
     }
   }
 

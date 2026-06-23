@@ -56,7 +56,9 @@ export function formatClaudeTranscript(messages: unknown[]): string {
   if (output.assistantText && output.resultText && output.assistantText !== output.resultText) {
     return [output.assistantText, output.resultText].join("\n\n");
   }
-  return output.resultText || output.assistantText || messages.map((message) => JSON.stringify(message)).join("\n");
+  // 优先返回 resultText 或 assistantText，如果没有则返回空字符串
+  // 不要返回 JSON 字符串，因为那会产生无意义的 "(no content)" 等占位内容
+  return output.resultText || output.assistantText || "";
 }
 
 function extractAssistantText(message: Record<string, unknown>): string[] {
