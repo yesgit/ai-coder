@@ -20,6 +20,20 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
   const onboardingStore = new OnboardingStore();
   const workflowRouter = new WorkflowRouter();
 
+  // 应用启动时，从会话历史中恢复已授权的项目路径
+  // 这样加载历史会话时不需要重新授权，除非项目路径已变化
+  void (async () => {
+    const allSessions = await sessions.list();
+    const uniqueProjectPaths = new Set(allSessions.map(s => s.project_path));
+    for (const projectPath of uniqueProjectPaths) {
+      try {
+        await authorizedProjects.authorize(projectPath);
+      } catch {
+        // 项目路径可能已不存在，跳过
+      }
+    }
+  })();
+
   ipcMain.handle("project:select", async (event) => {
     const parentWindow = BrowserWindow.fromWebContents(event.sender) ?? undefined;
     const options: OpenDialogOptions = { properties: ["openDirectory"] };
