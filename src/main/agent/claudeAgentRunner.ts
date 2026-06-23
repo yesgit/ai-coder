@@ -307,6 +307,11 @@ export class ClaudeAgentRunner {
 
   private describeSdkMessage(message: unknown): string {
     if (typeof message === "object" && message !== null && "type" in message && typeof message.type === "string") {
+      // 如果是工具调用消息，输出工具名称
+      if (message.type === "tool_use" || message.type === "tool_result") {
+        const toolName = (message as { name?: unknown; tool_name?: unknown }).name ?? (message as { tool_name?: unknown }).tool_name ?? "unknown";
+        return `收到 Claude SDK 工具调用：${toolName}`;
+      }
       return `收到 Claude SDK 消息：${message.type}`;
     }
     return "收到 Claude SDK 消息。";
