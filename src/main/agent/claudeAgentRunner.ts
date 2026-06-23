@@ -101,7 +101,7 @@ export class ClaudeAgentRunner {
           mcpServers: mcpServer ? { ai_coder: mcpServer } : undefined,
           tools: buildAllowedClaudeTools(input.workflow, currentStage),
           disallowedTools: buildDisallowedClaudeTools(input.workflow),
-          permissionMode: "dontAsk",
+          permissionMode: "allow_all", // 允许所有工具调用，实际的审批逻辑在 canUseTool 回调中实现
           settingSources: ["user", "project", "local"],
           canUseTool: async (toolName: string, toolInput: Record<string, unknown>, options: { toolUseID: string }) => {
             // 拦截 ask_human：作为 HumanQuestion 挂起，等待用户回答后继续
