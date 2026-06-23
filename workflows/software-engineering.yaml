@@ -24,6 +24,13 @@ permissions:
     approval_required: true
   network:
     enabled: false
+rework:
+  enabled: true
+  allowed_targets:
+    - plan
+    - impact_analysis
+  approval_required: true
+  invalidate_downstream: true
 stages:
   - id: requirements
     name: 需求确认
