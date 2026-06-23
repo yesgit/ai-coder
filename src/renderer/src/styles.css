@@ -825,6 +825,88 @@ textarea {
   color: #344054;
 }
 
+/* 确保 human-question 内的 markdown-content 样式正确继承 */
+.human-question .markdown-content {
+  font-size: inherit;
+  line-height: inherit;
+  color: inherit;
+}
+
+.human-question .markdown-content p {
+  margin: 0 0 8px 0;
+}
+
+.human-question .markdown-content p:last-child {
+  margin-bottom: 0;
+}
+
+.human-question .markdown-content code {
+  background: rgba(0, 0, 0, 0.06);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: "SF Mono", ui-monospace, monospace;
+  font-size: 0.9em;
+}
+
+.human-question .markdown-content pre {
+  background: #f4f5f7;
+  padding: 12px;
+  border-radius: 6px;
+  overflow-x: auto;
+  margin: 8px 0;
+}
+
+.human-question .markdown-content pre code {
+  background: transparent;
+  padding: 0;
+}
+
+.human-question .markdown-content ul,
+.human-question .markdown-content ol {
+  margin: 4px 0;
+  padding-left: 24px;
+}
+
+.human-question .markdown-content li {
+  margin: 2px 0;
+}
+
+.human-question .markdown-content strong {
+  font-weight: 600;
+  color: #003b6f;
+}
+
+.human-question .markdown-content h1,
+.human-question .markdown-content h2,
+.human-question .markdown-content h3 {
+  margin: 12px 0 8px;
+  font-weight: 600;
+  color: #003b6f;
+}
+
+.human-question .markdown-content h1 {
+  font-size: 1.4em;
+}
+
+.human-question .markdown-content h2 {
+  font-size: 1.2em;
+}
+
+.human-question .markdown-content h3 {
+  font-size: 1.1em;
+}
+
+/* 确保 human-question 内的 markdown-content 样式正确继承 */
+.human-question .markdown-content {
+  font-size: inherit;
+  line-height: inherit;
+  color: inherit;
+}
+
+.human-question .markdown-content p {
+  margin: 0;
+}
+
 .question-options {
   display: flex;
   flex-direction: column;

@@ -27,6 +27,7 @@ permissions:
 rework:
   enabled: true
   allowed_targets:
+    - requirements
     - plan
     - impact_analysis
   approval_required: true
