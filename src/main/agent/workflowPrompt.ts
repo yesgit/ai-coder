@@ -1,4 +1,4 @@
-import type { StageAgentInput } from "../../shared/types.js";
+import type { StageAgentInput, StageHooksConfig } from "../../shared/types.js";
 import { isMeaningfulAgentText } from "../../shared/agentMessages.js";
 
 export function buildStageInstructions(input: StageAgentInput): string {
@@ -27,6 +27,7 @@ export function buildStageInstructions(input: StageAgentInput): string {
   const allowedTools = input.allowed_tools.length ? input.allowed_tools.join(", ") : "read-only defaults";
   const requiredOutputs = input.required_outputs.length ? input.required_outputs.join(", ") : "concise stage summary";
   const gates = input.gates.length ? input.gates.join(", ") : "none";
+  const hooksSummary = describeStageHooks(input.current_stage.hooks);
 
   const messageHistory = input.recent_messages
     .filter((m) => isMeaningfulAgentText(m.content) || m.attachments?.length)
@@ -90,6 +91,7 @@ export function buildStageInstructions(input: StageAgentInput): string {
     `allowed_tools: ${allowedTools}`,
     `required_outputs: ${requiredOutputs}`,
     `gates: ${gates}`,
+    ...(hooksSummary ? ["", "本阶段工序闸门（在工具调用前由宿主校验，未满足会被 deny 并要求补齐）：", hooksSummary] : []),
     "",
     "最终 JSON 协议：",
     JSON.stringify(
@@ -117,4 +119,34 @@ export function buildStageInstructions(input: StageAgentInput): string {
     "对话历史：",
     messageHistory || "无"
   ].join("\n");
+}
+
+/**
+ * 把 stage.hooks 翻译成人话提示，让模型在动手前就知道闸门规则，而不是靠失败再学。
+ * 仅当存在规则时返回字符串；否则返回 null，调用方据此跳过整段。
+ */
+function describeStageHooks(hooks: StageHooksConfig | undefined): string | null {
+  const rules = hooks?.pre_tool_use;
+  if (!rules || rules.length === 0) return null;
+  return rules
+    .map((rule, idx) => {
+      const tools = Array.isArray(rule.when.tool)
+        ? rule.when.tool.join("/")
+        : rule.when.tool ?? "（任意工具）";
+      const cmd = rule.when.command_contains?.length
+        ? `，且命令含 ${rule.when.command_contains.map((s) => `\`${s}\``).join("/")}`
+        : "";
+      const requirements: string[] = [];
+      if (rule.require.same_file_reads_min !== undefined) {
+        requirements.push(`目标文件需先被 Read/Grep ≥ ${rule.require.same_file_reads_min} 次`);
+      }
+      if (rule.require.shell_must_have_run?.length) {
+        requirements.push(`本会话需先执行包含 ${rule.require.shell_must_have_run.map((s) => `\`${s.trim()}\``).join(" / ")} 的命令`);
+      }
+      if (rule.require.ask_human_consent) {
+        requirements.push("本阶段必须先通过 ask_human 取得用户明确确认");
+      }
+      return `${idx + 1}. 调用 ${tools}${cmd} 之前，${requirements.join("；")}。否则：${rule.on_fail}`;
+    })
+    .join("\n");
 }

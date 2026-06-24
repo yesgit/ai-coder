@@ -178,4 +178,64 @@ describe("WorkflowRegistry", () => {
     expect(loaded.stages[1].gates).toEqual(["authorized_files_only"]);
     expect(loaded.stages[1].approval_required).toBe(true);
   });
+
+  it("loads optional stage hooks", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-workflows-"));
+    await fs.writeFile(
+      path.join(dir, "hooks.yaml"),
+      [
+        "id: with-hooks",
+        "name: With Hooks",
+        "version: 1.0.0",
+        "stages:",
+        "  - id: implement",
+        "    name: Implement",
+        "    allowed_tools: [read_file, edit_file]",
+        "    hooks:",
+        "      pre_tool_use:",
+        "        - when: { tool: [Edit, Write] }",
+        "          require:",
+        "            same_file_reads_min: 3",
+        "            shell_must_have_run: ['git log ']",
+        "          on_fail: 改之前请先充分了解上下文。"
+      ].join("\n")
+    );
+    const [loaded] = await new WorkflowRegistry(dir).list();
+    expect(loaded.stages[0].hooks?.pre_tool_use?.[0].require.same_file_reads_min).toBe(3);
+    expect(loaded.stages[0].hooks?.pre_tool_use?.[0].require.shell_must_have_run).toEqual(["git log "]);
+    expect(loaded.stages[0].hooks?.pre_tool_use?.[0].on_fail).toContain("先充分了解");
+  });
+
+  it("leaves hooks undefined when not declared (backward compat)", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-workflows-"));
+    await fs.writeFile(
+      path.join(dir, "plain.yaml"),
+      ["id: plain", "name: Plain", "version: 1.0.0", "stages:", "  - id: only", "    name: Only"].join("\n")
+    );
+    const [loaded] = await new WorkflowRegistry(dir).list();
+    expect(loaded.stages[0].hooks).toBeUndefined();
+  });
+
+  it("rejects hook rules with empty require constraints", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-workflows-"));
+    await fs.writeFile(
+      path.join(dir, "bad.yaml"),
+      [
+        "id: bad",
+        "name: Bad",
+        "version: 1.0.0",
+        "stages:",
+        "  - id: only",
+        "    name: Only",
+        "    hooks:",
+        "      pre_tool_use:",
+        "        - when: { tool: Edit }",
+        "          require: {}",
+        "          on_fail: nope"
+      ].join("\n")
+    );
+    const result = await new WorkflowRegistry(dir).listWithIssues();
+    expect(result.workflows).toHaveLength(0);
+    expect(result.issues[0].message).toContain("hook rule require");
+  });
 });

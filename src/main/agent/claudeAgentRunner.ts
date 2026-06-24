@@ -8,6 +8,7 @@ import {
 } from "../security/projectPolicy.js";
 import { WorkflowEngine } from "../workflows/workflowEngine.js";
 import { buildStageInstructions } from "./workflowPrompt.js";
+import { evaluateHook } from "./stageHookEnforcer.js";
 import { buildStageAgentInput, createMockStageAgentResult, parseStageAgentResult } from "./stageAgentProtocol.js";
 import { extractClaudeStageOutput, formatClaudeTranscript } from "./claudeMessageAdapter.js";
 import { resolveNodeExecutable, shouldUseClaudeSdk } from "./claudeRuntime.js";
@@ -121,6 +122,15 @@ export class ClaudeAgentRunner {
               input.session.error = "ask_human 工具输入格式错误（缺少 question / type / options）";
               await this.recordProgress(input, "status", input.session.error, "milestone");
               return { behavior: "deny", message: input.session.error, interrupt: true };
+            }
+            // 阶段级工序闸门：仅当 stage.hooks 显式声明时生效；与 approveOrDenyToolUse（策略层）解耦。
+            // 失败时 interrupt:false——让模型读到拒绝原因后自行补齐前置步骤，不打断整个会话。
+            if (currentStage.hooks) {
+              const hookDecision = evaluateHook(currentStage, input.session, toolName, toolInput);
+              if (!hookDecision.allow) {
+                await this.recordProgress(input, "tool_policy", `工序闸门：${hookDecision.message}`, "milestone");
+                return { behavior: "deny", message: hookDecision.message, interrupt: false };
+              }
             }
             const decision = await approveOrDenyToolUse(input.session, input.workflow, toolName, toolInput, options.toolUseID);
             await this.recordProgress(input, "tool_policy", this.describeToolDecision(toolName, decision.allow), "milestone");

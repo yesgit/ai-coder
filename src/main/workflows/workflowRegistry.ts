@@ -84,6 +84,36 @@ export class WorkflowRegistry {
 }
 
 const stringArraySchema = z.array(z.string().min(1)).default([]);
+const stageHooksSchema = z
+  .object({
+    pre_tool_use: z
+      .array(
+        z.object({
+          when: z.object({
+            tool: z.union([z.string().min(1), z.array(z.string().min(1)).min(1)]).optional(),
+            command_contains: z.array(z.string().min(1)).optional()
+          }),
+          require: z
+            .object({
+              same_file_reads_min: z.number().int().min(1).optional(),
+              shell_must_have_run: z.array(z.string().min(1)).optional(),
+              ask_human_consent: z.boolean().optional()
+            })
+            .refine(
+              (req) =>
+                req.same_file_reads_min !== undefined ||
+                (req.shell_must_have_run && req.shell_must_have_run.length > 0) ||
+                req.ask_human_consent === true,
+              "hook rule require must declare at least one constraint"
+            ),
+          on_fail: z.string().min(1)
+        })
+      )
+      .min(1)
+      .optional()
+  })
+  .optional();
+
 const workflowSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
@@ -146,7 +176,8 @@ const workflowSchema = z.object({
         required_outputs: stringArraySchema,
         required_checks: stringArraySchema,
         gates: stringArraySchema,
-        auto_retry_limit: z.number().int().min(0).optional()
+        auto_retry_limit: z.number().int().min(0).optional(),
+        hooks: stageHooksSchema
       })
     )
     .min(1)
@@ -184,7 +215,8 @@ function normalizeWorkflow(input: unknown, sourceType: WorkflowSourceType, fileP
       required_outputs: stage.required_outputs,
       required_checks: stage.required_checks,
       gates: stage.gates,
-      auto_retry_limit: stage.auto_retry_limit
+      auto_retry_limit: stage.auto_retry_limit,
+      hooks: stage.hooks
     }))
   };
 }

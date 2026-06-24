@@ -33,6 +33,34 @@ export interface WorkflowRoutingConfig {
   examples: string[];
 }
 
+/**
+ * 阶段级工序闸门：在工具调用真正落地前，由 `stageHookEnforcer` 评估。
+ * 与 `projectPolicy.approveOrDenyToolUse`（策略层 = 能不能做）解耦——hook 只管"按不按顺序做"。
+ * 字段命名用 yaml 风格（snake_case），由 zod schema 透传到此处。
+ */
+export interface PreToolUseHookRule {
+  when: {
+    /** SDK 工具名（大写驼峰）：Edit/MultiEdit/Write/Bash/Read/Grep 等。可单值或数组。 */
+    tool?: string | string[];
+    /** 仅当 tool 含 Bash 时生效：input.command 须包含其中任一子串才匹配规则。 */
+    command_contains?: string[];
+  };
+  require: {
+    /** 目标文件被 Read/Grep/Glob 命中次数下限（来自 session.tool_calls 历史）。 */
+    same_file_reads_min?: number;
+    /** 本会话内必须执行过包含这些子串的 Bash 命令（每条都要满足）。 */
+    shell_must_have_run?: string[];
+    /** 本阶段必须发起过 ask_human（pending_human_questions 中至少一条 stage_id 匹配的记录）。 */
+    ask_human_consent?: boolean;
+  };
+  /** 拦截时回传给模型的中文人话提示。 */
+  on_fail: string;
+}
+
+export interface StageHooksConfig {
+  pre_tool_use?: PreToolUseHookRule[];
+}
+
 export interface WorkflowStage {
   id: string;
   name: string;
@@ -43,6 +71,8 @@ export interface WorkflowStage {
   required_checks?: string[];
   gates?: string[];
   auto_retry_limit?: number;
+  /** 可选；仅在显式声明时由 hookEnforcer 评估，否则该阶段零额外约束（向后兼容）。 */
+  hooks?: StageHooksConfig;
 }
 
 export interface WorkflowTemplate {

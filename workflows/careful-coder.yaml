@@ -1,0 +1,174 @@
+id: careful-coder
+name: 谨慎程序员
+version: 1.0.0
+description: 把人类资深开发者的"强制例程"固化为不能跳过的步骤——取证、对齐、敌对自审，让模型像谨慎的同事一样工作。
+source:
+  type: builtin
+  id: careful-coder
+  version: 1.0.0
+routing:
+  enabled: true
+  auto_start: true
+  # 与 software-engineering / plan-execute 错开：careful-coder 是"需要更谨慎"的语义触发器。
+  # 直接的"修 bug / 实现功能"应该走 software-engineering 走得更快；只有用户显式说
+  # "认真改"、"小心改"、"谨慎"、"敏感模块" 这类时，careful-coder 才胜出。
+  keywords:
+    - 谨慎
+    - 严谨
+    - 小心改
+    - 认真改
+    - 敏感
+    - 高风险
+    - 不要漏
+    - careful
+    - high stakes
+    - production critical
+  examples:
+    - 谨慎地修一下未登录访问 /settings 崩溃的问题（涉及鉴权别漏）
+    - 严谨地把 parseConfig 改为接收路径而不是字符串，并修所有调用方
+    - 这块是敏感模块，请仔细对照同类实现再动手
+permissions:
+  filesystem:
+    mode: project-only
+  shell:
+    approval_required: true
+  network:
+    enabled: false
+rework:
+  enabled: true
+  allowed_targets:
+    - understand
+    - investigate
+    - align
+    - design
+    - implement
+  approval_required: false
+  invalidate_downstream: true
+stages:
+  - id: understand
+    name: 理解
+    instructions: |
+      用简体中文复述用户的真实诉求与"完成的样子"。
+      严格区分三类信息：
+        - 事实：在代码/配置/历史里可直接核对的；
+        - 推断：从事实合理外推但尚未证实的；
+        - 假设：你不知道但暂时这样办的（必须在 assumptions 字段显式列出）。
+      不要在本阶段编辑文件或制定方案，只产出共识。
+    allowed_tools:
+      - read_file
+      - shell
+    required_outputs:
+      - user_goal_restated
+      - definition_of_done
+      - assumptions
+  - id: investigate
+    name: 取证
+    instructions: |
+      像资深开发者接手陌生模块：grep 同名调用、看相邻实现、翻 git log。
+      你必须用具体证据回答：
+        1) 同类调用在哪里？（≥3 条，每条给 path:line 与一句话作用）
+        2) 这块最近一次相关改动是什么？谁、为什么？（至少跑过一次 git log 或 git blame）
+        3) 你还不懂什么？（"我不知道"清单，宁可暴露不要藏）
+      不允许直接复述用户描述当作证据；事实必须可在仓库或历史里被复查。
+      output_summary 必须把上述三类信息的关键条目都列入（包含 path:line 与一句话作用），下游阶段无法读到结构化字段。
+    allowed_tools:
+      - read_file
+      - shell
+    required_outputs:
+      - similar_callsites
+      - git_history_summary
+      - unknowns
+    auto_retry_limit: 1
+  - id: align
+    name: 对齐
+    instructions: |
+      列出本次必须遵守的横向一致性约束（命名/错误处理/日志/i18n/参数风格等），
+      逐条列出边界自问（未登录/未授权/未实名/空数据/并发/不可逆/网络失败/超大输入），
+      把 understand+investigate 留下的模糊点用 ask_human 强制澄清——不允许出现"我假设"代替提问。
+      如果存在不可逆操作（删文件、清数据、git reset 等），请把"是否允许"列入 clarifications_asked。
+      output_summary 必须把 lateral_constraints 与 boundary_questions 的每一条都明文列出——self_review 阶段只能读到 summary 而非结构化字段，summary 写得粗则 reviewer 无法逐条核对。
+    allowed_tools:
+      - read_file
+    required_outputs:
+      - lateral_constraints
+      - boundary_questions
+      - clarifications_asked
+    auto_retry_limit: 1
+  - id: design
+    name: 设计
+    instructions: |
+      给最小可行方案，并完成两项自审：
+        1) 敌对自审：假设有一位挑刺的 reviewer 看你的方案，他会怎么打回？至少给 3 条具体反驳并答辩；
+        2) 一致性自审：本次改动里的同类条目（如多个同类页面、多个 API 入口）是否要么全做、要么全不做？任何偏离要写出理由。
+      避免过度抽象/过度工程：能用现有函数解决就不要新建。
+      output_summary 要点列出方案要点 + 同类条目处理策略，便于 implement 阶段对照、self_review 阶段核查偏离。
+    allowed_tools:
+      - read_file
+    required_outputs:
+      - design_summary
+      - adversarial_critique
+      - consistency_audit
+    auto_retry_limit: 1
+  - id: implement
+    name: 实施
+    instructions: |
+      严格按 design 实施最小改动；偏离 design 必须 needs_rework 回到 design。
+      改任何一个文件之前，先确保你真的读过它（不只是 grep 过 basename）：
+        - 同一目标文件的 Read/Grep 次数 ≥ 3；
+        - 本会话内对该文件跑过一次 git log；
+        - 涉及不可逆 shell 操作时，先 ask_human 取得用户同意。
+      宿主会在工具调用前强制校验上述前置条件，未达到会被 deny 并要求你补齐。这不是平台限制，是"先看后改"的纪律。
+    allowed_tools:
+      - read_file
+      - edit_file
+      - shell
+    gates:
+      - authorized_files_only
+    hooks:
+      pre_tool_use:
+        # 注意：Write 不在此列。Write 主要用于新建文件，目标路径还不存在时无法
+        # "先 Read/Grep 3 次"，硬挂会让"新建文件"类任务卡死或刷形式次数。
+        # Write 的纪律靠 design + self_review 兜底。
+        - when:
+            tool:
+              - Edit
+              - MultiEdit
+          require:
+            same_file_reads_min: 3
+            shell_must_have_run:
+              - "git log "
+          on_fail: "改既有代码之前请先充分了解上下文：对目标文件至少 Read/Grep 3 次，并对它跑过一次 git log。"
+        - when:
+            tool: Bash
+            command_contains:
+              - "rm "
+              - "git reset"
+              - "git clean"
+              - "drop table"
+              - "truncate"
+          require:
+            ask_human_consent: true
+          on_fail: "这是不可逆操作，必须先在本阶段通过 ask_human 取得用户明确确认。"
+  - id: self_review
+    name: 自审
+    instructions: |
+      你现在是一个独立的、敌对的 code reviewer，**不是作者**，看不到 implement 阶段的辩解，只看代码事实。
+      逐条核对 align.lateral_constraints 与 align.boundary_questions（在前序阶段 output_summary 中可读）对应到当前 diff：
+        - 漏覆盖的项目必须写明缺口；
+        - 即使全部覆盖，也要在 review_findings 给出一份"逐项核对"清单（每条约束/边界 → 在 diff 哪里被处理）。
+      仅允许只读工具：Read 看 diff、shell 跑 git diff 或 test，禁止 edit。
+      如果发现 implement 的偏离已经无法在原方案内修复（如设计前提被推翻），返工到 design 或更早。
+
+      返工触发协议（重要）：
+        - 决定回炉时，最外层 JSON 必须 status="needs_rework"、rework_target_stage_id="implement"（或更早阶段）、
+          rework_reason 用一两句中文说明缺口；
+        - 不要把 needs_rework 仅写进 rework_decision 字段——引擎只识别最外层 status。
+        - 通过时：status="completed"，rework_decision="pass"，review_findings 必须给出逐项核对清单。
+    allowed_tools:
+      - read_file
+      - shell
+    required_outputs:
+      - review_findings
+      - rework_decision
+      - residual_risks
+    auto_retry_limit: 1
