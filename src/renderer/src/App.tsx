@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
 import type {
   AgentSession,
   AgentRuntimeStatus,
@@ -1372,11 +1373,12 @@ function JsonValue({ value }: { value: unknown }) {
   }
   if (typeof value === "string") {
     const trimmed = value.trim();
-    // 包含 Markdown 标记的字符串用 Markdown 渲染
+    // 包含 Markdown 标记的字符串用 Markdown 渲染（复用 MarkdownContent 以保持与其他渲染入口一致：
+    // 例如 ```json``` 代码块会同样走 JSON 美化）
     if (hasMarkdown(trimmed)) {
       return (
-        <div className="markdown-content json-markdown-value">
-          <ReactMarkdown>{trimmed}</ReactMarkdown>
+        <div className="json-markdown-value">
+          <MarkdownContent>{trimmed}</MarkdownContent>
         </div>
       );
     }
@@ -1421,6 +1423,9 @@ function JsonObject({ value }: { value: Record<string, unknown> }) {
 function hasMarkdown(text: string): boolean {
   return /[*_~`#>|[\-]{2,}/.test(text) || text.includes("\n");
 }
+
+/** 共享的 remark 插件数组：提到模块作用域，避免每次 render 重建破坏 react-markdown 的浅比较缓存 */
+const REMARK_PLUGINS = [remarkGfm];
 
 /** 自定义 Markdown 组件：JSON 代码块用美化渲染 */
 const markdownComponents: Components = {
@@ -1469,7 +1474,7 @@ const markdownComponents: Components = {
 function MarkdownContent({ children }: { children: string }) {
   return (
     <div className="markdown-content">
-      <ReactMarkdown components={markdownComponents}>{children}</ReactMarkdown>
+      <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={markdownComponents}>{children}</ReactMarkdown>
     </div>
   );
 }
