@@ -140,4 +140,42 @@ describe("WorkflowRegistry", () => {
 
     expect(workflows[0].stages[0].instructions).toContain("CLAUDE.md");
   });
+
+  it("passes through stage allowed_tools, auto_retry_limit and gates", async () => {
+    // 防止后续修改丢失阶段层字段的透传——auto_retry_limit 之前就是这样静默被 schema 吞掉的。
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-workflows-"));
+    await fs.writeFile(
+      path.join(dir, "stages.yaml"),
+      [
+        "id: stages",
+        "name: Stages",
+        "version: 1.0.0",
+        "stages:",
+        "  - id: investigate",
+        "    name: Investigate",
+        "    allowed_tools:",
+        "      - read_file",
+        "      - shell",
+        "  - id: apply",
+        "    name: Apply",
+        "    approval_required: true",
+        "    auto_retry_limit: 2",
+        "    allowed_tools:",
+        "      - read_file",
+        "      - edit_file",
+        "    gates:",
+        "      - authorized_files_only"
+      ].join("\n")
+    );
+
+    const [loaded] = await new WorkflowRegistry(dir).list();
+    expect(loaded.stages[0].allowed_tools).toEqual(["read_file", "shell"]);
+    // 默认值：未声明时数组应为空（而不是 undefined），下游过滤逻辑依赖该不变量
+    expect(loaded.stages[0].gates).toEqual([]);
+    expect(loaded.stages[0].auto_retry_limit).toBeUndefined();
+    expect(loaded.stages[1].allowed_tools).toEqual(["read_file", "edit_file"]);
+    expect(loaded.stages[1].auto_retry_limit).toBe(2);
+    expect(loaded.stages[1].gates).toEqual(["authorized_files_only"]);
+    expect(loaded.stages[1].approval_required).toBe(true);
+  });
 });

@@ -106,6 +106,9 @@ stages:
       增量模式下不要重写整份 CLAUDE.md 或整套 rules/skills；除非旧画像结构已经明显阻碍维护，否则只做局部替换、追加或删除过时条目。
       如果近期变更不足以证明画像需要调整，请明确输出“无需更新”的依据，而不是为了产出而修改。
       不要包含密钥、令牌、私有凭证、个人本地偏好或未经证据支持的规则。
+    allowed_tools:
+      - read_file
+      - shell
     required_outputs:
       - compact_summary
       - claude_md_draft

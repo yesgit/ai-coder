@@ -90,9 +90,7 @@ stages:
       先给结论，再给必要细节；不要复述所有中间步骤。
       如果有未完成、未验证或被阻塞的部分，明确说明原因和影响。
       不要添加与任务无关的说明。
-    allowed_tools:
-      - read_file
-      - shell
+      本阶段只基于前序阶段产出的事实总结，不要再跑命令或重新验证；如需更多事实请请求返工到合适的阶段。
     required_outputs:
       - final_summary
       - verification_result
