@@ -145,7 +145,8 @@ const workflowSchema = z.object({
         allowed_tools: stringArraySchema,
         required_outputs: stringArraySchema,
         required_checks: stringArraySchema,
-        gates: stringArraySchema
+        gates: stringArraySchema,
+        auto_retry_limit: z.number().int().min(0).optional()
       })
     )
     .min(1)
@@ -182,7 +183,8 @@ function normalizeWorkflow(input: unknown, sourceType: WorkflowSourceType, fileP
       allowed_tools: stage.allowed_tools,
       required_outputs: stage.required_outputs,
       required_checks: stage.required_checks,
-      gates: stage.gates
+      gates: stage.gates,
+      auto_retry_limit: stage.auto_retry_limit
     }))
   };
 }

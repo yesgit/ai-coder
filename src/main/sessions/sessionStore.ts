@@ -215,8 +215,20 @@ export class SessionStore {
 
   private async enqueueWrite<T>(id: string, operation: () => Promise<T>): Promise<T> {
     const previous = this.writeChains.get(id) ?? Promise.resolve();
+    // 用 .catch(() => undefined) 让链路不被上一个失败的写阻断（每次 save 都是独立操作）；
+    // 但本次 operation 本身的错误必须能被调用方拿到，所以 await result 时不吞错。
     const result = previous.catch(() => undefined).then(operation);
-    const tail = result.then(() => undefined, () => undefined);
+    // tail 仅用于"等下一笔写"的链路占位；rejection handler 写日志便于排查写盘失败，
+    // 外层再 .catch 兜底是为了防止 console.error 自身抛错（极端情况）导致 unhandled rejection。
+    // 错误已经从 result 返回给调用方，这里仅是兜底告警，避免静默丢失。
+    const tail = result
+      .then(
+        () => undefined,
+        (error) => {
+          console.error(`[sessionStore] write failed for session ${id}:`, error);
+        }
+      )
+      .catch(() => undefined);
     this.writeChains.set(id, tail);
     try {
       return await result;

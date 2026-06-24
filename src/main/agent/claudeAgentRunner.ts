@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { AgentSession, HumanQuestion, HumanQuestionOption, SessionProgressEvent, WorkflowStage, WorkflowTemplate } from "../../shared/types.js";
+import { isMeaningfulAgentText } from "../../shared/agentMessages.js";
 import {
   approveOrDenyToolUse,
   buildAllowedClaudeTools,
@@ -138,8 +139,8 @@ export class ClaudeAgentRunner {
       if (abortController.signal.aborted) {
         if (sdkMessages.length > 0) {
           const transcript = formatClaudeTranscript(sdkMessages);
-          // 仅当 transcript 非空时才写入消息，避免 (no content) 占位内容
-          if (transcript.trim() && transcript !== "(no content)" && !transcript.startsWith("收到 Claude SDK 消息：")) {
+          // 仅当 transcript 含有真正内容时才写入消息，避免 (no content) / SDK 内部 transcript 污染
+          if (isMeaningfulAgentText(transcript)) {
             input.session.messages.push({
               role: "assistant",
               content: transcript,
@@ -155,8 +156,8 @@ export class ClaudeAgentRunner {
 
       const stageOutput = extractClaudeStageOutput(sdkMessages);
       const transcript = formatClaudeTranscript(sdkMessages);
-      // 仅当 transcript 非空时才写入消息，避免 (no content) 占位内容
-      if (transcript.trim() && transcript !== "(no content)" && !transcript.startsWith("收到 Claude SDK 消息：")) {
+      // 仅当 transcript 含有真正内容时才写入消息，避免 (no content) / SDK 内部 transcript 污染
+      if (isMeaningfulAgentText(transcript)) {
         input.session.messages.push({
           role: "assistant",
           content: transcript,
@@ -187,8 +188,8 @@ export class ClaudeAgentRunner {
       if (abortController.signal.aborted || isAbortError(error)) {
         if (sdkMessages.length > 0) {
           const transcript = formatClaudeTranscript(sdkMessages);
-          // 仅当 transcript 非空时才写入消息，避免 (no content) 占位内容
-          if (transcript.trim() && transcript !== "(no content)" && !transcript.startsWith("收到 Claude SDK 消息：")) {
+          // 仅当 transcript 含有真正内容时才写入消息，避免 (no content) / SDK 内部 transcript 污染
+          if (isMeaningfulAgentText(transcript)) {
             input.session.messages.push({
               role: "assistant",
               content: transcript,
@@ -372,21 +373,22 @@ export class ClaudeAgentRunner {
 
   private failFromSdkError(input: AgentRunInput, sdkMessages: unknown[], error: unknown): AgentSession {
     const fallbackError = error instanceof Error ? error.message : String(error);
-    // 收集详细的诊断信息
+    const errorName = error instanceof Error ? error.name : typeof error;
+    // 诊断信息：仅保留可追溯但不含敏感内容的字段（不要 stringify input —— 会泄露 task_prompt / 附件路径）。
     const errorDetails = [
       `错误：${fallbackError}`,
+      `错误类型：${errorName}`,
       `SDK 消息数：${sdkMessages.length}`,
       `会话 ID: ${input.session.id}`,
       `阶段：${input.session.current_stage}`,
-      `项目路径：${input.session.project_path}`,
-      `Node 可执行文件：${JSON.stringify(input)}`.slice(0, 200) // 限制长度
+      `工作流：${input.workflow.id}`
     ].join('\n');
 
     if (sdkMessages.length > 0) {
       const stageOutput = extractClaudeStageOutput(sdkMessages);
       const transcript = formatClaudeTranscript(sdkMessages);
-      // 仅当 transcript 非空时才写入消息，避免 (no content) 占位内容
-      if (transcript.trim() && transcript !== "(no content)" && !transcript.startsWith("收到 Claude SDK 消息：")) {
+      // 仅当 transcript 含有真正内容时才写入消息，避免 (no content) / SDK 内部 transcript 污染
+      if (isMeaningfulAgentText(transcript)) {
         input.session.messages.push({
           role: "assistant",
           content: transcript,
@@ -434,6 +436,15 @@ export class ClaudeAgentRunner {
       if (typeof createSdkMcpServer !== "function" || typeof tool !== "function") {
         return null;
       }
+      // 注意：ask_human 是"宿主拦截工具"——SDK 看到的工具 handler 永远返回占位符 `(intercepted by host)`，
+      // 因为真正的拦截发生在 canUseTool（本文件 canUseTool 回调内 `toolName === "mcp__ai_coder__ask_human"` 分支）：
+      //   1. 模型尝试调用 ask_human → canUseTool 命中该分支
+      //   2. 解析 toolInput 构造 HumanQuestion，挂到 session.pending_human_questions
+      //   3. 返回 { behavior: "deny", interrupt: true } 暂停 SDK 循环
+      //   4. 用户在前端回答后 IPC 写回 session，下一轮以问答历史形式注入 prompt
+      // 为什么仍然要在 MCP 注册：SDK 只允许模型调用"已声明"的工具；不注册的话模型无法发起调用。
+      // 暴露面：MCP 工具走 `mcpServers` 通道独立注册，**不**经过 buildAllowedClaudeTools 过滤
+      // （后者只控制 Read/Edit/Bash 等标准工具）。所以 ask_human 对所有阶段永远可见，唯一守门人是 canUseTool。
       const askHumanTool = (tool as (
         name: string,
         description: string,

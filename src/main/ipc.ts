@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readdir, readFile, mkdir, writeFile, stat, realpath } from "node:fs/promises";
+import { readdir, readFile, mkdir, writeFile, stat, realpath, unlink } from "node:fs/promises";
 import { join, resolve, relative, extname, basename, sep } from "node:path";
 import { pdfToImages } from "./pdfToImages.js";
 import { BrowserWindow, dialog, ipcMain } from "electron";
@@ -114,31 +114,6 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     session.status = "running";
     await sessions.save(session);
     runSessionInBackground(runner, sessions, session, workflow);
-    return session;
-  });
-
-  ipcMain.handle("sessions:authorize-stage", async (_event, sessionId: string, stageId: string) => {
-    const session = await sessions.get(sessionId);
-    if (!session) {
-      throw new Error(`Session not found: ${sessionId}`);
-    }
-    const projectPath = await authorizedProjects.assertAuthorized(session.project_path);
-    // 查找待处理的阶段授权
-    const approval = session.approvals.find(
-      (item) => item.kind === "stage" && item.stage_id === stageId && item.status === "pending"
-    );
-    if (!approval) {
-      throw new Error(`Pending stage authorization not found for stage: ${stageId}`);
-    }
-    approval.status = "approved";
-    approval.resolved_at = new Date().toISOString();
-    session.status = "running";
-    await sessions.save(session);
-    // 继续执行会话
-    const workflow = await registry.get(session.workflow_id, projectPath);
-    if (workflow) {
-      runSessionInBackground(runner, sessions, session, workflow);
-    }
     return session;
   });
 
@@ -565,9 +540,13 @@ async function saveBinaryAttachments(attachments: Attachment[], projectPath: str
         try {
           pages = await pdfToImages(buffer, { dpi: 150, maxPages: 50 });
         } catch (error) {
-          // 渲染失败：上传整体失败。原 PDF 已落盘，但不作为附件返回 ——
+          // 渲染失败：上传整体失败。原 PDF 已落盘，需清理避免在 .ai-coder/uploads 留下垃圾文件。
           // 当前后端（GLM/vLLM）拿到 PDF 原文件也无法处理，给一条会失败的附件比
           // 直接报错更迷惑。
+          // 清理失败不致命（用户已经看到 PDF 渲染失败），但写日志便于排查孤儿文件来源。
+          await unlink(pdfPath).catch((cleanupError) => {
+            console.error(`[uploads] 清理失败 PDF 未能删除: ${pdfPath}`, cleanupError);
+          });
           throw new Error(
             `PDF 渲染失败 (${safeDisplayName}): ${error instanceof Error ? error.message : String(error)}`
           );

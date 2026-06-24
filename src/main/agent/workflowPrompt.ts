@@ -1,4 +1,5 @@
 import type { StageAgentInput } from "../../shared/types.js";
+import { isMeaningfulAgentText } from "../../shared/agentMessages.js";
 
 export function buildStageInstructions(input: StageAgentInput): string {
   const stageLines = input.workflow.stages
@@ -28,7 +29,7 @@ export function buildStageInstructions(input: StageAgentInput): string {
   const gates = input.gates.length ? input.gates.join(", ") : "none";
 
   const messageHistory = input.recent_messages
-    .filter((m) => (m.content?.trim() && m.content !== "(no content)" && !m.content.startsWith("收到 Claude SDK 消息：")) || m.attachments?.length)
+    .filter((m) => isMeaningfulAgentText(m.content) || m.attachments?.length)
     .map((m) => {
       const roleLabel = m.role === "user" ? "用户" : m.role === "assistant" ? "助手" : "系统";
       let text = `[${roleLabel}]: ${m.content || "(附带附件)"}`;

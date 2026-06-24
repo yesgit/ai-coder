@@ -9,6 +9,7 @@ import type {
   StageRun,
   ToolCallRecord
 } from "../../shared/types.js";
+import { isMeaningfulAgentText } from "../../shared/agentMessages.js";
 import { formatApprovalKind, formatFileOperation, formatRole, formatStageName, formatStatus } from "./labels.js";
 
 export type TimelineEventType = "task" | "stage" | "message" | "approval" | "tool" | "file" | "rework" | "status" | "error";
@@ -55,17 +56,16 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
   let lastAssistantIndex = -1;
   session.messages.forEach((message: AgentMessage, index: number) => {
     if (message.role !== "assistant") return;
-    const content = message.content?.trim() ?? "";
-    if (!content || content === "(no content)" || content.startsWith("收到 Claude SDK 消息：")) return;
+    if (!isMeaningfulAgentText(message.content)) return;
     lastAssistantIndex = index;
   });
 
   session.messages.forEach((message: AgentMessage, index: number) => {
     // 跳过空内容或占位符内容的消息
-    const content = message.content?.trim();
-    if (!content || content === "(no content)" || content.startsWith("收到 Claude SDK 消息：")) {
+    if (!isMeaningfulAgentText(message.content)) {
       return;
     }
+    const content = message.content?.trim() ?? "";
     // 助手消息：仅保留最后一条有意义的回答，避免中间过程与最终结果重复
     if (message.role === "assistant" && index !== lastAssistantIndex) {
       return;

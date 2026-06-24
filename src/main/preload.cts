@@ -13,7 +13,6 @@ const api: AppApi = {
   listSessions: () => ipcRenderer.invoke("sessions:list"),
   getSession: (id: string) => ipcRenderer.invoke("sessions:get", id),
   approveStage: (sessionId: string, stageId: string) => ipcRenderer.invoke("sessions:approve-stage", sessionId, stageId),
-  authorizeStage: (sessionId: string, stageId: string) => ipcRenderer.invoke("sessions:authorize-stage", sessionId, stageId),
   approveRework: (sessionId: string, requestId: string) => ipcRenderer.invoke("sessions:approve-rework", sessionId, requestId),
   approveToolCall: (sessionId: string, toolCallId: string) =>
     ipcRenderer.invoke("sessions:approve-tool-call", sessionId, toolCallId),
