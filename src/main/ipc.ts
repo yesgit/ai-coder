@@ -261,20 +261,19 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
       throw new Error(`Pending human question not found: ${questionId}`);
     }
     // 校验答案与类型匹配 + 选项合法性
+    // 注意：UI 允许用户在单选/多选中选择"其他"并输入自定义文本，提交时该文本会替换虚拟值，
+    // 因此这里只能要求每一项是非空字符串且长度合法，不能强制命中 options[].value。
     const MAX_ANSWER_LEN = 2000;
     if (question.question_type === "multi") {
       if (!Array.isArray(answer)) throw new Error("多选问题需要数组答案");
-      if (!answer.every((v) => typeof v === "string" && v.length <= MAX_ANSWER_LEN)) {
-        throw new Error("多选答案元素必须为字符串且长度合法");
-      }
-      const validValues = new Set((question.options ?? []).map((o) => o.value));
-      if (!answer.every((v) => validValues.has(v))) {
-        throw new Error("答案包含未列出的选项");
+      if (answer.length === 0) throw new Error("多选问题需要至少一个答案");
+      if (!answer.every((v) => typeof v === "string" && v.length > 0 && v.length <= MAX_ANSWER_LEN)) {
+        throw new Error("多选答案元素必须为非空字符串且长度合法");
       }
     } else if (question.question_type === "single") {
       if (typeof answer !== "string") throw new Error("单选问题需要字符串答案");
-      const validValues = new Set((question.options ?? []).map((o) => o.value));
-      if (!validValues.has(answer)) throw new Error("答案不在选项列表中");
+      if (answer.length === 0) throw new Error("单选问题需要非空答案");
+      if (answer.length > MAX_ANSWER_LEN) throw new Error(`回答过长，上限 ${MAX_ANSWER_LEN} 字符`);
     } else {
       if (typeof answer !== "string") throw new Error("文本问题需要字符串答案");
       if (answer.length > MAX_ANSWER_LEN) throw new Error(`回答过长，上限 ${MAX_ANSWER_LEN} 字符`);

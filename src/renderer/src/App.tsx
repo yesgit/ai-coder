@@ -31,6 +31,10 @@ import {
 } from "./labels.js";
 import "./styles.css";
 
+// 单选/多选时 UI 自动追加的"其他"虚拟选项值——选中后提交前会被替换成用户输入的自定义文本，
+// 因此前缀用一段不太可能被 agent 自然指定的字符串以避免与真实 options[].value 冲突。
+const OTHER_OPTION_VALUE = "__ai_coder_other__";
+
 export default function App() {
   const [projectPath, setProjectPath] = useState("");
   const [workflows, setWorkflows] = useState<WorkflowTemplate[]>([]);
@@ -62,11 +66,14 @@ export default function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const taskFileInputRef = useRef<HTMLInputElement>(null);
   const [questionAnswers, setQuestionAnswers] = useState<Record<string, string | string[]>>({});
+  // 单选/多选中选择"其他"时的自定义文本草稿，按 question id 存放
+  const [questionOtherTexts, setQuestionOtherTexts] = useState<Record<string, string>>({});
   const [timelineLimit, setTimelineLimit] = useState(50); // 默认只显示最近 50 条事件
 
   // 切换 session 时清空草稿答案，避免不同 session 间的串味
   useEffect(() => {
     setQuestionAnswers({});
+    setQuestionOtherTexts({});
   }, [activeSessionId]);
 
   // 可上传的非图片二进制文件 MIME 与扩展名（PDF、文档、表格等）
@@ -467,6 +474,12 @@ export default function App() {
       upsertSession(updated);
       await refreshSessions(updated.id);
       setQuestionAnswers((prev) => {
+        const next = { ...prev };
+        delete next[questionId];
+        return next;
+      });
+      setQuestionOtherTexts((prev) => {
+        if (!(questionId in prev)) return prev;
         const next = { ...prev };
         delete next[questionId];
         return next;
@@ -1057,10 +1070,35 @@ export default function App() {
                 <div className="human-questions">
                   {pendingHumanQuestions.map((q: HumanQuestion) => {
                     const currentAnswer = questionAnswers[q.id];
-                    const isValid =
-                      q.question_type === "multi"
-                        ? Array.isArray(currentAnswer) && currentAnswer.length > 0
-                        : typeof currentAnswer === "string" && currentAnswer.trim().length > 0;
+                    const otherText = questionOtherTexts[q.id] ?? "";
+                    const trimmedOther = otherText.trim();
+                    // 单选/多选默认追加"其他"虚拟选项；text 不需要
+                    const showOtherInput =
+                      (q.question_type === "single" && currentAnswer === OTHER_OPTION_VALUE) ||
+                      (q.question_type === "multi" &&
+                        Array.isArray(currentAnswer) &&
+                        currentAnswer.includes(OTHER_OPTION_VALUE));
+                    let isValid: boolean;
+                    if (q.question_type === "multi") {
+                      if (!Array.isArray(currentAnswer) || currentAnswer.length === 0) {
+                        isValid = false;
+                      } else if (currentAnswer.includes(OTHER_OPTION_VALUE) && trimmedOther.length === 0) {
+                        // 选了"其他"但没填文本：只要还有别的真实选项就允许提交
+                        isValid = currentAnswer.some((v) => v !== OTHER_OPTION_VALUE);
+                      } else {
+                        isValid = true;
+                      }
+                    } else if (q.question_type === "single") {
+                      if (typeof currentAnswer !== "string" || currentAnswer.length === 0) {
+                        isValid = false;
+                      } else if (currentAnswer === OTHER_OPTION_VALUE) {
+                        isValid = trimmedOther.length > 0;
+                      } else {
+                        isValid = true;
+                      }
+                    } else {
+                      isValid = typeof currentAnswer === "string" && currentAnswer.trim().length > 0;
+                    }
                     return (
                       <article key={q.id} className="human-question">
                         <div className="question-header">
@@ -1087,6 +1125,17 @@ export default function App() {
                                 <span>{opt.label}</span>
                               </label>
                             ))}
+                            <label className="question-option">
+                              <input
+                                type="radio"
+                                name={q.id}
+                                checked={currentAnswer === OTHER_OPTION_VALUE}
+                                onChange={() =>
+                                  setQuestionAnswers((prev) => ({ ...prev, [q.id]: OTHER_OPTION_VALUE }))
+                                }
+                              />
+                              <span>其他（自行输入）</span>
+                            </label>
                           </div>
                         )}
                         {q.question_type === "multi" && q.options && (
@@ -1110,7 +1159,32 @@ export default function App() {
                                 </label>
                               );
                             })}
+                            <label className="question-option">
+                              <input
+                                type="checkbox"
+                                checked={Array.isArray(currentAnswer) && currentAnswer.includes(OTHER_OPTION_VALUE)}
+                                onChange={(event) => {
+                                  const arr = Array.isArray(currentAnswer) ? currentAnswer : [];
+                                  const next = event.target.checked
+                                    ? [...arr, OTHER_OPTION_VALUE]
+                                    : arr.filter((v) => v !== OTHER_OPTION_VALUE);
+                                  setQuestionAnswers((prev) => ({ ...prev, [q.id]: next }));
+                                }}
+                              />
+                              <span>其他（自行输入）</span>
+                            </label>
                           </div>
+                        )}
+                        {showOtherInput && (
+                          <textarea
+                            className="question-textarea"
+                            rows={2}
+                            value={otherText}
+                            onChange={(event) =>
+                              setQuestionOtherTexts((prev) => ({ ...prev, [q.id]: event.target.value }))
+                            }
+                            placeholder="输入你的其他意见..."
+                          />
                         )}
                         {q.question_type === "text" && (
                           <textarea
@@ -1126,10 +1200,18 @@ export default function App() {
                             className="primary"
                             disabled={busy || !isValid}
                             onClick={() => {
-                              const ans =
-                                q.question_type === "multi"
-                                  ? (currentAnswer as string[])
-                                  : ((currentAnswer as string) || "").trim();
+                              let ans: string | string[];
+                              if (q.question_type === "multi") {
+                                const arr = Array.isArray(currentAnswer) ? currentAnswer : [];
+                                ans = arr
+                                  .map((v) => (v === OTHER_OPTION_VALUE ? trimmedOther : v))
+                                  .filter((v) => v.length > 0);
+                              } else if (q.question_type === "single") {
+                                const v = (currentAnswer as string) || "";
+                                ans = v === OTHER_OPTION_VALUE ? trimmedOther : v;
+                              } else {
+                                ans = ((currentAnswer as string) || "").trim();
+                              }
                               void answerHumanQuestion(activeSession, q.id, ans);
                             }}
                           >
