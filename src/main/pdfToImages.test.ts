@@ -1,22 +1,17 @@
 import { describe, expect, it } from "vitest";
 import { readFile } from "node:fs/promises";
-import { access, mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pdfToImages } from "./pdfToImages.js";
 
 // 测试依赖项目外部的 sample PDF（/mnt/d/temp 下的任意小 PDF 都可以）。
-// 没找到时自动跳过，不会让 CI 红。
+// 没找到时通过 it.skipIf 显式跳过，CI 报告里能看到 "skipped" 而不是误以为通过。
 const SAMPLE = "/mnt/d/temp/10 个让我成为更好开发者的经验教训.pdf";
 
-async function hasSample(): Promise<boolean> {
-  try {
-    await access(SAMPLE);
-    return true;
-  } catch {
-    return false;
-  }
-}
+const sampleAvailable = existsSync(SAMPLE);
+const skipIfNoSample = sampleAvailable ? it : it.skip;
 
 describe("pdfToImages", () => {
   it("throws on corrupted / non-PDF input", async () => {
@@ -24,15 +19,13 @@ describe("pdfToImages", () => {
     await expect(pdfToImages(garbage)).rejects.toThrow(/Invalid PDF|InvalidPDFException|FormatError|corrupted/);
   });
 
-  it("respects maxPages limit", { timeout: 15000 }, async () => {
-    if (!await hasSample()) return void console.log("skip: sample PDF not found");
+  skipIfNoSample("respects maxPages limit", { timeout: 15000 }, async () => {
     const pdf = await readFile(SAMPLE);
     // 该 PDF 实际有 6 页，maxPages=2 应超限抛出
     await expect(pdfToImages(pdf, { maxPages: 2 })).rejects.toThrow(/exceeds page limit/);
   });
 
-  it("renders all pages within limit and returns valid PNG buffers", { timeout: 30000 }, async () => {
-    if (!await hasSample()) return void console.log("skip: sample PDF not found");
+  skipIfNoSample("renders all pages within limit and returns valid PNG buffers", { timeout: 30000 }, async () => {
     const pdf = await readFile(SAMPLE);
     const pages = await pdfToImages(pdf, { dpi: 150, maxPages: 50 });
     expect(pages.length).toBe(6);
@@ -47,8 +40,7 @@ describe("pdfToImages", () => {
     }
   });
 
-  it("writes PNGs to disk correctly", { timeout: 30000 }, async () => {
-    if (!await hasSample()) return void console.log("skip: sample PDF not found");
+  skipIfNoSample("writes PNGs to disk correctly", { timeout: 30000 }, async () => {
     const tmpDir = await mkdtemp(join(tmpdir(), "ai-coder-pdf-test-"));
     try {
       const pdf = await readFile(SAMPLE);
@@ -66,8 +58,7 @@ describe("pdfToImages", () => {
     }
   });
 
-  it("automatically downsizes huge pages under maxPx", { timeout: 30000 }, async () => {
-    if (!await hasSample()) return void console.log("skip: sample PDF not found");
+  skipIfNoSample("automatically downsizes huge pages under maxPx", { timeout: 30000 }, async () => {
     const pdf = await readFile(SAMPLE);
     // 故意设非常小的像素上限
     const pages = await pdfToImages(pdf, { dpi: 150, maxPx: 500 });
