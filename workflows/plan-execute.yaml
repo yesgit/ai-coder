@@ -33,6 +33,9 @@ stages:
       主动识别隐含风险，例如不可逆操作、范围膨胀、信息缺口和与现有状态的冲突。
       信息不足时，优先基于上下文做谨慎假设并标明；只有缺少关键信息会导致错误执行或不可逆操作时才要求用户补充。
       不要在本阶段执行任务或修改文件。
+    allowed_tools:
+      - read_file
+      - shell
     required_outputs:
       - task_summary
       - assumptions
@@ -46,6 +49,9 @@ stages:
       对关键选择说明取舍：为什么这样做足够、哪里保持保守、哪些事情暂不做。
       包含验证方式或完成判据，并说明哪些步骤可能触发 shell 或文件写入审批。
       保持计划聚焦，不要加入与用户目标无关的探索或优化。
+    allowed_tools:
+      - read_file
+      - shell
     required_outputs:
       - execution_steps
       - expected_output
@@ -71,6 +77,9 @@ stages:
       优先使用客观证据，例如测试、构建、类型检查、文件检查或可复现的输出。
       明确哪些内容已经验证、哪些没有验证、是否存在失败或残余风险。
       如果验证失败且需要修改执行结果，请请求返工到执行阶段。
+    allowed_tools:
+      - read_file
+      - shell
     required_checks:
       - result_verified
   - id: summarize
@@ -81,6 +90,9 @@ stages:
       先给结论，再给必要细节；不要复述所有中间步骤。
       如果有未完成、未验证或被阻塞的部分，明确说明原因和影响。
       不要添加与任务无关的说明。
+    allowed_tools:
+      - read_file
+      - shell
     required_outputs:
       - final_summary
       - verification_result

@@ -44,6 +44,9 @@ stages:
       如果用户请求含糊，优先结合项目上下文做保守解释，并在 task_summary 或 output_summary 中标明假设。
       只有当缺少信息会导致错误修改、破坏数据或无法选择实现路径时，才将阶段标记为 needs_rework 或 failed 并说明需要用户补充什么。
       不要在本阶段阅读大量代码、制定实现方案或修改文件。
+    allowed_tools:
+      - read_file
+      - shell
     required_outputs:
       - task_summary
       - acceptance_criteria
@@ -73,6 +76,9 @@ stages:
       对每个风险给出实际触发条件和验证方式；不要列泛泛的风险清单。
       如果发现必须扩大范围，说明原因、替代方案和不扩大范围的后果。
       不要执行实现，不要引入与当前目标无关的重构建议。
+    allowed_tools:
+      - read_file
+      - shell
     required_outputs:
       - impact_scope
       - risks
@@ -87,6 +93,9 @@ stages:
       验证计划应说明要运行的测试、类型检查、构建或手工检查；如果只需要局部验证，也要解释为什么足够。
       标出需要用户审批的文件写入或 shell 命令，但不要用文字请求代替后续实际工具调用。
       不要在计划里承诺无法从当前上下文保证的结果。
+    allowed_tools:
+      - read_file
+      - shell
     required_outputs:
       - implementation_plan
       - test_plan
@@ -127,6 +136,9 @@ stages:
       优先说明任务是否完成、实际变更、验证结果和仍需注意的风险或限制。
       提到文件时使用项目相对路径；不要复述完整过程，也不要包含与本任务无关的建议。
       如果存在未完成项、未运行验证或失败验证，必须清楚列出原因和影响。
+    allowed_tools:
+      - read_file
+      - shell
     required_outputs:
       - change_summary
       - verification_result

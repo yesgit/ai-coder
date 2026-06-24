@@ -49,6 +49,9 @@ stages:
       对每个可疑点做反证思考：是否有测试、调用约束或上游校验已经覆盖它；证据不足时不要夸大。
       只报告有证据支撑且会实际影响行为或维护的事项；不要把个人偏好、无关风格或泛泛建议列为问题。
       如果没有发现问题，也要明确说明，并列出剩余未验证风险。
+    allowed_tools:
+      - read_file
+      - shell
     required_outputs:
       - findings
       - severity
@@ -61,6 +64,9 @@ stages:
       如果没有问题，直接说明“未发现需要修改的问题”，再补充测试缺口或残余风险。
       变更摘要只能放在发现之后，保持简短。
       不要输出与审查无关的实现计划，除非用户明确要求修复。
+    allowed_tools:
+      - read_file
+      - shell
     required_outputs:
       - review_summary
       - test_gaps

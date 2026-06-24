@@ -70,6 +70,9 @@ stages:
       每个重要结论都应能追溯到已阅读文件；不确定的命令、约定或架构要明确标为不确定。
       区分“给代理必须遵守的规则”和“帮助理解项目的背景信息”。
       不要编造缺失信息，不要把一次性本地偏好写成团队规则。
+    allowed_tools:
+      - read_file
+      - shell
     required_outputs:
       - project_overview
       - tech_stack
