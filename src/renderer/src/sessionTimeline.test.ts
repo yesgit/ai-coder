@@ -221,4 +221,71 @@ describe("buildSessionTimeline", () => {
     expect(titles[1]).toBe("助手提问待回答"); // pending human question, 时间戳 (01:03:00)
     expect(titles[2]).toBe("阶段审批待处理"); // pending approval, 时间戳最早 (01:01:00)
   });
+
+  it("wraps embedded JSON blocks in fenced code blocks", () => {
+    const content =
+      "现在我已经收集了足够的证据。让我总结 investigate 阶段的发现：\n\n" +
+      JSON.stringify({
+        status: "completed",
+        output_summary: "已完成取证阶段。",
+        required_outputs: { similar_callsites: ["a", "b"] }
+      });
+    const events = buildSessionTimeline({
+      ...session,
+      messages: [
+        {
+          role: "assistant",
+          content,
+          created_at: "2026-06-03T01:02:00.000Z"
+        }
+      ]
+    });
+    const messageEvent = events.find((e) => e.type === "message");
+    expect(messageEvent).toBeDefined();
+    // 中文叙述前缀保留
+    expect(messageEvent!.detail).toContain("现在我已经收集了足够的证据");
+    // JSON 被包成 ```json 代码块，且被 prettify（带换行缩进）
+    expect(messageEvent!.detail).toMatch(/```json\n\{\n  "status": "completed",/);
+    expect(messageEvent!.detail).toMatch(/\n\}\n```/);
+    // 不应有原始单行 JSON 残留
+    expect(messageEvent!.detail).not.toMatch(/\{"status":"completed"/);
+  });
+
+  it("does not double-wrap JSON already inside a fenced code block", () => {
+    const content =
+      "前文叙述。\n\n```json\n" +
+      JSON.stringify({ a: 1, b: 2 }, null, 2) +
+      "\n```\n\n后文叙述。";
+    const events = buildSessionTimeline({
+      ...session,
+      messages: [
+        {
+          role: "assistant",
+          content,
+          created_at: "2026-06-03T01:02:00.000Z"
+        }
+      ]
+    });
+    const messageEvent = events.find((e) => e.type === "message");
+    expect(messageEvent).toBeDefined();
+    // 原 fenced code block 不被改写：仍是单一 ``` 对儿
+    const fenceCount = (messageEvent!.detail!.match(/```/g) ?? []).length;
+    expect(fenceCount).toBe(2);
+  });
+
+  it("leaves inline short JSON-like fragments alone", () => {
+    const events = buildSessionTimeline({
+      ...session,
+      messages: [
+        {
+          role: "assistant",
+          content: '配置示例：{"a":1} 就够了。',
+          created_at: "2026-06-03T01:02:00.000Z"
+        }
+      ]
+    });
+    const messageEvent = events.find((e) => e.type === "message");
+    expect(messageEvent!.detail).not.toContain("```");
+    expect(messageEvent!.detail).toContain('{"a":1}');
+  });
 });

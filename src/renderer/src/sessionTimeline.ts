@@ -70,16 +70,10 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
     if (message.role === "assistant" && index !== lastAssistantIndex) {
       return;
     }
-    // 尝试格式化 JSON 内容，使其更易读
-    let formattedContent = content;
-    try {
-      if (content.startsWith('{') || content.startsWith('[')) {
-        const parsed = JSON.parse(content);
-        formattedContent = '```json\n' + JSON.stringify(parsed, null, 2) + '\n```';
-      }
-    } catch {
-      // 不是 JSON，保持原样
-    }
+    // 把消息文本里嵌入的 JSON 子块包成 ```json``` 代码块，使其在 markdown 中渲染为美化的代码块。
+    // 之前只在「整段就是一个 JSON 字面量」时才 prettify（startsWith('{') / '['），
+    // 但 agent 常输出「中文叙述 + 末尾甩一段 JSON」，那种形态完全漏掉。
+    const formattedContent = formatEmbeddedJsonBlocks(content);
     // display_name 用户可控，需转义 markdown 元字符避免被解析为链接
     const escapeMd = (s: string) => s.replace(/[\\`*_{}\[\]()#+\-.!|<>]/g, "\\$&");
     const attachmentDetail = message.attachments?.length
@@ -286,4 +280,130 @@ function isMilestoneProgress(progress: SessionProgressEvent): boolean {
 
 function formatJson(value: unknown) {
   return JSON.stringify(value, null, 2);
+}
+
+/**
+ * 扫描文本，把内嵌的合法 JSON 对象/数组替换成 ```json ``` 代码块。
+ *
+ * - 已在 ``` fenced code block 内的内容原样保留（避免二次包裹）
+ * - 只处理满足以下条件的 JSON 候选：
+ *    1) 通过括号配平（粗略支持字符串字面量内的 `{` `}` `[` `]`）找到完整片段
+ *    2) `JSON.parse` 成功，且 parse 结果是 object/array（避免误把数学表达式当 JSON）
+ *    3) 串长 ≥ 40 字符或 parse 后是带嵌套的复合值——避免把 `{"a":1}` 这种短片段抢走 inline 显示
+ * - 不抛错：解析失败的候选原样保留
+ */
+function formatEmbeddedJsonBlocks(text: string): string {
+  if (!text) return text;
+  // 没有 `{` `[` 直接返回，省掉一次扫描
+  if (text.indexOf("{") === -1 && text.indexOf("[") === -1) return text;
+
+  const segments: string[] = [];
+  let i = 0;
+  let plainStart = 0;
+  // 标识符 + 选项的代码块栅栏：` ``` ` 直到行首再 ``` 才闭合
+  const fenceRe = /(^|\n)```/;
+
+  while (i < text.length) {
+    const ch = text[i];
+
+    // 跳过已存在的 fenced code block
+    if (ch === "`" && text.startsWith("```", i) && (i === 0 || text[i - 1] === "\n")) {
+      // 找到闭合的 ``` （行首）
+      const rest = text.slice(i + 3);
+      const closeMatch = rest.search(fenceRe);
+      if (closeMatch === -1) {
+        // 没闭合：整段当代码块跳过到末尾
+        i = text.length;
+      } else {
+        // 闭合位置：i + 3 + closeMatch 指向 \n 或 0；前移到 ``` 后
+        const closeAt = i + 3 + closeMatch;
+        // closeMatch 命中的是 (^|\n)``` 的开头；跳到三反引号之后
+        const newlineOffset = text[closeAt] === "\n" ? 1 : 0;
+        i = closeAt + newlineOffset + 3;
+      }
+      continue;
+    }
+
+    if (ch !== "{" && ch !== "[") {
+      i++;
+      continue;
+    }
+
+    const end = findBalancedJsonEnd(text, i);
+    if (end === -1) {
+      i++;
+      continue;
+    }
+    const candidate = text.slice(i, end + 1);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(candidate);
+    } catch {
+      i++;
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object") {
+      i++;
+      continue;
+    }
+    // 短 JSON 内联保留可读性更好；阈值定在 40 字符——能容纳 `{"a":1,"b":2,"c":3}` 这类
+    // 单行配置示例，但不会让多键嵌套块漏过
+    if (candidate.length < 40) {
+      i++;
+      continue;
+    }
+
+    // flush 前面的普通段
+    segments.push(text.slice(plainStart, i));
+    // 用 trim 收尾：parse/stringify 已经规范化了空白
+    const pretty = formatJson(parsed);
+    // 保证前后留空行——MarkdownContent 用了 GFM，紧贴中文会渲染成段内
+    segments.push("\n\n```json\n" + pretty + "\n```\n\n");
+    i = end + 1;
+    plainStart = i;
+  }
+
+  segments.push(text.slice(plainStart));
+  return segments.join("");
+}
+
+/**
+ * 从 text[start] 开始（必须是 `{` 或 `[`）找到匹配的闭合括号位置（含）。
+ * 字符串字面量内的括号不计数；转义字符按 JSON 规则跳过。
+ * 找不到返回 -1。
+ */
+function findBalancedJsonEnd(text: string, start: number): number {
+  const open = text[start];
+  const close = open === "{" ? "}" : open === "[" ? "]" : "";
+  if (!close) return -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === "{" || ch === "[") depth++;
+    else if (ch === "}" || ch === "]") {
+      depth--;
+      if (depth === 0) {
+        // 必须配对：开 { 闭 } ；开 [ 闭 ]
+        return ch === close ? i : -1;
+      }
+      if (depth < 0) return -1;
+    }
+  }
+  return -1;
 }
