@@ -9,8 +9,10 @@
   },
   "description": "Desktop AI coding agent with pluggable local workflows.",
   "main": "dist/main/main.js",
+  "desktopName": "ai-coder.desktop",
   "scripts": {
     "build:main": "tsc -p tsconfig.main.json",
+    "build:icon": "node scripts/make-icon.cjs",
     "dev": "npm run build:main && concurrently -k \"vite --host 127.0.0.1\" \"wait-on tcp:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
     "build": "tsc -p tsconfig.main.json && vite build",
     "start": "electron .",
@@ -26,7 +28,8 @@
     },
     "files": [
       "dist/**/*",
-      "workflows/*.yaml"
+      "workflows/*.yaml",
+      "build/icon.png"
     ],
     "extraResources": [
       {
@@ -43,7 +46,8 @@
         "deb"
       ],
       "category": "Development",
-      "icon": null
+      "icon": "build/icon.png",
+      "syncDesktopName": true
     }
   },
   "dependencies": {
