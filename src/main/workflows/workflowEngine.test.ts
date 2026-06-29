@@ -299,4 +299,145 @@ describe("WorkflowEngine", () => {
     expect(session.status).toBe("blocked");
     expect(session.error).toContain("Missing required outputs after 1 attempts");
   });
+
+  it("post_output_assertions: review_self_consistency 命中 → 走 retry → 超限 block", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+    const wf: WorkflowTemplate = {
+      ...workflow,
+      stages: [
+        {
+          id: "self_review",
+          name: "Self Review",
+          auto_retry_limit: 1,
+          hooks: { post_output_assertions: ["review_self_consistency"] }
+        }
+      ]
+    };
+
+    engine.ensureState(session, wf);
+    // 第 1 次：findings 含 blocker 但 decision=pass —— 触发断言 → retry
+    engine.applyStageResult(session, wf, {
+      status: "completed",
+      output_summary: "发现一个 blocker",
+      required_outputs: { rework_decision: "pass" }
+    });
+    expect(session.status).toBe("running");
+    expect(session.error).toContain("review_self_consistency");
+    expect(session.stage_runs?.[0]).toMatchObject({ attempt: 2, status: "running" });
+
+    // 第 2 次：仍然自相矛盾 → 超限 block
+    engine.applyStageResult(session, wf, {
+      status: "completed",
+      output_summary: "依然 blocker",
+      required_outputs: { rework_decision: "pass" }
+    });
+    expect(session.status).toBe("blocked");
+    expect(session.error).toContain("after 2 attempts");
+  });
+
+  it("post_output_assertions: 修正后通过", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+    const wf: WorkflowTemplate = {
+      ...workflow,
+      stages: [
+        {
+          id: "self_review",
+          name: "Self Review",
+          auto_retry_limit: 1,
+          hooks: { post_output_assertions: ["review_self_consistency"] }
+        }
+      ]
+    };
+
+    engine.ensureState(session, wf);
+    engine.applyStageResult(session, wf, {
+      status: "completed",
+      output_summary: "发现一个 blocker",
+      required_outputs: { rework_decision: "pass" }
+    });
+    expect(session.status).toBe("running");
+
+    // 模型修正：改为 needs_rework
+    engine.applyStageResult(session, wf, {
+      status: "needs_rework",
+      output_summary: "回炉 implement",
+      required_outputs: { rework_decision: "needs_rework" },
+      rework_target_stage_id: "self_review", // 故意不合法但流程上只是测断言不再触发
+      rework_reason: "存在阻塞缺口"
+    });
+    // 注意：rework_target_stage_id 的合法性由 requestRework 校验，可能 block，
+    // 但断言层已通过——这里我们只验证不再因 review_self_consistency 卡住。
+    expect(session.error ?? "").not.toContain("review_self_consistency");
+  });
+
+  it("post_output_assertions: 未声明该断言时 review 自相矛盾照样放行（向后兼容）", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+    const wf: WorkflowTemplate = {
+      ...workflow,
+      stages: [{ id: "self_review", name: "Self Review" }]
+    };
+
+    engine.ensureState(session, wf);
+    engine.applyStageResult(session, wf, {
+      status: "completed",
+      output_summary: "blocker 存在",
+      required_outputs: { rework_decision: "pass" }
+    });
+    expect(session.status).not.toBe("blocked");
+  });
+
+  it("needs_rework_target_required: 声明该断言时，缺 target → retry 而非立即 block", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+    const wf: WorkflowTemplate = {
+      ...workflow,
+      stages: [
+        {
+          id: "self_review",
+          name: "Self Review",
+          auto_retry_limit: 1,
+          hooks: { post_output_assertions: ["needs_rework_target_required"] }
+        }
+      ]
+    };
+
+    engine.ensureState(session, wf);
+    // 第 1 次：status=needs_rework 但缺 target —— 旧路径会直接 block，
+    // 新路径应让断言层给一次 retry。
+    engine.applyStageResult(session, wf, {
+      status: "needs_rework",
+      output_summary: "回炉但忘了写 target"
+    });
+    expect(session.status).toBe("running");
+    expect(session.error).toContain("needs_rework_target_required");
+    expect(session.stage_runs?.[0]).toMatchObject({ attempt: 2, status: "running" });
+
+    // 第 2 次仍缺 target → 超限 block
+    engine.applyStageResult(session, wf, {
+      status: "needs_rework",
+      output_summary: "还是没写"
+    });
+    expect(session.status).toBe("blocked");
+    expect(session.error).toContain("after 2 attempts");
+  });
+
+  it("needs_rework_target_required: 未声明该断言时仍保持旧的立即 block 行为（向后兼容）", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+    const wf: WorkflowTemplate = {
+      ...workflow,
+      stages: [{ id: "self_review", name: "Self Review", auto_retry_limit: 1 }]
+    };
+
+    engine.ensureState(session, wf);
+    engine.applyStageResult(session, wf, {
+      status: "needs_rework",
+      output_summary: "回炉但忘了写 target"
+    });
+    expect(session.status).toBe("blocked");
+    expect(session.error).toContain("Rework result requires");
+  });
 });

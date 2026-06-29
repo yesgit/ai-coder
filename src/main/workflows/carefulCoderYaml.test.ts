@@ -15,5 +15,9 @@ describe("careful-coder.yaml validates", () => {
     expect(implement?.hooks?.pre_tool_use?.[1].require.ask_human_consent).toBe(true);
     const sr = cc!.stages.find(s => s.id === "self_review");
     expect(sr?.allowed_tools).not.toContain("edit_file");
+    expect(sr?.hooks?.post_output_assertions).toEqual([
+      "review_self_consistency",
+      "needs_rework_target_required"
+    ]);
   });
 });

@@ -84,6 +84,12 @@ export class WorkflowRegistry {
 }
 
 const stringArraySchema = z.array(z.string().min(1)).default([]);
+const postOutputAssertionSchema = z.enum([
+  "review_self_consistency",
+  "needs_rework_target_required",
+  "unknowns_present",
+  "item_matrix_when_multi"
+]);
 const stageHooksSchema = z
   .object({
     pre_tool_use: z
@@ -110,7 +116,8 @@ const stageHooksSchema = z
         })
       )
       .min(1)
-      .optional()
+      .optional(),
+    post_output_assertions: z.array(postOutputAssertionSchema).min(1).optional()
   })
   .optional();
 

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { evaluateOutputAssertions } from "../agent/stageOutputAssertions.js";
 import type {
   AgentSession,
   ApprovalRecord,
@@ -57,8 +58,16 @@ export class WorkflowEngine {
       return this.failCurrentStage(session, result.error ?? result.output_summary);
     }
 
+    const stage = this.getStage(workflow, stageRun.stage_id);
+
     if (result.status === "needs_rework") {
+      // target/reason 缺失时优先走断言层：如果 stage 声明了 needs_rework_target_required
+      // 断言，给模型一次按 auto_retry_limit 重试补齐的机会；未声明则保持原 block 路径，
+      // 保证未启用该断言的旧工作流行为不变。
       if (!result.rework_target_stage_id || !result.rework_reason) {
+        if (stage && this.runOutputAssertions(session, workflow, stage, stageRun, result)) {
+          return session;
+        }
         return this.blockCurrentStage(session, "Rework result requires rework_target_stage_id and rework_reason");
       }
       try {
@@ -68,7 +77,6 @@ export class WorkflowEngine {
       }
     }
 
-    const stage = this.getStage(workflow, stageRun.stage_id);
     const missingOutputs = (stage?.required_outputs ?? []).filter((name) => !hasRequiredOutput(result, name));
     if (missingOutputs.length > 0) {
       const maxRetry = stage?.auto_retry_limit ?? 0;
@@ -79,7 +87,41 @@ export class WorkflowEngine {
       return this.blockCurrentStage(session, `Missing required outputs after ${currentAttempt} attempts: ${missingOutputs.join(", ")}`);
     }
 
+    // 阶段产物自洽性断言：与 missing outputs 同模式走 retry → block。
+    // 仅当 stage.hooks.post_output_assertions 显式声明时触发；未声明=透传，与既有工作流完全兼容。
+    if (stage && this.runOutputAssertions(session, workflow, stage, stageRun, result)) {
+      return session;
+    }
+
     return this.completeCurrentStage(session, workflow, result.output_summary);
+  }
+
+  /**
+   * 评估阶段输出断言。命中失败时按 stage.auto_retry_limit 走 retry → block 路径，
+   * 返回 true 表示已处理（调用方应直接 return session）；返回 false 表示无失败、调用方继续。
+   *
+   * needs_rework_target_required 这种"结构性"断言在 applyStageResult 的早期分支也会用到——
+   * 这是断言层有意被抽出 helper 的原因：让 missing-outputs 之后和 needs_rework 缺字段两条路径
+   * 共享同一种 retry-or-block 行为。
+   */
+  private runOutputAssertions(
+    session: AgentSession,
+    workflow: WorkflowTemplate,
+    stage: WorkflowStage,
+    stageRun: StageRun,
+    result: StageAgentResult
+  ): boolean {
+    const failures = evaluateOutputAssertions(stage, result);
+    if (failures.length === 0) return false;
+    const reason = `Output assertions failed: ${failures.map((f) => `[${f.assertion}] ${f.message}`).join(" | ")}`;
+    const maxRetry = stage.auto_retry_limit ?? 0;
+    const currentAttempt = this.getStageAttempt(session, stageRun.stage_id);
+    if (currentAttempt <= maxRetry) {
+      this.retryCurrentStage(session, workflow, reason);
+    } else {
+      this.blockCurrentStage(session, `${reason} (after ${currentAttempt} attempts)`);
+    }
+    return true;
   }
 
   approveStage(session: AgentSession, workflow: WorkflowTemplate, stageId: string): AgentSession {
