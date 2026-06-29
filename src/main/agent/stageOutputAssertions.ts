@@ -302,12 +302,21 @@ const findingsTraceableToProbes: AssertionImpl = (result) => {
       orphans.push(`[${i}] from_hypothesis="${fromHyp}" 在 hypotheses 找不到`);
       continue;
     }
-    const linkedTaskId = typeof hyp.linked_task_id === "string" ? hyp.linked_task_id : "";
-    const task = linkedTaskId ? taskById.get(linkedTaskId) : undefined;
-    const verdict = task && typeof task.verdict === "string" ? task.verdict.trim().toLowerCase() : "";
+    // 区分三种失败：让作者看错误信息就知道改哪里，不浪费 retry。
+    const linkedTaskId = typeof hyp.linked_task_id === "string" ? hyp.linked_task_id.trim() : "";
+    if (!linkedTaskId) {
+      orphans.push(`[${i}] hypothesis="${fromHyp}" 缺 linked_task_id（请在 hypotheses 里填上对应 task 的 id）`);
+      continue;
+    }
+    const task = taskById.get(linkedTaskId);
+    if (!task) {
+      orphans.push(`[${i}] hypothesis="${fromHyp}" 的 linked_task_id="${linkedTaskId}" 在 investigation_tasks 找不到`);
+      continue;
+    }
+    const verdict = typeof task.verdict === "string" ? task.verdict.trim().toLowerCase() : "";
     if (verdict !== "confirmed" && verdict !== "refuted") {
       orphans.push(
-        `[${i}] hypothesis="${fromHyp}" 对应的 task verdict=${verdict || "(缺失)"}，需 confirmed/refuted 才能升 finding`
+        `[${i}] task="${linkedTaskId}" 的 verdict=${verdict || "(缺失)"}，需 confirmed/refuted 才能让 finding 升上来`
       );
     }
   }
@@ -346,7 +355,7 @@ function indexBy(items: unknown[], key: string): Map<string, Record<string, unkn
  * 注意：避开误伤——只扫 findings 字段，不扫 unknowns/hypotheses（那里出现 hedge 是合理的）。
  */
 const HEDGE_PATTERN = /可能|或许|似乎|疑似|大概|maybe|might|likely|probably/i;
-const NEGATION_FOR_HEDGE = /(没|没有|无|未|不|不会|绝无|未发现|不存在|not\s|no\s|never\s|none\s)\s*[一-龥\w]{0,3}$/i;
+const NEGATION_FOR_HEDGE = /(没|没有|无|未|不|不会|绝无|未发现|不存在|not\s|no\s|never\s|none\s)\s*[一-龥\w]{0,8}$/i;
 
 const hedgedFindingsDemoted: AssertionImpl = (result) => {
   const findings = collectStructured(result, "findings");
@@ -366,7 +375,7 @@ const hedgedFindingsDemoted: AssertionImpl = (result) => {
     for (const sentence of splitSentences(text)) {
       const m = sentence.match(HEDGE_PATTERN);
       if (!m) continue;
-      const before = sentence.slice(Math.max(0, (m.index ?? 0) - 12), m.index ?? 0);
+      const before = sentence.slice(Math.max(0, (m.index ?? 0) - 20), m.index ?? 0);
       if (NEGATION_FOR_HEDGE.test(before)) continue;
       violators.push(`[${i}] ${describeFinding(f)}：含 hedge 词 "${m[0]}"`);
       break;
@@ -491,13 +500,17 @@ function collectFindingIds(prior: PriorStageOutputs): Set<string> {
 }
 
 /**
- * implement 阶段：deviations_from_plan 非空时，plan_revisions 必须有对应条目。
+ * implement 阶段：deviations_from_plan 非空时，plan_revisions 必须有对应条目；
+ * 同时每条 deviation 必须有可读的 what_changed/why（不允许只占位）。
  *
  * 阻断"动手中发现 plan 跑不通但闷头改下去不更新计划"。每个 deviation 应当对应一条
  * plan_revisions[*]——按 step_id 配对；plan_revisions 里的 trigger 字段应当能引用到该 deviation。
  *
  * 容错：plan_revisions 不要求一一对应到 step_id（trigger 字段措辞自由），只要数量 ≥ deviations 即可——
  * 让模型有空间把多个相关 deviation 合到一条 revision。
+ *
+ * 反滥用：仅校验数量会让模型写 1 条空 deviation + 1 条空 revision 假装诚实。
+ * 这里同时要求 deviation 至少有 what_changed 或 why 字段非空——逼模型给出真实理由。
  */
 const deviationsMustBeRevised: AssertionImpl = (result) => {
   const dev = collectStructured(result, "deviations_from_plan");
@@ -505,12 +518,31 @@ const deviationsMustBeRevised: AssertionImpl = (result) => {
 
   const rev = collectStructured(result, "plan_revisions");
   const revisions = Array.isArray(rev) ? rev : [];
-  if (revisions.length >= dev.length) return null;
 
+  const reasons: string[] = [];
+  if (revisions.length < dev.length) {
+    reasons.push(`plan_revisions 只有 ${revisions.length} 条（应 ≥ ${dev.length}）`);
+  }
+
+  // 每条 deviation 必须 what_changed 或 why 至少一项有实质内容
+  for (let i = 0; i < dev.length; i += 1) {
+    const d = dev[i];
+    if (!isRecord(d)) continue;
+    const what = typeof d.what_changed === "string" ? d.what_changed.trim() : "";
+    const why = typeof d.why === "string" ? d.why.trim() : "";
+    if (what.length < 4 && why.length < 4) {
+      const step = typeof d.step_id === "string" ? d.step_id : `[${i}]`;
+      reasons.push(`deviation ${step}: what_changed 与 why 都为空或过短（请写真实理由）`);
+    }
+  }
+
+  if (reasons.length === 0) return null;
   return [
-    `检测到 ${dev.length} 条 deviations_from_plan，但 plan_revisions 只有 ${revisions.length} 条。`,
-    "动手中发现 plan 跑不通时，必须同步更新 plan_revisions——",
-    "每条 deviation 至少对应一条 revision（说明触发原因、新增/修改了哪些 step）。",
+    "deviations 未充分记录：",
+    reasons.join("; "),
+    "。动手中发现 plan 跑不通时，必须同步更新 plan_revisions——",
+    "每条 deviation 至少对应一条 revision（说明触发原因、新增/修改了哪些 step），",
+    "且 deviation 本身的 what_changed/why 不能用占位文字。",
     "如果不更新计划就闷头改，下次回头看就再也对不上账。"
   ].join("");
 };

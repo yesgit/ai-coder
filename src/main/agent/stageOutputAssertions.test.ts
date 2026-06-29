@@ -573,6 +573,20 @@ describe("evaluateOutputAssertions", () => {
       expect(out).toEqual([]);
     });
 
+    it("远距离否定语境：'我没有发现任何可能存在的风险' → 不误挡（13 字距离）", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            findings: [{ id: "f1", claim: "我没有发现任何可能存在的风险", from_hypothesis: "h1" }]
+          }
+        })
+      );
+      expect(out).toEqual([]);
+    });
+
     it("肯定结论无 hedge → 通过", () => {
       const out = evaluateOutputAssertions(
         s,
@@ -786,10 +800,10 @@ describe("evaluateOutputAssertions", () => {
           output_summary: "x",
           required_outputs: {
             deviations_from_plan: [
-              { step_id: "p1", what_changed: "x" },
-              { step_id: "p2", what_changed: "y" }
+              { step_id: "p1", what_changed: "改用 helper", why: "可读性" },
+              { step_id: "p2", what_changed: "拆分两个文件", why: "降低耦合" }
             ],
-            plan_revisions: [{ trigger: "x", new_or_modified_steps: "..." }]
+            plan_revisions: [{ trigger: "p1", new_or_modified_steps: "..." }]
           }
         })
       );
@@ -804,12 +818,30 @@ describe("evaluateOutputAssertions", () => {
           status: "completed",
           output_summary: "x",
           required_outputs: {
-            deviations_from_plan: [{ step_id: "p1", what_changed: "x" }],
-            plan_revisions: [{ trigger: "x", new_or_modified_steps: "..." }]
+            deviations_from_plan: [
+              { step_id: "p1", what_changed: "实施时改用 indexBy 而非内联 for 循环", why: "可读性更好" }
+            ],
+            plan_revisions: [{ trigger: "p1 复用度", new_or_modified_steps: "重排为先抽 helper" }]
           }
         })
       );
       expect(out).toEqual([]);
+    });
+
+    it("deviation 字段占位太短 → 失败（反滥用：单字'x'不算诚实记录）", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            deviations_from_plan: [{ step_id: "p1", what_changed: "x", why: "" }],
+            plan_revisions: [{ trigger: "x", new_or_modified_steps: "..." }]
+          }
+        })
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0].message).toContain("what_changed 与 why 都为空或过短");
     });
 
     it("没有 deviations → 透传", () => {

@@ -209,11 +209,13 @@ stages:
       1) **files_changed**: `[{path, summary_of_change}]` —— 本阶段你改过的文件清单。
 
       2) **deviations_from_plan**: `[{step_id, what_changed, why, out_of_scope}]`
-         - `what_changed`: 与 design.plan_steps[step_id] 偏离的具体内容
+         - `what_changed`: 与 design.plan_steps[step_id] 偏离的具体内容（不许写"x"/"少量调整"等占位）
          - `why`: 触发偏离的真实原因（"实施时发现 X"）
          - `out_of_scope`: 偏离是否超出 design.plan_steps 的边界
            - true → 引擎强制要求 status=needs_rework 回 design（前提被推翻了，不许越界继续）
            - false → 必须在 plan_revisions 给对应修正
+         - 反滥用提示：动手中若发现 "原本 design 说 A 我实际做了 B" 这种非琐碎偏差，
+           诚实标 out_of_scope=true 比硬塞 false 更安全——后者下次回看就再也对不上账。
          - 没有偏离时给空数组 `[]`，不要省略字段。
 
       3) **plan_revisions**: `[{trigger, new_or_modified_steps}]`
