@@ -187,6 +187,8 @@ stages:
     hooks:
       post_output_assertions:
         - plan_steps_grounded
+        - design_considerations_filled
+        - item_matrix_when_multi
         - no_trailing_unparsed_payload
   - id: implement
     name: 实施
@@ -322,4 +324,5 @@ stages:
         - review_self_consistency
         - needs_rework_target_required
         - pass_requires_all_validated
+        - item_matrix_when_multi
         - no_trailing_unparsed_payload

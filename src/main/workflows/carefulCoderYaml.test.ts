@@ -21,6 +21,7 @@ describe("careful-coder.yaml validates", () => {
       "review_self_consistency",
       "needs_rework_target_required",
       "pass_requires_all_validated",
+      "item_matrix_when_multi",
       "no_trailing_unparsed_payload"
     ]);
   });
@@ -40,6 +41,8 @@ describe("careful-coder.yaml validates", () => {
       ])
     );
     expect(design?.hooks?.post_output_assertions).toContain("plan_steps_grounded");
+    expect(design?.hooks?.post_output_assertions).toContain("design_considerations_filled");
+    expect(design?.hooks?.post_output_assertions).toContain("item_matrix_when_multi");
   });
 
   it("implement stage wires the deviation assertions and goal_alignment_check", async () => {

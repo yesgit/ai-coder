@@ -632,6 +632,44 @@ const passRequiresAllValidated: AssertionImpl = (result, prior) => {
   ].join("");
 };
 
+/**
+ * design 阶段：plan_steps 每条必须填 perf/security/extensibility 三栏 consideration。
+ *
+ * 目的不是要求所有任务都涉及这三类问题，而是让"三个维度都想过"成为肌肉记忆——
+ * 写"不适用 + 原因"也算通过。但全栏为空 / 只写"无" / 只写"none" → fail。
+ *
+ * 弱断言（trivial-non-empty 即可），故意不深究内容，避免 prompt-engineering 内卷。
+ */
+const designConsiderationsFilled: AssertionImpl = (result) => {
+  const steps = collectStructured(result, "plan_steps");
+  if (!Array.isArray(steps) || steps.length === 0) return null; // required_outputs 另校验
+
+  const violators: string[] = [];
+  for (let i = 0; i < steps.length; i += 1) {
+    const step = steps[i];
+    if (!isRecord(step)) continue;
+    const stepId = typeof step.id === "string" ? step.id : `[${i}]`;
+    const missing: string[] = [];
+    for (const key of ["perf_consideration", "security_consideration", "extensibility_consideration"] as const) {
+      const v = step[key];
+      const text = typeof v === "string" ? v.trim() : flattenToText(v).trim();
+      if (text.length === 0 || TRIVIAL_NEGATIVE.has(text.toLowerCase())) {
+        missing.push(key);
+      }
+    }
+    if (missing.length > 0) violators.push(`${stepId}: 缺 ${missing.join(", ")}`);
+  }
+
+  if (violators.length === 0) return null;
+  return [
+    "plan_steps 三栏 consideration 未填：",
+    violators.join("; "),
+    "。perf_consideration / security_consideration / extensibility_consideration 三栏必须每条都填——",
+    "若该步骤不涉及某维度，请写'不适用：<一句话原因>'。目的是让资深 dev 的'三维度反射'肌肉化，",
+    "不是要求所有任务都涉及性能/安全/扩展性。"
+  ].join("");
+};
+
 const ASSERTION_IMPLS: Record<StageOutputAssertion, AssertionImpl> = {
   review_self_consistency: reviewSelfConsistency,
   needs_rework_target_required: needsReworkTargetRequired,
@@ -645,7 +683,8 @@ const ASSERTION_IMPLS: Record<StageOutputAssertion, AssertionImpl> = {
   plan_steps_grounded: planStepsGrounded,
   deviations_must_be_revised: deviationsMustBeRevised,
   deviation_severity_must_rework: deviationSeverityMustRework,
-  pass_requires_all_validated: passRequiresAllValidated
+  pass_requires_all_validated: passRequiresAllValidated,
+  design_considerations_filled: designConsiderationsFilled
 };
 
 function pickReworkDecision(result: StageAgentResult): string | null {

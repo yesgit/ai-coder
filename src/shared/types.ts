@@ -125,7 +125,14 @@ export type StageOutputAssertion =
    *   - residual_risks 为空、investigate.unknowns 已关闭
    * 否则必须改为 pass_with_followups（每条 residual 配 followup_owner+followup_action）或 needs_rework。
    */
-  | "pass_requires_all_validated";
+  | "pass_requires_all_validated"
+  /**
+   * design 阶段：plan_steps 每条必须填 perf_consideration / security_consideration /
+   * extensibility_consideration 三栏。允许写"不适用 + 原因"——目的是让"三个维度都想过"
+   * 成为肌肉记忆，而非要求所有任务都涉及性能/安全/扩展性。
+   * 全栏空（或只写"无"/"none"）→ fail。
+   */
+  | "design_considerations_filled";
 
 export interface StageHooksConfig {
   pre_tool_use?: PreToolUseHookRule[];

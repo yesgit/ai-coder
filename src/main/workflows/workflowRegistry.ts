@@ -97,7 +97,8 @@ const postOutputAssertionSchema = z.enum([
   "plan_steps_grounded",
   "deviations_must_be_revised",
   "deviation_severity_must_rework",
-  "pass_requires_all_validated"
+  "pass_requires_all_validated",
+  "design_considerations_filled"
 ]);
 const stageHooksSchema = z
   .object({

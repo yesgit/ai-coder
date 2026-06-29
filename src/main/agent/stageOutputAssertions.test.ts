@@ -960,4 +960,95 @@ describe("evaluateOutputAssertions", () => {
       expect(out).toEqual([]);
     });
   });
+
+  describe("design_considerations_filled", () => {
+    const s = stage({ post_output_assertions: ["design_considerations_filled"] });
+
+    it("三栏全空 → 失败", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            plan_steps: [{ id: "p1", action: "do X" }]
+          }
+        })
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0].message).toContain("p1");
+      expect(out[0].message).toContain("perf_consideration");
+    });
+
+    it("只写'无' → 失败（trivial 否定不算填）", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            plan_steps: [
+              {
+                id: "p1",
+                action: "do X",
+                perf_consideration: "无",
+                security_consideration: "none",
+                extensibility_consideration: "n/a"
+              }
+            ]
+          }
+        })
+      );
+      expect(out).toHaveLength(1);
+    });
+
+    it("写'不适用：<原因>' → 通过", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            plan_steps: [
+              {
+                id: "p1",
+                action: "改注释 typo",
+                perf_consideration: "不适用：仅注释改动",
+                security_consideration: "不适用：仅注释改动",
+                extensibility_consideration: "不适用：仅注释改动"
+              }
+            ]
+          }
+        })
+      );
+      expect(out).toEqual([]);
+    });
+
+    it("正常填写 → 通过", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            plan_steps: [
+              {
+                id: "p1",
+                action: "新增 hedged 断言",
+                perf_consideration: "O(N) 扫描数组，量级几十条可接受",
+                security_consideration: "不适用：纯本地校验",
+                extensibility_consideration: "新断言遵循 AssertionImpl 接口，与现有 4 个解耦"
+              }
+            ]
+          }
+        })
+      );
+      expect(out).toEqual([]);
+    });
+
+    it("plan_steps 缺失 → 透传", () => {
+      const out = evaluateOutputAssertions(s, result({ status: "completed", output_summary: "x" }));
+      expect(out).toEqual([]);
+    });
+  });
 });
