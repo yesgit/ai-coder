@@ -515,4 +515,41 @@ describe("WorkflowEngine", () => {
     expect(session.error).toContain("plan_steps_grounded");
     expect(session.error).toContain("f-ghost");
   });
+
+  it("missing_outputs：parse_diagnostics.had_unparsed_tail 命中时，retry hint 必须附诊断信息（治 13:27 卡死症状）", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+    const wf: WorkflowTemplate = {
+      ...workflow,
+      stages: [
+        {
+          id: "investigate",
+          name: "Investigate",
+          required_outputs: ["findings", "unknowns"],
+          auto_retry_limit: 2
+        }
+      ]
+    };
+
+    engine.ensureState(session, wf);
+    // 模拟实际症状：模型输出 JSON 烂尾，parseStageAgentResult 兜底产出 required_outputs 缺失
+    // + parse_diagnostics.had_unparsed_tail=true
+    engine.applyStageResult(session, wf, {
+      status: "completed",
+      output_summary: "...",
+      required_outputs: undefined,
+      parse_diagnostics: {
+        had_unparsed_tail: true,
+        tail_length: 240,
+        last_open_brace_index: 800,
+        bracket_balance: 3,
+        candidate_count: 1
+      }
+    });
+    expect(session.status).toBe("running");
+    expect(session.error).toContain("Missing required outputs");
+    // 关键：必须把 JSON parse 诊断带给模型，否则它以为自己只是少写了字段会再次输出同一份烂 JSON
+    expect(session.error).toContain("JSON parse 失败诊断");
+    expect(session.error).toContain("bracket_balance=3");
+  });
 });

@@ -81,10 +81,16 @@ export class WorkflowEngine {
     if (missingOutputs.length > 0) {
       const maxRetry = stage?.auto_retry_limit ?? 0;
       const currentAttempt = this.getStageAttempt(session, stageRun.stage_id);
+      // 若 parse_diagnostics 已经发现 JSON 烂尾，极大概率"missing"的真因是 JSON 没解析出来，
+      // 而不是模型真的少写了字段。把诊断信息一并回传——避免模型反复输出同一份烂 JSON 还以为自己写对了。
+      const diag = result.parse_diagnostics;
+      const diagHint = diag?.had_unparsed_tail
+        ? ` (JSON parse 失败诊断：bracket_balance=${diag.bracket_balance}, tail_length=${diag.tail_length}, candidate_count=${diag.candidate_count}——最外层 JSON 大概率有未闭合字符串/花括号/多余引号。请本地 JSON.parse 验证一遍再回传，整段写成单一合法对象。)`
+        : "";
       if (currentAttempt <= maxRetry) {
-        return this.retryCurrentStage(session, workflow, `Missing required outputs: ${missingOutputs.join(", ")}`);
+        return this.retryCurrentStage(session, workflow, `Missing required outputs: ${missingOutputs.join(", ")}${diagHint}`);
       }
-      return this.blockCurrentStage(session, `Missing required outputs after ${currentAttempt} attempts: ${missingOutputs.join(", ")}`);
+      return this.blockCurrentStage(session, `Missing required outputs after ${currentAttempt} attempts: ${missingOutputs.join(", ")}${diagHint}`);
     }
 
     // 阶段产物自洽性断言：与 missing outputs 同模式走 retry → block。

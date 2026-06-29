@@ -74,6 +74,16 @@ stages:
   - id: investigate
     name: 取证
     instructions: |
+      ⚠️ 输出格式硬要求（先看这条再写内容）：
+      最外层是单一合法 JSON 对象。请在回传前在脑里 / 临时编辑器里
+      JSON.parse 一遍——绝对不能出现：
+        - 多余引号 / 引号未闭合（最常见错误）
+        - 字段名拼错（如 evidence_code vs evidence_collected）
+        - 双引号粘连（如 "x" "y"）
+        - 在 JSON 块外再粘第二份草稿 JSON
+      宿主只 parse 最外层一个 JSON 对象，烂掉就视为字段缺失，retry 时你看到的
+      错误信息会含 bracket_balance / tail_length 等诊断帮你定位。
+
       像资深开发者接手陌生模块：**先拟定调查任务清单，再逐项落实，复盘是否方案无虞，
       不放心就补任务、再调查——这是 Plan loop 的内循环**。
       未走完这个 loop 不允许把"可能 X"当结论写出来。
@@ -119,7 +129,7 @@ stages:
       - findings
       - unknowns
       - plan_readiness
-    auto_retry_limit: 1
+    auto_retry_limit: 2
     hooks:
       post_output_assertions:
         - all_tasks_resolved
