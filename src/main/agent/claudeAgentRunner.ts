@@ -186,12 +186,23 @@ export class ClaudeAgentRunner {
         return input.session;
       }
       this.workflowEngine.applyStageResult(input.session, input.workflow, parseStageAgentResult(stageOutput.resultText || transcript));
-      // 如果阶段完成后需要审批（waiting_approval），则立即返回，让前端显示审批弹窗
-      if (input.session.status === "waiting_approval") {
-        await this.recordProgress(input, "status", `阶段已完成，等待审批：${currentStage.name || currentStage.id}`, "milestone");
-        return input.session;
+      // 阶段终态决定 milestone 文案：completed / waiting_approval 是正向终态；
+      // blocked / failed 是异常终态（断言挡回、超过 retry 限、缺必填等），需要明确告诉用户。
+      // running 是 retry 中——只是无声继续到下一轮，无需 milestone。
+      const stageName = currentStage.name || currentStage.id;
+      const status = input.session.status;
+      const error = input.session.error;
+      if (status === "waiting_approval") {
+        await this.recordProgress(input, "status", `阶段已完成，等待审批：${stageName}`, "milestone");
+      } else if (status === "blocked") {
+        await this.recordProgress(input, "status", `阶段被拦截：${stageName}${error ? `（${error}）` : ""}`, "milestone");
+      } else if (status === "failed") {
+        await this.recordProgress(input, "status", `阶段失败：${stageName}${error ? `（${error}）` : ""}`, "milestone");
+      } else if (status === "running") {
+        await this.recordProgress(input, "status", `阶段重试中：${stageName}${error ? `（${error}）` : ""}`, "transient");
+      } else {
+        await this.recordProgress(input, "status", `阶段已完成：${stageName}`, "milestone");
       }
-      await this.recordProgress(input, "status", `阶段已完成：${currentStage.name || currentStage.id}`, "milestone");
       return input.session;
     } catch (error) {
       // 用户主动中止：保留已写入的消息和工具调用，根据是否有未决问题决定终态

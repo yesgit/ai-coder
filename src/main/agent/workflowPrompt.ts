@@ -27,7 +27,7 @@ export function buildStageInstructions(input: StageAgentInput): string {
   const allowedTools = input.allowed_tools.length ? input.allowed_tools.join(", ") : "read-only defaults";
   const requiredOutputs = input.required_outputs.length ? input.required_outputs.join(", ") : "concise stage summary";
   const gates = input.gates.length ? input.gates.join(", ") : "none";
-  const hooksSummary = describeStageHooks(input.current_stage.hooks);
+  const hookSections = describeStageHooks(input.current_stage.hooks);
 
   const messageHistory = input.recent_messages
     .filter((m) => isMeaningfulAgentText(m.content) || m.attachments?.length)
@@ -91,7 +91,12 @@ export function buildStageInstructions(input: StageAgentInput): string {
     `allowed_tools: ${allowedTools}`,
     `required_outputs: ${requiredOutputs}`,
     `gates: ${gates}`,
-    ...(hooksSummary ? ["", "本阶段工序闸门（在工具调用前由宿主校验，未满足会被 deny 并要求补齐）：", hooksSummary] : []),
+    ...(hookSections.preToolUse
+      ? ["", "本阶段工序闸门（在工具调用前由宿主校验，未满足会被 deny 并要求补齐）：", hookSections.preToolUse]
+      : []),
+    ...(hookSections.postOutput
+      ? ["", "本阶段产物自洽性断言（输出落地后由宿主评估，未通过按 auto_retry_limit 重试，超限走 blocked）：", hookSections.postOutput]
+      : []),
     "",
     "最终 JSON 协议：",
     JSON.stringify(
@@ -122,11 +127,21 @@ export function buildStageInstructions(input: StageAgentInput): string {
 }
 
 /**
- * 把 stage.hooks 翻译成人话提示，让模型在动手前就知道闸门规则，而不是靠失败再学。
- * 仅当存在规则时返回字符串；否则返回 null，调用方据此跳过整段。
+ * 把 stage.hooks 翻译成两段人话提示，让模型在动手前就知道闸门规则。
+ *
+ * 返回 { preToolUse, postOutput }：分别对应"动手前由宿主拦截 deny"和"输出后宿主评估 retry"。
+ * 这两类机制语义不同（前者是工具调用前的硬挡 + 由用户写的 on_fail 文案；后者是输出落地后的
+ * retry/block + 由引擎写的固定文案）——分两段返回让调用方各自加 header，避免模型把它们混为一谈。
+ *
+ * 任何一段为空时对应字段为 null，调用方据此决定是否在 prompt 里渲染该段。
  */
-function describeStageHooks(hooks: StageHooksConfig | undefined): string | null {
-  const rules = hooks?.pre_tool_use;
+function describeStageHooks(hooks: StageHooksConfig | undefined): { preToolUse: string | null; postOutput: string | null } {
+  const preToolUse = describePreToolUse(hooks?.pre_tool_use);
+  const postOutput = describePostOutputAssertions(hooks?.post_output_assertions);
+  return { preToolUse, postOutput };
+}
+
+function describePreToolUse(rules: StageHooksConfig["pre_tool_use"]): string | null {
   if (!rules || rules.length === 0) return null;
   return rules
     .map((rule, idx) => {
@@ -149,4 +164,24 @@ function describeStageHooks(hooks: StageHooksConfig | undefined): string | null 
       return `${idx + 1}. 调用 ${tools}${cmd} 之前，${requirements.join("；")}。否则：${rule.on_fail}`;
     })
     .join("\n");
+}
+
+function describePostOutputAssertions(assertions: StageHooksConfig["post_output_assertions"]): string | null {
+  if (!assertions || assertions.length === 0) return null;
+  return assertions.map((name, idx) => `${idx + 1}. ${describeAssertion(name)}`).join("\n");
+}
+
+function describeAssertion(name: string): string {
+  switch (name) {
+    case "review_self_consistency":
+      return "review_self_consistency：output 中出现阻塞类问题信号（blocker/critical/严重不一致/安全问题/高优先级问题…）时，rework_decision 不允许是 pass——要么改 needs_rework，要么改写描述消除阻塞词。";
+    case "needs_rework_target_required":
+      return "needs_rework_target_required：status=needs_rework 时必须带 rework_target_stage_id。";
+    case "unknowns_present":
+      return "unknowns_present：unknowns 不能为空或仅写'无/none/n/a'。陌生代码区域几乎不存在'无未知'，请如实暴露。";
+    case "item_matrix_when_multi":
+      return "item_matrix_when_multi：任务涉及 ≥3 同类条目（数字范围/批量/逗号列表）时，required_outputs.item_matrix 必须是合法 markdown 表。";
+    default:
+      return `${name}：（断言）`;
+  }
 }

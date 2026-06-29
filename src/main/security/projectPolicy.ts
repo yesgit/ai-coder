@@ -111,6 +111,11 @@ export async function approveOrDenyToolUse(
   // 如果当前阶段声明了允许的工具，自动允许这些工具的调用
   // 对于需要阶段审批的阶段（approval_required=true），只有在阶段已获批准后才行
   // 对于不需要阶段审批的阶段（如 implementation），直接允许声明的工具
+  //
+  // 重要：自动放行只覆盖"逐工具点 OK"那层 UI 审批，不能跳过硬安全约束——
+  // workflow.permissions.shell.approval_required / 项目外路径 / 危险命令 这些
+  // 仍然必须在下面的检查里走 pending_approval 或 blocked，否则 yaml 作者写的
+  // 约束会被静默忽略。
   const currentStage = workflow.stages.find((s) => s.id === session.current_stage);
   if (currentStage) {
     const stageAllowsCurrentTool =
@@ -119,9 +124,9 @@ export async function approveOrDenyToolUse(
       (isReadOnlyFileTool(toolName) && (currentStage.allowed_tools?.includes("read_file") || currentStage.allowed_tools?.includes("edit_file")));
 
     if (stageAllowsCurrentTool) {
-      // 需要阶段审批的阶段：检查是否已获批准
       const needsStageApproval = currentStage.approval_required && !hasStageApproval(session, currentStage.id);
-      if (!needsStageApproval) {
+      const skippableByStageAuth = await canSkipPerToolApproval(session, workflow, toolName, input);
+      if (!needsStageApproval && skippableByStageAuth) {
         // 自动允许该阶段声明的工具
         const toolCall: ToolCallRecord = {
           id: toolUseId,
@@ -209,6 +214,43 @@ function extractFilePaths(input: Record<string, unknown>): string[] {
     .map((edit) => (isRecord(edit) ? edit.file_path ?? edit.path : undefined))
     .filter((value): value is string => typeof value === "string" && value.length > 0);
   return [...new Set([...directPaths, ...editPaths])];
+}
+
+/**
+ * 判断当前调用能否走"阶段预授权"快捷通道，跳过逐工具点 OK。
+ *
+ * 返回 false 表示快捷通道不适用——必须落到下面完整的安全检查路径上。
+ * 这些"硬安全约束"对应 yaml 作者写的不可绕过的策略：
+ *   - 危险 shell 命令（DANGEROUS_COMMANDS）
+ *   - workflow.permissions.shell.approval_required 显式声明的 shell 审批
+ *   - 项目外路径（写工具直接 blocked，只读工具走 pending_approval）
+ *
+ * 反之"软约束"——比如普通的 read_file 在项目内、edit_file 在项目内——
+ * 可以由阶段预授权一次性覆盖，不必每个工具调用都点 OK。
+ */
+async function canSkipPerToolApproval(
+  session: AgentSession,
+  workflow: WorkflowTemplate,
+  toolName: string,
+  input: Record<string, unknown>
+): Promise<boolean> {
+  if (toolName === "Bash") {
+    const command = String(input.command ?? "");
+    if (DANGEROUS_COMMANDS.some((p) => command.toLowerCase().includes(p))) return false;
+    if (requiresShellApproval(workflow)) return false;
+    return true;
+  }
+  for (const filePath of extractFilePaths(input)) {
+    const { inside, realTarget } = await checkPathInsideProject(session.project_path, filePath);
+    if (inside) continue;
+    if (!isReadOnlyFileTool(toolName)) return false; // 写工具：项目外路径必须硬阻断
+    const approvedExternal = session.approved_external_paths ?? [];
+    if (!approvedExternal.includes(realTarget)) return false; // 只读但未被加白名单：走 pending_approval
+  }
+  // 写工具落入项目内仍然可能需要逐文件审批——交给下面的 isWriteTool 分支处理：
+  // 如果阶段没声明 edit_file 我们前面就不会走到这里；如果声明了，意味着 yaml 作者
+  // 已经接受"这个阶段可以改文件"，不再每个 Edit 单独审批。
+  return true;
 }
 
 function isWriteTool(toolName: string): boolean {

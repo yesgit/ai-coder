@@ -54,6 +54,12 @@ stages:
         - 推断：从事实合理外推但尚未证实的；
         - 假设：你不知道但暂时这样办的（必须在 assumptions 字段显式列出）。
       不要在本阶段编辑文件或制定方案，只产出共识。
+
+      字段输出要求（重要）：最终 JSON 的 required_outputs 必须**逐键**填写以下三个字段，
+      不要把内容只写在 output_summary 自然语言里：
+        - user_goal_restated: 用一两句复述用户的真实诉求
+        - definition_of_done: 列出本次任务"完成的样子"（具体可验收的条件）
+        - assumptions: 你做的所有假设（数组或多行字符串），没有就写"无明确假设"也比省略好
     allowed_tools:
       - read_file
       - shell
@@ -61,6 +67,7 @@ stages:
       - user_goal_restated
       - definition_of_done
       - assumptions
+    auto_retry_limit: 1
   - id: investigate
     name: 取证
     instructions: |
@@ -124,6 +131,7 @@ stages:
       - shell
     gates:
       - authorized_files_only
+    auto_retry_limit: 1
     hooks:
       pre_tool_use:
         # 注意：Write 不在此列。Write 主要用于新建文件，目标路径还不存在时无法
@@ -159,6 +167,13 @@ stages:
       仅允许只读工具：Read 看 diff、shell 跑 git diff 或 test，禁止 edit。
       如果发现 implement 的偏离已经无法在原方案内修复（如设计前提被推翻），返工到 design 或更早。
 
+      自洽性纪律（重要——不是格式问题，是判断纪律）：
+        - 一旦你在 review_findings/residual_risks 里出现"blocker / critical / 严重不一致 / 安全问题 / 高优先级问题"
+          这类阻塞类描述，就**不允许**把 rework_decision 写成 pass——
+          要么把这些条目从描述里去掉（说明已修复 / 不适用 + 对应 diff 位置），
+          要么承认这是阻塞、把 status 与 rework_decision 都改成 needs_rework。
+        - 自我矛盾的产物（findings 写"有阻塞"+ decision 写 pass）会被引擎自动判定为不自洽并回炉重做。
+
       返工触发协议（重要）：
         - 决定回炉时，最外层 JSON 必须 status="needs_rework"、rework_target_stage_id="implement"（或更早阶段）、
           rework_reason 用一两句中文说明缺口；
@@ -172,3 +187,7 @@ stages:
       - rework_decision
       - residual_risks
     auto_retry_limit: 1
+    hooks:
+      post_output_assertions:
+        - review_self_consistency
+        - needs_rework_target_required

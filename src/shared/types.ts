@@ -57,8 +57,29 @@ export interface PreToolUseHookRule {
   on_fail: string;
 }
 
+/**
+ * 阶段产物落地时跑的内置断言名集合。
+ *
+ * 与 pre_tool_use 解耦——pre_tool_use 挡"动手前没准备好"，
+ * 这里挡"动手完发现自己列出问题却写 pass"这类输出侧的自相矛盾。
+ *
+ * 断言名是枚举（不是 JS 表达式），实现写在 stageOutputAssertions.ts，
+ * 一一对应。yaml 端按名字声明，无法注入逻辑。
+ */
+export type StageOutputAssertion =
+  /** review 类阶段：findings/summary 含阻塞词时，rework_decision 不能是 pass */
+  | "review_self_consistency"
+  /** status=needs_rework 时必须带 rework_target_stage_id */
+  | "needs_rework_target_required"
+  /** investigate 类阶段：unknowns 必须显式给出非空内容（不允许沉默） */
+  | "unknowns_present"
+  /** design 类阶段：当任务文字含枚举性提示（多/批量/范围/逗号列表）时，必须输出 markdown 矩阵 */
+  | "item_matrix_when_multi";
+
 export interface StageHooksConfig {
   pre_tool_use?: PreToolUseHookRule[];
+  /** 阶段输出落地时按顺序评估的断言名。失败按 stage.auto_retry_limit 重试，超限走 block。 */
+  post_output_assertions?: StageOutputAssertion[];
 }
 
 export interface WorkflowStage {
