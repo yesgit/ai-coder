@@ -74,7 +74,34 @@ export type StageOutputAssertion =
   /** investigate 类阶段：unknowns 必须显式给出非空内容（不允许沉默） */
   | "unknowns_present"
   /** design 类阶段：当任务文字含枚举性提示（多/批量/范围/逗号列表）时，必须输出 markdown 矩阵 */
-  | "item_matrix_when_multi";
+  | "item_matrix_when_multi"
+  /**
+   * investigate 类阶段：required_outputs.investigation_tasks 中每条 task 的 status 必须 ∈
+   * {done, deferred}，deferred 必须配 defer_reason。pending/in_progress 残留视为"调查未闭合"。
+   * 配合"先拟定任务清单、逐项落实、复盘补漏"的人类思维 loop——闭环前不许进入 align/design。
+   */
+  | "all_tasks_resolved"
+  /**
+   * findings 必须可追溯：每条 finding.from_hypothesis 在 hypotheses 中存在，
+   * 且其 linked task 的 verdict ∈ {confirmed, refuted}。
+   * 阻断"未取证就开列结论"。
+   */
+  | "findings_traceable_to_probes"
+  /**
+   * findings[*] 文本中含 hedge 措辞（可能/或许/似乎/疑似/maybe/might/likely）→ 失败。
+   * 强制 demote 到 unknowns 或补取证 task——避免用模糊措辞绕过取证义务。
+   */
+  | "hedged_findings_demoted"
+  /**
+   * plan_readiness.sufficient === false 时，unknowns 或 investigation_tasks[status=pending] 必须非空。
+   * 禁止"自报方案不 ready 但啥都不补"。
+   */
+  | "plan_readiness_honest"
+  /**
+   * raw 输出尾部存在未闭合 JSON（bracket_balance != 0 或 last 合法 JSON 之后还有大段 JSON 残骸）→ 失败。
+   * 跨场景通用——结构性断言，不绑定具体任务类型，建议每阶段都挂。
+   */
+  | "no_trailing_unparsed_payload";
 
 export interface StageHooksConfig {
   pre_tool_use?: PreToolUseHookRule[];
@@ -207,6 +234,27 @@ export interface StageAgentResult {
   rework_target_stage_id?: string;
   rework_reason?: string;
   error?: string;
+  /**
+   * 原始 agent 输出的 JSON 解析诊断——`parseStageAgentResult` 在所有出口填写。
+   * 用途：让 `no_trailing_unparsed_payload` 断言能感知"输出有合法 JSON 但尾部还有大段未闭合 JSON 残骸"
+   * 这种当前会被静默吞掉的情况，并触发 retry → block。
+   *
+   * 字段对所有阶段都可选（向后兼容），但 `parseStageAgentResult` 始终会填。
+   */
+  parse_diagnostics?: ParseDiagnostics;
+}
+
+export interface ParseDiagnostics {
+  /** true = raw 末尾还有未闭合 JSON 或大段 JSON 残骸（多余引号/未闭合括号等） */
+  had_unparsed_tail: boolean;
+  /** 末尾未解析文本字符数（去除合法 JSON 已覆盖的范围） */
+  tail_length: number;
+  /** raw 中最后一个 `{` 的位置；-1 表示根本没有 */
+  last_open_brace_index: number;
+  /** 全文 `{`/`}` 配平计数（在字符串外）；0 = 平衡，>0 = 多 `{` 未闭，<0 = 多 `}` */
+  bracket_balance: number;
+  /** 找到的合法 JSON 候选总数 */
+  candidate_count: number;
 }
 
 export interface FileRefAttachment {

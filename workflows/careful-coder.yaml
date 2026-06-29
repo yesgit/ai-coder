@@ -68,24 +68,66 @@ stages:
       - definition_of_done
       - assumptions
     auto_retry_limit: 1
+    hooks:
+      post_output_assertions:
+        - no_trailing_unparsed_payload
   - id: investigate
     name: 取证
     instructions: |
-      像资深开发者接手陌生模块：grep 同名调用、看相邻实现、翻 git log。
-      你必须用具体证据回答：
-        1) 同类调用在哪里？（≥3 条，每条给 path:line 与一句话作用）
-        2) 这块最近一次相关改动是什么？谁、为什么？（至少跑过一次 git log 或 git blame）
-        3) 你还不懂什么？（"我不知道"清单，宁可暴露不要藏）
-      不允许直接复述用户描述当作证据；事实必须可在仓库或历史里被复查。
-      output_summary 必须把上述三类信息的关键条目都列入（包含 path:line 与一句话作用），下游阶段无法读到结构化字段。
+      像资深开发者接手陌生模块：**先拟定调查任务清单，再逐项落实，复盘是否方案无虞，
+      不放心就补任务、再调查——这是 Plan loop 的内循环**。
+      未走完这个 loop 不允许把"可能 X"当结论写出来。
+
+      你必须按以下结构产出（在最外层 JSON 的 required_outputs 里）：
+
+      1) **investigation_tasks**：你打算调查的所有任务，每条形如
+          `{id, question, why_needed, status, evidence_collected, verdict, defer_reason}`
+         - status：pending | in_progress | done | deferred（出阶段时必须全部 done 或 deferred）
+         - deferred 必须填 defer_reason（如"此任务依赖 align 决策，本阶段先记录"）
+         - done 的 task 应填 verdict ∈ {confirmed, refuted, inconclusive}
+         - 资深开发者拿到陌生代码时反射动作（你也照做）：
+           a. 至少一条 `git log` 类任务（看相关 commit 意图，理解"为什么会长成这样"）
+           b. 任何提到"调用 X 组件/函数"的 task，必须有一次该组件源码的 Read
+           c. 集群型现象（多个同类页面/入口/模块）至少有一条 task 专门评估集群整体性
+
+      2) **hypotheses**：基于调查任务你的假设，每条形如
+          `{id, claim, alternative, linked_task_id}`
+         - alternative：必须列至少一个对立假设（不允许只列一种可能）
+         - linked_task_id：必须指向 investigation_tasks 里某条 task
+
+      3) **findings**：**只允许从 verdict ∈ {confirmed, refuted} 的 hypothesis 升上来**，每条形如
+          `{id, from_hypothesis, path_anchor, confidence: "verified", evidence_ref, claim}`
+         - claim 中**禁止**出现"可能/或许/似乎/疑似/maybe/might/likely"——
+           那是 unknowns 的领地。如果只能这样写，说明取证未完成，应留在 unknowns
+         - 引擎会硬性校验 from_hypothesis 指向的 task verdict——蒙混不过去
+
+      4) **unknowns**：你没查清的、查了但 verdict=inconclusive 的、主动暴露的不知道。
+         宁可暴露不要藏；写"无"会被引擎判定不诚实。
+
+      5) **plan_readiness**：`{sufficient: bool, missing_evidence_for: string[]}`
+         - 自报方案是否已经"调查充分、可以进入 align/design"
+         - sufficient=false 时，必须在 unknowns 或 pending tasks 或 missing_evidence_for 至少一处写明"缺什么"
+
+      output_summary 必须把上述五个键的关键条目都列入（含 path:line 与一句话作用），
+      下游阶段无法读到结构化字段。
     allowed_tools:
       - read_file
       - shell
     required_outputs:
-      - similar_callsites
-      - git_history_summary
+      - investigation_tasks
+      - hypotheses
+      - findings
       - unknowns
+      - plan_readiness
     auto_retry_limit: 1
+    hooks:
+      post_output_assertions:
+        - all_tasks_resolved
+        - findings_traceable_to_probes
+        - hedged_findings_demoted
+        - plan_readiness_honest
+        - unknowns_present
+        - no_trailing_unparsed_payload
   - id: align
     name: 对齐
     instructions: |
@@ -101,6 +143,9 @@ stages:
       - boundary_questions
       - clarifications_asked
     auto_retry_limit: 1
+    hooks:
+      post_output_assertions:
+        - no_trailing_unparsed_payload
   - id: design
     name: 设计
     instructions: |
@@ -116,6 +161,9 @@ stages:
       - adversarial_critique
       - consistency_audit
     auto_retry_limit: 1
+    hooks:
+      post_output_assertions:
+        - no_trailing_unparsed_payload
   - id: implement
     name: 实施
     instructions: |
@@ -157,6 +205,8 @@ stages:
           require:
             ask_human_consent: true
           on_fail: "这是不可逆操作，必须先在本阶段通过 ask_human 取得用户明确确认。"
+      post_output_assertions:
+        - no_trailing_unparsed_payload
   - id: self_review
     name: 自审
     instructions: |
@@ -191,3 +241,4 @@ stages:
       post_output_assertions:
         - review_self_consistency
         - needs_rework_target_required
+        - no_trailing_unparsed_payload

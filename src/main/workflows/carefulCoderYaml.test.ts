@@ -13,11 +13,50 @@ describe("careful-coder.yaml validates", () => {
     const implement = cc!.stages.find(s => s.id === "implement");
     expect(implement?.hooks?.pre_tool_use?.[0].require.same_file_reads_min).toBe(3);
     expect(implement?.hooks?.pre_tool_use?.[1].require.ask_human_consent).toBe(true);
+    expect(implement?.hooks?.post_output_assertions).toContain("no_trailing_unparsed_payload");
+
     const sr = cc!.stages.find(s => s.id === "self_review");
     expect(sr?.allowed_tools).not.toContain("edit_file");
     expect(sr?.hooks?.post_output_assertions).toEqual([
       "review_self_consistency",
-      "needs_rework_target_required"
+      "needs_rework_target_required",
+      "no_trailing_unparsed_payload"
     ]);
+  });
+
+  it("investigate stage wires the Plan loop assertions", async () => {
+    const r = new WorkflowRegistry(path.resolve(__dirname, "../../../workflows"));
+    const result = await r.listWithIssues();
+    const cc = result.workflows.find(w => w.id === "careful-coder");
+    const investigate = cc!.stages.find(s => s.id === "investigate");
+    expect(investigate, "investigate 阶段必须存在").toBeDefined();
+    // required_outputs 必须覆盖 Plan loop 的五个键
+    expect(investigate?.required_outputs).toEqual(
+      expect.arrayContaining(["investigation_tasks", "hypotheses", "findings", "unknowns", "plan_readiness"])
+    );
+    // 五个 Plan loop 断言 + 既有 unknowns_present + 通用 no_trailing_unparsed_payload
+    const assertions = investigate?.hooks?.post_output_assertions ?? [];
+    for (const name of [
+      "all_tasks_resolved",
+      "findings_traceable_to_probes",
+      "hedged_findings_demoted",
+      "plan_readiness_honest",
+      "unknowns_present",
+      "no_trailing_unparsed_payload"
+    ]) {
+      expect(assertions, `investigate 应挂 ${name}`).toContain(name);
+    }
+  });
+
+  it("every stage carries the JSON-integrity assertion", async () => {
+    const r = new WorkflowRegistry(path.resolve(__dirname, "../../../workflows"));
+    const result = await r.listWithIssues();
+    const cc = result.workflows.find(w => w.id === "careful-coder");
+    for (const stage of cc!.stages) {
+      expect(
+        stage.hooks?.post_output_assertions ?? [],
+        `${stage.id} 应挂 no_trailing_unparsed_payload`
+      ).toContain("no_trailing_unparsed_payload");
+    }
   });
 });

@@ -88,7 +88,12 @@ const postOutputAssertionSchema = z.enum([
   "review_self_consistency",
   "needs_rework_target_required",
   "unknowns_present",
-  "item_matrix_when_multi"
+  "item_matrix_when_multi",
+  "all_tasks_resolved",
+  "findings_traceable_to_probes",
+  "hedged_findings_demoted",
+  "plan_readiness_honest",
+  "no_trailing_unparsed_payload"
 ]);
 const stageHooksSchema = z
   .object({

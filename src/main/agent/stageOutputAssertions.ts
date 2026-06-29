@@ -217,11 +217,222 @@ function isMarkdownTable(text: string): boolean {
   return lines.some((line) => /^\|\s*:?-{1,}/.test(line));
 }
 
+/**
+ * "Plan loop 闭环" —— investigation_tasks 的每条 task 必须达到终态：
+ *  - status === "done"，且（若 task 有 verdict 字段）verdict ∈ {confirmed, refuted, inconclusive}
+ *  - 或 status === "deferred"，且 defer_reason 非空
+ *
+ * 拒绝接收 pending/in_progress 残留——这是"先拟定调查任务、逐项落实、复盘"thinking loop 的闭环条件。
+ * inconclusive 也允许 done（结论是 "查了但没结论"），但这种 hypothesis 不应升上 findings——
+ * 那个由 findings_traceable_to_probes 兜底。
+ *
+ * 故意宽松：不强求 evidence_collected 字段必填，避免误伤简单任务。
+ */
+const allTasksResolved: AssertionImpl = (result) => {
+  const tasks = collectStructured(result, "investigation_tasks");
+  if (!Array.isArray(tasks)) return null; // 字段缺失另由 required_outputs 校验
+  const unresolved: string[] = [];
+  for (let i = 0; i < tasks.length; i += 1) {
+    const t = tasks[i];
+    if (!isRecord(t)) continue;
+    const status = typeof t.status === "string" ? t.status.trim().toLowerCase() : "";
+    if (status === "done") continue;
+    if (status === "deferred") {
+      const reason = typeof t.defer_reason === "string" ? t.defer_reason.trim() : "";
+      if (reason.length === 0) {
+        unresolved.push(`[${i}] ${describeTask(t)}：deferred 但 defer_reason 为空`);
+      }
+      continue;
+    }
+    unresolved.push(`[${i}] ${describeTask(t)}：status=${status || "(缺失)"}`);
+  }
+  if (unresolved.length === 0) return null;
+  return [
+    "investigation_tasks 未闭环：以下 task 仍处于 pending/in_progress/未知状态——",
+    unresolved.join("; "),
+    "。请按'拟定 → 落实 → 复盘'走完：每条 task 要么落实到 done（并填 verdict）、",
+    "要么 deferred 并写明 defer_reason。Plan loop 不闭环不允许进入下一阶段。"
+  ].join("");
+};
+
+function describeTask(task: Record<string, unknown>): string {
+  const id = typeof task.id === "string" ? task.id : "";
+  const q = typeof task.question === "string" ? task.question : "";
+  const label = id || q || "(unnamed)";
+  return label.length > 40 ? `${label.slice(0, 37)}...` : label;
+}
+
+/**
+ * findings 必须可追溯到取证：每条 finding.from_hypothesis 在 hypotheses 里有对应条目，
+ * 且其 linked task 的 verdict ∈ {confirmed, refuted}。
+ *
+ * 阻断"未取证就开列结论"——任何"我看着像 X"的结论必须先有 task → probe → verdict 的支持。
+ * inconclusive 的 hypothesis 不允许升上来；这种应当留在 unknowns。
+ */
+const findingsTraceableToProbes: AssertionImpl = (result) => {
+  const findings = collectStructured(result, "findings");
+  if (!Array.isArray(findings) || findings.length === 0) return null; // 没 findings 自然没违规
+
+  const hypotheses = collectStructured(result, "hypotheses");
+  const tasks = collectStructured(result, "investigation_tasks");
+  const hypothesisById = indexBy(Array.isArray(hypotheses) ? hypotheses : [], "id");
+  const taskById = indexBy(Array.isArray(tasks) ? tasks : [], "id");
+
+  const orphans: string[] = [];
+  for (let i = 0; i < findings.length; i += 1) {
+    const f = findings[i];
+    if (!isRecord(f)) continue;
+    const fromHyp = typeof f.from_hypothesis === "string" ? f.from_hypothesis : "";
+    if (!fromHyp) {
+      orphans.push(`[${i}] ${describeFinding(f)}：缺 from_hypothesis`);
+      continue;
+    }
+    const hyp = hypothesisById.get(fromHyp);
+    if (!hyp) {
+      orphans.push(`[${i}] from_hypothesis="${fromHyp}" 在 hypotheses 找不到`);
+      continue;
+    }
+    const linkedTaskId = typeof hyp.linked_task_id === "string" ? hyp.linked_task_id : "";
+    const task = linkedTaskId ? taskById.get(linkedTaskId) : undefined;
+    const verdict = task && typeof task.verdict === "string" ? task.verdict.trim().toLowerCase() : "";
+    if (verdict !== "confirmed" && verdict !== "refuted") {
+      orphans.push(
+        `[${i}] hypothesis="${fromHyp}" 对应的 task verdict=${verdict || "(缺失)"}，需 confirmed/refuted 才能升 finding`
+      );
+    }
+  }
+  if (orphans.length === 0) return null;
+  return [
+    "findings 未取证：以下结论缺少可追溯的取证链路——",
+    orphans.join("; "),
+    "。每条 finding 必须挂 from_hypothesis；该 hypothesis 必须挂 linked_task_id；",
+    "对应 task 的 verdict 必须是 confirmed 或 refuted。inconclusive 的请回到 unknowns 或新增取证 task。"
+  ].join("");
+};
+
+function describeFinding(f: Record<string, unknown>): string {
+  const claim = typeof f.claim === "string" ? f.claim : "";
+  const anchor = typeof f.path_anchor === "string" ? f.path_anchor : "";
+  const label = claim || anchor || "(no claim)";
+  return label.length > 40 ? `${label.slice(0, 37)}...` : label;
+}
+
+function indexBy(items: unknown[], key: string): Map<string, Record<string, unknown>> {
+  const m = new Map<string, Record<string, unknown>>();
+  for (const item of items) {
+    if (!isRecord(item)) continue;
+    const k = typeof item[key] === "string" ? (item[key] as string) : "";
+    if (k) m.set(k, item);
+  }
+  return m;
+}
+
+/**
+ * findings[*] 文本含 hedge 措辞（可能/或许/似乎/疑似/maybe/might/likely）→ 失败。
+ *
+ * findings 是"已经取证的肯定/否定结论"，不允许出现模糊措辞——那是 unknowns 的领地。
+ * 强制 demote：要么补 task 取证到肯定/否定，要么挪到 unknowns。
+ *
+ * 注意：避开误伤——只扫 findings 字段，不扫 unknowns/hypotheses（那里出现 hedge 是合理的）。
+ */
+const HEDGE_PATTERN = /可能|或许|似乎|疑似|大概|maybe|might|likely|probably/i;
+const NEGATION_FOR_HEDGE = /(没|没有|无|未|不|不会|绝无|未发现|不存在|not\s|no\s|never\s|none\s)\s*[一-龥\w]{0,3}$/i;
+
+const hedgedFindingsDemoted: AssertionImpl = (result) => {
+  const findings = collectStructured(result, "findings");
+  if (!Array.isArray(findings) || findings.length === 0) return null;
+
+  const violators: string[] = [];
+  for (let i = 0; i < findings.length; i += 1) {
+    const f = findings[i];
+    if (!isRecord(f)) continue;
+    const text = [
+      typeof f.claim === "string" ? f.claim : "",
+      typeof f.description === "string" ? f.description : "",
+      typeof f.note === "string" ? f.note : ""
+    ].join(" \n ");
+    if (!text.trim()) continue;
+    // 逐句扫描，避免被否定语境（"未发现可能 X"之类）误伤
+    for (const sentence of splitSentences(text)) {
+      const m = sentence.match(HEDGE_PATTERN);
+      if (!m) continue;
+      const before = sentence.slice(Math.max(0, (m.index ?? 0) - 12), m.index ?? 0);
+      if (NEGATION_FOR_HEDGE.test(before)) continue;
+      violators.push(`[${i}] ${describeFinding(f)}：含 hedge 词 "${m[0]}"`);
+      break;
+    }
+  }
+  if (violators.length === 0) return null;
+  return [
+    "findings 含模糊措辞：",
+    violators.join("; "),
+    "。findings 必须是已取证的结论，不允许'可能/或许/似乎/maybe/might/likely'。",
+    "请二选一：(1) 把这条移到 unknowns 并新增 investigation_task 去取证；",
+    "(2) 真正读对应代码取证后改成肯定/否定结论。"
+  ].join("");
+};
+
+/**
+ * plan_readiness.sufficient === false 时，unknowns 或 investigation_tasks 中 status=pending 的至少一项必须非空。
+ *
+ * 阻断"自报不 ready 但啥都不补"——人类工程师说"还差点意思"必然能说出差啥；
+ * 模型不被允许只表态、不落到清单。
+ */
+const planReadinessHonest: AssertionImpl = (result) => {
+  const readiness = collectStructured(result, "plan_readiness");
+  if (!isRecord(readiness)) return null; // 字段缺失另由 required_outputs 校验
+  if (readiness.sufficient === true) return null; // 自报 ready 由其他断言把关
+
+  const unknowns = collectStructured(result, "unknowns");
+  const unknownsFlat = unknowns === undefined ? "" : flattenToText(unknowns).trim();
+
+  const tasks = collectStructured(result, "investigation_tasks");
+  const hasPending = Array.isArray(tasks)
+    ? tasks.some((t) => isRecord(t) && typeof t.status === "string" && /^(pending|in_progress)$/i.test(t.status.trim()))
+    : false;
+
+  const missingFor = readiness.missing_evidence_for;
+  const missingFlat = missingFor === undefined ? "" : flattenToText(missingFor).trim();
+
+  if (unknownsFlat.length > 0 || hasPending || missingFlat.length > 0) return null;
+  return [
+    "plan_readiness 不诚实：自报 sufficient=false 但既无 unknowns、又无 pending 的 investigation_tasks、",
+    "也没填 missing_evidence_for。请明确写出缺什么证据/还要查什么。",
+    "Plan loop 的语义是'差点啥要说清'——只表态不补漏算未闭环。"
+  ].join("");
+};
+
+/**
+ * raw 输出有未闭合 JSON 残骸 / 尾部丢弃 → 失败。
+ *
+ * 跨场景通用：触发条件不依赖具体任务字段，看 parseStageAgentResult 写的 parse_diagnostics 即可。
+ * 建议挂到每个阶段的 post_output_assertions——结构性断言，零业务语义、零误伤。
+ */
+const noTrailingUnparsedPayload: AssertionImpl = (result) => {
+  const d = result.parse_diagnostics;
+  if (!d) return null;
+  if (!d.had_unparsed_tail) return null;
+  return [
+    "JSON 输出有残骸：",
+    `bracket_balance=${d.bracket_balance}`,
+    `, tail_length=${d.tail_length}`,
+    `, candidate_count=${d.candidate_count}`,
+    "。这通常是字符串引号未闭合、花括号未闭合、末尾多余分隔符等。",
+    "请把最外层 stage result 写成单一合法 JSON 对象——本地 JSON.parse 验证一遍再回传。",
+    "不要在 JSON 外再粘一段未完成的 JSON 草稿。"
+  ].join("");
+};
+
 const ASSERTION_IMPLS: Record<StageOutputAssertion, AssertionImpl> = {
   review_self_consistency: reviewSelfConsistency,
   needs_rework_target_required: needsReworkTargetRequired,
   unknowns_present: unknownsPresent,
-  item_matrix_when_multi: itemMatrixWhenMulti
+  item_matrix_when_multi: itemMatrixWhenMulti,
+  all_tasks_resolved: allTasksResolved,
+  findings_traceable_to_probes: findingsTraceableToProbes,
+  hedged_findings_demoted: hedgedFindingsDemoted,
+  plan_readiness_honest: planReadinessHonest,
+  no_trailing_unparsed_payload: noTrailingUnparsedPayload
 };
 
 function pickReworkDecision(result: StageAgentResult): string | null {
@@ -271,4 +482,18 @@ function flattenValues(value: unknown): string {
     return Object.values(value as Record<string, unknown>).map(flattenValues).join("\n");
   }
   return "";
+}
+
+/**
+ * 与 `flattenToText`/`flattenValues` 不同：直接返回 required_outputs[key] 的原始值（不打平、不字符串化）。
+ *
+ * 新断言（all_tasks_resolved / findings_traceable_to_probes / hedged_findings_demoted /
+ * plan_readiness_honest）需要按对象/数组结构遍历，而非按文本扫描，故需要这条入口。
+ */
+function collectStructured(result: StageAgentResult, key: string): unknown {
+  return result.required_outputs?.[key];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

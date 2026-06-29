@@ -74,7 +74,33 @@ describe("stage agent protocol", () => {
   it("falls back to completed summary when the result is plain text", () => {
     const result = parseStageAgentResult("Plain assistant response");
 
-    expect(result).toEqual({ status: "completed", output_summary: "Plain assistant response" });
+    expect(result).toMatchObject({ status: "completed", output_summary: "Plain assistant response" });
+    expect(result.parse_diagnostics?.had_unparsed_tail).toBe(false);
+    expect(result.parse_diagnostics?.candidate_count).toBe(0);
+  });
+
+  it("flags trailing unparsed JSON as a diagnostic (so the assertion can retry)", () => {
+    // 模拟本次失误样本：先一段合法 JSON，再粘一段未闭合 JSON 草稿。
+    const raw = [
+      '{"status":"completed","output_summary":"x","required_outputs":{"a":1}}',
+      "\n\n",
+      // 多余引号 + 空 key + 未闭合
+      '{",\n  "status": "completed",\n  " "output_summary": ""\n}{\n'
+    ].join("");
+    const result = parseStageAgentResult(raw);
+
+    expect(result.status).toBe("completed");
+    expect(result.required_outputs).toEqual({ a: 1 });
+    expect(result.parse_diagnostics).toBeDefined();
+    expect(result.parse_diagnostics!.had_unparsed_tail).toBe(true);
+    // 起码包括 raw 末尾的未闭合 `{`
+    expect(result.parse_diagnostics!.bracket_balance).toBeGreaterThan(0);
+  });
+
+  it("clean single-object JSON: had_unparsed_tail=false", () => {
+    const result = parseStageAgentResult('{"status":"completed","output_summary":"ok"}');
+    expect(result.parse_diagnostics?.had_unparsed_tail).toBe(false);
+    expect(result.parse_diagnostics?.bracket_balance).toBe(0);
   });
 
   it("parses stage JSON from assistant prose with embedded markdown fences", () => {

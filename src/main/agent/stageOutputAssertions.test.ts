@@ -389,4 +389,315 @@ describe("evaluateOutputAssertions", () => {
     // 但 needs_rework_target_required 会失败
     expect(out.map((f) => f.assertion)).toContain("needs_rework_target_required");
   });
+
+  describe("all_tasks_resolved", () => {
+    const s = stage({ post_output_assertions: ["all_tasks_resolved"] });
+
+    it("有 pending task → 失败", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            investigation_tasks: [
+              { id: "t1", question: "查 productType 是否必传", status: "done", verdict: "confirmed" },
+              { id: "t2", question: "查 LQB 上下游", status: "pending" }
+            ]
+          }
+        })
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0].assertion).toBe("all_tasks_resolved");
+      expect(out[0].message).toContain("t2");
+    });
+
+    it("deferred 但缺 defer_reason → 失败", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            investigation_tasks: [{ id: "t1", question: "x", status: "deferred" }]
+          }
+        })
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0].message).toContain("defer_reason");
+    });
+
+    it("全部 done/deferred + defer_reason 完备 → 通过", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            investigation_tasks: [
+              { id: "t1", question: "q1", status: "done", verdict: "confirmed" },
+              { id: "t2", question: "q2", status: "deferred", defer_reason: "依赖 align 阶段决策" }
+            ]
+          }
+        })
+      );
+      expect(out).toEqual([]);
+    });
+
+    it("字段缺失 → 透传（required_outputs 校验另负责）", () => {
+      const out = evaluateOutputAssertions(s, result({ status: "completed", output_summary: "x" }));
+      expect(out).toEqual([]);
+    });
+  });
+
+  describe("findings_traceable_to_probes", () => {
+    const s = stage({ post_output_assertions: ["findings_traceable_to_probes"] });
+
+    it("finding 缺 from_hypothesis → 失败", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            findings: [{ id: "f1", claim: "OLS 漏改", path_anchor: "Index.tsx:748" }]
+          }
+        })
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0].message).toContain("缺 from_hypothesis");
+    });
+
+    it("from_hypothesis 在 hypotheses 找不到 → 失败", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            findings: [{ id: "f1", from_hypothesis: "h99", claim: "x" }],
+            hypotheses: [{ id: "h1", claim: "y", linked_task_id: "t1" }]
+          }
+        })
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0].message).toContain("h99");
+    });
+
+    it("linked task verdict=inconclusive → 失败（应回 unknowns）", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            findings: [{ id: "f1", from_hypothesis: "h1", claim: "x" }],
+            hypotheses: [{ id: "h1", claim: "y", linked_task_id: "t1" }],
+            investigation_tasks: [{ id: "t1", question: "q", status: "done", verdict: "inconclusive" }]
+          }
+        })
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0].message).toContain("inconclusive");
+    });
+
+    it("verdict=confirmed → 通过", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            findings: [{ id: "f1", from_hypothesis: "h1", claim: "x" }],
+            hypotheses: [{ id: "h1", claim: "y", linked_task_id: "t1" }],
+            investigation_tasks: [{ id: "t1", question: "q", status: "done", verdict: "confirmed" }]
+          }
+        })
+      );
+      expect(out).toEqual([]);
+    });
+
+    it("findings 为空 → 透传", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({ status: "completed", output_summary: "x", required_outputs: { findings: [] } })
+      );
+      expect(out).toEqual([]);
+    });
+  });
+
+  describe("hedged_findings_demoted", () => {
+    const s = stage({ post_output_assertions: ["hedged_findings_demoted"] });
+
+    it("finding.claim 含'可能' → 失败", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            findings: [{ id: "f1", claim: "productType 缺失可能导致页面异常", from_hypothesis: "h1" }]
+          }
+        })
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0].assertion).toBe("hedged_findings_demoted");
+      expect(out[0].message).toContain("可能");
+    });
+
+    it("finding.description 含 'maybe' → 失败", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            findings: [{ id: "f1", description: "this might be a regression", from_hypothesis: "h1" }]
+          }
+        })
+      );
+      expect(out).toHaveLength(1);
+    });
+
+    it("否定语境：'未发现 likely 风险' → 不误挡", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            findings: [{ id: "f1", claim: "未发现 likely 的回归风险", from_hypothesis: "h1" }]
+          }
+        })
+      );
+      expect(out).toEqual([]);
+    });
+
+    it("肯定结论无 hedge → 通过", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            findings: [{ id: "f1", claim: "OLS 处缺少 goLogin 包裹，应 cherry-pick", from_hypothesis: "h1" }]
+          }
+        })
+      );
+      expect(out).toEqual([]);
+    });
+  });
+
+  describe("plan_readiness_honest", () => {
+    const s = stage({ post_output_assertions: ["plan_readiness_honest"] });
+
+    it("sufficient=false 且 unknowns/pending/missing 都空 → 失败", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            plan_readiness: { sufficient: false },
+            unknowns: "",
+            investigation_tasks: [{ id: "t1", status: "done", verdict: "confirmed" }]
+          }
+        })
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0].assertion).toBe("plan_readiness_honest");
+    });
+
+    it("sufficient=false 且 unknowns 有内容 → 通过", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            plan_readiness: { sufficient: false, missing_evidence_for: [] },
+            unknowns: "productType 默认值未确认"
+          }
+        })
+      );
+      expect(out).toEqual([]);
+    });
+
+    it("sufficient=false 但有 pending task → 通过", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            plan_readiness: { sufficient: false },
+            unknowns: "",
+            investigation_tasks: [{ id: "t2", status: "pending", question: "查 X" }]
+          }
+        })
+      );
+      expect(out).toEqual([]);
+    });
+
+    it("sufficient=true → 透传（pass 门槛由其他断言负责）", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            plan_readiness: { sufficient: true },
+            unknowns: ""
+          }
+        })
+      );
+      expect(out).toEqual([]);
+    });
+  });
+
+  describe("no_trailing_unparsed_payload", () => {
+    const s = stage({ post_output_assertions: ["no_trailing_unparsed_payload"] });
+
+    it("had_unparsed_tail=true → 失败", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          parse_diagnostics: {
+            had_unparsed_tail: true,
+            tail_length: 320,
+            last_open_brace_index: 1200,
+            bracket_balance: 2,
+            candidate_count: 1
+          }
+        })
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0].message).toContain("bracket_balance=2");
+    });
+
+    it("had_unparsed_tail=false → 通过", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          parse_diagnostics: {
+            had_unparsed_tail: false,
+            tail_length: 0,
+            last_open_brace_index: 5,
+            bracket_balance: 0,
+            candidate_count: 1
+          }
+        })
+      );
+      expect(out).toEqual([]);
+    });
+
+    it("parse_diagnostics 缺失 → 透传（向后兼容）", () => {
+      const out = evaluateOutputAssertions(s, result({ status: "completed", output_summary: "x" }));
+      expect(out).toEqual([]);
+    });
+  });
 });
