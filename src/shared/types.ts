@@ -76,63 +76,16 @@ export type StageOutputAssertion =
   /** design 类阶段：当任务文字含枚举性提示（多/批量/范围/逗号列表）时，必须输出 markdown 矩阵 */
   | "item_matrix_when_multi"
   /**
-   * investigate 类阶段：required_outputs.investigation_tasks 中每条 task 的 status 必须 ∈
-   * {done, deferred}，deferred 必须配 defer_reason。pending/in_progress 残留视为"调查未闭合"。
-   * 配合"先拟定任务清单、逐项落实、复盘补漏"的人类思维 loop——闭环前不许进入 align/design。
-   */
-  | "all_tasks_resolved"
-  /**
-   * findings 必须可追溯：每条 finding.from_hypothesis 在 hypotheses 中存在，
-   * 且其 linked task 的 verdict ∈ {confirmed, refuted}。
-   * 阻断"未取证就开列结论"。
-   */
-  | "findings_traceable_to_probes"
-  /**
-   * findings[*] 文本中含 hedge 措辞（可能/或许/似乎/疑似/maybe/might/likely）→ 失败。
-   * 强制 demote 到 unknowns 或补取证 task——避免用模糊措辞绕过取证义务。
+   * 扫文本：句子里 hedge 词（可能/或许/maybe/might/likely）与负面词（问题/风险/缺口/...）共现
+   * 且无 path:line 证据引用时 → 失败。让"未取证就下 hedged 结论"无处可藏。
+   * 不依赖任何结构化字段——v1.1 软化方案下唯一保留的"未取证检测"。
    */
   | "hedged_findings_demoted"
-  /**
-   * plan_readiness.sufficient === false 时，unknowns 或 investigation_tasks[status=pending] 必须非空。
-   * 禁止"自报方案不 ready 但啥都不补"。
-   */
-  | "plan_readiness_honest"
   /**
    * raw 输出尾部存在未闭合 JSON（bracket_balance != 0 或 last 合法 JSON 之后还有大段 JSON 残骸）→ 失败。
    * 跨场景通用——结构性断言，不绑定具体任务类型，建议每阶段都挂。
    */
-  | "no_trailing_unparsed_payload"
-  /**
-   * design 类阶段：plan_steps[*].supporting_finding_ids 中每个 id 必须能在 investigate.findings 找到。
-   * 阻断"想出方案但没挂到 finding"——动手前的步骤必须有取证血脉。
-   */
-  | "plan_steps_grounded"
-  /**
-   * implement 类阶段：deviations_from_plan 非空时，plan_revisions 必须有对应条目。
-   * 阻断"动手中发现 plan 跑不通但闷头改下去"。
-   */
-  | "deviations_must_be_revised"
-  /**
-   * implement 类阶段：任一 deviation 自报 out_of_scope=true 时，stage 必须 needs_rework 回 design。
-   * 阻断"偏差超出 design 边界但还在 implement 内继续"。
-   */
-  | "deviation_severity_must_rework"
-  /**
-   * self_review 阶段：rework_decision="pass" 时同时要求
-   *   - phase_1_self_check 无 status=missing 项（partial 必须有 mitigation）
-   *   - phase_2_tests.green === true
-   *   - phase_3_adversarial_review 三类 findings 无 severity=high
-   *   - residual_risks 为空、investigate.unknowns 已关闭
-   * 否则必须改为 pass_with_followups（每条 residual 配 followup_owner+followup_action）或 needs_rework。
-   */
-  | "pass_requires_all_validated"
-  /**
-   * design 阶段：plan_steps 每条必须填 perf_consideration / security_consideration /
-   * extensibility_consideration 三栏。允许写"不适用 + 原因"——目的是让"三个维度都想过"
-   * 成为肌肉记忆，而非要求所有任务都涉及性能/安全/扩展性。
-   * 全栏空（或只写"无"/"none"）→ fail。
-   */
-  | "design_considerations_filled";
+  | "no_trailing_unparsed_payload";
 
 export interface StageHooksConfig {
   pre_tool_use?: PreToolUseHookRule[];

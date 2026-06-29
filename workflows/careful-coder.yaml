@@ -1,11 +1,11 @@
 id: careful-coder
 name: 谨慎程序员
-version: 1.0.0
-description: 把人类资深开发者的"强制例程"固化为不能跳过的步骤——取证、对齐、敌对自审，让模型像谨慎的同事一样工作。
+version: 1.1.0
+description: 把人类资深开发者的"强制例程"软化为可读的纪律——取证、对齐、敌对自审，让模型像谨慎的同事一样工作。
 source:
   type: builtin
   id: careful-coder
-  version: 1.0.0
+  version: 1.1.0
 routing:
   enabled: true
   auto_start: true
@@ -44,6 +44,13 @@ rework:
     - implement
   approval_required: false
   invalidate_downstream: true
+# v1.1 设计笔记（写给后来者）：
+# v1.0 曾经用 required_outputs 强制 LLM 一次性产出 5 个对象数组（investigation_tasks /
+# hypotheses / findings / plan_steps / phase_1_self_check 等）+ 跨阶段血脉断言。
+# 实证结果：LLM 在长 prompt 下 JSON 频繁烂尾（candidate_count=9, bracket_balance=3），
+# 无法在 retry 内自我修复，引擎层卡死。
+# v1.1 回归软引导——instructions 描述思维例程、required_outputs 只留少量简单字段，
+# 断言只保留扫文本/查结构存在性的低复杂度规则。思想仍在，硬约束让位给 LLM 的实际能力。
 stages:
   - id: understand
     name: 理解
@@ -55,7 +62,7 @@ stages:
         - 假设：你不知道但暂时这样办的（必须在 assumptions 字段显式列出）。
       不要在本阶段编辑文件或制定方案，只产出共识。
 
-      字段输出要求（重要）：最终 JSON 的 required_outputs 必须**逐键**填写以下三个字段，
+      字段输出要求：最终 JSON 的 required_outputs 必须**逐键**填写以下三个字段，
       不要把内容只写在 output_summary 自然语言里：
         - user_goal_restated: 用一两句复述用户的真实诉求
         - definition_of_done: 列出本次任务"完成的样子"（具体可验收的条件）
@@ -74,69 +81,42 @@ stages:
   - id: investigate
     name: 取证
     instructions: |
-      ⚠️ 输出格式硬要求（先看这条再写内容）：
-      最外层是单一合法 JSON 对象。请在回传前在脑里 / 临时编辑器里
-      JSON.parse 一遍——绝对不能出现：
-        - 多余引号 / 引号未闭合（最常见错误）
-        - 字段名拼错（如 evidence_code vs evidence_collected）
-        - 双引号粘连（如 "x" "y"）
-        - 在 JSON 块外再粘第二份草稿 JSON
-      宿主只 parse 最外层一个 JSON 对象，烂掉就视为字段缺失，retry 时你看到的
-      错误信息会含 bracket_balance / tail_length 等诊断帮你定位。
+      像资深开发者接手陌生模块的反射动作——**先拟定调查任务、逐条取证、复盘是否方案无虞、
+      不放心就补任务再调查**。这是 Plan loop 的内循环；走完才允许下结论。
 
-      像资深开发者接手陌生模块：**先拟定调查任务清单，再逐项落实，复盘是否方案无虞，
-      不放心就补任务、再调查——这是 Plan loop 的内循环**。
-      未走完这个 loop 不允许把"可能 X"当结论写出来。
+      具体例程（建议自己在脑子里走一遍，但不强制结构化产出）：
+        1) 列出本次要查的问题清单（包含至少一条 `git log` 类任务看 commit 意图）；
+        2) 每条问题挂一个假设，并列出反向假设（不要只想一种可能）；
+        3) 跑取证：grep 同名调用、Read 相邻实现、查 git log/blame；
+        4) 取证后判定 confirmed/refuted/inconclusive——inconclusive 的进 unknowns，
+           不允许伪装成 finding；
+        5) 集群型现象（多个同类页面/入口/模块）必须有一条 task 专门评估集群整体性。
 
-      你必须按以下结构产出（在最外层 JSON 的 required_outputs 里）：
+      产物（required_outputs，写在最外层 JSON 里——保持精简，不要塞嵌套对象数组）：
+        - similar_callsites: 至少 3 条 path:line + 一句话作用（字符串数组或多行字符串都行）
+        - git_history_summary: 跑过的 git log/blame 关键结论（字符串，含 commit hash + 一行 message）
+        - unknowns: 你没查清的、查了但 inconclusive 的、主动暴露的"我不知道"
+          （字符串数组或多行字符串。写"无"会被引擎判定不诚实）
 
-      1) **investigation_tasks**：你打算调查的所有任务，每条形如
-          `{id, question, why_needed, status, evidence_collected, verdict, defer_reason}`
-         - status：pending | in_progress | done | deferred（出阶段时必须全部 done 或 deferred）
-         - deferred 必须填 defer_reason（如"此任务依赖 align 决策，本阶段先记录"）
-         - done 的 task 应填 verdict ∈ {confirmed, refuted, inconclusive}
-         - 资深开发者拿到陌生代码时反射动作（你也照做）：
-           a. 至少一条 `git log` 类任务（看相关 commit 意图，理解"为什么会长成这样"）
-           b. 任何提到"调用 X 组件/函数"的 task，必须有一次该组件源码的 Read
-           c. 集群型现象（多个同类页面/入口/模块）至少有一条 task 专门评估集群整体性
+      在 output_summary（自然语言段）里：明确写"已查实的结论 / 仍存疑的事项"两栏；
+      涉及"可能 X 导致 Y 问题/风险/缺口"这类 hedged 表述时必须配 path:line 证据，
+      否则按"未取证"处理、归入 unknowns。
 
-      2) **hypotheses**：基于调查任务你的假设，每条形如
-          `{id, claim, alternative, linked_task_id}`
-         - alternative：必须列至少一个对立假设（不允许只列一种可能）
-         - linked_task_id：必须指向 investigation_tasks 里某条 task
-
-      3) **findings**：**只允许从 verdict ∈ {confirmed, refuted} 的 hypothesis 升上来**，每条形如
-          `{id, from_hypothesis, path_anchor, confidence: "verified", evidence_ref, claim}`
-         - claim 中**禁止**出现"可能/或许/似乎/疑似/maybe/might/likely"——
-           那是 unknowns 的领地。如果只能这样写，说明取证未完成，应留在 unknowns
-         - 引擎会硬性校验 from_hypothesis 指向的 task verdict——蒙混不过去
-
-      4) **unknowns**：你没查清的、查了但 verdict=inconclusive 的、主动暴露的不知道。
-         宁可暴露不要藏；写"无"会被引擎判定不诚实。
-
-      5) **plan_readiness**：`{sufficient: bool, missing_evidence_for: string[]}`
-         - 自报方案是否已经"调查充分、可以进入 align/design"
-         - sufficient=false 时，必须在 unknowns 或 pending tasks 或 missing_evidence_for 至少一处写明"缺什么"
-
-      output_summary 必须把上述五个键的关键条目都列入（含 path:line 与一句话作用），
-      下游阶段无法读到结构化字段。
+      ⚠️ 输出 JSON 时请先在脑里 / 临时编辑器里 JSON.parse 一遍——多余引号、字段名拼错、
+      引号未闭合是最常见错误；烂掉宿主会视为字段缺失，retry 时你看到的错误信息会含
+      bracket_balance/tail_length 等诊断。
     allowed_tools:
       - read_file
       - shell
     required_outputs:
-      - investigation_tasks
-      - hypotheses
-      - findings
+      - similar_callsites
+      - git_history_summary
       - unknowns
-      - plan_readiness
-    auto_retry_limit: 2
+    auto_retry_limit: 1
     hooks:
       post_output_assertions:
-        - all_tasks_resolved
-        - findings_traceable_to_probes
-        - hedged_findings_demoted
-        - plan_readiness_honest
         - unknowns_present
+        - hedged_findings_demoted
         - no_trailing_unparsed_payload
   - id: align
     name: 对齐
@@ -145,7 +125,8 @@ stages:
       逐条列出边界自问（未登录/未授权/未实名/空数据/并发/不可逆/网络失败/超大输入），
       把 understand+investigate 留下的模糊点用 ask_human 强制澄清——不允许出现"我假设"代替提问。
       如果存在不可逆操作（删文件、清数据、git reset 等），请把"是否允许"列入 clarifications_asked。
-      output_summary 必须把 lateral_constraints 与 boundary_questions 的每一条都明文列出——self_review 阶段只能读到 summary 而非结构化字段，summary 写得粗则 reviewer 无法逐条核对。
+      output_summary 必须把 lateral_constraints 与 boundary_questions 的每一条都明文列出——
+      self_review 阶段只能读到 summary 而非结构化字段，summary 写得粗则 reviewer 无法逐条核对。
     allowed_tools:
       - read_file
     required_outputs:
@@ -159,92 +140,49 @@ stages:
   - id: design
     name: 设计
     instructions: |
-      把 investigate 阶段 verified 的 findings 翻成可执行步骤——**每一步都要挂取证血脉，
-      不允许凭空设计**。同时完成两项自审。
+      把 investigate 阶段查实的结论翻成可执行步骤——**每一步都要引用对应的取证证据**，
+      不允许凭空设计。同时完成两项自审。
 
-      字段输出要求（最外层 JSON 的 required_outputs）：
-
-      1) **plan_steps**: 步骤数组，每条形如
-          `{id, action, supporting_finding_ids, perf_consideration, security_consideration, extensibility_consideration}`
-         - `supporting_finding_ids`: 至少 1 个，且每个 id 在 investigate.findings 里能查到——
-           引擎硬性校验，蒙混不过。如果某步无法溯源到 finding，要么补 investigation_task 取证，
-           要么把这步从方案里删掉。
-         - `perf_consideration` / `security_consideration` / `extensibility_consideration`:
-           三栏必须填。写"不适用 + 原因"也比省略好——这是资深 dev 的反射动作。
-
-      2) **success_criteria**: 完成的样子（字符串数组），每条**可验收**——
-         self_review 阶段会逐条核对，含糊措辞（"代码质量提升"）会导致核对无法落地。
-
-      3) **adversarial_critique**: 至少给 3 条具体反驳并答辩——
-         挑刺 reviewer 角度的"这方案哪里会出事"。
-
-      4) **consistency_audit**: 同类条目要么全做、要么全不做的核对结论；任何偏离要写理由。
-
-      5) **risks_carried_into_implement**: `[{risk, mitigation_in_plan_step_id}]`
-         把 design 阶段已知的风险显式带入 implement（如"X 改动会破坏 Y 缓存，已在 step2 mitigate"）。
+      建议自检例程（写在 output_summary 里，不强制结构化产出）：
+        1) 列出 plan steps（每条配 path:line 取证引用 + perf/security/extensibility 三维度考量；
+           不涉及就写"不适用：<一句话原因>"，目的是让三维度想过——这是肌肉记忆而非格式要求）；
+        2) 给出可验收的 success_criteria（self_review 阶段会逐条核对，含糊措辞会让对账失效）；
+        3) 敌对自审：假设挑刺 reviewer 看你的方案，他会怎么打回？至少给 3 条具体反驳并答辩；
+        4) 一致性自审：同类条目要么全做、要么全不做；任何偏离写出理由；
+        5) 集群型任务（多个同类条目 ≥3）：在 output_summary 里给一张 markdown 矩阵——
+           列至少"条目 / 鉴权策略 / 参数 / 备注"，让 implement 一眼看清横向是否齐整。
 
       避免过度抽象/过度工程：能用现有函数解决就不要新建。
-      output_summary 要点列出 plan_steps id + success_criteria，便于 implement/self_review 对照。
     allowed_tools:
       - read_file
     required_outputs:
-      - plan_steps
-      - success_criteria
+      - design_summary
       - adversarial_critique
       - consistency_audit
-      - risks_carried_into_implement
     auto_retry_limit: 1
     hooks:
       post_output_assertions:
-        - plan_steps_grounded
-        - design_considerations_filled
-        - item_matrix_when_multi
         - no_trailing_unparsed_payload
   - id: implement
     name: 实施
     instructions: |
-      严格按 design.plan_steps 实施最小改动；偏离 design 必须显式记录在 deviations_from_plan 中。
+      严格按 design 实施最小改动；偏离 design 必须 needs_rework 回到 design。
       改任何一个文件之前，先确保你真的读过它（不只是 grep 过 basename）：
         - 同一目标文件的 Read/Grep 次数 ≥ 3；
         - 本会话内对该文件跑过一次 git log；
         - 涉及不可逆 shell 操作时，先 ask_human 取得用户同意。
-      宿主会在工具调用前强制校验上述前置条件，未达到会被 deny 并要求你补齐。这不是平台限制，是"先看后改"的纪律。
+      宿主会在工具调用前强制校验上述前置条件，未达到会被 deny 并要求你补齐。这不是平台限制，
+      是"先看后改"的纪律。
 
-      **过程中随时与总体目标核对**：每改完一个文件，请用一句话回写到 `goal_alignment_check`，
-      对照 understand.user_goal_restated 与 design.success_criteria，明示这次改动推进/未推进哪一条。
-      不要等到 self_review 阶段才发现走偏。
-
-      字段输出要求（最外层 JSON 的 required_outputs）：
-
-      1) **files_changed**: `[{path, summary_of_change}]` —— 本阶段你改过的文件清单。
-
-      2) **deviations_from_plan**: `[{step_id, what_changed, why, out_of_scope}]`
-         - `what_changed`: 与 design.plan_steps[step_id] 偏离的具体内容（不许写"x"/"少量调整"等占位）
-         - `why`: 触发偏离的真实原因（"实施时发现 X"）
-         - `out_of_scope`: 偏离是否超出 design.plan_steps 的边界
-           - true → 引擎强制要求 status=needs_rework 回 design（前提被推翻了，不许越界继续）
-           - false → 必须在 plan_revisions 给对应修正
-         - 反滥用提示：动手中若发现 "原本 design 说 A 我实际做了 B" 这种非琐碎偏差，
-           诚实标 out_of_scope=true 比硬塞 false 更安全——后者下次回看就再也对不上账。
-         - 没有偏离时给空数组 `[]`，不要省略字段。
-
-      3) **plan_revisions**: `[{trigger, new_or_modified_steps}]`
-         - 每条 deviation 至少对应一条 revision（数量 ≥ deviations 数）。
-         - 没有偏离时给空数组 `[]`。
-
-      4) **goal_alignment_check**: 字符串或字符串数组，逐次核对的口径——
-         "改完 X，推进了 success_criteria[Y]" / "改完 X，发现与 user_goal 偏离，已在 deviation 记录"。
+      **过程中随时与总体目标核对**：每改完一个文件，在自己脑子里对照 understand.user_goal_restated
+      与 design.success_criteria，明示这次改动推进/未推进哪一条。如果发现走偏，及时 needs_rework
+      回 design 重新规划——不要等到 self_review 阶段才发现。
 
       改动尽量小、贴近原代码风格。坚决不顺手"清理无关代码"。
     allowed_tools:
       - read_file
       - edit_file
       - shell
-    required_outputs:
-      - files_changed
-      - deviations_from_plan
-      - plan_revisions
-      - goal_alignment_check
     gates:
       - authorized_files_only
     auto_retry_limit: 1
@@ -274,59 +212,34 @@ stages:
             ask_human_consent: true
           on_fail: "这是不可逆操作，必须先在本阶段通过 ask_human 取得用户明确确认。"
       post_output_assertions:
-        - deviations_must_be_revised
-        - deviation_severity_must_rework
         - no_trailing_unparsed_payload
   - id: self_review
     name: 自审
     instructions: |
       你现在是一个独立的、敌对的 code reviewer，**不是作者**，看不到 implement 阶段的辩解，只看代码事实。
-      review 拆成三段递进，**每段都要落到结构化字段**，不允许把所有判断挤在自然语言里：
+      逐条核对 align.lateral_constraints 与 align.boundary_questions（在前序阶段 output_summary 中可读）
+      对应到当前 diff：
+        - 漏覆盖的项目必须写明缺口；
+        - 即使全部覆盖，也要在 review_findings 给出一份"逐项核对"清单（每条约束/边界 → 在 diff 哪里被处理）。
 
-      ## 第一段：phase_1_self_check —— 逐条核对 success_criteria 与 plan_steps
-      对照 design.success_criteria 与 design.plan_steps（在前序阶段 required_outputs 中可读）
-      把 diff 与之对账。输出对象数组：
-        `[{criterion, status: met|partial|missing, evidence_path_anchor, mitigation}]`
-        - status=met: 必须给 evidence_path_anchor（指向 diff 里实现这条 criterion 的位置）
-        - status=partial: 必须填 mitigation（如"X 已实现一半，followup 中补 Y"）
-        - status=missing: 这条 criterion 没被满足——这种状态下不允许 pass
+      review 的内功（写在 output_summary 里，不强制结构化字段）：
+        - 真去跑测试/构建/lint——不允许只口头说"应该通过"；如果跑了，把命令与结果摘要写在 review_findings；
+        - 三维度挑刺：性能 / 安全 / 扩展性——发现 high 级风险时不允许 pass；
+        - 自洽性纪律：一旦 review_findings/residual_risks 出现"blocker / critical / 严重不一致 / 安全问题 /
+          高优先级问题"这类阻塞类描述，就**不允许**把 rework_decision 写成 pass——
+          要么改描述（已修复 + diff 位置）、要么改 needs_rework。引擎会自动判定不自洽并回炉重做。
 
-      ## 第二段：phase_2_tests —— 真的跑测试/构建
-      不允许只口头说"应该通过"。必须真跑过至少一条命令：
-        `{commands_run: string[], green: bool, stdout_summary: string}`
-        - 至少跑过 test/build/lint/typecheck 中的一条；写明命令与 exit_code/输出摘要。
-        - green=true 当且仅当所有 commands_run 都通过。
-        - 没法跑（如纯文档改动）也要在 stdout_summary 写明原因，否则视为未验证。
-
-      ## 第三段：phase_3_adversarial_review —— 三类风险扫描
-      以挑刺 reviewer 身份对**代码本身**扫三类风险：
-        `{perf_findings, security_findings, extensibility_findings}`
-        每项是 `[{path_anchor, concern, severity: low|med|high}]`。
-        无风险时给空数组——不要省略字段。任一类含 severity=high 时不允许 pass。
-
-      ## 决策：rework_decision 三态
-      `rework_decision` 必须是 `pass | pass_with_followups | needs_rework` 之一：
-        - **pass**: 严格语义——phase_1 无 missing、partial 必有 mitigation、phase_2.green=true、
-          phase_3 三类无 high、residual_risks 为空、investigate.unknowns 已关闭。
-          引擎硬性校验，不达标会被回炉。
-        - **pass_with_followups**: 主体通过但留尾巴。`followups` 必须给每条 residual 配
-          `{owner, action, related_risk}`——不允许只表态不留落地动作。
-        - **needs_rework**: 回炉。最外层 JSON 必须 status="needs_rework"、
-          rework_target_stage_id（implement/design/investigate 之一）、rework_reason。
-
-      ## 自洽性纪律
-        - 一旦 review_findings/residual_risks 出现"blocker/critical/严重不一致/安全问题/高优先级问题"
-          这类阻塞描述，就不允许 pass——要么改描述（已修复 + diff 位置），要么改 needs_rework。
-        - 自我矛盾会被引擎判定不自洽并回炉。
+      返工触发协议：
+        - 决定回炉时，最外层 JSON 必须 status="needs_rework"、rework_target_stage_id 是
+          implement/design/investigate 之一、rework_reason 用一两句中文说明缺口；
+        - 不要把 needs_rework 仅写进 rework_decision 字段——引擎只识别最外层 status。
+        - 通过时：status="completed"，rework_decision="pass"，review_findings 必须给出逐项核对清单。
 
       仅允许只读工具：Read 看 diff、shell 跑 git diff/test/build/lint，禁止 edit。
     allowed_tools:
       - read_file
       - shell
     required_outputs:
-      - phase_1_self_check
-      - phase_2_tests
-      - phase_3_adversarial_review
       - review_findings
       - rework_decision
       - residual_risks
@@ -335,6 +248,5 @@ stages:
       post_output_assertions:
         - review_self_consistency
         - needs_rework_target_required
-        - pass_requires_all_validated
-        - item_matrix_when_multi
+        - hedged_findings_demoted
         - no_trailing_unparsed_payload

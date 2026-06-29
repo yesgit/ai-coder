@@ -228,196 +228,48 @@ function isMarkdownTable(text: string): boolean {
 }
 
 /**
- * "Plan loop 闭环" —— investigation_tasks 的每条 task 必须达到终态：
- *  - status === "done"，且（若 task 有 verdict 字段）verdict ∈ {confirmed, refuted, inconclusive}
- *  - 或 status === "deferred"，且 defer_reason 非空
+ * "未取证的 hedged 结论" —— 扫 output_summary + required_outputs 摊平文本，
+ * 句子里"可能 / 或许 / 似乎 / 疑似 / maybe / might / likely / probably" 与
+ * "问题 / 风险 / 缺口 / 隐患 / 不一致 / 漏洞 / bug / issue / gap / defect / regression"
+ * 共现 ∩ 句中无 path:line 证据引用 → 视为未取证下了结论 → fail。
  *
- * 拒绝接收 pending/in_progress 残留——这是"先拟定调查任务、逐项落实、复盘"thinking loop 的闭环条件。
- * inconclusive 也允许 done（结论是 "查了但没结论"），但这种 hypothesis 不应升上 findings——
- * 那个由 findings_traceable_to_probes 兜底。
+ * 设计动机：v1.0 这条断言依赖 required_outputs.findings 是数组——但实证表明 LLM 在硬
+ * schema 约束下经常产不出结构化对象数组。v1.1 改成纯文本扫描，不挑场景，不依赖具体字段。
  *
- * 故意宽松：不强求 evidence_collected 字段必填，避免误伤简单任务。
- */
-const allTasksResolved: AssertionImpl = (result) => {
-  const tasks = collectStructured(result, "investigation_tasks");
-  if (!Array.isArray(tasks)) return null; // 字段缺失另由 required_outputs 校验
-  const unresolved: string[] = [];
-  for (let i = 0; i < tasks.length; i += 1) {
-    const t = tasks[i];
-    if (!isRecord(t)) continue;
-    const status = typeof t.status === "string" ? t.status.trim().toLowerCase() : "";
-    if (status === "done") continue;
-    if (status === "deferred") {
-      const reason = typeof t.defer_reason === "string" ? t.defer_reason.trim() : "";
-      if (reason.length === 0) {
-        unresolved.push(`[${i}] ${describeTask(t)}：deferred 但 defer_reason 为空`);
-      }
-      continue;
-    }
-    unresolved.push(`[${i}] ${describeTask(t)}：status=${status || "(缺失)"}`);
-  }
-  if (unresolved.length === 0) return null;
-  return [
-    "investigation_tasks 未闭环：以下 task 仍处于 pending/in_progress/未知状态——",
-    unresolved.join("; "),
-    "。请按'拟定 → 落实 → 复盘'走完：每条 task 要么落实到 done（并填 verdict）、",
-    "要么 deferred 并写明 defer_reason。Plan loop 不闭环不允许进入下一阶段。"
-  ].join("");
-};
-
-function describeTask(task: Record<string, unknown>): string {
-  const id = typeof task.id === "string" ? task.id : "";
-  const q = typeof task.question === "string" ? task.question : "";
-  const label = id || q || "(unnamed)";
-  return label.length > 40 ? `${label.slice(0, 37)}...` : label;
-}
-
-/**
- * findings 必须可追溯到取证：每条 finding.from_hypothesis 在 hypotheses 里有对应条目，
- * 且其 linked task 的 verdict ∈ {confirmed, refuted}。
- *
- * 阻断"未取证就开列结论"——任何"我看着像 X"的结论必须先有 task → probe → verdict 的支持。
- * inconclusive 的 hypothesis 不允许升上来；这种应当留在 unknowns。
- */
-const findingsTraceableToProbes: AssertionImpl = (result) => {
-  const findings = collectStructured(result, "findings");
-  if (!Array.isArray(findings) || findings.length === 0) return null; // 没 findings 自然没违规
-
-  const hypotheses = collectStructured(result, "hypotheses");
-  const tasks = collectStructured(result, "investigation_tasks");
-  const hypothesisById = indexBy(Array.isArray(hypotheses) ? hypotheses : [], "id");
-  const taskById = indexBy(Array.isArray(tasks) ? tasks : [], "id");
-
-  const orphans: string[] = [];
-  for (let i = 0; i < findings.length; i += 1) {
-    const f = findings[i];
-    if (!isRecord(f)) continue;
-    const fromHyp = typeof f.from_hypothesis === "string" ? f.from_hypothesis : "";
-    if (!fromHyp) {
-      orphans.push(`[${i}] ${describeFinding(f)}：缺 from_hypothesis`);
-      continue;
-    }
-    const hyp = hypothesisById.get(fromHyp);
-    if (!hyp) {
-      orphans.push(`[${i}] from_hypothesis="${fromHyp}" 在 hypotheses 找不到`);
-      continue;
-    }
-    // 区分三种失败：让作者看错误信息就知道改哪里，不浪费 retry。
-    const linkedTaskId = typeof hyp.linked_task_id === "string" ? hyp.linked_task_id.trim() : "";
-    if (!linkedTaskId) {
-      orphans.push(`[${i}] hypothesis="${fromHyp}" 缺 linked_task_id（请在 hypotheses 里填上对应 task 的 id）`);
-      continue;
-    }
-    const task = taskById.get(linkedTaskId);
-    if (!task) {
-      orphans.push(`[${i}] hypothesis="${fromHyp}" 的 linked_task_id="${linkedTaskId}" 在 investigation_tasks 找不到`);
-      continue;
-    }
-    const verdict = typeof task.verdict === "string" ? task.verdict.trim().toLowerCase() : "";
-    if (verdict !== "confirmed" && verdict !== "refuted") {
-      orphans.push(
-        `[${i}] task="${linkedTaskId}" 的 verdict=${verdict || "(缺失)"}，需 confirmed/refuted 才能让 finding 升上来`
-      );
-    }
-  }
-  if (orphans.length === 0) return null;
-  return [
-    "findings 未取证：以下结论缺少可追溯的取证链路——",
-    orphans.join("; "),
-    "。每条 finding 必须挂 from_hypothesis；该 hypothesis 必须挂 linked_task_id；",
-    "对应 task 的 verdict 必须是 confirmed 或 refuted。inconclusive 的请回到 unknowns 或新增取证 task。"
-  ].join("");
-};
-
-function describeFinding(f: Record<string, unknown>): string {
-  const claim = typeof f.claim === "string" ? f.claim : "";
-  const anchor = typeof f.path_anchor === "string" ? f.path_anchor : "";
-  const label = claim || anchor || "(no claim)";
-  return label.length > 40 ? `${label.slice(0, 37)}...` : label;
-}
-
-function indexBy(items: unknown[], key: string): Map<string, Record<string, unknown>> {
-  const m = new Map<string, Record<string, unknown>>();
-  for (const item of items) {
-    if (!isRecord(item)) continue;
-    const k = typeof item[key] === "string" ? (item[key] as string) : "";
-    if (k) m.set(k, item);
-  }
-  return m;
-}
-
-/**
- * findings[*] 文本含 hedge 措辞（可能/或许/似乎/疑似/maybe/might/likely）→ 失败。
- *
- * findings 是"已经取证的肯定/否定结论"，不允许出现模糊措辞——那是 unknowns 的领地。
- * 强制 demote：要么补 task 取证到肯定/否定，要么挪到 unknowns。
- *
- * 注意：避开误伤——只扫 findings 字段，不扫 unknowns/hypotheses（那里出现 hedge 是合理的）。
+ * 避免误伤的三层过滤：
+ *  1) 否定语境（"未发现可能 X"/"无可能 Y 风险"）→ 放行
+ *  2) 句子里出现 path:line 证据引用（如 "Foo.tsx:123" / "src/x.js:45" ）→ 视为已取证、放行
+ *  3) 单独"可能"或单独"风险"不触发——必须共现
  */
 const HEDGE_PATTERN = /可能|或许|似乎|疑似|大概|maybe|might|likely|probably/i;
+const NEGATIVE_NOUN_PATTERN = /问题|风险|缺口|缺失|隐患|不一致|未覆盖|未校验|漏洞|bug|issue|gap|defect|regression|fail/i;
 const NEGATION_FOR_HEDGE = /(没|没有|无|未|不|不会|绝无|未发现|不存在|not\s|no\s|never\s|none\s)\s*[一-龥\w]{0,8}$/i;
+const EVIDENCE_REF_PATTERN = /[\w\-./@]+:\d+|commit\s*[0-9a-f]{7,}|git\s+log/i;
 
 const hedgedFindingsDemoted: AssertionImpl = (result) => {
-  const findings = collectStructured(result, "findings");
-  if (!Array.isArray(findings) || findings.length === 0) return null;
+  const text = collectText(result);
+  if (!text.trim()) return null;
 
   const violators: string[] = [];
-  for (let i = 0; i < findings.length; i += 1) {
-    const f = findings[i];
-    if (!isRecord(f)) continue;
-    const text = [
-      typeof f.claim === "string" ? f.claim : "",
-      typeof f.description === "string" ? f.description : "",
-      typeof f.note === "string" ? f.note : ""
-    ].join(" \n ");
-    if (!text.trim()) continue;
-    // 逐句扫描，避免被否定语境（"未发现可能 X"之类）误伤
-    for (const sentence of splitSentences(text)) {
-      const m = sentence.match(HEDGE_PATTERN);
-      if (!m) continue;
-      const before = sentence.slice(Math.max(0, (m.index ?? 0) - 20), m.index ?? 0);
-      if (NEGATION_FOR_HEDGE.test(before)) continue;
-      violators.push(`[${i}] ${describeFinding(f)}：含 hedge 词 "${m[0]}"`);
-      break;
-    }
+  for (const sentence of splitSentences(text)) {
+    const hedgeMatch = sentence.match(HEDGE_PATTERN);
+    if (!hedgeMatch) continue;
+    if (!NEGATIVE_NOUN_PATTERN.test(sentence)) continue;
+    // 否定语境过滤："未发现可能 X 风险" 不算下结论
+    const before = sentence.slice(Math.max(0, (hedgeMatch.index ?? 0) - 20), hedgeMatch.index ?? 0);
+    if (NEGATION_FOR_HEDGE.test(before)) continue;
+    // 取证语境过滤：句子里挂了 path:line 或 commit hash 引用就视为已取证
+    if (EVIDENCE_REF_PATTERN.test(sentence)) continue;
+    violators.push(sentence.length > 60 ? `${sentence.slice(0, 57)}...` : sentence);
+    if (violators.length >= 3) break; // 提示三条够了，别刷屏
   }
   if (violators.length === 0) return null;
   return [
-    "findings 含模糊措辞：",
-    violators.join("; "),
-    "。findings 必须是已取证的结论，不允许'可能/或许/似乎/maybe/might/likely'。",
-    "请二选一：(1) 把这条移到 unknowns 并新增 investigation_task 去取证；",
-    "(2) 真正读对应代码取证后改成肯定/否定结论。"
-  ].join("");
-};
-
-/**
- * plan_readiness.sufficient === false 时，unknowns 或 investigation_tasks 中 status=pending 的至少一项必须非空。
- *
- * 阻断"自报不 ready 但啥都不补"——人类工程师说"还差点意思"必然能说出差啥；
- * 模型不被允许只表态、不落到清单。
- */
-const planReadinessHonest: AssertionImpl = (result) => {
-  const readiness = collectStructured(result, "plan_readiness");
-  if (!isRecord(readiness)) return null; // 字段缺失另由 required_outputs 校验
-  if (readiness.sufficient === true) return null; // 自报 ready 由其他断言把关
-
-  const unknowns = collectStructured(result, "unknowns");
-  const unknownsFlat = unknowns === undefined ? "" : flattenToText(unknowns).trim();
-
-  const tasks = collectStructured(result, "investigation_tasks");
-  const hasPending = Array.isArray(tasks)
-    ? tasks.some((t) => isRecord(t) && typeof t.status === "string" && /^(pending|in_progress)$/i.test(t.status.trim()))
-    : false;
-
-  const missingFor = readiness.missing_evidence_for;
-  const missingFlat = missingFor === undefined ? "" : flattenToText(missingFor).trim();
-
-  if (unknownsFlat.length > 0 || hasPending || missingFlat.length > 0) return null;
-  return [
-    "plan_readiness 不诚实：自报 sufficient=false 但既无 unknowns、又无 pending 的 investigation_tasks、",
-    "也没填 missing_evidence_for。请明确写出缺什么证据/还要查什么。",
-    "Plan loop 的语义是'差点啥要说清'——只表态不补漏算未闭环。"
+    "未取证的 hedged 结论：",
+    violators.join(" | "),
+    "。'可能/或许/似乎/maybe/might/likely + 问题/风险/缺口/...' 这种句式是 unknowns 的领地，",
+    "不允许当结论写出来。请二选一：(1) 真去读对应代码取证、改写成肯定/否定结论 + path:line 证据；",
+    "(2) 把这条移进 unknowns 字段，明示你还没查清。"
   ].join("");
 };
 
@@ -442,281 +294,14 @@ const noTrailingUnparsedPayload: AssertionImpl = (result) => {
   ].join("");
 };
 
-/**
- * design 阶段：每个 plan_step 必须挂 ≥1 个 supporting_finding_ids，且这些 id 能在
- * investigate.findings 里找到。阻断"想得很多但没挂取证血脉"。
- *
- * 跨阶段断言：依赖 PriorStageOutputs 拿到 investigate 阶段已落地的 findings。
- * 容错：findings 不是数组 / 缺 id 字段 → 退化到"只要 supporting_finding_ids 非空"。
- */
-const planStepsGrounded: AssertionImpl = (result, prior) => {
-  const steps = collectStructured(result, "plan_steps");
-  if (!Array.isArray(steps) || steps.length === 0) return null; // 字段缺失另由 required_outputs 校验
-
-  // 拿 investigate.findings（任一前序阶段都可放 findings，但优先 investigate）
-  const findingIds = collectFindingIds(prior);
-  const violators: string[] = [];
-
-  for (let i = 0; i < steps.length; i += 1) {
-    const step = steps[i];
-    if (!isRecord(step)) continue;
-    const stepId = typeof step.id === "string" ? step.id : `[${i}]`;
-    const refs = step.supporting_finding_ids;
-    const list = Array.isArray(refs) ? refs.map((r) => (typeof r === "string" ? r.trim() : "")).filter(Boolean) : [];
-    if (list.length === 0) {
-      violators.push(`${stepId}: supporting_finding_ids 为空`);
-      continue;
-    }
-    // 若拿到了 findingIds 集合，每个 ref 必须存在；如果整个 findings 集合都拿不到，
-    // 我们至少保证 supporting_finding_ids 非空（不退化为"放过一切"）。
-    if (findingIds.size === 0) continue;
-    const missing = list.filter((id) => !findingIds.has(id));
-    if (missing.length > 0) {
-      violators.push(`${stepId}: 引用了不存在的 finding id [${missing.join(", ")}]`);
-    }
-  }
-
-  if (violators.length === 0) return null;
-  return [
-    "plan_steps 缺取证血脉：",
-    violators.join("; "),
-    "。每个 plan_step 必须挂 ≥1 个 supporting_finding_ids，且 id 在 investigate.findings 里能查到。",
-    "如果某步骤无法溯源到 finding，说明它是凭空设计的——请要么补 investigation_task 取证后再设计，",
-    "要么把这步从方案里去掉。"
-  ].join("");
-};
-
-function collectFindingIds(prior: PriorStageOutputs): Set<string> {
-  const ids = new Set<string>();
-  for (const stageOutputs of Object.values(prior)) {
-    if (!stageOutputs) continue;
-    const findings = stageOutputs.findings;
-    if (!Array.isArray(findings)) continue;
-    for (const f of findings) {
-      if (isRecord(f) && typeof f.id === "string" && f.id.trim()) ids.add(f.id);
-    }
-  }
-  return ids;
-}
-
-/**
- * implement 阶段：deviations_from_plan 非空时，plan_revisions 必须有对应条目；
- * 同时每条 deviation 必须有可读的 what_changed/why（不允许只占位）。
- *
- * 阻断"动手中发现 plan 跑不通但闷头改下去不更新计划"。每个 deviation 应当对应一条
- * plan_revisions[*]——按 step_id 配对；plan_revisions 里的 trigger 字段应当能引用到该 deviation。
- *
- * 容错：plan_revisions 不要求一一对应到 step_id（trigger 字段措辞自由），只要数量 ≥ deviations 即可——
- * 让模型有空间把多个相关 deviation 合到一条 revision。
- *
- * 反滥用：仅校验数量会让模型写 1 条空 deviation + 1 条空 revision 假装诚实。
- * 这里同时要求 deviation 至少有 what_changed 或 why 字段非空——逼模型给出真实理由。
- */
-const deviationsMustBeRevised: AssertionImpl = (result) => {
-  const dev = collectStructured(result, "deviations_from_plan");
-  if (!Array.isArray(dev) || dev.length === 0) return null;
-
-  const rev = collectStructured(result, "plan_revisions");
-  const revisions = Array.isArray(rev) ? rev : [];
-
-  const reasons: string[] = [];
-  if (revisions.length < dev.length) {
-    reasons.push(`plan_revisions 只有 ${revisions.length} 条（应 ≥ ${dev.length}）`);
-  }
-
-  // 每条 deviation 必须 what_changed 或 why 至少一项有实质内容
-  for (let i = 0; i < dev.length; i += 1) {
-    const d = dev[i];
-    if (!isRecord(d)) continue;
-    const what = typeof d.what_changed === "string" ? d.what_changed.trim() : "";
-    const why = typeof d.why === "string" ? d.why.trim() : "";
-    if (what.length < 4 && why.length < 4) {
-      const step = typeof d.step_id === "string" ? d.step_id : `[${i}]`;
-      reasons.push(`deviation ${step}: what_changed 与 why 都为空或过短（请写真实理由）`);
-    }
-  }
-
-  if (reasons.length === 0) return null;
-  return [
-    "deviations 未充分记录：",
-    reasons.join("; "),
-    "。动手中发现 plan 跑不通时，必须同步更新 plan_revisions——",
-    "每条 deviation 至少对应一条 revision（说明触发原因、新增/修改了哪些 step），",
-    "且 deviation 本身的 what_changed/why 不能用占位文字。",
-    "如果不更新计划就闷头改，下次回头看就再也对不上账。"
-  ].join("");
-};
-
-/**
- * implement 阶段：任一 deviation 自报 out_of_scope=true 时，stage 必须 needs_rework 回 design。
- *
- * 阻断"偏差超出 design 边界但还在 implement 内继续改"——这种情况下 design 的前提假设
- * 已被推翻，正确做法是回到 design 重新规划，而不是越界完成 implement。
- */
-const deviationSeverityMustRework: AssertionImpl = (result) => {
-  const dev = collectStructured(result, "deviations_from_plan");
-  if (!Array.isArray(dev)) return null;
-
-  const outOfScope = dev.filter(
-    (d) => isRecord(d) && d.out_of_scope === true
-  );
-  if (outOfScope.length === 0) return null;
-
-  // status=needs_rework 且 target 为 design（或更早）→ 通过
-  if (result.status === "needs_rework") {
-    const target = result.rework_target_stage_id;
-    if (typeof target === "string" && target.trim()) return null;
-  }
-
-  const samples = outOfScope
-    .slice(0, 2)
-    .map((d, i) => {
-      const r = d as Record<string, unknown>;
-      const step = typeof r.step_id === "string" ? r.step_id : `[${i}]`;
-      const what = typeof r.what_changed === "string" ? r.what_changed.slice(0, 40) : "";
-      return `${step}: ${what}`;
-    });
-
-  return [
-    `检测到 ${outOfScope.length} 条 deviation 自报 out_of_scope=true（例：${samples.join("; ")}）。`,
-    "这意味着 design 的前提已被推翻，本阶段无法在原方案边界内继续——",
-    "请把 status 改为 needs_rework、rework_target_stage_id 改为 design（或更早），",
-    "在 rework_reason 写明哪些前提需要重新规划。继续 implement 会让 plan 与代码脱节。"
-  ].join("");
-};
-
-/**
- * self_review 阶段：rework_decision="pass" 时同时要求
- *   - phase_1_self_check 无 status=missing；partial 必须配 mitigation
- *   - phase_2_tests.green === true
- *   - phase_3_adversarial_review 三类（perf/security/extensibility）findings 无 severity=high
- *   - residual_risks 为空，investigate.unknowns 已关闭
- *
- * 任一不满足 → fail，要求改为 pass_with_followups（每条 residual 配 followup_owner/followup_action）
- * 或 needs_rework。pass 的语义收紧为"无遗留 + 全部已查实 + 测试绿 + 无高危"。
- */
-const passRequiresAllValidated: AssertionImpl = (result, prior) => {
-  const decision = pickReworkDecision(result);
-  if (decision !== "pass") return null;
-
-  const reasons: string[] = [];
-
-  // phase_1: 无 missing；partial 必须配 mitigation
-  const phase1 = collectStructured(result, "phase_1_self_check");
-  if (Array.isArray(phase1)) {
-    for (let i = 0; i < phase1.length; i += 1) {
-      const c = phase1[i];
-      if (!isRecord(c)) continue;
-      const status = typeof c.status === "string" ? c.status.trim().toLowerCase() : "";
-      if (status === "missing") {
-        reasons.push(`phase_1_self_check[${i}]: status=missing`);
-      } else if (status === "partial") {
-        const mit = typeof c.mitigation === "string" ? c.mitigation.trim() : "";
-        if (mit.length === 0) reasons.push(`phase_1_self_check[${i}]: partial 但缺 mitigation`);
-      }
-    }
-  }
-
-  // phase_2: green 必须为 true
-  const phase2 = collectStructured(result, "phase_2_tests");
-  if (isRecord(phase2)) {
-    if (phase2.green !== true) reasons.push("phase_2_tests.green != true");
-  } else {
-    reasons.push("phase_2_tests 缺失或非对象");
-  }
-
-  // phase_3: 三类 findings 无 severity=high
-  const phase3 = collectStructured(result, "phase_3_adversarial_review");
-  if (isRecord(phase3)) {
-    for (const dim of ["perf_findings", "security_findings", "extensibility_findings"] as const) {
-      const arr = phase3[dim];
-      if (!Array.isArray(arr)) continue;
-      const highs = arr.filter((f) => isRecord(f) && typeof f.severity === "string" && /^high$/i.test(f.severity.trim()));
-      if (highs.length > 0) reasons.push(`phase_3_adversarial_review.${dim}: ${highs.length} 项 severity=high`);
-    }
-  }
-
-  // residual_risks 为空
-  const residuals = collectStructured(result, "residual_risks");
-  const residualsFlat = residuals === undefined ? "" : flattenToText(residuals).trim();
-  // "无"/"none" 视为空
-  if (residualsFlat.length > 0 && !/^(无|none|n\/a|na|nothing|无明显风险|无遗留|—|-)$/i.test(residualsFlat)) {
-    reasons.push("residual_risks 非空");
-  }
-
-  // investigate.unknowns 必须关闭——把它当作前序阶段产物来读
-  const investigate = prior?.investigate;
-  if (investigate) {
-    const unknowns = investigate.unknowns;
-    const unknownsFlat = unknowns === undefined ? "" : flattenToText(unknowns).trim();
-    if (unknownsFlat.length > 0 && !TRIVIAL_NEGATIVE.has(unknownsFlat.toLowerCase())) {
-      reasons.push("investigate.unknowns 仍非空（请在 followups 关闭或在 review_findings 里说明已消解）");
-    }
-  }
-
-  if (reasons.length === 0) return null;
-  return [
-    "pass 高门槛未达成：",
-    reasons.join("; "),
-    "。pass 的语义是'所有自检过、测试绿、无高危、无遗留'——任一项不满足请二选一：",
-    "(1) rework_decision='pass_with_followups'，并在 followups 数组里给每条 residual 配 followup_owner + followup_action；",
-    "(2) rework_decision='needs_rework' 回炉。不允许稀释 pass 的语义。"
-  ].join("");
-};
-
-/**
- * design 阶段：plan_steps 每条必须填 perf/security/extensibility 三栏 consideration。
- *
- * 目的不是要求所有任务都涉及这三类问题，而是让"三个维度都想过"成为肌肉记忆——
- * 写"不适用 + 原因"也算通过。但全栏为空 / 只写"无" / 只写"none" → fail。
- *
- * 弱断言（trivial-non-empty 即可），故意不深究内容，避免 prompt-engineering 内卷。
- */
-const designConsiderationsFilled: AssertionImpl = (result) => {
-  const steps = collectStructured(result, "plan_steps");
-  if (!Array.isArray(steps) || steps.length === 0) return null; // required_outputs 另校验
-
-  const violators: string[] = [];
-  for (let i = 0; i < steps.length; i += 1) {
-    const step = steps[i];
-    if (!isRecord(step)) continue;
-    const stepId = typeof step.id === "string" ? step.id : `[${i}]`;
-    const missing: string[] = [];
-    for (const key of ["perf_consideration", "security_consideration", "extensibility_consideration"] as const) {
-      const v = step[key];
-      const text = typeof v === "string" ? v.trim() : flattenToText(v).trim();
-      if (text.length === 0 || TRIVIAL_NEGATIVE.has(text.toLowerCase())) {
-        missing.push(key);
-      }
-    }
-    if (missing.length > 0) violators.push(`${stepId}: 缺 ${missing.join(", ")}`);
-  }
-
-  if (violators.length === 0) return null;
-  return [
-    "plan_steps 三栏 consideration 未填：",
-    violators.join("; "),
-    "。perf_consideration / security_consideration / extensibility_consideration 三栏必须每条都填——",
-    "若该步骤不涉及某维度，请写'不适用：<一句话原因>'。目的是让资深 dev 的'三维度反射'肌肉化，",
-    "不是要求所有任务都涉及性能/安全/扩展性。"
-  ].join("");
-};
 
 const ASSERTION_IMPLS: Record<StageOutputAssertion, AssertionImpl> = {
   review_self_consistency: reviewSelfConsistency,
   needs_rework_target_required: needsReworkTargetRequired,
   unknowns_present: unknownsPresent,
   item_matrix_when_multi: itemMatrixWhenMulti,
-  all_tasks_resolved: allTasksResolved,
-  findings_traceable_to_probes: findingsTraceableToProbes,
   hedged_findings_demoted: hedgedFindingsDemoted,
-  plan_readiness_honest: planReadinessHonest,
-  no_trailing_unparsed_payload: noTrailingUnparsedPayload,
-  plan_steps_grounded: planStepsGrounded,
-  deviations_must_be_revised: deviationsMustBeRevised,
-  deviation_severity_must_rework: deviationSeverityMustRework,
-  pass_requires_all_validated: passRequiresAllValidated,
-  design_considerations_filled: designConsiderationsFilled
+  no_trailing_unparsed_payload: noTrailingUnparsedPayload
 };
 
 function pickReworkDecision(result: StageAgentResult): string | null {
