@@ -101,10 +101,13 @@ describe("project policy", () => {
     expect(current.tool_calls.at(-1)?.status).toBe("approved");
   });
 
-  it("creates pending approval for write tools", async () => {
+  it("creates pending approval for write tools when stage does NOT pre-authorize edit_file", async () => {
+    // 注释：当阶段声明了 allowed_tools 含 edit_file 时，Edit 调用走"阶段预授权"自动放行（67d4d0c 起）。
+    // 这条测试反映"未预授权"路径：把 current_stage 指向一个不存在的阶段，
+    // 让自动放行短路失效，验证旧的"逐工具点 OK"路径仍然工作。
     const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-project-"));
     await fs.mkdir(path.join(projectDir, "src"));
-    const current = { ...session(), project_path: projectDir };
+    const current = { ...session(), project_path: projectDir, current_stage: "no-such-stage" };
 
     const decision = await approveOrDenyToolUse(current, workflow, "Edit", { file_path: "src/app.ts" }, "tool-3");
 
