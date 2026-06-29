@@ -93,7 +93,11 @@ const postOutputAssertionSchema = z.enum([
   "findings_traceable_to_probes",
   "hedged_findings_demoted",
   "plan_readiness_honest",
-  "no_trailing_unparsed_payload"
+  "no_trailing_unparsed_payload",
+  "plan_steps_grounded",
+  "deviations_must_be_revised",
+  "deviation_severity_must_rework",
+  "pass_requires_all_validated"
 ]);
 const stageHooksSchema = z
   .object({

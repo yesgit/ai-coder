@@ -440,4 +440,79 @@ describe("WorkflowEngine", () => {
     expect(session.status).toBe("blocked");
     expect(session.error).toContain("Rework result requires");
   });
+
+  it("priorOutputs：completed stage 的 required_outputs 会被存到 stageRun 并透传给后续断言", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+    const wf: WorkflowTemplate = {
+      ...workflow,
+      stages: [
+        { id: "investigate", name: "Investigate", required_outputs: ["findings"] },
+        {
+          id: "design",
+          name: "Design",
+          required_outputs: ["plan_steps"],
+          auto_retry_limit: 1,
+          hooks: { post_output_assertions: ["plan_steps_grounded"] }
+        }
+      ]
+    };
+
+    engine.ensureState(session, wf);
+    // investigate 通过，required_outputs 应落地到 stage_run.required_outputs
+    engine.applyStageResult(session, wf, {
+      status: "completed",
+      output_summary: "ok",
+      required_outputs: { findings: [{ id: "f1" }] }
+    });
+    const invRun = session.stage_runs?.find((r) => r.stage_id === "investigate");
+    expect(invRun?.status).toBe("completed");
+    expect(invRun?.required_outputs).toEqual({ findings: [{ id: "f1" }] });
+
+    // design 阶段引用合法 finding id → 通过
+    engine.applyStageResult(session, wf, {
+      status: "completed",
+      output_summary: "ok",
+      required_outputs: {
+        plan_steps: [{ id: "p1", action: "x", supporting_finding_ids: ["f1"] }]
+      }
+    });
+    expect(session.status).not.toBe("blocked");
+    const designRun = session.stage_runs?.find((r) => r.stage_id === "design");
+    expect(designRun?.status).toBe("completed");
+  });
+
+  it("priorOutputs：design 引用了不存在的 finding id → plan_steps_grounded 触发 retry", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+    const wf: WorkflowTemplate = {
+      ...workflow,
+      stages: [
+        { id: "investigate", name: "Investigate", required_outputs: ["findings"] },
+        {
+          id: "design",
+          name: "Design",
+          required_outputs: ["plan_steps"],
+          auto_retry_limit: 1,
+          hooks: { post_output_assertions: ["plan_steps_grounded"] }
+        }
+      ]
+    };
+
+    engine.ensureState(session, wf);
+    engine.applyStageResult(session, wf, {
+      status: "completed",
+      output_summary: "ok",
+      required_outputs: { findings: [{ id: "f1" }] }
+    });
+    engine.applyStageResult(session, wf, {
+      status: "completed",
+      output_summary: "ok",
+      required_outputs: {
+        plan_steps: [{ id: "p1", action: "x", supporting_finding_ids: ["f-ghost"] }]
+      }
+    });
+    expect(session.error).toContain("plan_steps_grounded");
+    expect(session.error).toContain("f-ghost");
+  });
 });

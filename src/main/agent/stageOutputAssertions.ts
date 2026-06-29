@@ -21,9 +21,19 @@ export type AssertionFailure = {
   message: string;
 };
 
+/**
+ * 已完成的前序阶段 required_outputs 的只读视图：键为 stage_id，值为该阶段最新 completed run 的
+ * required_outputs 原对象。允许跨阶段断言（如 plan_steps_grounded 在 design 阶段读 investigate.findings）
+ * 在引擎层直接核对取证血脉，而不是靠 prompt 让模型自己抄一遍。
+ *
+ * 对当前阶段是 implement/self_review 之类需要跨阶段验证的断言尤其关键。
+ */
+export type PriorStageOutputs = Record<string, Record<string, unknown> | undefined>;
+
 export function evaluateOutputAssertions(
   stage: WorkflowStage,
-  result: StageAgentResult
+  result: StageAgentResult,
+  priorOutputs: PriorStageOutputs = {}
 ): AssertionFailure[] {
   const declared = stage.hooks?.post_output_assertions;
   if (!declared || declared.length === 0) return [];
@@ -32,13 +42,13 @@ export function evaluateOutputAssertions(
   for (const name of declared) {
     const fn = ASSERTION_IMPLS[name];
     if (!fn) continue; // schema 应该挡住未知名，这里防御性跳过而非抛
-    const message = fn(result);
+    const message = fn(result, priorOutputs);
     if (message) failures.push({ assertion: name, message });
   }
   return failures;
 }
 
-type AssertionImpl = (result: StageAgentResult) => string | null;
+type AssertionImpl = (result: StageAgentResult, prior: PriorStageOutputs) => string | null;
 
 /**
  * "动手完发现自己列出问题却写 pass" —— 本次案例的直接病灶。
@@ -423,6 +433,205 @@ const noTrailingUnparsedPayload: AssertionImpl = (result) => {
   ].join("");
 };
 
+/**
+ * design 阶段：每个 plan_step 必须挂 ≥1 个 supporting_finding_ids，且这些 id 能在
+ * investigate.findings 里找到。阻断"想得很多但没挂取证血脉"。
+ *
+ * 跨阶段断言：依赖 PriorStageOutputs 拿到 investigate 阶段已落地的 findings。
+ * 容错：findings 不是数组 / 缺 id 字段 → 退化到"只要 supporting_finding_ids 非空"。
+ */
+const planStepsGrounded: AssertionImpl = (result, prior) => {
+  const steps = collectStructured(result, "plan_steps");
+  if (!Array.isArray(steps) || steps.length === 0) return null; // 字段缺失另由 required_outputs 校验
+
+  // 拿 investigate.findings（任一前序阶段都可放 findings，但优先 investigate）
+  const findingIds = collectFindingIds(prior);
+  const violators: string[] = [];
+
+  for (let i = 0; i < steps.length; i += 1) {
+    const step = steps[i];
+    if (!isRecord(step)) continue;
+    const stepId = typeof step.id === "string" ? step.id : `[${i}]`;
+    const refs = step.supporting_finding_ids;
+    const list = Array.isArray(refs) ? refs.map((r) => (typeof r === "string" ? r.trim() : "")).filter(Boolean) : [];
+    if (list.length === 0) {
+      violators.push(`${stepId}: supporting_finding_ids 为空`);
+      continue;
+    }
+    // 若拿到了 findingIds 集合，每个 ref 必须存在；如果整个 findings 集合都拿不到，
+    // 我们至少保证 supporting_finding_ids 非空（不退化为"放过一切"）。
+    if (findingIds.size === 0) continue;
+    const missing = list.filter((id) => !findingIds.has(id));
+    if (missing.length > 0) {
+      violators.push(`${stepId}: 引用了不存在的 finding id [${missing.join(", ")}]`);
+    }
+  }
+
+  if (violators.length === 0) return null;
+  return [
+    "plan_steps 缺取证血脉：",
+    violators.join("; "),
+    "。每个 plan_step 必须挂 ≥1 个 supporting_finding_ids，且 id 在 investigate.findings 里能查到。",
+    "如果某步骤无法溯源到 finding，说明它是凭空设计的——请要么补 investigation_task 取证后再设计，",
+    "要么把这步从方案里去掉。"
+  ].join("");
+};
+
+function collectFindingIds(prior: PriorStageOutputs): Set<string> {
+  const ids = new Set<string>();
+  for (const stageOutputs of Object.values(prior)) {
+    if (!stageOutputs) continue;
+    const findings = stageOutputs.findings;
+    if (!Array.isArray(findings)) continue;
+    for (const f of findings) {
+      if (isRecord(f) && typeof f.id === "string" && f.id.trim()) ids.add(f.id);
+    }
+  }
+  return ids;
+}
+
+/**
+ * implement 阶段：deviations_from_plan 非空时，plan_revisions 必须有对应条目。
+ *
+ * 阻断"动手中发现 plan 跑不通但闷头改下去不更新计划"。每个 deviation 应当对应一条
+ * plan_revisions[*]——按 step_id 配对；plan_revisions 里的 trigger 字段应当能引用到该 deviation。
+ *
+ * 容错：plan_revisions 不要求一一对应到 step_id（trigger 字段措辞自由），只要数量 ≥ deviations 即可——
+ * 让模型有空间把多个相关 deviation 合到一条 revision。
+ */
+const deviationsMustBeRevised: AssertionImpl = (result) => {
+  const dev = collectStructured(result, "deviations_from_plan");
+  if (!Array.isArray(dev) || dev.length === 0) return null;
+
+  const rev = collectStructured(result, "plan_revisions");
+  const revisions = Array.isArray(rev) ? rev : [];
+  if (revisions.length >= dev.length) return null;
+
+  return [
+    `检测到 ${dev.length} 条 deviations_from_plan，但 plan_revisions 只有 ${revisions.length} 条。`,
+    "动手中发现 plan 跑不通时，必须同步更新 plan_revisions——",
+    "每条 deviation 至少对应一条 revision（说明触发原因、新增/修改了哪些 step）。",
+    "如果不更新计划就闷头改，下次回头看就再也对不上账。"
+  ].join("");
+};
+
+/**
+ * implement 阶段：任一 deviation 自报 out_of_scope=true 时，stage 必须 needs_rework 回 design。
+ *
+ * 阻断"偏差超出 design 边界但还在 implement 内继续改"——这种情况下 design 的前提假设
+ * 已被推翻，正确做法是回到 design 重新规划，而不是越界完成 implement。
+ */
+const deviationSeverityMustRework: AssertionImpl = (result) => {
+  const dev = collectStructured(result, "deviations_from_plan");
+  if (!Array.isArray(dev)) return null;
+
+  const outOfScope = dev.filter(
+    (d) => isRecord(d) && d.out_of_scope === true
+  );
+  if (outOfScope.length === 0) return null;
+
+  // status=needs_rework 且 target 为 design（或更早）→ 通过
+  if (result.status === "needs_rework") {
+    const target = result.rework_target_stage_id;
+    if (typeof target === "string" && target.trim()) return null;
+  }
+
+  const samples = outOfScope
+    .slice(0, 2)
+    .map((d, i) => {
+      const r = d as Record<string, unknown>;
+      const step = typeof r.step_id === "string" ? r.step_id : `[${i}]`;
+      const what = typeof r.what_changed === "string" ? r.what_changed.slice(0, 40) : "";
+      return `${step}: ${what}`;
+    });
+
+  return [
+    `检测到 ${outOfScope.length} 条 deviation 自报 out_of_scope=true（例：${samples.join("; ")}）。`,
+    "这意味着 design 的前提已被推翻，本阶段无法在原方案边界内继续——",
+    "请把 status 改为 needs_rework、rework_target_stage_id 改为 design（或更早），",
+    "在 rework_reason 写明哪些前提需要重新规划。继续 implement 会让 plan 与代码脱节。"
+  ].join("");
+};
+
+/**
+ * self_review 阶段：rework_decision="pass" 时同时要求
+ *   - phase_1_self_check 无 status=missing；partial 必须配 mitigation
+ *   - phase_2_tests.green === true
+ *   - phase_3_adversarial_review 三类（perf/security/extensibility）findings 无 severity=high
+ *   - residual_risks 为空，investigate.unknowns 已关闭
+ *
+ * 任一不满足 → fail，要求改为 pass_with_followups（每条 residual 配 followup_owner/followup_action）
+ * 或 needs_rework。pass 的语义收紧为"无遗留 + 全部已查实 + 测试绿 + 无高危"。
+ */
+const passRequiresAllValidated: AssertionImpl = (result, prior) => {
+  const decision = pickReworkDecision(result);
+  if (decision !== "pass") return null;
+
+  const reasons: string[] = [];
+
+  // phase_1: 无 missing；partial 必须配 mitigation
+  const phase1 = collectStructured(result, "phase_1_self_check");
+  if (Array.isArray(phase1)) {
+    for (let i = 0; i < phase1.length; i += 1) {
+      const c = phase1[i];
+      if (!isRecord(c)) continue;
+      const status = typeof c.status === "string" ? c.status.trim().toLowerCase() : "";
+      if (status === "missing") {
+        reasons.push(`phase_1_self_check[${i}]: status=missing`);
+      } else if (status === "partial") {
+        const mit = typeof c.mitigation === "string" ? c.mitigation.trim() : "";
+        if (mit.length === 0) reasons.push(`phase_1_self_check[${i}]: partial 但缺 mitigation`);
+      }
+    }
+  }
+
+  // phase_2: green 必须为 true
+  const phase2 = collectStructured(result, "phase_2_tests");
+  if (isRecord(phase2)) {
+    if (phase2.green !== true) reasons.push("phase_2_tests.green != true");
+  } else {
+    reasons.push("phase_2_tests 缺失或非对象");
+  }
+
+  // phase_3: 三类 findings 无 severity=high
+  const phase3 = collectStructured(result, "phase_3_adversarial_review");
+  if (isRecord(phase3)) {
+    for (const dim of ["perf_findings", "security_findings", "extensibility_findings"] as const) {
+      const arr = phase3[dim];
+      if (!Array.isArray(arr)) continue;
+      const highs = arr.filter((f) => isRecord(f) && typeof f.severity === "string" && /^high$/i.test(f.severity.trim()));
+      if (highs.length > 0) reasons.push(`phase_3_adversarial_review.${dim}: ${highs.length} 项 severity=high`);
+    }
+  }
+
+  // residual_risks 为空
+  const residuals = collectStructured(result, "residual_risks");
+  const residualsFlat = residuals === undefined ? "" : flattenToText(residuals).trim();
+  // "无"/"none" 视为空
+  if (residualsFlat.length > 0 && !/^(无|none|n\/a|na|nothing|无明显风险|无遗留|—|-)$/i.test(residualsFlat)) {
+    reasons.push("residual_risks 非空");
+  }
+
+  // investigate.unknowns 必须关闭——把它当作前序阶段产物来读
+  const investigate = prior?.investigate;
+  if (investigate) {
+    const unknowns = investigate.unknowns;
+    const unknownsFlat = unknowns === undefined ? "" : flattenToText(unknowns).trim();
+    if (unknownsFlat.length > 0 && !TRIVIAL_NEGATIVE.has(unknownsFlat.toLowerCase())) {
+      reasons.push("investigate.unknowns 仍非空（请在 followups 关闭或在 review_findings 里说明已消解）");
+    }
+  }
+
+  if (reasons.length === 0) return null;
+  return [
+    "pass 高门槛未达成：",
+    reasons.join("; "),
+    "。pass 的语义是'所有自检过、测试绿、无高危、无遗留'——任一项不满足请二选一：",
+    "(1) rework_decision='pass_with_followups'，并在 followups 数组里给每条 residual 配 followup_owner + followup_action；",
+    "(2) rework_decision='needs_rework' 回炉。不允许稀释 pass 的语义。"
+  ].join("");
+};
+
 const ASSERTION_IMPLS: Record<StageOutputAssertion, AssertionImpl> = {
   review_self_consistency: reviewSelfConsistency,
   needs_rework_target_required: needsReworkTargetRequired,
@@ -432,7 +641,11 @@ const ASSERTION_IMPLS: Record<StageOutputAssertion, AssertionImpl> = {
   findings_traceable_to_probes: findingsTraceableToProbes,
   hedged_findings_demoted: hedgedFindingsDemoted,
   plan_readiness_honest: planReadinessHonest,
-  no_trailing_unparsed_payload: noTrailingUnparsedPayload
+  no_trailing_unparsed_payload: noTrailingUnparsedPayload,
+  plan_steps_grounded: planStepsGrounded,
+  deviations_must_be_revised: deviationsMustBeRevised,
+  deviation_severity_must_rework: deviationSeverityMustRework,
+  pass_requires_all_validated: passRequiresAllValidated
 };
 
 function pickReworkDecision(result: StageAgentResult): string | null {

@@ -101,7 +101,31 @@ export type StageOutputAssertion =
    * raw 输出尾部存在未闭合 JSON（bracket_balance != 0 或 last 合法 JSON 之后还有大段 JSON 残骸）→ 失败。
    * 跨场景通用——结构性断言，不绑定具体任务类型，建议每阶段都挂。
    */
-  | "no_trailing_unparsed_payload";
+  | "no_trailing_unparsed_payload"
+  /**
+   * design 类阶段：plan_steps[*].supporting_finding_ids 中每个 id 必须能在 investigate.findings 找到。
+   * 阻断"想出方案但没挂到 finding"——动手前的步骤必须有取证血脉。
+   */
+  | "plan_steps_grounded"
+  /**
+   * implement 类阶段：deviations_from_plan 非空时，plan_revisions 必须有对应条目。
+   * 阻断"动手中发现 plan 跑不通但闷头改下去"。
+   */
+  | "deviations_must_be_revised"
+  /**
+   * implement 类阶段：任一 deviation 自报 out_of_scope=true 时，stage 必须 needs_rework 回 design。
+   * 阻断"偏差超出 design 边界但还在 implement 内继续"。
+   */
+  | "deviation_severity_must_rework"
+  /**
+   * self_review 阶段：rework_decision="pass" 时同时要求
+   *   - phase_1_self_check 无 status=missing 项（partial 必须有 mitigation）
+   *   - phase_2_tests.green === true
+   *   - phase_3_adversarial_review 三类 findings 无 severity=high
+   *   - residual_risks 为空、investigate.unknowns 已关闭
+   * 否则必须改为 pass_with_followups（每条 residual 配 followup_owner+followup_action）或 needs_rework。
+   */
+  | "pass_requires_all_validated";
 
 export interface StageHooksConfig {
   pre_tool_use?: PreToolUseHookRule[];
@@ -171,6 +195,12 @@ export interface StageRun {
   status: StageRunStatus;
   input_summary: string;
   output_summary?: string;
+  /**
+   * 已通过的阶段产出（completed/waiting_approval 时由 workflowEngine 写入）。
+   * 跨阶段断言（如 plan_steps_grounded 在 design 阶段读 investigate.findings）依赖此字段。
+   * 字段可选——向后兼容旧 session.json；老 stageRun 没存就是空字典。
+   */
+  required_outputs?: Record<string, unknown>;
   started_at: string;
   completed_at?: string;
   rework_reason?: string;

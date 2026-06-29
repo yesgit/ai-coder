@@ -700,4 +700,264 @@ describe("evaluateOutputAssertions", () => {
       expect(out).toEqual([]);
     });
   });
+
+  describe("plan_steps_grounded", () => {
+    const s = stage({ post_output_assertions: ["plan_steps_grounded"] });
+
+    it("supporting_finding_ids 空 → 失败", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            plan_steps: [{ id: "p1", action: "do X", supporting_finding_ids: [] }]
+          }
+        }),
+        { investigate: { findings: [{ id: "f1" }] } }
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0].message).toContain("supporting_finding_ids 为空");
+    });
+
+    it("引用了不存在的 finding id → 失败", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            plan_steps: [{ id: "p1", action: "do X", supporting_finding_ids: ["f99"] }]
+          }
+        }),
+        { investigate: { findings: [{ id: "f1" }] } }
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0].message).toContain("f99");
+    });
+
+    it("所有 step 都挂到合法 finding → 通过", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            plan_steps: [
+              { id: "p1", action: "do X", supporting_finding_ids: ["f1"] },
+              { id: "p2", action: "do Y", supporting_finding_ids: ["f1", "f2"] }
+            ]
+          }
+        }),
+        { investigate: { findings: [{ id: "f1" }, { id: "f2" }] } }
+      );
+      expect(out).toEqual([]);
+    });
+
+    it("拿不到 findings 集合时退化到'非空'校验（非空通过）", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            plan_steps: [{ id: "p1", action: "do X", supporting_finding_ids: ["f1"] }]
+          }
+        }),
+        {} // 完全无前序产物
+      );
+      expect(out).toEqual([]);
+    });
+
+    it("plan_steps 缺失 → 透传（required_outputs 校验另负责）", () => {
+      const out = evaluateOutputAssertions(s, result({ status: "completed", output_summary: "x" }));
+      expect(out).toEqual([]);
+    });
+  });
+
+  describe("deviations_must_be_revised", () => {
+    const s = stage({ post_output_assertions: ["deviations_must_be_revised"] });
+
+    it("有 deviations 但 plan_revisions 数量不足 → 失败", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            deviations_from_plan: [
+              { step_id: "p1", what_changed: "x" },
+              { step_id: "p2", what_changed: "y" }
+            ],
+            plan_revisions: [{ trigger: "x", new_or_modified_steps: "..." }]
+          }
+        })
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0].message).toContain("plan_revisions 只有 1 条");
+    });
+
+    it("deviations 与 revisions 数量匹配 → 通过", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            deviations_from_plan: [{ step_id: "p1", what_changed: "x" }],
+            plan_revisions: [{ trigger: "x", new_or_modified_steps: "..." }]
+          }
+        })
+      );
+      expect(out).toEqual([]);
+    });
+
+    it("没有 deviations → 透传", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: { deviations_from_plan: [], plan_revisions: [] }
+        })
+      );
+      expect(out).toEqual([]);
+    });
+  });
+
+  describe("deviation_severity_must_rework", () => {
+    const s = stage({ post_output_assertions: ["deviation_severity_must_rework"] });
+
+    it("有 out_of_scope=true 的 deviation 但 status=completed → 失败", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            deviations_from_plan: [
+              { step_id: "p1", what_changed: "前提推翻", out_of_scope: true }
+            ]
+          }
+        })
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0].message).toContain("out_of_scope=true");
+    });
+
+    it("有 out_of_scope=true 且 status=needs_rework + 有 target → 通过", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "needs_rework",
+          output_summary: "回炉",
+          rework_target_stage_id: "design",
+          required_outputs: {
+            deviations_from_plan: [{ step_id: "p1", what_changed: "x", out_of_scope: true }]
+          }
+        })
+      );
+      expect(out).toEqual([]);
+    });
+
+    it("deviations 全为 out_of_scope=false → 透传", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "x",
+          required_outputs: {
+            deviations_from_plan: [{ step_id: "p1", what_changed: "x", out_of_scope: false }]
+          }
+        })
+      );
+      expect(out).toEqual([]);
+    });
+  });
+
+  describe("pass_requires_all_validated", () => {
+    const s = stage({ post_output_assertions: ["pass_requires_all_validated"] });
+
+    function basePassing(): Record<string, unknown> {
+      return {
+        rework_decision: "pass",
+        phase_1_self_check: [{ criterion: "C1", status: "met", evidence_path_anchor: "a.ts:1" }],
+        phase_2_tests: { commands_run: ["pnpm test"], green: true, stdout_summary: "ok" },
+        phase_3_adversarial_review: { perf_findings: [], security_findings: [], extensibility_findings: [] },
+        residual_risks: ""
+      };
+    }
+
+    it("phase_1 含 missing 项 → 失败", () => {
+      const ro = basePassing();
+      ro.phase_1_self_check = [{ criterion: "C1", status: "missing" }];
+      const out = evaluateOutputAssertions(s, result({ status: "completed", output_summary: "x", required_outputs: ro }));
+      expect(out).toHaveLength(1);
+      expect(out[0].message).toContain("status=missing");
+    });
+
+    it("phase_1 partial 缺 mitigation → 失败", () => {
+      const ro = basePassing();
+      ro.phase_1_self_check = [{ criterion: "C1", status: "partial" }];
+      const out = evaluateOutputAssertions(s, result({ status: "completed", output_summary: "x", required_outputs: ro }));
+      expect(out).toHaveLength(1);
+      expect(out[0].message).toContain("缺 mitigation");
+    });
+
+    it("phase_2.green=false → 失败", () => {
+      const ro = basePassing();
+      ro.phase_2_tests = { commands_run: ["pnpm test"], green: false, stdout_summary: "x failed" };
+      const out = evaluateOutputAssertions(s, result({ status: "completed", output_summary: "x", required_outputs: ro }));
+      expect(out).toHaveLength(1);
+      expect(out[0].message).toContain("phase_2_tests.green");
+    });
+
+    it("phase_3 含 severity=high → 失败", () => {
+      const ro = basePassing();
+      ro.phase_3_adversarial_review = {
+        perf_findings: [],
+        security_findings: [{ path_anchor: "a.ts:1", concern: "X", severity: "high" }],
+        extensibility_findings: []
+      };
+      const out = evaluateOutputAssertions(s, result({ status: "completed", output_summary: "x", required_outputs: ro }));
+      expect(out).toHaveLength(1);
+      expect(out[0].message).toContain("security_findings");
+    });
+
+    it("residual_risks 非空 → 失败", () => {
+      const ro = basePassing();
+      ro.residual_risks = "登录策略仍需确认";
+      const out = evaluateOutputAssertions(s, result({ status: "completed", output_summary: "x", required_outputs: ro }));
+      expect(out).toHaveLength(1);
+      expect(out[0].message).toContain("residual_risks 非空");
+    });
+
+    it("investigate.unknowns 非空 → 失败", () => {
+      const ro = basePassing();
+      const out = evaluateOutputAssertions(
+        s,
+        result({ status: "completed", output_summary: "x", required_outputs: ro }),
+        { investigate: { unknowns: "productType 默认值未确认" } }
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0].message).toContain("investigate.unknowns");
+    });
+
+    it("rework_decision != 'pass' → 透传", () => {
+      const ro = basePassing();
+      ro.rework_decision = "pass_with_followups";
+      ro.residual_risks = "X";
+      const out = evaluateOutputAssertions(s, result({ status: "completed", output_summary: "x", required_outputs: ro }));
+      expect(out).toEqual([]);
+    });
+
+    it("全部满足 → 通过", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({ status: "completed", output_summary: "x", required_outputs: basePassing() }),
+        { investigate: { unknowns: "" } }
+      );
+      expect(out).toEqual([]);
+    });
+  });
 });

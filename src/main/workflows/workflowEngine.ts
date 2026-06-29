@@ -93,6 +93,12 @@ export class WorkflowEngine {
       return session;
     }
 
+    // 通过所有校验后落地 required_outputs 到 stageRun，供后续阶段的跨阶段断言读取。
+    // 这一步必须晚于 runOutputAssertions——失败重试时 stageRun 不应吸收无效产出。
+    if (result.required_outputs) {
+      stageRun.required_outputs = result.required_outputs;
+    }
+
     return this.completeCurrentStage(session, workflow, result.output_summary);
   }
 
@@ -111,7 +117,8 @@ export class WorkflowEngine {
     stageRun: StageRun,
     result: StageAgentResult
   ): boolean {
-    const failures = evaluateOutputAssertions(stage, result);
+    const prior = this.collectPriorOutputs(session, stageRun.stage_id);
+    const failures = evaluateOutputAssertions(stage, result, prior);
     if (failures.length === 0) return false;
     const reason = `Output assertions failed: ${failures.map((f) => `[${f.assertion}] ${f.message}`).join(" | ")}`;
     const maxRetry = stage.auto_retry_limit ?? 0;
@@ -122,6 +129,27 @@ export class WorkflowEngine {
       this.blockCurrentStage(session, `${reason} (after ${currentAttempt} attempts)`);
     }
     return true;
+  }
+
+  /**
+   * 收集已完成阶段的 required_outputs，构造 {stage_id: required_outputs} 字典传给断言层。
+   *
+   * 跳过自己（currentStageId），并对同一 stage_id 只取最新的 completed run——
+   * 这样 rework 走回 design 再前进时，新值会覆盖旧值。
+   */
+  private collectPriorOutputs(
+    session: AgentSession,
+    currentStageId: string
+  ): Record<string, Record<string, unknown> | undefined> {
+    const out: Record<string, Record<string, unknown> | undefined> = {};
+    for (const run of session.stage_runs ?? []) {
+      if (run.stage_id === currentStageId) continue;
+      if (run.status !== "completed" && run.status !== "waiting_approval") continue;
+      if (!run.required_outputs) continue;
+      // 后写入者覆盖——遍历顺序即时间顺序，最新 completed 自然胜出
+      out[run.stage_id] = run.required_outputs;
+    }
+    return out;
   }
 
   approveStage(session: AgentSession, workflow: WorkflowTemplate, stageId: string): AgentSession {

@@ -20,8 +20,59 @@ describe("careful-coder.yaml validates", () => {
     expect(sr?.hooks?.post_output_assertions).toEqual([
       "review_self_consistency",
       "needs_rework_target_required",
+      "pass_requires_all_validated",
       "no_trailing_unparsed_payload"
     ]);
+  });
+
+  it("design stage wires the plan_steps blood-line assertions", async () => {
+    const r = new WorkflowRegistry(path.resolve(__dirname, "../../../workflows"));
+    const result = await r.listWithIssues();
+    const cc = result.workflows.find(w => w.id === "careful-coder");
+    const design = cc!.stages.find(s => s.id === "design");
+    expect(design?.required_outputs).toEqual(
+      expect.arrayContaining([
+        "plan_steps",
+        "success_criteria",
+        "adversarial_critique",
+        "consistency_audit",
+        "risks_carried_into_implement"
+      ])
+    );
+    expect(design?.hooks?.post_output_assertions).toContain("plan_steps_grounded");
+  });
+
+  it("implement stage wires the deviation assertions and goal_alignment_check", async () => {
+    const r = new WorkflowRegistry(path.resolve(__dirname, "../../../workflows"));
+    const result = await r.listWithIssues();
+    const cc = result.workflows.find(w => w.id === "careful-coder");
+    const impl = cc!.stages.find(s => s.id === "implement");
+    expect(impl?.required_outputs).toEqual(
+      expect.arrayContaining(["files_changed", "deviations_from_plan", "plan_revisions", "goal_alignment_check"])
+    );
+    const assertions = impl?.hooks?.post_output_assertions ?? [];
+    for (const name of ["deviations_must_be_revised", "deviation_severity_must_rework", "no_trailing_unparsed_payload"]) {
+      expect(assertions, `implement 应挂 ${name}`).toContain(name);
+    }
+    // pre_tool_use 规则保持不动
+    expect(impl?.hooks?.pre_tool_use?.[0].require.same_file_reads_min).toBe(3);
+  });
+
+  it("self_review stage requires the three-phase validation outputs", async () => {
+    const r = new WorkflowRegistry(path.resolve(__dirname, "../../../workflows"));
+    const result = await r.listWithIssues();
+    const cc = result.workflows.find(w => w.id === "careful-coder");
+    const sr = cc!.stages.find(s => s.id === "self_review");
+    expect(sr?.required_outputs).toEqual(
+      expect.arrayContaining([
+        "phase_1_self_check",
+        "phase_2_tests",
+        "phase_3_adversarial_review",
+        "review_findings",
+        "rework_decision",
+        "residual_risks"
+      ])
+    );
   });
 
   it("investigate stage wires the Plan loop assertions", async () => {
