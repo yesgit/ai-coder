@@ -43,7 +43,7 @@ describe("careful-coder.yaml v1.1 (软化版)", () => {
       "unknowns"
     ]);
     const assertions = investigate?.hooks?.post_output_assertions ?? [];
-    for (const name of ["unknowns_present", "hedged_findings_demoted", "no_trailing_unparsed_payload"]) {
+    for (const name of ["investigate_structure_present", "hedged_findings_demoted", "unknowns_present", "no_trailing_unparsed_payload"]) {
       expect(assertions, `investigate 应挂 ${name}`).toContain(name);
     }
   });

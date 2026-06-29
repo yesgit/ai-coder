@@ -89,6 +89,7 @@ const postOutputAssertionSchema = z.enum([
   "needs_rework_target_required",
   "unknowns_present",
   "item_matrix_when_multi",
+  "investigate_structure_present",
   "hedged_findings_demoted",
   "no_trailing_unparsed_payload"
 ]);

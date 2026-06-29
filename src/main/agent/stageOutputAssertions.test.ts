@@ -390,7 +390,91 @@ describe("evaluateOutputAssertions", () => {
     expect(out.map((f) => f.assertion)).toContain("needs_rework_target_required");
   });
 
-  describe("hedged_findings_demoted（v1.1 文本扫描版）", () => {
+  describe("investigate_structure_present（v1.2 结构化自然语言）", () => {
+    const s = stage({ post_output_assertions: ["investigate_structure_present"] });
+
+    it("4 个 markdown 标题全有 → 通过", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: `
+## 调查任务清单
+1. [ ] task_1: 查 X → [已查]
+
+## 假设与验证
+- H1: 可能是 Y → [证实]
+
+## 已证实的结论
+1. f1: 结论（证据：\`file.ts:42\`）
+
+## 仍未确定的事项
+- 无
+`
+        })
+      );
+      expect(out).toEqual([]);
+    });
+
+    it("缺'## 假设与验证' → 失败", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: `
+## 调查任务清单
+1. [ ] task_1: 查 X → [已查]
+
+## 已证实的结论
+1. f1: 结论
+
+## 仍未确定的事项
+- 无
+`
+        })
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0].assertion).toBe("investigate_structure_present");
+      expect(out[0].message).toContain("假设与验证");
+    });
+
+    it("标题都有但拼写不完全一致（如少#） → 失败", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: `
+调查任务清单
+1. [ ] task_1
+
+假设与验证
+- H1
+
+已证实的结论
+1. f1
+
+仍未确定的事项
+- 无
+`
+        })
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0].message).toContain("markdown 标题");
+    });
+
+    it("output_summary 为空 → 失败", () => {
+      const out = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: ""
+        })
+      );
+      expect(out).toHaveLength(1);
+    });
+  });
+
+  describe("hedged_findings_demoted（v1.2 证据锚点升级版）", () => {
     const s = stage({ post_output_assertions: ["hedged_findings_demoted"] });
 
     it("output_summary 含 'X 可能存在 Y 问题' 且无 path:line 证据 → 失败", () => {

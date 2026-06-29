@@ -294,6 +294,29 @@ const noTrailingUnparsedPayload: AssertionImpl = (result) => {
   ].join("");
 };
 
+/**
+ * v1.2 新增：investigate 阶段 output_summary 必须含 4 个 markdown 标题——用模板引导 LLM 把思维过程写出来。
+ */
+const investigateStructurePresent: AssertionImpl = (result) => {
+  const text = result.output_summary ?? "";
+  const requiredHeaders = [
+    "## 调查任务清单",
+    "## 假设与验证",
+    "## 已证实的结论",
+    "## 仍未确定的事项"
+  ];
+  const missing = requiredHeaders.filter(h => !text.includes(h));
+  if (missing.length === 0) return null;
+  return [
+    "output_summary 缺少 investigate 思维模板的 markdown 标题：",
+    missing.join(" / "),
+    "。请按模板填写：\n",
+    "## 调查任务清单\n- 任务 1: ...\n\n",
+    "## 假设与验证\n- H1: ... → [证实/证伪/inconclusive]\n\n",
+    "## 已证实的结论\n- f1: ...（证据：`file:line`）\n\n",
+    "## 仍未确定的事项\n- ..."
+  ].join("");
+};
 
 const ASSERTION_IMPLS: Record<StageOutputAssertion, AssertionImpl> = {
   review_self_consistency: reviewSelfConsistency,
@@ -301,7 +324,8 @@ const ASSERTION_IMPLS: Record<StageOutputAssertion, AssertionImpl> = {
   unknowns_present: unknownsPresent,
   item_matrix_when_multi: itemMatrixWhenMulti,
   hedged_findings_demoted: hedgedFindingsDemoted,
-  no_trailing_unparsed_payload: noTrailingUnparsedPayload
+  no_trailing_unparsed_payload: noTrailingUnparsedPayload,
+  investigate_structure_present: investigateStructurePresent
 };
 
 function pickReworkDecision(result: StageAgentResult): string | null {

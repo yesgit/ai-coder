@@ -82,6 +82,12 @@ export type StageOutputAssertion =
    */
   | "hedged_findings_demoted"
   /**
+   * investigate 阶段专用：扫 output_summary 是否含 4 个 markdown 标题（## 调查任务清单 / ## 假设与验证 /
+   * ## 已证实的结论 / ## 仍未确定的事项）。用模板引导 LLM 把思维过程写出来，而非跳步。
+   * v1.2 新增——结构化自然语言，不依赖 JSON 嵌套对象。
+   */
+  | "investigate_structure_present"
+  /**
    * raw 输出尾部存在未闭合 JSON（bracket_balance != 0 或 last 合法 JSON 之后还有大段 JSON 残骸）→ 失败。
    * 跨场景通用——结构性断言，不绑定具体任务类型，建议每阶段都挂。
    */
