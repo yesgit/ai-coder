@@ -62,11 +62,19 @@ stages:
         - 假设：你不知道但暂时这样办的（必须在 assumptions 字段显式列出）。
       不要在本阶段编辑文件或制定方案，只产出共识。
 
-      字段输出要求：最终 JSON 的 required_outputs 必须**逐键**填写以下三个字段，
-      不要把内容只写在 output_summary 自然语言里：
-        - user_goal_restated: 用一两句复述用户的真实诉求
-        - definition_of_done: 列出本次任务"完成的样子"（具体可验收的条件）
-        - assumptions: 你做的所有假设（数组或多行字符串），没有就写"无明确假设"也比省略好
+      **输出格式（重要）**：请直接输出一个 JSON 对象，不要包裹在 ```json 代码块里。
+      必须包含以下字段：
+      ```
+      {
+        "status": "completed",
+        "output_summary": "用 1-2 句话总结用户诉求",
+        "required_outputs": {
+          "user_goal_restated": "用户想要什么",
+          "definition_of_done": "完成的标准",
+          "assumptions": ["假设 1", "假设 2"]
+        }
+      }
+      ```
     allowed_tools:
       - read_file
       - shell
@@ -74,7 +82,7 @@ stages:
       - user_goal_restated
       - definition_of_done
       - assumptions
-    auto_retry_limit: 1
+    auto_retry_limit: 3
     hooks:
       post_output_assertions:
         - no_trailing_unparsed_payload
