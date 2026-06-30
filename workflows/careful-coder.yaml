@@ -56,22 +56,22 @@ stages:
     name: 理解
     instructions: |
       用简体中文复述用户的真实诉求与"完成的样子"。
-      严格区分三类信息：
-        - 事实：在代码/配置/历史里可直接核对的；
-        - 推断：从事实合理外推但尚未证实的；
-        - 假设：你不知道但暂时这样办的（必须在 assumptions 字段显式列出）。
-      不要在本阶段编辑文件或制定方案，只产出共识。
 
-      **输出格式（重要）**：请直接输出一个 JSON 对象，不要包裹在 ```json 代码块里。
+      **自主推断原则**：
+      - 能从用户任务描述、代码上下文、项目结构中自行推断的信息，不要问用户
+      - 只有任务描述明显缺失关键信息、且无法从代码/文档中推断时，才列入 assumptions
+      - assumptions 不是"问用户的问题"，而是"暂时这样假设，如有偏差再修正"
+
+      **输出格式**：直接输出 JSON 对象，不要包裹在 ```json 代码块里。
       必须包含以下字段：
       ```
       {
         "status": "completed",
-        "output_summary": "用 1-2 句话总结用户诉求",
+        "output_summary": "1-2 句话总结",
         "required_outputs": {
           "user_goal_restated": "用户想要什么",
-          "definition_of_done": "完成的标准",
-          "assumptions": ["假设 1", "假设 2"]
+          "definition_of_done": "完成的标准（可验收）",
+          "assumptions": ["暂时假设 1", "暂时假设 2"]  // 如无需假设，可写空数组 []
         }
       }
       ```
@@ -91,6 +91,11 @@ stages:
     instructions: |
       像资深开发者接手陌生模块的反射动作——**先拟定调查任务、逐条取证、复盘是否方案无虞、
       不放心就补任务再调查**。这是 Plan loop 的内循环；走完才允许下结论。
+
+      **自主查证原则**：
+      - 能 grep/read_file/git log 查到的信息，不要问用户
+      - unknowns 里写的是"代码里没有明确答案"的事项，不是"我没去查"的事项
+      - 如果查证后发现用户任务描述与实际代码不符，以代码为准，在 output_summary 里说明
 
       ⚠️ **output_summary（自然语言总结）必须按以下 markdown 模板写**（标题不能省）：
 
@@ -131,17 +136,19 @@ stages:
   - id: align
     name: 对齐
     instructions: |
-      列出本次必须遵守的横向一致性约束（命名/错误处理/日志/i18n/参数风格等），
-      逐条列出边界自问（未登录/未授权/未实名/空数据/并发/不可逆/网络失败/超大输入），
-      把 understand+investigate 留下的模糊点用 ask_human 强制澄清——不允许出现"我假设"代替提问。
-      如果存在不可逆操作（删文件、清数据、git reset 等），请把"是否允许"列入 clarifications_asked。
-      output_summary 必须把 lateral_constraints 与 boundary_questions 的每一条都明文列出——
-      self_review 阶段只能读到 summary 而非结构化字段，summary 写得粗则 reviewer 无法逐条核对。
+      列出本次必须遵守的横向一致性约束（命名/错误处理/日志/i18n/参数风格等）。
+
+      **自主决策原则**：能查代码确认的就不要问用户。只有以下情况才需要 ask_human：
+      - 涉及不可逆操作（删文件、清数据、git reset --hard 等）
+      - 需求有歧义且代码/文档无法确认
+      - 需要在多个合理方案中做选择（且没有明显最优解）
+
+      output_summary 里写明：横向约束清单 + 已自主确认的事项 +（如有）需要用户决策的问题。
     allowed_tools:
       - read_file
+      - shell
     required_outputs:
       - lateral_constraints
-      - boundary_questions
       - clarifications_asked
     auto_retry_limit: 1
     hooks:
