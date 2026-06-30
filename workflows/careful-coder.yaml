@@ -62,18 +62,16 @@ stages:
       - 只有任务描述明显缺失关键信息、且无法从代码/文档中推断时，才列入 assumptions
       - assumptions 不是"问用户的问题"，而是"暂时这样假设，如有偏差再修正"
 
-      **输出格式**：直接输出 JSON 对象，不要包裹在 ```json 代码块里。
-      必须包含以下字段：
-      ```
-      {
-        "status": "completed",
-        "output_summary": "1-2 句话总结",
-        "required_outputs": {
-          "user_goal_restated": "用户想要什么",
-          "definition_of_done": "完成的标准（可验收）",
-          "assumptions": ["暂时假设 1", "暂时假设 2"]  // 如无需假设，可写空数组 []
-        }
-      }
+      **输出格式（非常重要）**：
+      1. 直接输出 JSON 对象，**不要**包裹在 ```json 或 ``` 代码块里
+      2. 键名必须用双引号包裹，如 `"status"` 不是 `status`
+      3. 字符串值必须用双引号包裹，如 `"completed"` 不是 `completed`
+      4. 数组元素用双引号包裹，如 `["假设 1"]` 不是 `[假设 1]`
+      5. 不要有尾随逗号
+
+      必须输出且只能输出以下 JSON 结构：
+      ```json
+      {"status":"completed","output_summary":"一句话总结","required_outputs":{"user_goal_restated":"用户想要什么","definition_of_done":"完成的标准","assumptions":[]}}
       ```
     allowed_tools:
       - read_file
@@ -82,7 +80,7 @@ stages:
       - user_goal_restated
       - definition_of_done
       - assumptions
-    auto_retry_limit: 3
+    auto_retry_limit: 5
     hooks:
       post_output_assertions:
         - no_trailing_unparsed_payload
