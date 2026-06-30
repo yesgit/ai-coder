@@ -84,45 +84,28 @@ stages:
       像资深开发者接手陌生模块的反射动作——**先拟定调查任务、逐条取证、复盘是否方案无虞、
       不放心就补任务再调查**。这是 Plan loop 的内循环；走完才允许下结论。
 
-      ⚠️ **output_summary 必须按以下 markdown 模板写**（标题不能省，这是思维 Loop 的落地）：
+      ⚠️ **output_summary（自然语言总结）必须按以下 markdown 模板写**（标题不能省）：
 
       ```markdown
       ## 调查任务清单
-      1. [ ] task_1: <问题描述> → [已查/未查]
-      2. [ ] task_2: <问题描述> → [已查/未查]
-      ...（至少 2 条）
+      1. [ ] task_1: ... → [已查/未查]
 
       ## 假设与验证
-      - H1: <假设内容> → [证实/证伪/inconclusive]
-      - H2: <假设内容> → [证实/证伪/inconclusive]
-      ...（至少 1 条）
+      - H1: ... → [证实/证伪/inconclusive]
 
       ## 已证实的结论
-      1. f1: <结论>（证据：`file:line` 或 `commit hash`）
-      ...（至少 1 条，每条必须带证据锚点）
+      1. f1: ...（证据：`file:line`）
 
       ## 仍未确定的事项
-      - <unknown_1>
-      - <unknown_2>
-      ...（至少 1 条，写"无"也可以，但不能省略这个标题）
+      - ...
       ```
 
-      具体例程（建议自己在脑子里走一遍）：
-        1) 列出本次要查的问题清单（包含至少一条 `git log` 类任务看 commit 意图）；
-        2) 每条问题挂一个假设，并列出反向假设（不要只想一种可能）；
-        3) 跑取证：grep 同名调用、Read 相邻实现、查 git log/blame；
-        4) 取证后判定 confirmed/refuted/inconclusive——inconclusive 的进"仍未确定的事项"；
-        5) 集群型现象（多个同类页面/入口/模块）必须有一条 task 专门评估集群整体性。
+      required_outputs（JSON 字段）保持精简：
+        - similar_callsites: 至少 3 条 path:line + 一句话作用
+        - git_history_summary: 跑过的 git log/blame 关键结论（含 commit hash）
+        - unknowns: 未查清的事项（写"无"也可以，但不能省略）
 
-      产物（required_outputs，写在最外层 JSON 里——保持精简，不要塞嵌套对象数组）：
-        - similar_callsites: 至少 3 条 path:line + 一句话作用（字符串数组或多行字符串都行）
-        - git_history_summary: 跑过的 git log/blame 关键结论（字符串，含 commit hash + 一行 message）
-        - unknowns: 你没查清的、查了但 inconclusive 的、主动暴露的"我不知道"
-          （字符串数组或多行字符串。小写"无"会被引擎判定不诚实）
-
-      ⚠️ 输出 JSON 时请先在脑里 / 临时编辑器里 JSON.parse 一遍——多余引号、字段名拼错、
-      引号未闭合是最常见错误；烂掉宿主会视为字段缺失，retry 时你看到的错误信息会含
-      bracket_balance/tail_length 等诊断。
+      ⚠️ JSON 输出前请先 JSON.parse 验证——多余引号/未闭合括号会导致 retry。
     allowed_tools:
       - read_file
       - shell
@@ -130,7 +113,7 @@ stages:
       - similar_callsites
       - git_history_summary
       - unknowns
-    auto_retry_limit: 2
+    auto_retry_limit: 3
     hooks:
       post_output_assertions:
         - investigate_structure_present
