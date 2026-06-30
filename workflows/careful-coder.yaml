@@ -156,24 +156,19 @@ stages:
     name: 设计
     instructions: |
       把 investigate 阶段查实的结论翻成可执行步骤——**每一步都要引用对应的取证证据**，
-      不允许凭空设计。同时完成两项自审。
+      不允许凭空设计。
 
-      建议自检例程（写在 output_summary 里，不强制结构化产出）：
-        1) 列出 plan steps（每条配 path:line 取证引用 + perf/security/extensibility 三维度考量；
-           不涉及就写"不适用：<一句话原因>"，目的是让三维度想过——这是肌肉记忆而非格式要求）；
-        2) 给出可验收的 success_criteria（self_review 阶段会逐条核对，含糊措辞会让对账失效）；
-        3) 敌对自审：假设挑刺 reviewer 看你的方案，他会怎么打回？至少给 3 条具体反驳并答辩；
-        4) 一致性自审：同类条目要么全做、要么全不做；任何偏离写出理由；
-        5) 集群型任务（多个同类条目 ≥3）：在 output_summary 里给一张 markdown 矩阵——
-           列至少"条目 / 鉴权策略 / 参数 / 备注"，让 implement 一眼看清横向是否齐整。
+      **输出要求（软约束——在 output_summary 里自然语言描述即可，不强制 JSON 字段）**：
+      1. **design_summary**：方案要点（要做什么、怎么做、涉及哪些文件）
+      2. **adversarial_critique**：敌对自审——挑刺 reviewer 会怎么打回？至少 3 条具体反驳并答辩
+      3. **consistency_audit**：一致性自审——同类条目要么全做要么全不做；任何偏离写出理由
+      4. **success_criteria**（可选）：完成的样子，便于 self_review 核对
+      5. **集群型任务**（可选）：多个同类条目≥3 时，给一张 markdown 矩阵（条目/鉴权/参数/备注）
 
       避免过度抽象/过度工程：能用现有函数解决就不要新建。
     allowed_tools:
       - read_file
-    required_outputs:
-      - design_summary
-      - adversarial_critique
-      - consistency_audit
+    required_outputs: []
     auto_retry_limit: 1
     hooks:
       post_output_assertions:
