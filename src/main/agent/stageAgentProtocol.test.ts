@@ -54,6 +54,166 @@ describe("stage agent protocol", () => {
     expect(input.allowed_tools).toEqual(["read_file", "edit_file"]);
   });
 
+  it("builds rework_context when an approved rework_request targets the current stage", () => {
+    // execute 发现 plan 产出有缺口 → 回 needs_rework 指向 plan → applyRework 把 plan 旧 run 置 superseded、execute 置 needs_rework → 重做 plan
+    const reworkSession: AgentSession = {
+      ...session,
+      stage_runs: [
+        {
+          id: "plan-run-1",
+          stage_id: "plan",
+          attempt: 1,
+          status: "superseded",
+          input_summary: "Initial task",
+          output_summary: "上一版 plan 产出，有缺口",
+          started_at: new Date().toISOString(),
+          completed_at: new Date().toISOString()
+        },
+        {
+          id: "plan-run-2",
+          stage_id: "plan",
+          attempt: 2,
+          status: "running",
+          input_summary: "Rework requested from execute: plan 未确定存储格式，execute 无法推进",
+          started_at: new Date().toISOString()
+        },
+        {
+          id: "execute-run-1",
+          stage_id: "execute",
+          attempt: 1,
+          status: "needs_rework",
+          input_summary: "Continue after plan",
+          output_summary: "发现 plan 缺存储格式决策",
+          started_at: new Date().toISOString(),
+          completed_at: new Date().toISOString(),
+          rework_reason: "Need to choose storage format"
+        }
+      ],
+      rework_requests: [
+        {
+          id: "rework-1",
+          from_stage_id: "execute",
+          target_stage_id: "plan",
+          status: "approved",
+          reason: "plan 未确定存储格式，execute 无法推进",
+          created_at: new Date().toISOString(),
+          resolved_at: new Date().toISOString()
+        }
+      ]
+    };
+
+    const input = buildStageAgentInput(reworkSession, workflow, workflow.stages[0]);
+
+    expect(input.rework_context).toEqual({
+      from_stage: "execute",
+      reason: "plan 未确定存储格式，execute 无法推进",
+      previous_output_summary: "上一版 plan 产出，有缺口"
+    });
+  });
+
+  it("prefers retry_context over stale rework_context on assertion retry after rework", () => {
+    const retryAfterReworkSession: AgentSession = {
+      ...session,
+      stage_runs: [
+        {
+          id: "plan-run-1",
+          stage_id: "plan",
+          attempt: 1,
+          status: "superseded",
+          input_summary: "Initial task",
+          output_summary: "上一版 plan 产出，有缺口",
+          started_at: new Date().toISOString(),
+          completed_at: new Date().toISOString()
+        },
+        {
+          id: "plan-run-2",
+          stage_id: "plan",
+          attempt: 2,
+          status: "running",
+          input_summary: "Rework requested from execute",
+          retry_reason: "断言失败：缺少候选方案",
+          started_at: new Date().toISOString()
+        }
+      ],
+      rework_requests: [
+        {
+          id: "rework-1",
+          from_stage_id: "execute",
+          target_stage_id: "plan",
+          status: "approved",
+          reason: "plan 未确定存储格式，execute 无法推进",
+          created_at: new Date().toISOString(),
+          resolved_at: new Date().toISOString()
+        }
+      ]
+    };
+
+    const input = buildStageAgentInput(retryAfterReworkSession, workflow, workflow.stages[0]);
+
+    expect(input.retry_context).toMatchObject({ previous_attempt: 2, output_summary: "断言失败：缺少候选方案" });
+    expect(input.rework_context).toBeUndefined();
+  });
+
+  it("does not inject stale rework_context on a plain resume run", () => {
+    const resumedSession: AgentSession = {
+      ...session,
+      stage_runs: [
+        {
+          id: "plan-run-1",
+          stage_id: "plan",
+          attempt: 1,
+          status: "superseded",
+          input_summary: "Initial task",
+          output_summary: "旧的返工前 plan 产出",
+          started_at: new Date().toISOString(),
+          completed_at: new Date().toISOString()
+        },
+        {
+          id: "plan-run-2",
+          stage_id: "plan",
+          attempt: 2,
+          status: "running",
+          input_summary: "Resume from failed stage",
+          started_at: new Date().toISOString()
+        }
+      ],
+      rework_requests: [
+        {
+          id: "rework-1",
+          from_stage_id: "execute",
+          target_stage_id: "plan",
+          status: "approved",
+          reason: "旧的返工原因",
+          created_at: new Date().toISOString(),
+          resolved_at: new Date().toISOString()
+        }
+      ]
+    };
+
+    const input = buildStageAgentInput(resumedSession, workflow, workflow.stages[0]);
+    expect(input.rework_context).toBeUndefined();
+  });
+
+  it("leaves rework_context undefined when the rework_request targets a different stage", () => {
+    const reworkSession: AgentSession = {
+      ...session,
+      rework_requests: [
+        {
+          id: "rework-1",
+          from_stage_id: "execute",
+          target_stage_id: "plan",
+          status: "approved",
+          reason: "plan 缺口",
+          created_at: new Date().toISOString()
+        }
+      ]
+    };
+
+    // 当前 stage 是 execute，但 rework_request 指向 plan → 不应注入给 execute
+    const input = buildStageAgentInput(reworkSession, workflow, workflow.stages[1]);
+    expect(input.rework_context).toBeUndefined();
+  });
+
   it("parses structured JSON stage results", () => {
     const result = parseStageAgentResult(
       JSON.stringify({

@@ -1,11 +1,11 @@
 id: careful-coder
 name: 谨慎程序员
-version: 1.1.0
+version: 1.2.0
 description: 把人类资深开发者的"强制例程"软化为可读的纪律——取证、对齐、敌对自审，让模型像谨慎的同事一样工作。
 source:
   type: builtin
   id: careful-coder
-  version: 1.1.0
+  version: 1.2.0
 routing:
   enabled: true
   auto_start: true
@@ -51,6 +51,18 @@ rework:
 # 无法在 retry 内自我修复，引擎层卡死。
 # v1.1 回归软引导——instructions 描述思维例程、required_outputs 只留少量简单字段，
 # 断言只保留扫文本/查结构存在性的低复杂度规则。思想仍在，硬约束让位给 LLM 的实际能力。
+#
+# v1.2 设计笔记（人类谨慎思维工程化）：
+# 在 v1.1 软引导基础上新增 11 条思维例程 + 9 个扫标题/扫词断言，把"人类资深开发者的内在思维"
+# （而非仅外在例程）工程化。仍守软约束——不新增任何 required_outputs 字段，断言只做扫标题/扫词存在性。
+# - investigate：markdown 模板从 4 标题扩到 7 标题（+同类参考/调用方清单/边界与异常路径），
+#   每条 finding 标置信度 [high/medium/low + 依据]，low 项须尝试第二证据源交叉验证。
+# - design：必写核心 3 段（候选方案≥2 对照/方案评估四维/事前风险预演），按需写 6 段
+#   （design_summary/adversarial_critique 降级/consistency_audit/success_criteria/测试清单/影响半径）。
+# - implement：delta_check 每文件一段（推进哪条 success_criteria + 新风险）+ 不可逆操作回滚预案。
+# - self_review：3 条闭环核对（优先核对 low/medium 置信项 + 调用方语义假设 + 测试清单执行）。
+# design 段分必写/按需写以控 output_summary 长度，降低 JSON 烂尾风险。
+# 烂尾回退策略：A 删 adversarial_critique；B 合并同类参考与调用方清单；C 放宽候选方案为≥1。
 stages:
   - id: understand
     name: 理解
@@ -95,7 +107,7 @@ stages:
       - unknowns 里写的是"代码里没有明确答案"的事项，不是"我没去查"的事项
       - 如果查证后发现用户任务描述与实际代码不符，以代码为准，在 output_summary 里说明
 
-      ⚠️ **output_summary（自然语言总结）必须按以下 markdown 模板写**（标题不能省）：
+      ⚠️ **output_summary（自然语言总结）必须按以下 markdown 模板写**（7 个标题不能省）：
 
       ```markdown
       ## 调查任务清单
@@ -103,16 +115,38 @@ stages:
 
       ## 假设与验证
       - H1: ... → [证实/证伪/inconclusive]
+      （标 low 置信度的 finding 必须尝试第二证据源交叉验证，如 grep + git log + 测试三路印证；
+       仍无法确认才标 low——交叉验证是"我尽力查了"的证明，不是可选项）
+
+      ## 同类参考
+      - 同类实现怎么写的：≥2 条 path:line + 模式说明
+      （如"login.ts:42 用了 redirect-after-auth 模式"）
+
+      ## 调用方清单
+      - 目标符号的所有调用方 + 每处对其行为的语义假设
+      （如"src/router/index.ts:88 调用 parseConfig，假定返回非 null"）
+      - 无明确目标符号的任务（如新建文件）写"本次无目标符号"
 
       ## 已证实的结论
-      1. f1: ...（证据：`file:line`）
+      1. f1: ...（证据：`file:line`，置信度：[high/medium/low] + 依据类型：代码直读/git log/推断）
+      2. f2: ...
+
+      ## 边界与异常路径
+      - 已知需要处理的边缘情况：空/零/负/并发/超时/失败/超大输入
+      （与 unknowns 互补：unknowns 是没查清的，boundary 是已知需处理的）
 
       ## 仍未确定的事项
-      - ...
+      - ...（置信度：low + 为什么没查清）
       ```
 
+      **置信度分级**（每条 finding 必标）：
+      - **high**：代码直读确认 / git log 明确记录 / 测试跑过
+      - **medium**：推断但有间接证据 / 同类代码风格类推
+      - **low**：纯推断 / 未读到关键代码 / 依赖假设
+      标 low 不是坏事，是诚实暴露——self_review 阶段会优先核对 low/medium 项。
+
       required_outputs（JSON 字段）保持精简：
-        - similar_callsites: 至少 3 条 path:line + 一句话作用
+        - similar_callsites: 覆盖"同类参考"+"调用方清单"两类，至少 3 条 path:line + 一句话作用
         - git_history_summary: 跑过的 git log/blame 关键结论（含 commit hash）
         - unknowns: 未查清的事项（写"无"也可以，但不能省略）
 
@@ -128,6 +162,10 @@ stages:
     hooks:
       post_output_assertions:
         - investigate_structure_present
+        - callsites_inventory_present
+        - boundary_enumeration_present
+        - confidence_levels_present
+        - needs_rework_target_required
         - hedged_findings_demoted
         - unknowns_present
         - no_trailing_unparsed_payload
@@ -151,6 +189,7 @@ stages:
     auto_retry_limit: 1
     hooks:
       post_output_assertions:
+        - needs_rework_target_required
         - no_trailing_unparsed_payload
   - id: design
     name: 设计
@@ -158,12 +197,43 @@ stages:
       把 investigate 阶段查实的结论翻成可执行步骤——**每一步都要引用对应的取证证据**，
       不允许凭空设计。
 
-      **输出要求（软约束——在 output_summary 里自然语言描述即可，不强制 JSON 字段）**：
-      1. **design_summary**：方案要点（要做什么、怎么做、涉及哪些文件）
-      2. **adversarial_critique**：敌对自审——挑刺 reviewer 会怎么打回？至少 3 条具体反驳并答辩
-      3. **consistency_audit**：一致性自审——同类条目要么全做要么全不做；任何偏离写出理由
-      4. **success_criteria**（可选）：完成的样子，便于 self_review 核对
-      5. **集群型任务**（可选）：多个同类条目≥3 时，给一张 markdown 矩阵（条目/鉴权/参数/备注）
+      **必写核心段（output_summary 必须含以下 3 个 markdown 标题，断言会校验）**：
+
+      1. **## 候选方案**：先列 ≥2 候选方案并排比较，再写选定理由。写法：
+         ```markdown
+         ## 候选方案
+         - 方案 A：...（要点 + 取舍维度：复杂度/风险/可逆性）
+         - 方案 B：...（要点 + 同样维度）
+         选定：方案 X，理由：...
+         ```
+         不允许只写一个方案就跳到下一项——"比较"本身就是思维过程，不是"先定再辩护"。
+
+      2. **## 方案评估**：对**选定方案**给性能/安全/扩展/可维护四维简评（每维一两句 + 风险等级 high/med/low）。
+         与候选方案的取舍矩阵互补——前者是方案间横向比较，后者是选定方案的纵深审视。
+         ```markdown
+         ## 方案评估
+         - 性能：...（风险：low）
+         - 安全：...（风险：med）
+         - 扩展：...（风险：low）
+         - 可维护：...（风险：low）
+         ```
+
+      3. **## 事前风险**：动手前预演失败——最易出错的两三处、最没把握的反例 + 预案。写法：
+         ```markdown
+         ## 事前风险
+         - 风险 1：...（最易出错的点 + 触发条件 + 预案）
+         - 风险 2：...（最没把握的反例 + 验证手段）
+         ```
+         这是"事前预演"，不是事后挑刺——挑的是"我自己心里都没底的地方"。
+
+      **按需写段（软约束，不强制作断言；涉及就写，靠 self_review 兜底）**：
+      - **design_summary**：方案要点（要做什么、怎么做、涉及哪些文件）
+      - **adversarial_critique**：敌对自审——reviewer 视角会怎么打回？至少 3 条具体反驳并答辩
+        （与事前风险+方案评估有重叠，按需写，避免 output_summary 过长）
+      - **consistency_audit**：一致性自审——同类条目要么全做要么全不做；任何偏离写出理由
+      - **success_criteria**（推荐写）：完成的样子，便于 self_review 核对
+      - **测试清单**：涉及逻辑改动时列需新增/修改的测试 + 覆盖哪条 success_criteria
+      - **影响半径**：涉及公共接口/共享数据时列改动波及的下游（含间接传递依赖）
 
       避免过度抽象/过度工程：能用现有函数解决就不要新建。
     allowed_tools:
@@ -172,6 +242,10 @@ stages:
     auto_retry_limit: 1
     hooks:
       post_output_assertions:
+        - design_alternatives_present
+        - design_quadrant_eval_present
+        - preflight_risks_present
+        - needs_rework_target_required
         - no_trailing_unparsed_payload
   - id: implement
     name: 实施
@@ -184,9 +258,24 @@ stages:
       宿主会在工具调用前强制校验上述前置条件，未达到会被 deny 并要求你补齐。这不是平台限制，
       是"先看后改"的纪律。
 
-      **过程中随时与总体目标核对**：每改完一个文件，在自己脑子里对照 understand.user_goal_restated
-      与 design.success_criteria，明示这次改动推进/未推进哪一条。如果发现走偏，及时 needs_rework
-      回 design 重新规划——不要等到 self_review 阶段才发现。
+      **改动核对（delta_check，必写）**：每改完一个文件，在 output_summary 里用 markdown 分段
+      写一段 delta_check——推进了哪条 success_criteria + 引入了什么新风险。写法：
+      ```markdown
+      ## 改动核对
+      ### src/auth/login.ts
+      - 推进：success_criteria 第 2 条（未登录跳转 /settings）
+      - 新风险：引入了 redirect 时序依赖，需 self_review 跑一遍 e2e
+      ### src/router/index.ts
+      - 推进：success_criteria 第 1 条
+      - 新风险：无
+      ```
+      如果本次未改动任何文件，仍要写一段"## 改动核对：本次未改动，原因：..."。
+      这是"过程中"的自审——不是等 self_review 才发现走偏。每改完一个文件就对照
+      understand.user_goal_restated 与 design.success_criteria 核对，发现走偏及时 needs_rework
+      回 design，不要等到 self_review 阶段才发现。
+
+      **回滚预案**：涉及不可逆操作（rm/git reset/drop table/truncate 等）时，在对应文件的
+      delta_check 子段内写明回滚步骤（如何撤销本次不可逆操作）。
 
       改动尽量小、贴近原代码风格。坚决不顺手"清理无关代码"。
     allowed_tools:
@@ -222,6 +311,9 @@ stages:
             ask_human_consent: true
           on_fail: "这是不可逆操作，必须先在本阶段通过 ask_human 取得用户明确确认。"
       post_output_assertions:
+        - implement_delta_check_present
+        - rollback_plan_when_irreversible
+        - needs_rework_target_required
         - no_trailing_unparsed_payload
   - id: self_review
     name: 自审
@@ -238,6 +330,14 @@ stages:
         - 自洽性纪律：一旦 review_findings/residual_risks 出现"blocker / critical / 严重不一致 / 安全问题 /
           高优先级问题"这类阻塞类描述，就**不允许**把 rework_decision 写成 pass——
           要么改描述（已修复 + diff 位置）、要么改 needs_rework。引擎会自动判定不自洽并回炉重做。
+
+      **三条闭环核对（v1.2 新增，必须执行）**：
+        - **优先核对低置信项**：investigate 阶段标了置信度（high/medium/low）的 finding，
+          优先核对 low 与 medium 项是否在本次 diff 中被验证或反驳。low/medium 项未核对就 pass 视为漏审。
+        - **核对调用方清单每处的语义假设**：investigate 的"## 调用方清单"列了每个调用方对目标符号的
+          语义假设（如"调用方假定返回非 null"）。逐条核对本次改动是否打破了这些假设——打破必须 needs_rework。
+        - **核对测试清单是否执行**：design 阶段的"测试清单"（如有）列了需新增/修改的测试。核对是否在
+          implement 落地、self_review 跑过；未执行的测试必须在 review_findings 写明缺口。
 
       返工触发协议：
         - 决定回炉时，最外层 JSON 必须 status="needs_rework"、rework_target_stage_id 是

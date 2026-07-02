@@ -88,6 +88,47 @@ export type StageOutputAssertion =
    */
   | "investigate_structure_present"
   /**
+   * investigate 阶段：扫 output_summary 是否出现 high/medium/low 任一词或"置信度"/"confidence"。
+   * 极宽松——只验证模型提到了置信度概念，不强制每条 finding 都标。深层质量靠 self_review 闭环。
+   * v1.2 新增——配合 investigate markdown 模板里"## 已证实的结论"每条 finding 标 [等级+依据]。
+   */
+  | "confidence_levels_present"
+  /**
+   * investigate 阶段：扫 output_summary 含"## 调用方清单"标题。强制列目标符号的所有调用方 + 每处语义假设。
+   * v1.2 新增——把原 similar_callsites 的"目标调用方"语义显式化，防逻辑遗漏。
+   */
+  | "callsites_inventory_present"
+  /**
+   * investigate 阶段：扫 output_summary 含"## 边界与异常路径"标题。强制枚举空/零/负/并发/超时/失败/超大输入。
+   * v1.2 新增——与 unknowns（没查清的）互补：boundary 是已知需处理的边缘情况。
+   */
+  | "boundary_enumeration_present"
+  /**
+   * design 阶段：扫 output_summary 含"## 事前风险"标题。动手前预演失败——最易出错处 + 最没把握的反例 + 预案。
+   * v1.2 新增——区别于事后 adversarial_critique，是"事前焦虑"的显式化。
+   */
+  | "preflight_risks_present"
+  /**
+   * design 阶段：扫"## 候选方案"标题 + 粗扫候选数 ≥2（方案 A/B、方案 甲/乙、候选 1/2、alternative A/B）。
+   * v1.2 新增——强制双方案对照，避免"先定再辩护"。不复用 item_matrix_when_multi（触发条件/维度都不同）。
+   */
+  | "design_alternatives_present"
+  /**
+   * design 阶段：扫"## 方案评估"标题 + 四维关键词（性能/安全/扩展/可维护）共现。
+   * v1.2 新增——把 self_review 的事后挑刺前置到 design，对选定方案做纵深审视。
+   */
+  | "design_quadrant_eval_present"
+  /**
+   * implement 阶段：扫 output_summary 含"## 改动核对"标题。每改过文件一段（推进哪条 success_criteria + 新风险）。
+   * v1.2 新增——让"边写边审"成为可见产物，回溯写在最终 output_summary，引擎零改动。
+   */
+  | "implement_delta_check_present"
+  /**
+   * implement 阶段：弱断言——若 output_summary 含 rm/git reset/git clean/drop table/truncate 等不可逆词，
+   * 必须含"回滚"或"rollback"字样，否则失败。v1.2 新增。
+   */
+  | "rollback_plan_when_irreversible"
+  /**
    * raw 输出尾部存在未闭合 JSON（bracket_balance != 0 或 last 合法 JSON 之后还有大段 JSON 残骸）→ 失败。
    * 跨场景通用——结构性断言，不绑定具体任务类型，建议每阶段都挂。
    */
@@ -219,6 +260,15 @@ export interface StageAgentInput {
   required_outputs: string[];
   gates: string[];
   retry_context?: StageRetryContext;
+  rework_context?: {
+    from_stage: string;
+    reason: string;
+    /**
+     * 被退回目标 stage 上一版产出摘要。invalidate_downstream=false 的工作流可能无
+     * superseded run（此时仅注入 from_stage/reason），故可选。
+     */
+    previous_output_summary?: string;
+  };
   recent_messages: AgentMessage[];
   human_qa_history: HumanQuestion[];
 }

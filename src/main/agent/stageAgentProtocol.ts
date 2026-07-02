@@ -32,6 +32,25 @@ export function buildStageAgentInput(
         }
       : undefined;
 
+  // 返工（needs_rework）重做时，把"谁退我、为什么、我上次产出什么"注入给被退回的目标 stage。
+  // 与 retryContext 互补：retry 是 stage 因自身输出不合格被原地退回；rework 是被下游 stage 跨阶段退回。
+  // 闭环入境验收（workflowPrompt.ts）：下游发现上游产出不合格→回 needs_rework 指向上游→applyRework
+  // 把目标 stage 旧 run 置 superseded（保留 output_summary）→重做时由这里把上下文回灌给它，避免盲重做。
+  const reworkRequest = [...(session.rework_requests ?? [])]
+    .reverse()
+    .find((req) => req.target_stage_id === currentStage.id && req.status === "approved");
+  const previousSuperseded = [...(session.stage_runs ?? [])]
+    .reverse()
+    .find((stageRun) => stageRun.stage_id === currentStage.id && stageRun.status === "superseded");
+  const isActiveReworkRun = currentStageRun?.input_summary.startsWith("Rework requested from ") ?? false;
+  const reworkContext = !retryContext && isActiveReworkRun && reworkRequest
+    ? {
+        from_stage: reworkRequest.from_stage_id,
+        reason: reworkRequest.reason,
+        previous_output_summary: previousSuperseded?.output_summary
+      }
+    : undefined;
+
   return {
     workflow: {
       id: workflow.id,
@@ -61,6 +80,7 @@ export function buildStageAgentInput(
     required_outputs: currentStage.required_outputs ?? [],
     gates: currentStage.gates ?? [],
     retry_context: retryContext,
+    rework_context: reworkContext,
     recent_messages: session.messages.slice(-20),
     human_qa_history: (session.pending_human_questions ?? []).filter((q) => q.status === "answered")
   };

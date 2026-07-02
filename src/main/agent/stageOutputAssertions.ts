@@ -318,6 +318,167 @@ const investigateStructurePresent: AssertionImpl = (result) => {
   ].join("");
 };
 
+/**
+ * v1.2 新增：investigate 阶段每个 finding 应标注置信度（high/medium/low）。
+ * 极宽松判定——只扫是否出现 high/medium/low 任一词或"置信度"/"confidence"。
+ * 不强制每条 finding 都标（避免 JSON 负担和误伤）。深层质量靠 self_review"优先核对 low/medium"闭环。
+ */
+const CONFIDENCE_MARKER_PATTERN = /\b(high|medium|low)\b|置信度|confidence/i;
+const confidenceLevelsPresent: AssertionImpl = (result) => {
+  const text = result.output_summary ?? "";
+  if (CONFIDENCE_MARKER_PATTERN.test(text)) return null;
+  return [
+    "investigate 缺少置信度分级：output_summary 里每个 finding 应标注 ",
+    "[high/medium/low + 依据类型（代码直读/git log/推断）]。",
+    "high=代码直读确认，medium=推断有间接证据，low=纯推断/未读到关键代码。",
+    "标 low 不是坏事——是诚实暴露，self_review 会优先核对。"
+  ].join("");
+};
+
+/**
+ * v1.2 新增：investigate 阶段必须含"## 调用方清单"标题——列目标符号的所有调用方 + 每处语义假设。
+ * 把原 similar_callsites 的"目标调用方"语义显式化，防逻辑遗漏（改动会打破哪些调用方的假设）。
+ * 无明确目标符号的任务（新建文件）可写"本次无目标符号"。
+ */
+const CALLSITES_HEADER_PATTERN = /^#{1,3}\s*(调用方清单|callsites?)/im;
+const callsitesInventoryPresent: AssertionImpl = (result) => {
+  const text = result.output_summary ?? "";
+  if (CALLSITES_HEADER_PATTERN.test(text)) return null;
+  return [
+    "investigate 缺少调用方清单：output_summary 必须含 '## 调用方清单' 标题段落，",
+    "列目标符号的所有调用方 + 每处对其行为的语义假设（如'调用方假定返回非 null'）。",
+    "无明确目标符号的任务（如新建文件）可写'本次无目标符号'。"
+  ].join("");
+};
+
+/**
+ * v1.2 新增：investigate 阶段必须含"## 边界与异常路径"标题——枚举空/零/负/并发/超时/失败/超大输入。
+ * 与 unknowns（没查清的）互补：boundary 是已知需要处理的边缘情况。
+ */
+const BOUNDARY_HEADER_PATTERN = /^#{1,3}\s*(边界与异常路径|边界条件|boundary)/im;
+const boundaryEnumerationPresent: AssertionImpl = (result) => {
+  const text = result.output_summary ?? "";
+  if (BOUNDARY_HEADER_PATTERN.test(text)) return null;
+  return [
+    "investigate 缺少边界与异常路径枚举：output_summary 必须含 '## 边界与异常路径' 标题段落，",
+    "列已知需要处理的边缘情况（空/零/负/并发/超时/失败/超大输入等）。",
+    "与 unknowns 互补——unknowns 是没查清的，boundary 是已知需处理的。"
+  ].join("");
+};
+
+/**
+ * v1.2 新增：design 阶段必须含"## 事前风险"标题——动手前预演失败。
+ * 区别于事后 adversarial_critique——挑的是"我自己心里都没底的地方"，不是方案定好后的辩护式反驳。
+ */
+const PREFLIGHT_HEADER_PATTERN = /^#{1,3}\s*(事前风险|preflight\s*risks?)/im;
+const preflightRisksPresent: AssertionImpl = (result) => {
+  const text = result.output_summary ?? "";
+  if (PREFLIGHT_HEADER_PATTERN.test(text)) return null;
+  return [
+    "design 缺少事前风险预演：output_summary 必须含 '## 事前风险' 标题段落，",
+    "列出最易出错的两三处 + 最没把握的反例 + 预案。",
+    "这是'事前预演失败'，不是事后挑刺——挑你心里没底的地方。"
+  ].join("");
+};
+
+/**
+ * v1.2 新增：design 阶段必须含"## 候选方案"标题 + 候选数 ≥2。
+ * 强制双方案对照，避免"先定再辩护"。不复用 item_matrix_when_multi（触发条件/条目数/维度都不同）。
+ */
+const ALTERNATIVES_HEADER_PATTERN = /^#{1,3}\s*(候选方案|方案对照|双方案|alternatives?)/im;
+const designAlternativesPresent: AssertionImpl = (result) => {
+  const text = result.output_summary ?? "";
+  if (!ALTERNATIVES_HEADER_PATTERN.test(text)) {
+    return [
+      "design 缺少候选方案对照：output_summary 必须含 '## 候选方案' 标题段落，",
+      "先列 ≥2 候选并排比较（取舍维度：复杂度/风险/可逆性），再写选定理由。"
+    ].join("");
+  }
+  const altCount = countAlternatives(text);
+  if (altCount < 2) {
+    return [
+      "候选方案数量不足：'## 候选方案' 段落里至少要列 2 个候选",
+      "（如'方案 A'/'方案 B'或'候选 1'/'候选 2'），并给出选定理由。"
+    ].join("");
+  }
+  return null;
+};
+
+function countAlternatives(text: string): number {
+  const patterns: RegExp[] = [
+    /方案\s*[A-Z]/g,
+    /方案\s*[甲乙丙丁]/g,
+    /方案\s*[一二三四五六七八九十]/g,
+    /候选\s*\d+/g,
+    /alternative\s*[A-Z]/gi
+  ];
+  const alternatives = new Set<string>();
+  for (const p of patterns) {
+    const matches = text.match(p);
+    for (const match of matches ?? []) alternatives.add(match.toLowerCase());
+  }
+  return alternatives.size;
+}
+
+/**
+ * v1.2 新增：design 阶段必须含"## 方案评估"标题 + 四维关键词（性能/安全/扩展/可维护）共现。
+ * 把 self_review 的事后挑刺前置到 design——对选定方案做纵深审视，而非仅在方案间横向比较。
+ */
+const QUADRANT_HEADER_PATTERN = /^#{1,3}\s*(方案评估|方案四维|quadrant\s*eval)/im;
+const QUADRANT_KEYWORD_PATTERNS = [
+  /性能|performance/i,
+  /安全|security/i,
+  /扩展|extensib/i,
+  /可维护|maintainab/i
+];
+const designQuadrantEvalPresent: AssertionImpl = (result) => {
+  const text = result.output_summary ?? "";
+  if (!QUADRANT_HEADER_PATTERN.test(text)) {
+    return [
+      "design 缺少方案评估：output_summary 必须含 '## 方案评估' 标题段落，",
+      "对选定方案给性能/安全/扩展/可维护四维简评（每维一两句 + 风险等级 high/med/low）。"
+    ].join("");
+  }
+  if (!QUADRANT_KEYWORD_PATTERNS.every((pattern) => pattern.test(text))) {
+    return [
+      "方案评估缺少四维关键词：'## 方案评估' 段落里必须同时出现 性能/安全/扩展/可维护 四维关键词，",
+      "并对每维给风险等级。"
+    ].join("");
+  }
+  return null;
+};
+
+/**
+ * v1.2 新增：implement 阶段必须含"## 改动核对"标题——每改过文件一段（推进哪条 success_criteria + 新风险）。
+ * 让"边写边审"成为可见产物，回溯写在最终 output_summary，引擎零改动。未改动也要写一段说明原因。
+ */
+const DELTA_CHECK_HEADER_PATTERN = /^#{1,3}\s*(改动核对|delta\s*check)/im;
+const implementDeltaCheckPresent: AssertionImpl = (result) => {
+  const text = result.output_summary ?? "";
+  if (DELTA_CHECK_HEADER_PATTERN.test(text)) return null;
+  return [
+    "implement 缺少改动核对：output_summary 必须含 '## 改动核对' 标题段落，",
+    "每个改过的文件一段（推进了哪条 success_criteria + 引入了什么新风险）。",
+    "未改动也要写一段说明原因——过程留痕，不等 self_review 才发现走偏。"
+  ].join("");
+};
+
+/**
+ * v1.2 新增：implement 弱断言——若 output_summary 含 rm/git reset/git clean/drop table/truncate 等不可逆词，
+ * 必须含"回滚"或"rollback"字样。不可逆操作前要想好怎么退。
+ */
+const IRREVERSIBLE_PATTERN = /\b(rm\b|git\s+reset\b|git\s+clean\b|drop\s+table\b|truncate\s+table\b)/i;
+const ROLLBACK_PATTERN = /回滚|rollback/i;
+const rollbackPlanWhenIrreversible: AssertionImpl = (result) => {
+  const text = result.output_summary ?? "";
+  if (!IRREVERSIBLE_PATTERN.test(text)) return null;
+  if (ROLLBACK_PATTERN.test(text)) return null;
+  return [
+    "implement 检测到不可逆操作（rm/git reset/git clean/drop table/truncate）但未提供回滚预案：",
+    "请在对应文件的 '## 改动核对' 子段内写明回滚步骤（如何撤销本次不可逆操作）。"
+  ].join("");
+};
+
 const ASSERTION_IMPLS: Record<StageOutputAssertion, AssertionImpl> = {
   review_self_consistency: reviewSelfConsistency,
   needs_rework_target_required: needsReworkTargetRequired,
@@ -325,7 +486,15 @@ const ASSERTION_IMPLS: Record<StageOutputAssertion, AssertionImpl> = {
   item_matrix_when_multi: itemMatrixWhenMulti,
   hedged_findings_demoted: hedgedFindingsDemoted,
   no_trailing_unparsed_payload: noTrailingUnparsedPayload,
-  investigate_structure_present: investigateStructurePresent
+  investigate_structure_present: investigateStructurePresent,
+  confidence_levels_present: confidenceLevelsPresent,
+  callsites_inventory_present: callsitesInventoryPresent,
+  boundary_enumeration_present: boundaryEnumerationPresent,
+  preflight_risks_present: preflightRisksPresent,
+  design_alternatives_present: designAlternativesPresent,
+  design_quadrant_eval_present: designQuadrantEvalPresent,
+  implement_delta_check_present: implementDeltaCheckPresent,
+  rollback_plan_when_irreversible: rollbackPlanWhenIrreversible
 };
 
 function pickReworkDecision(result: StageAgentResult): string | null {

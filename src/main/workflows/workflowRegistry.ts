@@ -90,6 +90,14 @@ const postOutputAssertionSchema = z.enum([
   "unknowns_present",
   "item_matrix_when_multi",
   "investigate_structure_present",
+  "confidence_levels_present",
+  "callsites_inventory_present",
+  "boundary_enumeration_present",
+  "preflight_risks_present",
+  "design_alternatives_present",
+  "design_quadrant_eval_present",
+  "implement_delta_check_present",
+  "rollback_plan_when_irreversible",
   "hedged_findings_demoted",
   "no_trailing_unparsed_payload"
 ]);
