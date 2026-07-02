@@ -126,4 +126,71 @@ describe("buildStageInstructions", () => {
     expect(prompt).toContain("本阶段产物自洽性断言");
     expect(prompt).toContain("unknowns_present");
   });
+
+  it("renders rework_context section when present", () => {
+    const input: StageAgentInput = {
+      workflow: { id: "test", name: "Test", description: "", stages: [{ id: "s", name: "S", approval_required: false, required_outputs: [], required_checks: [], gates: [] }] },
+      previous_stage_summaries: [],
+      current_stage: { id: "s", name: "S", instructions: "do it", approval_required: false },
+      task_prompt: "",
+      project_path: "/tmp",
+      allowed_tools: [],
+      required_outputs: [],
+      gates: [],
+      rework_context: {
+        from_stage: "implement",
+        reason: "investigate 调用方清单缺失",
+        previous_output_summary: "上一版 investigate 产出"
+      },
+      recent_messages: [],
+      human_qa_history: []
+    };
+
+    const prompt = buildStageInstructions(input);
+
+    expect(prompt).toContain("被下游阶段退回重做");
+    expect(prompt).toContain("退回方：implement");
+    expect(prompt).toContain("investigate 调用方清单缺失");
+    expect(prompt).toContain("你上一版产出：上一版 investigate 产出");
+  });
+
+  it("renders rework_context without previous_output_summary line when that field is absent", () => {
+    const input: StageAgentInput = {
+      workflow: { id: "test", name: "Test", description: "", stages: [{ id: "s", name: "S", approval_required: false, required_outputs: [], required_checks: [], gates: [] }] },
+      previous_stage_summaries: [],
+      current_stage: { id: "s", name: "S", instructions: "do it", approval_required: false },
+      task_prompt: "",
+      project_path: "/tmp",
+      allowed_tools: [],
+      required_outputs: [],
+      gates: [],
+      rework_context: { from_stage: "implement", reason: "缺口" },
+      recent_messages: [],
+      human_qa_history: []
+    };
+
+    const prompt = buildStageInstructions(input);
+
+    expect(prompt).toContain("退回方：implement");
+    expect(prompt).not.toContain("你上一版产出");
+  });
+
+  it("omits rework section when rework_context absent", () => {
+    const input: StageAgentInput = {
+      workflow: { id: "test", name: "Test", description: "", stages: [{ id: "s", name: "S", approval_required: false, required_outputs: [], required_checks: [], gates: [] }] },
+      previous_stage_summaries: [],
+      current_stage: { id: "s", name: "S", instructions: "do it", approval_required: false },
+      task_prompt: "",
+      project_path: "/tmp",
+      allowed_tools: [],
+      required_outputs: [],
+      gates: [],
+      recent_messages: [],
+      human_qa_history: []
+    };
+
+    const prompt = buildStageInstructions(input);
+
+    expect(prompt).not.toContain("被下游阶段退回重做");
+  });
 });

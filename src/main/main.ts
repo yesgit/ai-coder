@@ -66,7 +66,7 @@ async function createWindow(): Promise<void> {
     }
   });
 
-  if (process.env.VITE_DEV_SERVER_URL) {
+  if (!app.isPackaged && process.env.VITE_DEV_SERVER_URL) {
     await window.loadURL(process.env.VITE_DEV_SERVER_URL);
   } else {
     await window.loadFile(path.join(__dirname, "../renderer/index.html"));

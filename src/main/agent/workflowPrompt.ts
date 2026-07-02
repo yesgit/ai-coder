@@ -24,6 +24,19 @@ export function buildStageInstructions(input: StageAgentInput): string {
       ].join("\n")
     : "";
 
+  const reworkSection = input.rework_context
+    ? [
+        "",
+        "本次为被下游阶段退回重做（入境验收不通过）：",
+        `- 退回方：${input.rework_context.from_stage}`,
+        `- 退回原因：${input.rework_context.reason}`,
+        ...(input.rework_context.previous_output_summary
+          ? [`- 你上一版产出：${input.rework_context.previous_output_summary}`]
+          : []),
+        "请对照退回原因修正上一版产出的缺口，而非原样重做。"
+      ].join("\n")
+    : "";
+
   const allowedTools = input.allowed_tools.length ? input.allowed_tools.join(", ") : "read-only defaults";
   const requiredOutputs = input.required_outputs.length ? input.required_outputs.join(", ") : "concise stage summary";
   const gates = input.gates.length ? input.gates.join(", ") : "none";
@@ -73,6 +86,11 @@ export function buildStageInstructions(input: StageAgentInput): string {
     "当策略要求审批时，仍然要正常发起对应工具调用；宿主应用会拦截工具调用、创建审批项并暂停执行。",
     "不要用文字审批请求代替工具调用，也不要仅因为 shell 命令或文件写入需要审批就把阶段标记为 failed。",
     "如果当前阶段发现需要返工到更早阶段，请说明目标阶段和原因，不要自行改变工作流状态。",
+    "入境验收（重要）：如果存在前序阶段摘要（即非首阶段），动手当前阶段工作之前必须先核对前序阶段产出是否满足本阶段的输入要求——",
+    "  - 核对维度：前序阶段的 output_summary 是否覆盖了它声明的 required_outputs / 必写核心段；内容是否具体可用（不是空话套话）；是否与当前阶段任务衔接。",
+    "  - 不合格时：把当前阶段 status 写成 needs_rework、rework_target_stage_id 指向不合格的前序阶段、rework_reason 用一两句中文写明哪里不合格、缺了什么。",
+    "  - 合格时：继续当前阶段工作，无需在 output_summary 里专门说明验收通过。",
+    "  - 这不是挑刺，是'我能基于前序产出继续推进吗'的诚实自检——前序产出有缺口却硬推进，只会把问题留到 self_review 才暴露，成本更高。",
     "如果阶段要求输出结构化字段，请让 required_outputs 中的字段内容具体、可复用，并包含支撑判断的事实或路径。",
     "使用任何工具后，或在不需要工具时完成阶段工作后，请通过且仅通过一个符合下方协议的 JSON 对象结束当前阶段。",
     "最终 JSON 对象前后不要添加额外说明文字。",
@@ -83,6 +101,7 @@ export function buildStageInstructions(input: StageAgentInput): string {
     "此前阶段摘要：",
     previousStageLines || "无",
     retrySection,
+    reworkSection,
     "",
     "当前阶段：",
     `id: ${input.current_stage.id}`,
@@ -181,6 +200,22 @@ function describeAssertion(name: string): string {
       return "unknowns_present：unknowns 不能为空或仅写'无/none/n/a'。陌生代码区域几乎不存在'无未知'，请如实暴露。";
     case "item_matrix_when_multi":
       return "item_matrix_when_multi：任务涉及 ≥3 同类条目（数字范围/批量/逗号列表）时，required_outputs.item_matrix 必须是合法 markdown 表。";
+    case "confidence_levels_present":
+      return "confidence_levels_present：investigate 的 output_summary 必须出现置信度标记（high/medium/low 或'置信度'），每个 finding 标 [等级 + 依据类型]。self_review 优先核对 low/medium。";
+    case "callsites_inventory_present":
+      return "callsites_inventory_present：investigate 的 output_summary 必须含 '## 调用方清单' 标题段落，列目标符号所有调用方 + 每处语义假设。无目标符号可写'本次无目标符号'。";
+    case "boundary_enumeration_present":
+      return "boundary_enumeration_present：investigate 的 output_summary 必须含 '## 边界与异常路径' 标题段落，枚举空/零/负/并发/超时/失败/超大输入等已知需处理的边缘情况。";
+    case "preflight_risks_present":
+      return "preflight_risks_present：design 的 output_summary 必须含 '## 事前风险' 标题段落，列出最易出错处与最没把握的反例（事前预演，非事后挑刺）。";
+    case "design_alternatives_present":
+      return "design_alternatives_present：design 的 output_summary 必须含 '## 候选方案' 标题段落，列 ≥2 候选并排比较（复杂度/风险/可逆性维度）+ 选定理由。不允许只写一个方案。";
+    case "design_quadrant_eval_present":
+      return "design_quadrant_eval_present：design 的 output_summary 必须含 '## 方案评估' 标题段落，对选定方案给性能/安全/扩展/可维护四维简评（每维一两句 + 风险等级）。";
+    case "implement_delta_check_present":
+      return "implement_delta_check_present：implement 的 output_summary 必须含 '## 改动核对' 标题段落，每个改过文件一段（推进了哪条 success_criteria + 新风险）。未改动也要写说明。";
+    case "rollback_plan_when_irreversible":
+      return "rollback_plan_when_irreversible：implement 若执行了不可逆操作（rm/git reset/git clean/drop table/truncate），output_summary 必须含'回滚'或'rollback'字样，并在 '## 改动核对' 子段写明回滚步骤。";
     default:
       return `${name}：（断言）`;
   }

@@ -81,16 +81,28 @@ export class WorkflowEngine {
     if (missingOutputs.length > 0) {
       const maxRetry = stage?.auto_retry_limit ?? 0;
       const currentAttempt = this.getStageAttempt(session, stageRun.stage_id);
+      // 若 parse_diagnostics 已经发现 JSON 烂尾，极大概率"missing"的真因是 JSON 没解析出来，
+      // 而不是模型真的少写了字段。把诊断信息一并回传——避免模型反复输出同一份烂 JSON 还以为自己写对了。
+      const diag = result.parse_diagnostics;
+      const diagHint = diag?.had_unparsed_tail
+        ? ` (JSON parse 失败诊断：bracket_balance=${diag.bracket_balance}, tail_length=${diag.tail_length}, candidate_count=${diag.candidate_count}——最外层 JSON 大概率有未闭合字符串/花括号/多余引号。请本地 JSON.parse 验证一遍再回传，整段写成单一合法对象。)`
+        : "";
       if (currentAttempt <= maxRetry) {
-        return this.retryCurrentStage(session, workflow, `Missing required outputs: ${missingOutputs.join(", ")}`);
+        return this.retryCurrentStage(session, workflow, `Missing required outputs: ${missingOutputs.join(", ")}${diagHint}`);
       }
-      return this.blockCurrentStage(session, `Missing required outputs after ${currentAttempt} attempts: ${missingOutputs.join(", ")}`);
+      return this.blockCurrentStage(session, `Missing required outputs after ${currentAttempt} attempts: ${missingOutputs.join(", ")}${diagHint}`);
     }
 
     // 阶段产物自洽性断言：与 missing outputs 同模式走 retry → block。
     // 仅当 stage.hooks.post_output_assertions 显式声明时触发；未声明=透传，与既有工作流完全兼容。
     if (stage && this.runOutputAssertions(session, workflow, stage, stageRun, result)) {
       return session;
+    }
+
+    // 通过所有校验后落地 required_outputs 到 stageRun，供后续阶段的跨阶段断言读取。
+    // 这一步必须晚于 runOutputAssertions——失败重试时 stageRun 不应吸收无效产出。
+    if (result.required_outputs) {
+      stageRun.required_outputs = result.required_outputs;
     }
 
     return this.completeCurrentStage(session, workflow, result.output_summary);
@@ -111,7 +123,8 @@ export class WorkflowEngine {
     stageRun: StageRun,
     result: StageAgentResult
   ): boolean {
-    const failures = evaluateOutputAssertions(stage, result);
+    const prior = this.collectPriorOutputs(session, stageRun.stage_id);
+    const failures = evaluateOutputAssertions(stage, result, prior);
     if (failures.length === 0) return false;
     const reason = `Output assertions failed: ${failures.map((f) => `[${f.assertion}] ${f.message}`).join(" | ")}`;
     const maxRetry = stage.auto_retry_limit ?? 0;
@@ -122,6 +135,27 @@ export class WorkflowEngine {
       this.blockCurrentStage(session, `${reason} (after ${currentAttempt} attempts)`);
     }
     return true;
+  }
+
+  /**
+   * 收集已完成阶段的 required_outputs，构造 {stage_id: required_outputs} 字典传给断言层。
+   *
+   * 跳过自己（currentStageId），并对同一 stage_id 只取最新的 completed run——
+   * 这样 rework 走回 design 再前进时，新值会覆盖旧值。
+   */
+  private collectPriorOutputs(
+    session: AgentSession,
+    currentStageId: string
+  ): Record<string, Record<string, unknown> | undefined> {
+    const out: Record<string, Record<string, unknown> | undefined> = {};
+    for (const run of session.stage_runs ?? []) {
+      if (run.stage_id === currentStageId) continue;
+      if (run.status !== "completed" && run.status !== "waiting_approval") continue;
+      if (!run.required_outputs) continue;
+      // 后写入者覆盖——遍历顺序即时间顺序，最新 completed 自然胜出
+      out[run.stage_id] = run.required_outputs;
+    }
+    return out;
   }
 
   approveStage(session: AgentSession, workflow: WorkflowTemplate, stageId: string): AgentSession {
@@ -230,24 +264,18 @@ export class WorkflowEngine {
   }
 
   restartFromBeginning(session: AgentSession, workflow: WorkflowTemplate): AgentSession {
-    this.ensureState(session, workflow);
+    // 完全清理旧状态，重新开始
+    session.stage_runs = [];
+    session.rework_requests = [];
+    session.approvals = [];
+    session.error = undefined;
+    session.status = "running";
 
-    // 将所有现有的阶段运行标记为 superseded
-    for (const stageRun of session.stage_runs ?? []) {
-      if (stageRun.status === "running" || stageRun.status === "waiting_approval") {
-        stageRun.status = "superseded";
-        stageRun.completed_at = new Date().toISOString();
-      }
-    }
-
-    // 从第一个阶段重新开始
     const firstStage = workflow.stages[0];
     if (!firstStage) {
       throw new Error("Workflow has no stages");
     }
 
-    session.error = undefined;
-    session.status = "running";
     this.startStage(session, workflow, firstStage, session.task_prompt);
     return session;
   }
