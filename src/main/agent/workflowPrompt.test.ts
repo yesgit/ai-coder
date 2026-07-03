@@ -87,12 +87,12 @@ describe("buildStageInstructions", () => {
     expect(prompt).toContain("请先 Read");
 
     // post_output_assertions header 必须强调"输出后 / retry / blocked"
-    expect(prompt).toContain("本阶段产物自洽性断言（输出落地后由宿主评估，未通过按 auto_retry_limit 重试，超限走 blocked）");
+    expect(prompt).toContain("本阶段产物校验（输出落地后由宿主评估：自洽性断言扫产出文本、行为校验按 tool_calls 核对真动作；未通过按 auto_retry_limit 重试，超限走 blocked）");
     expect(prompt).toContain("review_self_consistency");
 
     // 两段 header 在 prompt 中按出现顺序排列，pre 在前
     const preIdx = prompt.indexOf("本阶段工序闸门");
-    const postIdx = prompt.indexOf("本阶段产物自洽性断言");
+    const postIdx = prompt.indexOf("本阶段产物校验");
     expect(preIdx).toBeGreaterThan(0);
     expect(postIdx).toBeGreaterThan(preIdx);
   });
@@ -123,7 +123,7 @@ describe("buildStageInstructions", () => {
 
     const prompt = buildStageInstructions(input);
     expect(prompt).not.toContain("本阶段工序闸门");
-    expect(prompt).toContain("本阶段产物自洽性断言");
+    expect(prompt).toContain("本阶段产物校验");
     expect(prompt).toContain("unknowns_present");
   });
 

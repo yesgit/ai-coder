@@ -1,11 +1,11 @@
 id: careful-coder
 name: 谨慎程序员
-version: 1.2.0
+version: 1.3.0
 description: 把人类资深开发者的"强制例程"软化为可读的纪律——取证、对齐、敌对自审，让模型像谨慎的同事一样工作。
 source:
   type: builtin
   id: careful-coder
-  version: 1.2.0
+  version: 1.3.0
 routing:
   enabled: true
   auto_start: true
@@ -63,6 +63,16 @@ rework:
 # - self_review：3 条闭环核对（优先核对 low/medium 置信项 + 调用方语义假设 + 测试清单执行）。
 # design 段分必写/按需写以控 output_summary 长度，降低 JSON 烂尾风险。
 # 烂尾回退策略：A 删 adversarial_critique；B 合并同类参考与调用方清单；C 放宽候选方案为≥1。
+#
+# v1.3 设计笔记（行为即证据——形式断言退场）：
+# v1.2 的 9 个扫标题/扫词断言实证为"形式合规"——模型填空壳 markdown 标题就能过，是仪式不是谨慎。
+# v1.3 把 investigate 的 4 条标题断言（investigate_structure_present / callsites_inventory_present /
+# boundary_enumeration_present / confidence_levels_present）退场，改用 post_output_checks 查 tool_calls：
+# 本阶段必须真跑过 git log。行为即证据——模型没法假装跑过一个没跑过的命令。
+# verify(self_review) 同理新增"必须真跑过 git diff"——敌对自审的前提是真看了 diff，不是口头说"应该通过"。
+# 思维模板仍留在 instructions 作引导，但不再被引擎扫；真正的谨慎由行为闸门保证。
+# 这是"把人类程序员心智切实落实"大方向的第一步（L1 行为校验下沉为引擎一等能力），后续相位见
+# docs/workflow-design-principles.md：外化认知状态 + 检查点观察 + 任意层 rework。
 stages:
   - id: understand
     name: 理解
@@ -107,7 +117,8 @@ stages:
       - unknowns 里写的是"代码里没有明确答案"的事项，不是"我没去查"的事项
       - 如果查证后发现用户任务描述与实际代码不符，以代码为准，在 output_summary 里说明
 
-      ⚠️ **output_summary（自然语言总结）必须按以下 markdown 模板写**（7 个标题不能省）：
+      ⚠️ **output_summary（自然语言总结）建议按以下 markdown 模板写**（引导思维，不是形式要求——
+      引擎不再扫这些标题，改为按 tool_calls 核对你**本阶段真跑过 git log**：调查的真证据是行为，不是标题）：
 
       ```markdown
       ## 调查任务清单
@@ -160,15 +171,20 @@ stages:
       - unknowns
     auto_retry_limit: 3
     hooks:
+      # v1.3：4 条扫标题的形式断言（investigate_structure_present / callsites_inventory_present /
+      # boundary_enumeration_present / confidence_levels_present）退场——它们只校验 markdown 标题字面存在，
+      # 模型填空壳就能过，是仪式不是谨慎。改为 post_output_checks 查 tool_calls：本阶段真跑过 git log
+      # 才算调查过。行为即证据，不可糊弄。模板仍留在 instructions 作思维引导。
       post_output_assertions:
-        - investigate_structure_present
-        - callsites_inventory_present
-        - boundary_enumeration_present
-        - confidence_levels_present
         - needs_rework_target_required
         - hedged_findings_demoted
         - unknowns_present
         - no_trailing_unparsed_payload
+      post_output_checks:
+        - require:
+            commands_run:
+              - "git log "
+          on_fail: "investigate 必须真跑过 git log（宿主按 tool_calls 核对，写文字不算数）——本轮调查的行为证据"
   - id: align
     name: 对齐
     instructions: |
@@ -360,3 +376,12 @@ stages:
         - needs_rework_target_required
         - hedged_findings_demoted
         - no_trailing_unparsed_payload
+      # v1.3：自审(self_review)必须真跑过 git diff——敌对自审的前提是真看了 diff，不是口头说"应该通过"。
+      # 这把 instructions 里"真去跑测试/构建/lint，不允许只口头说"从口号变成可糊弄不过的硬约束。
+      # 注：needle 用 "git diff"（无尾空格）——裸 `git diff` 是最常见形式，加尾空格会漏掉它；
+      # 代价是 `git difftool`/`git diff-tree` 等子串也命中，但作为逃逸手段极不可能，可接受。
+      post_output_checks:
+        - require:
+            commands_run:
+              - "git diff"
+          on_fail: "自审必须真跑过 git diff 看本次改动（宿主按 tool_calls 核对）——没看 diff 就 pass 是空审"

@@ -128,7 +128,28 @@ const stageHooksSchema = z
       )
       .min(1)
       .optional(),
-    post_output_assertions: z.array(postOutputAssertionSchema).min(1).optional()
+    post_output_assertions: z.array(postOutputAssertionSchema).min(1).optional(),
+    post_output_checks: z
+      .array(
+        z.object({
+          require: z
+            .object({
+              commands_run: z.array(z.string().min(1)).optional(),
+              files_read: z
+                .array(z.object({ target: z.string().min(1), min: z.number().int().min(1) }))
+                .optional()
+            })
+            .refine(
+              (req) =>
+                (req.commands_run && req.commands_run.length > 0) ||
+                (req.files_read && req.files_read.length > 0),
+              "post_output_check require must declare at least one constraint (commands_run or files_read)"
+            ),
+          on_fail: z.string().min(1)
+        })
+      )
+      .min(1)
+      .optional()
   })
   .optional();
 

@@ -118,7 +118,14 @@ function extractTargetPaths(input: Record<string, unknown>): string[] {
 
 const READ_LIKE_TOOLS = new Set(["Read", "Grep", "Glob", "LS", "NotebookRead"]);
 
-function countReadHits(toolCalls: ToolCallRecord[], target: string, projectPath: string): number {
+/**
+ * 统计 target 文件被 Read/Grep/Glob/LS 等读取类工具命中的次数。
+ * 供 pre_tool_use 闸门（"改文件前先读够次数"）与 post_output_checks（"本阶段真看过目标"）共用。
+ *
+ * 传入的 toolCalls 应已按需切片：pre_tool_use 传 session 全量（累计准备度），
+ * post_output_checks 传本阶段切片（验证本轮真发生）。语义由调用方决定，本函数只数命中。
+ */
+export function countReadHits(toolCalls: ToolCallRecord[], target: string, projectPath: string): number {
   const targetKey = normalizePath(target, projectPath);
   let count = 0;
   for (const call of toolCalls) {
@@ -140,7 +147,7 @@ function countReadHits(toolCalls: ToolCallRecord[], target: string, projectPath:
   return count;
 }
 
-function hasShellRun(toolCalls: ToolCallRecord[], needle: string): boolean {
+export function hasShellRun(toolCalls: ToolCallRecord[], needle: string): boolean {
   const lower = needle.toLowerCase();
   return toolCalls.some((call) => {
     if (call.tool !== "Bash") return false;

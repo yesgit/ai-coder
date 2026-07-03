@@ -134,10 +134,41 @@ export type StageOutputAssertion =
    */
   | "no_trailing_unparsed_payload";
 
+/**
+ * 阶段产物落地时的*行为*校验——post_output_assertions 的参数化兄弟。
+ *
+ * 与 post_output_assertions（扫产出文本形态，L3，可被模板糊弄）的根本区别：
+ * 这里校验的是**本阶段的工具调用序列**（L1，行为即证据，不可糊弄）——
+ * "你真跑过这条命令吗 / 你真读过目标文件吗"。模型可以写一堵 markdown 标题糊弄文本断言，
+ * 但没法假装跑过一个没跑过的命令。
+ *
+ * 镜像 pre_tool_use 的 require/on_fail 约定，使"动手前门控"与"落地后门控"共用同一套行为词汇。
+ * 评估范围：post_output_checks 按 stage_id 过滤 session.tool_calls 取*本阶段*切片
+ * （验证本轮真发生，而非全会话累计——rework 回炉后第二轮仍须重新验证）。
+ */
+export interface PostOutputBehaviorCheck {
+  require: {
+    /**
+     * 本阶段内必须跑过包含这些子串的 Bash 命令，每条都要满足（与 pre_tool_use.shell_must_have_run
+     * 同语义，但作用域为本阶段切片）。如 ["git log "] / ["git diff"] / ["npm test"]。
+     */
+    commands_run?: string[];
+    /**
+     * 本阶段内必须 Read/Grep/Glob 命中目标文件至少 min 次。用于强制"真看过"关键文件。
+     * target 为项目相对路径或 basename（与 same_file_reads_min 同一归一化）。
+     */
+    files_read?: { target: string; min: number }[];
+  };
+  /** 命中失败时回传给模型的中文人话提示。与 pre_tool_use.on_fail 同约定。 */
+  on_fail: string;
+}
+
 export interface StageHooksConfig {
   pre_tool_use?: PreToolUseHookRule[];
-  /** 阶段输出落地时按顺序评估的断言名。失败按 stage.auto_retry_limit 重试，超限走 block。 */
+  /** 阶段输出落地时按顺序评估的断言名（扫产出文本，L3）。失败按 stage.auto_retry_limit 重试，超限走 block。 */
   post_output_assertions?: StageOutputAssertion[];
+  /** 阶段输出落地时按顺序评估的行为校验（查 tool_calls，L1，不可糊弄）。与 post_output_assertions 同走 retry → block。 */
+  post_output_checks?: PostOutputBehaviorCheck[];
 }
 
 export interface WorkflowStage {

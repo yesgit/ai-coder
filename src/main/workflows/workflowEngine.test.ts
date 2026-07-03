@@ -389,6 +389,189 @@ describe("WorkflowEngine", () => {
     expect(session.status).not.toBe("blocked");
   });
 
+  it("post_output_checks: 本阶段未跑指定命令 → retry → 超限 block；跑过后放行", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+    const wf: WorkflowTemplate = {
+      ...workflow,
+      stages: [
+        {
+          id: "investigate",
+          name: "Investigate",
+          auto_retry_limit: 1,
+          hooks: {
+            post_output_checks: [
+              { require: { commands_run: ["git log "] }, on_fail: "investigate 必须真跑过 git log" }
+            ]
+          }
+        }
+      ]
+    };
+
+    engine.ensureState(session, wf);
+    // session.tool_calls 里没有 stage_id=investigate 的 git log 调用 → 行为校验失败 → retry
+    engine.applyStageResult(session, wf, {
+      status: "completed",
+      output_summary: "我查过了（但其实没跑命令）"
+    });
+    expect(session.status).toBe("running");
+    expect(session.error).toContain("commands_run");
+    expect(session.error).toContain("git log");
+    expect(session.stage_runs?.[0]).toMatchObject({ attempt: 2, status: "running" });
+
+    // 仍没跑 → 超限 block
+    engine.applyStageResult(session, wf, {
+      status: "completed",
+      output_summary: "还是没跑"
+    });
+    expect(session.status).toBe("blocked");
+
+    // 另一会话：真跑了 git log（stage_id 匹配）→ 放行
+    const session2 = createSession();
+    engine.ensureState(session2, wf);
+    session2.tool_calls.push({
+      id: "tc1",
+      stage_id: "investigate",
+      tool: "Bash",
+      input: { command: "git log --oneline -5" },
+      status: "completed",
+      created_at: "t"
+    });
+    engine.applyStageResult(session2, wf, { status: "completed", output_summary: "已查证" });
+    expect(session2.status).not.toBe("blocked");
+    expect(session2.stage_runs?.[0]).toMatchObject({ status: "completed" });
+  });
+
+  it("post_output_checks: 他阶段（stage_id 不匹配）的命令不算本阶段行为", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+    const wf: WorkflowTemplate = {
+      ...workflow,
+      stages: [
+        {
+          id: "investigate",
+          name: "Investigate",
+          auto_retry_limit: 0,
+          hooks: {
+            post_output_checks: [
+              { require: { commands_run: ["git log "] }, on_fail: "本阶段须跑 git log" }
+            ]
+          }
+        }
+      ]
+    };
+    engine.ensureState(session, wf);
+    // git log 跑在 implement 阶段，不算 investigate 的本阶段行为 → 失败 block
+    session.tool_calls.push({
+      id: "tc-other",
+      stage_id: "implement",
+      tool: "Bash",
+      input: { command: "git log --oneline" },
+      status: "completed",
+      created_at: "t"
+    });
+    engine.applyStageResult(session, wf, { status: "completed", output_summary: "查过了" });
+    expect(session.status).toBe("blocked");
+  });
+
+  it("post_output_checks: 同阶段前序 rework run 的旧调用不算本轮（per-run 切片）", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+    const wf: WorkflowTemplate = {
+      ...workflow,
+      stages: [
+        {
+          id: "investigate",
+          name: "Investigate",
+          auto_retry_limit: 0, // 直接 block，便于断言
+          hooks: {
+            post_output_checks: [
+              { require: { commands_run: ["git log "] }, on_fail: "本轮须跑 git log" }
+            ]
+          }
+        }
+      ]
+    };
+    // run-1（已完成，跑过 git log，created_at=T1）+ run-2（rework 回炉，running，started_at=T2>T1）
+    session.stage_runs = [
+      {
+        id: "run-1", stage_id: "investigate", attempt: 1, status: "completed",
+        input_summary: "", output_summary: "首轮查证", required_outputs: {},
+        started_at: "2026-01-01T00:00:00.000Z", completed_at: "2026-01-01T00:00:05.000Z"
+      },
+      {
+        id: "run-2", stage_id: "investigate", attempt: 2, status: "running",
+        input_summary: "Rework requested", started_at: "2026-01-02T00:00:00.000Z"
+      }
+    ];
+    session.current_stage = "investigate";
+    // run-1 的 git log 调用，created_at=T1，早于 run-2.started_at=T2 → 不应算本轮
+    session.tool_calls.push({
+      id: "tc-old", stage_id: "investigate", tool: "Bash",
+      input: { command: "git log --oneline" }, status: "completed",
+      created_at: "2026-01-01T00:00:01.000Z"
+    });
+    // run-2 没跑 git log → 行为检查应失败 block（即便 run-1 跑过）
+    engine.applyStageResult(session, wf, { status: "completed", output_summary: "复用上轮结论" });
+    expect(session.status).toBe("blocked");
+    expect(session.error).toContain("git log");
+
+    // 对照：run-2 真跑过 git log（created_at ≥ T2）→ 放行
+    const session2 = createSession();
+    session2.stage_runs = [
+      {
+        id: "run-1b", stage_id: "investigate", attempt: 1, status: "completed",
+        input_summary: "", output_summary: "首轮", required_outputs: {},
+        started_at: "2026-01-01T00:00:00.000Z", completed_at: "2026-01-01T00:00:05.000Z"
+      },
+      {
+        id: "run-2b", stage_id: "investigate", attempt: 2, status: "running",
+        input_summary: "Rework", started_at: "2026-01-02T00:00:00.000Z"
+      }
+    ];
+    session2.current_stage = "investigate";
+    session2.tool_calls.push({
+      id: "tc-new", stage_id: "investigate", tool: "Bash",
+      input: { command: "git log --oneline" }, status: "completed",
+      created_at: "2026-01-02T00:00:01.000Z" // ≥ run-2b.started_at
+    });
+    engine.applyStageResult(session2, wf, { status: "completed", output_summary: "重查证" });
+    expect(session2.status).not.toBe("blocked");
+  });
+
+  it("post_output_checks: needs_rework 不触行为检查（仅 completed 才门控行为）", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+    const wf: WorkflowTemplate = {
+      ...workflow,
+      stages: [
+        {
+          id: "investigate",
+          name: "Investigate",
+          auto_retry_limit: 1,
+          hooks: {
+            post_output_assertions: ["needs_rework_target_required"],
+            post_output_checks: [
+              { require: { commands_run: ["git log "] }, on_fail: "本轮须跑 git log" }
+            ]
+          }
+        }
+      ]
+    };
+    engine.ensureState(session, wf);
+    // 模型发 needs_rework 但缺 target/reason，且没跑 git log——
+    // 早期分支应只触 needs_rework_target_required（文本断言），不触行为检查（status != completed）
+    engine.applyStageResult(session, wf, {
+      status: "needs_rework",
+      output_summary: "要回炉 understand"
+      // 故意缺 rework_target_stage_id / rework_reason
+    });
+    expect(session.status).toBe("running"); // 走 retry
+    expect(session.error).toContain("needs_rework_target_required");
+    expect(session.error).not.toContain("git log");
+    expect(session.error).not.toContain("commands_run");
+  });
+
   it("needs_rework_target_required: 声明该断言时，缺 target → retry 而非立即 block", () => {
     const engine = new WorkflowEngine();
     const session = createSession();

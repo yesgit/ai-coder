@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { evaluateOutputAssertions } from "../agent/stageOutputAssertions.js";
+import { evaluateBehaviorChecks, evaluateOutputAssertions } from "../agent/stageOutputAssertions.js";
 import type {
   AgentSession,
   ApprovalRecord,
@@ -124,9 +124,28 @@ export class WorkflowEngine {
     result: StageAgentResult
   ): boolean {
     const prior = this.collectPriorOutputs(session, stageRun.stage_id);
-    const failures = evaluateOutputAssertions(stage, result, prior);
-    if (failures.length === 0) return false;
-    const reason = `Output assertions failed: ${failures.map((f) => `[${f.assertion}] ${f.message}`).join(" | ")}`;
+    const textFailures = evaluateOutputAssertions(stage, result, prior);
+    // 行为校验（L1，行为即证据）只在阶段声明"完成"时生效——needs_rework/failed 不主张完成了工作，
+    // 不应被行为门控（否则 needs_rework 早期分支会误触，且模型可用合法 needs_rework 逃逸行为要求）。
+    // 切片范围：stage_id 匹配 + created_at ≥ 本次 stageRun.started_at——既排除他阶段调用，
+    // 也排除同阶段前序 rework run 的旧调用（rework 起 new stageRun 有新 started_at，旧 run 调用被排除，
+    // 第二轮须重新验证）；retry 复用同一 stageRun 不改 started_at，故同 run 多 attempt 调用都算，
+    // 符合"本次 stageRun 真发生过"语义。与文本断言（L3）合并走同一条 retry → block。
+    const behaviorFailures = result.status === "completed"
+      ? evaluateBehaviorChecks(
+          stage,
+          (session.tool_calls ?? []).filter(
+            (tc) => tc.stage_id === stageRun.stage_id && tc.created_at >= stageRun.started_at
+          ),
+          session.project_path
+        )
+      : [];
+    const allFailures = [
+      ...textFailures.map((f) => `[${f.assertion}] ${f.message}`),
+      ...behaviorFailures.map((f) => `[${f.check}] ${f.message}`)
+    ];
+    if (allFailures.length === 0) return false;
+    const reason = `Output checks failed: ${allFailures.join(" | ")}`;
     const maxRetry = stage.auto_retry_limit ?? 0;
     const currentAttempt = this.getStageAttempt(session, stageRun.stage_id);
     if (currentAttempt <= maxRetry) {

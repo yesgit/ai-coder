@@ -1,4 +1,4 @@
-import type { StageAgentInput, StageHooksConfig } from "../../shared/types.js";
+import type { PostOutputBehaviorCheck, StageAgentInput, StageHooksConfig } from "../../shared/types.js";
 import { isMeaningfulAgentText } from "../../shared/agentMessages.js";
 
 export function buildStageInstructions(input: StageAgentInput): string {
@@ -114,7 +114,7 @@ export function buildStageInstructions(input: StageAgentInput): string {
       ? ["", "本阶段工序闸门（在工具调用前由宿主校验，未满足会被 deny 并要求补齐）：", hookSections.preToolUse]
       : []),
     ...(hookSections.postOutput
-      ? ["", "本阶段产物自洽性断言（输出落地后由宿主评估，未通过按 auto_retry_limit 重试，超限走 blocked）：", hookSections.postOutput]
+      ? ["", "本阶段产物校验（输出落地后由宿主评估：自洽性断言扫产出文本、行为校验按 tool_calls 核对真动作；未通过按 auto_retry_limit 重试，超限走 blocked）：", hookSections.postOutput]
       : []),
     "",
     "最终 JSON 协议：",
@@ -156,7 +156,7 @@ export function buildStageInstructions(input: StageAgentInput): string {
  */
 function describeStageHooks(hooks: StageHooksConfig | undefined): { preToolUse: string | null; postOutput: string | null } {
   const preToolUse = describePreToolUse(hooks?.pre_tool_use);
-  const postOutput = describePostOutputAssertions(hooks?.post_output_assertions);
+  const postOutput = describePostOutput(hooks);
   return { preToolUse, postOutput };
 }
 
@@ -185,9 +185,32 @@ function describePreToolUse(rules: StageHooksConfig["pre_tool_use"]): string | n
     .join("\n");
 }
 
-function describePostOutputAssertions(assertions: StageHooksConfig["post_output_assertions"]): string | null {
-  if (!assertions || assertions.length === 0) return null;
-  return assertions.map((name, idx) => `${idx + 1}. ${describeAssertion(name)}`).join("\n");
+function describePostOutput(hooks: StageHooksConfig | undefined): string | null {
+  const lines: string[] = [];
+  const assertions = hooks?.post_output_assertions;
+  if (assertions && assertions.length > 0) {
+    assertions.forEach((name) => lines.push(`${lines.length + 1}. ${describeAssertion(name)}`));
+  }
+  const checks = hooks?.post_output_checks;
+  if (checks && checks.length > 0) {
+    checks.forEach((check) => lines.push(`${lines.length + 1}. ${describeBehaviorCheck(check)}`));
+  }
+  return lines.length > 0 ? lines.join("\n") : null;
+}
+
+function describeBehaviorCheck(check: PostOutputBehaviorCheck): string {
+  const reqs: string[] = [];
+  if (check.require.commands_run?.length) {
+    reqs.push(
+      `本阶段必须真跑过包含 ${check.require.commands_run.map((s) => `\`${s.trim()}\``).join(" / ")} 的 Bash 命令（宿主按 tool_calls 核对，写文字不算数）`
+    );
+  }
+  if (check.require.files_read?.length) {
+    reqs.push(
+      `本阶段必须 Read/Grep 命中 ${check.require.files_read.map((f) => `\`${f.target}\` ≥ ${f.min} 次`).join(" / ")}`
+    );
+  }
+  return `行为校验：${reqs.join("；")}。否则：${check.on_fail}`;
 }
 
 function describeAssertion(name: string): string {

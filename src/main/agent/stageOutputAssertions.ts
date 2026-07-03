@@ -1,8 +1,11 @@
 import type {
+  PostOutputBehaviorCheck,
   StageAgentResult,
   StageOutputAssertion,
+  ToolCallRecord,
   WorkflowStage
 } from "../../shared/types.js";
+import { countReadHits, hasShellRun } from "./stageHookEnforcer.js";
 
 /**
  * 阶段产物落地侧的断言评估器。
@@ -49,6 +52,74 @@ export function evaluateOutputAssertions(
 }
 
 type AssertionImpl = (result: StageAgentResult, prior: PriorStageOutputs) => string | null;
+
+/**
+ * 行为校验失败。与 AssertionFailure 平行——这里 check 是行为检查标签（commands_run/files_read 组合），
+ * 不进 StageOutputAssertion 联合（那是文本断言名）。引擎层把两类失败合并走同一条 retry → block 路径。
+ */
+export type BehaviorCheckFailure = { check: string; message: string };
+
+/**
+ * 评估 stage.hooks.post_output_checks——行为即证据层（L1）。
+ *
+ * 与 evaluateOutputAssertions（扫产出文本，L3，可被模板糊弄）解耦：
+ * - 那边管"写出来的东西形态对不对"；
+ * - 这边管"该做的动作真做了没"——查 tool_calls，模型没法假装跑过一个没跑过的命令。
+ *
+ * 传入的 toolCalls 由调用方按 stage_id + created_at ≥ 本次 stageRun.started_at 过滤——
+ * 排除他阶段调用与同阶段前序 rework run 的旧调用（rework 第二轮须重新验证）；
+ * retry 复用同一 stageRun 不改 started_at，故同 run 多 attempt 调用都算。
+ *
+ * 调用方仅在 result.status === "completed" 时调用本函数——needs_rework/failed 不主张完成，不适用行为门控。
+ *
+ * 实现纯函数 / 只读 / 无 IO。复用 stageHookEnforcer 的 hasShellRun/countReadHits，与 pre_tool_use 同一套行为判定。
+ */
+export function evaluateBehaviorChecks(
+  stage: WorkflowStage,
+  toolCalls: ToolCallRecord[],
+  projectPath: string
+): BehaviorCheckFailure[] {
+  const checks = stage.hooks?.post_output_checks;
+  if (!checks || checks.length === 0) return [];
+  const failures: BehaviorCheckFailure[] = [];
+  for (const check of checks) {
+    const missing = checkBehaviorRequire(check, toolCalls, projectPath);
+    if (missing) {
+      failures.push({ check: behaviorCheckLabel(check), message: `${check.on_fail}（缺：${missing}）` });
+    }
+  }
+  return failures;
+}
+
+function behaviorCheckLabel(check: PostOutputBehaviorCheck): string {
+  const parts: string[] = [];
+  if (check.require.commands_run?.length) {
+    parts.push(`commands_run[${check.require.commands_run.join(",")}]`);
+  }
+  if (check.require.files_read?.length) {
+    parts.push(`files_read[${check.require.files_read.map((f) => f.target).join(",")}]`);
+  }
+  return parts.join("+") || "post_output_check";
+}
+
+function checkBehaviorRequire(
+  check: PostOutputBehaviorCheck,
+  toolCalls: ToolCallRecord[],
+  projectPath: string
+): string | null {
+  const { commands_run, files_read } = check.require;
+  if (commands_run && commands_run.length > 0) {
+    const missing = commands_run.filter((needle) => !hasShellRun(toolCalls, needle));
+    if (missing.length > 0) return `本阶段未执行：${missing.join(" / ")}`;
+  }
+  if (files_read && files_read.length > 0) {
+    const under = files_read.filter((f) => countReadHits(toolCalls, f.target, projectPath) < f.min);
+    if (under.length > 0) {
+      return `目标文件读取不足：${under.map((f) => `${f.target}(需${f.min})`).join(" / ")}`;
+    }
+  }
+  return null;
+}
 
 /**
  * "动手完发现自己列出问题却写 pass" —— 本次案例的直接病灶。
