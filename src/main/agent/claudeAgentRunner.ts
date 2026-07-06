@@ -328,15 +328,7 @@ export class ClaudeAgentRunner {
   }
 
   private describeSdkMessage(message: unknown): string {
-    if (typeof message === "object" && message !== null && "type" in message && typeof message.type === "string") {
-      // 如果是工具调用消息，输出工具名称
-      if (message.type === "tool_use" || message.type === "tool_result") {
-        const toolName = (message as { name?: unknown; tool_name?: unknown }).name ?? (message as { tool_name?: unknown }).tool_name ?? "unknown";
-        return `收到 Claude SDK 工具调用：${toolName}`;
-      }
-      return `收到 Claude SDK 消息：${message.type}`;
-    }
-    return "收到 Claude SDK 消息。";
+    return describeSdkMessageSnippet(message);
   }
 
   private hasBlockedToolCall(session: AgentSession): boolean {
@@ -496,4 +488,50 @@ function isAbortError(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
   const name = (error as { name?: unknown }).name;
   return name === "AbortError";
+}
+
+/**
+ * 把一条 SDK 消息摘要成活动流可读的片段——assistant 文本前 80 字 / tool_use 工具名+关键参数，
+ * 让实时活动流能看出"在干嘛"，而非只显示"收到 Claude SDK 消息：assistant"。
+ *
+ * SDK 消息结构假设与 extractClaudeStageOutput 一致：assistant message 的内容在
+ * `message.message.content`（content blocks：text / tool_use）。
+ */
+export function describeSdkMessageSnippet(message: unknown): string {
+  if (typeof message !== "object" || message === null) return "收到 Claude SDK 消息。";
+  const msg = message as Record<string, unknown>;
+  const type = typeof msg.type === "string" ? msg.type : "";
+
+  if (type === "assistant") {
+    const inner = isPlainObject(msg.message) ? (msg.message as Record<string, unknown>) : undefined;
+    const content = Array.isArray(inner?.content) ? inner!.content : [];
+    const parts: string[] = [];
+    for (const block of content) {
+      if (!isPlainObject(block)) continue;
+      if (block.type === "text" && typeof block.text === "string") {
+        const snippet = block.text.replace(/\s+/g, " ").trim().slice(0, 80);
+        if (snippet) parts.push(snippet);
+      } else if (block.type === "tool_use") {
+        const name = String(block.name ?? "unknown");
+        parts.push(`调用 ${name}${describeToolInputSnippet(block.input)}`);
+      }
+    }
+    return parts.length > 0 ? parts.join(" | ") : "助手消息（无文本）";
+  }
+  if (type === "tool_result") return "工具结果";
+  if (type === "result") return "阶段结果";
+  return type ? `SDK:${type}` : "收到 Claude SDK 消息。";
+}
+
+function describeToolInputSnippet(input: unknown): string {
+  if (!isPlainObject(input)) return "";
+  const filePath = input.file_path ?? input.path;
+  if (typeof filePath === "string") return `(${filePath})`;
+  const cmd = input.command;
+  if (typeof cmd === "string") return `(${cmd.replace(/\s+/g, " ").trim().slice(0, 60)})`;
+  return "";
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

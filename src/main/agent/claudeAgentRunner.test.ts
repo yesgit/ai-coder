@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ClaudeAgentRunner } from "./claudeAgentRunner.js";
+import { ClaudeAgentRunner, describeSdkMessageSnippet } from "./claudeAgentRunner.js";
 import type { AgentSession, WorkflowTemplate } from "../../shared/types.js";
 
 const workflow: WorkflowTemplate = {
@@ -181,5 +181,60 @@ describe("ClaudeAgentRunner", () => {
       status: "failed",
       output_summary: expect.stringContaining("Invalid API key")
     });
+  });
+});
+
+describe("describeSdkMessageSnippet", () => {
+  it("assistant 文本 block 提取前 80 字", () => {
+    const msg = {
+      type: "assistant",
+      message: { content: [{ type: "text", text: "正在查看登录模块的实现，确认鉴权逻辑..." }] }
+    };
+    expect(describeSdkMessageSnippet(msg)).toBe("正在查看登录模块的实现，确认鉴权逻辑...");
+  });
+
+  it("assistant 文本超长截断 80 字", () => {
+    const long = "x".repeat(120);
+    const msg = { type: "assistant", message: { content: [{ type: "text", text: long }] } };
+    expect(describeSdkMessageSnippet(msg).length).toBe(80);
+  });
+
+  it("assistant tool_use 提取工具名 + file_path", () => {
+    const msg = {
+      type: "assistant",
+      message: { content: [{ type: "tool_use", name: "Read", input: { file_path: "src/auth.ts" } }] }
+    };
+    expect(describeSdkMessageSnippet(msg)).toBe("调用 Read(src/auth.ts)");
+  });
+
+  it("assistant tool_use 提取 command 片段", () => {
+    const msg = {
+      type: "assistant",
+      message: { content: [{ type: "tool_use", name: "Bash", input: { command: "git log --oneline -5" } }] }
+    };
+    expect(describeSdkMessageSnippet(msg)).toBe("调用 Bash(git log --oneline -5)");
+  });
+
+  it("assistant 混合 text + tool_use", () => {
+    const msg = {
+      type: "assistant",
+      message: {
+        content: [
+          { type: "text", text: "先看一下历史。" },
+          { type: "tool_use", name: "Bash", input: { command: "git log" } }
+        ]
+      }
+    };
+    expect(describeSdkMessageSnippet(msg)).toBe("先看一下历史。 | 调用 Bash(git log)");
+  });
+
+  it("assistant 无 content", () => {
+    expect(describeSdkMessageSnippet({ type: "assistant", message: { content: [] } })).toBe("助手消息（无文本）");
+  });
+
+  it("result / tool_result / 其他类型", () => {
+    expect(describeSdkMessageSnippet({ type: "result" })).toBe("阶段结果");
+    expect(describeSdkMessageSnippet({ type: "tool_result" })).toBe("工具结果");
+    expect(describeSdkMessageSnippet({ type: "system" })).toBe("SDK:system");
   });
 });
