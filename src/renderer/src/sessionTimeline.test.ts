@@ -127,7 +127,7 @@ describe("buildSessionTimeline", () => {
     expect(events.map((event) => event.title)).toContain("阶段开始：计划 第 2 次尝试");
   });
 
-  it("shows transient progress in the timeline (marked transient)", () => {
+  it("keeps transient progress out of the timeline (transient goes to activity stream)", () => {
     const events = buildSessionTimeline({
       ...session,
       progress_events: [
@@ -148,17 +148,10 @@ describe("buildSessionTimeline", () => {
       ]
     });
 
-    const transientProgress = events.find((e) => e.detail === "收到 Claude SDK 消息：assistant");
-    const milestoneProgress = events.find((e) => e.detail === "开始执行阶段：Plan");
-
-    // v2：transient 现在也展示（让用户看到"在跑"），但标记 transient 以供渲染区分轻样式
-    expect(transientProgress).toBeDefined();
-    expect(transientProgress?.transient).toBe(true);
-    expect(transientProgress?.title).toBe("实时活动");
-    // milestone 不标 transient
-    expect(milestoneProgress).toBeDefined();
-    expect(milestoneProgress?.transient).toBeFalsy();
-    expect(milestoneProgress?.title).toBe("运行进度");
+    // transient 走独立活动流，不进 timeline 节点
+    expect(events.map((event) => event.detail)).not.toContain("收到 Claude SDK 消息：assistant");
+    // milestone 仍在 timeline
+    expect(events.map((event) => event.detail)).toContain("开始执行阶段：Plan");
   });
 
   it("filters out empty or placeholder assistant messages", () => {

@@ -761,6 +761,15 @@ export default function App() {
   );
   const timeline = useMemo(() => timelineAll.slice(0, timelineLimit), [timelineAll, timelineLimit]);
   const showMoreTimeline = timelineAll.length > timelineLimit;
+  const activityEvents = useMemo(
+    () => (activeSession?.progress_events ?? []).filter((p) => p.visibility === "transient").slice(-80),
+    [activeSession]
+  );
+  const activityStreamRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = activityStreamRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [activityEvents]);
   const latestProgress = activeSession?.progress_events?.at(-1);
   const showOnboardingWarning = onboardingRequired;
 
@@ -1302,24 +1311,31 @@ export default function App() {
               {pendingReworkRequests.length > 0 && (
                 <div className="pending-banner">{pendingReworkRequests.length} 个返工请求等待审批。</div>
               )}
+              {activityEvents.length > 0 && (
+                <section className="activity-stream">
+                  <div className="activity-stream-header">实时活动（滚动）</div>
+                  <div className="activity-stream-body" ref={activityStreamRef}>
+                    {activityEvents.map((p) => (
+                      <div key={p.id} className="activity-item">
+                        <time>{formatTimestamp(p.created_at)}</time>
+                        <span className="muted">{p.message}</span>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              )}
               <div className="timeline">
                 {timeline.map((event: TimelineEvent) => (
-                  <article
-                    key={event.id}
-                    className={`timeline-item ${event.type}${event.transient ? " transient" : ""}`}
-                  >
+                  <article key={event.id} className={`timeline-item ${event.type}`}>
                     <div className="timeline-meta">
                       <time>{formatTimestamp(event.timestamp)}</time>
                       {event.status && <span className="timeline-status">{formatStatus(event.status)}</span>}
                     </div>
                     <div className="timeline-body">
                       <strong>{event.title}</strong>
-                      {event.detail &&
-                        (event.transient ? (
-                          <small className="muted">{event.detail}</small>
-                        ) : (
-                          <MarkdownContent>{event.detail}</MarkdownContent>
-                        ))}
+                      {event.detail && (
+                        <MarkdownContent>{event.detail}</MarkdownContent>
+                      )}
                     </div>
                   </article>
                 ))}

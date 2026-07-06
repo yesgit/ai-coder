@@ -1155,22 +1155,41 @@ textarea {
   background: #7f56d9;
 }
 
-/* 瞬时进度（SDK 消息/工具决策/重试中）：灰显 + 小圆点，与 milestone 区分，
-   让用户看到"在跑"而不喧宾夺主。 */
-.timeline-item.transient {
-  opacity: 0.62;
+/* 实时活动流：transient 进度（SDK 消息/工具决策/重试中）单独滚动展示，
+   不占 timeline 节点，保持关键节点干净。最新在底，自动滚。 */
+.activity-stream {
+  border: 1px solid #d9e2ec;
+  border-radius: 6px;
+  margin-bottom: 16px;
+  background: #f9fafb;
+  overflow: hidden;
 }
 
-.timeline-item.transient::before {
-  background: #9ca3af;
-  width: 6px;
-  height: 6px;
-  top: 4px;
-  left: -5px;
+.activity-stream-header {
+  padding: 6px 12px;
+  font-size: 12px;
+  color: #667085;
+  border-bottom: 1px solid #d9e2ec;
+  background: #f2f4f7;
 }
 
-.timeline-item.transient .timeline-body strong {
-  font-weight: 500;
+.activity-stream-body {
+  max-height: 160px;
+  overflow-y: auto;
+  padding: 6px 12px;
+}
+
+.activity-item {
+  display: grid;
+  grid-template-columns: 64px 1fr;
+  gap: 8px;
+  font-size: 12px;
+  color: #475467;
+  padding: 2px 0;
+}
+
+.activity-item time {
+  color: #98a2b3;
 }
 
 .timeline-meta {

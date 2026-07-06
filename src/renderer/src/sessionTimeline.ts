@@ -24,8 +24,6 @@ export interface TimelineEvent {
   sort_order: number;
   /** 是否需要用户处理（待审批/待回答）— 这类事件优先显示在最上面 */
   needs_user_action?: boolean;
-  /** 是否为瞬时进度（SDK 消息/工具决策/重试中）— 渲染时用更轻样式，与 milestone 区分 */
-  transient?: boolean;
 }
 
 export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
@@ -121,17 +119,18 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
     }
   });
 
+  // transient 进度（SDK 消息/工具决策/重试中）走独立活动流，不进 timeline 节点；
+  // timeline 只留 milestone 进度，保持关键节点干净。
   (session.progress_events ?? []).forEach((progress: SessionProgressEvent) => {
-    const isTransient = progress.visibility === "transient";
+    if (progress.visibility === "transient") return;
     events.push({
       id: `${session.id}:progress:${progress.id}`,
       type: "status",
-      title: isTransient ? "实时活动" : "运行进度",
+      title: "运行进度",
       detail: progress.message,
       timestamp: progress.created_at,
       status: progress.type,
-      sort_order: 18,
-      transient: isTransient
+      sort_order: 18
     });
   });
 
