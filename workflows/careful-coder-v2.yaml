@@ -180,12 +180,13 @@ stages:
     instructions: |
       严格按 design 实施最小改动；偏离 design 必须 needs_rework 回到 design。
 
-      改任何一个文件之前，先确保你真的读过它（不只是 grep 过 basename）——这是"先看后改"的纪律，
-      宿主会在工具调用前强制校验：
-        - 同一目标文件的 Read/Grep 次数 ≥ 3；
-        - 本会话内对该文件跑过一次 git log；
-        - 涉及不可逆 shell 操作时，先 ask_human 取得用户同意。
-      未达到会被 deny 并要求补齐。这不是平台限制，是"先看后改"的纪律。
+      **任务点驱动（基于真实需要，不刷次数）**：
+      动手前先想清楚——总体目标（understand.user_goal_restated）和本阶段目标（design 成功标准）是什么？
+      基于真实需要列出本次要做的 Points（要读哪些文件、改哪些、跑什么验证），逐步执行，每步对照目标自检：
+        - 这个 Point 做完了吗？还偏离总体目标吗？需要回 design 吗？
+        - "看几次"由真实需要决定——理解了就不必再读，没理解就读到理解为止。不为凑次数而刷 Read。
+        - 涉及不可逆 shell 操作（rm/git reset/drop table/truncate）时，先 ask_human 取得用户同意（宿主强制）。
+      "先看后改"是纪律，但次数不硬性门控（那会让模型为凑次数而形式读取）。改由你自检是否真的理解了目标文件。
 
       **边写边核对**：每改完一个文件，在 output_summary 里写一段"改动核对"——推进了哪条
       success_criteria + 引入了什么新风险。写法：
@@ -211,18 +212,9 @@ stages:
     auto_retry_limit: 1
     hooks:
       pre_tool_use:
-        # 注意：Write 不在此列。Write 主要用于新建文件，目标路径还不存在时无法
-        # "先 Read/Grep 3 次"，硬挂会让"新建文件"类任务卡死或刷形式次数。
-        # Write 的纪律靠 design + self_review 兜底。
-        - when:
-            tool:
-              - Edit
-              - MultiEdit
-          require:
-            same_file_reads_min: 3
-            shell_must_have_run:
-              - "git log "
-          on_fail: "改既有代码之前请先充分了解上下文：对目标文件至少 Read/Grep 3 次，并对它跑过一次 git log。"
+        # v2.1：去掉 same_file_reads_min + shell_must_have_run 的"读≥3次+跑过git log"硬门控——
+        # 它是 Goodhart 源：模型为凑次数而形式刷 Read，而非基于真实需要理解文件。改为 prompt
+        # 引导任务点驱动 + 自检（见 instructions）。只保留不可逆操作的 ask_human consent（安全门）。
         - when:
             tool: Bash
             command_contains:

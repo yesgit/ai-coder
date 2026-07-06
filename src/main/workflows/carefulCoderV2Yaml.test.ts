@@ -65,18 +65,20 @@ describe("careful-coder-v2.yaml (减架构)", () => {
     expect(inv.required_outputs).toEqual(["similar_callsites", "unknowns"]);
   });
 
-  it("implement 保留安全门（pre_tool_use + rollback），去 delta_check L3", async () => {
+  it("implement 只留不可逆操作安全门(去掉读≥3次硬门控,避免刷次数)", async () => {
     const v2 = await loadV2();
     const impl = v2.stages.find((s) => s.id === "implement")!;
-    // 安全门保留
-    expect(impl.hooks?.pre_tool_use?.[0].require.same_file_reads_min).toBe(3);
-    expect(impl.hooks?.pre_tool_use?.[0].require.shell_must_have_run).toEqual(["git log "]);
-    expect(impl.hooks?.pre_tool_use?.[1].require.ask_human_consent).toBe(true);
+    // v2.1：去掉 same_file_reads_min + shell_must_have_run（Goodhart 源：模型为凑次数刷 Read），
+    // 只留不可逆操作 ask_human consent（安全门，非谨慎门）。读几次改由 prompt 自检引导。
+    const preToolUse = impl.hooks?.pre_tool_use ?? [];
+    expect(preToolUse).toHaveLength(1);
+    expect(preToolUse[0].require.ask_human_consent).toBe(true);
+    expect(preToolUse[0].require.same_file_reads_min).toBeUndefined();
+    expect(preToolUse[0].require.shell_must_have_run).toBeUndefined();
     const assertions = impl.hooks?.post_output_assertions ?? [];
     expect(assertions).toContain("rollback_plan_when_irreversible");
     expect(assertions).toContain("needs_rework_target_required");
     expect(assertions).toContain("no_trailing_unparsed_payload");
-    // L3 delta_check 退场
     expect(assertions).not.toContain("implement_delta_check_present");
   });
 
