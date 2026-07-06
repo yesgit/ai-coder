@@ -223,15 +223,21 @@ const READONLY_SHELL_PREFIXES = [
   "grep", "rg", "ls", "cat", "head", "tail", "wc", "find", "echo", "test", "which",
   "file", "stat", "pwd", "whoami", "uname", "df", "du", "env", "printenv", "date"
 ];
-const DANGEROUS_SHELL_SUBSTRINGS = ["|", ">", ">>", "<", ";", "&&", "||", "$(", "`"];
+// 危险语法：重定向/命令替换——但允许尾随 || echo / && echo 错误处理；管道 | 单独查
+const DANGEROUS_SHELL_PATTERN = /^(?=.*[<>])(?!.*\|\|\s*echo)(?!.*&&\s*echo).*$|^\s*\|\||^\s*&&|^.*;\s*\S/;
 
 export function isReadOnlyShellCommand(command: string): boolean {
   const trimmed = command.trim().toLowerCase();
   if (!trimmed) return false;
-  for (const danger of DANGEROUS_SHELL_SUBSTRINGS) {
-    if (trimmed.includes(danger)) return false;
-  }
-  return READONLY_SHELL_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
+  const isReadonlyPrefix = READONLY_SHELL_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
+  if (!isReadonlyPrefix) return false;
+  // 允许尾随 || echo / && echo 错误处理，但拒绝其他危险语法
+  if (DANGEROUS_SHELL_PATTERN.test(trimmed)) return false;
+  // 单独 |（管道）也拒绝（除非是 || 的一部分）
+  if (/[^|]\|[^|]/.test(trimmed)) return false;
+  // 命令替换 $() 和 `` 也拒绝
+  if (/\$\(|`/.test(trimmed)) return false;
+  return true;
 }
 
 function extractFilePaths(input: Record<string, unknown>): string[] {
