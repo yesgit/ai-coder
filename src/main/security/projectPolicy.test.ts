@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { approveOrDenyToolUse } from "./projectPolicy.js";
+import { approveOrDenyToolUse, isReadOnlyShellCommand } from "./projectPolicy.js";
 import type { AgentSession, WorkflowTemplate } from "../../shared/types.js";
 
 const workflow: WorkflowTemplate = {
@@ -198,5 +198,37 @@ describe("project policy", () => {
       operation: "create",
       approved: true
     });
+  });
+});
+
+describe("isReadOnlyShellCommand", () => {
+  it("read-only 命令免审批", () => {
+    expect(isReadOnlyShellCommand("git log --oneline -5")).toBe(true);
+    expect(isReadOnlyShellCommand("git diff HEAD~1")).toBe(true);
+    expect(isReadOnlyShellCommand("git show abc123")).toBe(true);
+    expect(isReadOnlyShellCommand("git blame src/x.ts")).toBe(true);
+    expect(isReadOnlyShellCommand("git status")).toBe(true);
+    expect(isReadOnlyShellCommand("grep -rn foo src/")).toBe(true);
+    expect(isReadOnlyShellCommand("ls -la")).toBe(true);
+    expect(isReadOnlyShellCommand("cat README.md")).toBe(true);
+    expect(isReadOnlyShellCommand("find . -name '*.ts'")).toBe(true);
+    expect(isReadOnlyShellCommand("wc -l file.ts")).toBe(true);
+  });
+
+  it("危险/写命令需审批", () => {
+    expect(isReadOnlyShellCommand("rm -rf node_modules")).toBe(false);
+    expect(isReadOnlyShellCommand("git reset --hard")).toBe(false);
+    expect(isReadOnlyShellCommand("git clean -fd")).toBe(false);
+    expect(isReadOnlyShellCommand("npm test")).toBe(false);
+    expect(isReadOnlyShellCommand("node script.js")).toBe(false);
+    expect(isReadOnlyShellCommand("mv a b")).toBe(false);
+  });
+
+  it("含管道/重定向/分隔符的命令需审批（即使首词是 read-only）", () => {
+    expect(isReadOnlyShellCommand("git log | head")).toBe(false);
+    expect(isReadOnlyShellCommand("git diff > patch.txt")).toBe(false);
+    expect(isReadOnlyShellCommand("grep foo; rm bar")).toBe(false);
+    expect(isReadOnlyShellCommand("cat file && echo done")).toBe(false);
+    expect(isReadOnlyShellCommand("echo $(rm x)")).toBe(false);
   });
 });

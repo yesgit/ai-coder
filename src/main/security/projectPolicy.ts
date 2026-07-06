@@ -162,7 +162,9 @@ export async function approveOrDenyToolUse(
     if (toolName === "Bash") {
       const command = String(input.command ?? "");
       assertCommandAllowed(command);
-      if (requiresShellApproval(workflow)) {
+      // read-only shell（git log/grep/ls/cat 等）免逐次审批——否则 investigate 阶段每个只读
+      // 命令都 interrupt + 重跑 stage，循环卡死（跨版本老 bug）。危险/写 shell 仍走审批。
+      if (requiresShellApproval(workflow) && !isReadOnlyShellCommand(command)) {
         record("pending_approval");
         session.status = "waiting_approval";
         return { allow: false, message: "Shell command is waiting for user approval.", interrupt: true };
@@ -203,6 +205,33 @@ export async function approveOrDenyToolUse(
     record("blocked");
     return { allow: false, message: error instanceof Error ? error.message : String(error), interrupt: true };
   }
+}
+
+/**
+ * 判定 shell 命令是否只读（不改状态）、可免逐次审批。
+ *
+ * 命令首段命中 read-only 白名单（git log/diff/show/blame、grep/rg/ls/cat/head/tail/wc/find 等）
+ * 且不含管道/重定向/命令分隔/命令替换——任一语法分隔符出现即视为非只读、回退审批。
+ * 命令名本身（rm/mv/cp 等）不在白名单 → 首段不匹配 → 本就走审批，无需在此列举。
+ *
+ * 保守：宁可误伤（grep pattern 含 > 等少见情况）也不放行可能写/删的命令。
+ * 这层让 investigate 的 git log/grep 不再每个都 interrupt（审批后重跑 stage 循环卡死的根因）。
+ */
+const READONLY_SHELL_PREFIXES = [
+  "git log", "git diff", "git show", "git blame", "git status", "git ls-files", "git ls-tree",
+  "git remote -v", "git branch", "git config --get", "git rev-parse", "git grep",
+  "grep", "rg", "ls", "cat", "head", "tail", "wc", "find", "echo", "test", "which",
+  "file", "stat", "pwd", "whoami", "uname", "df", "du", "env", "printenv", "date"
+];
+const DANGEROUS_SHELL_SUBSTRINGS = ["|", ">", ">>", "<", ";", "&&", "||", "$(", "`"];
+
+export function isReadOnlyShellCommand(command: string): boolean {
+  const trimmed = command.trim().toLowerCase();
+  if (!trimmed) return false;
+  for (const danger of DANGEROUS_SHELL_SUBSTRINGS) {
+    if (trimmed.includes(danger)) return false;
+  }
+  return READONLY_SHELL_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
 }
 
 function extractFilePaths(input: Record<string, unknown>): string[] {
