@@ -616,17 +616,3 @@ function flattenValues(value: unknown): string {
   }
   return "";
 }
-
-/**
- * 与 `flattenToText`/`flattenValues` 不同：直接返回 required_outputs[key] 的原始值（不打平、不字符串化）。
- *
- * 新断言（all_tasks_resolved / findings_traceable_to_probes / hedged_findings_demoted /
- * plan_readiness_honest）需要按对象/数组结构遍历，而非按文本扫描，故需要这条入口。
- */
-function collectStructured(result: StageAgentResult, key: string): unknown {
-  return result.required_outputs?.[key];
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}

@@ -24,6 +24,8 @@ export interface TimelineEvent {
   sort_order: number;
   /** 是否需要用户处理（待审批/待回答）— 这类事件优先显示在最上面 */
   needs_user_action?: boolean;
+  /** 是否为瞬时进度（SDK 消息/工具决策/重试中）— 渲染时用更轻样式，与 milestone 区分 */
+  transient?: boolean;
 }
 
 export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
@@ -119,15 +121,17 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
     }
   });
 
-  (session.progress_events ?? []).filter(isMilestoneProgress).forEach((progress: SessionProgressEvent) => {
+  (session.progress_events ?? []).forEach((progress: SessionProgressEvent) => {
+    const isTransient = progress.visibility === "transient";
     events.push({
       id: `${session.id}:progress:${progress.id}`,
       type: "status",
-      title: "运行进度",
+      title: isTransient ? "实时活动" : "运行进度",
       detail: progress.message,
       timestamp: progress.created_at,
       status: progress.type,
-      sort_order: 18
+      sort_order: 18,
+      transient: isTransient
     });
   });
 
@@ -272,10 +276,6 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
     if (timeDelta !== 0) return timeDelta;
     return right.sort_order - left.sort_order;
   });
-}
-
-function isMilestoneProgress(progress: SessionProgressEvent): boolean {
-  return !("visibility" in progress) || progress.visibility === "milestone";
 }
 
 function formatJson(value: unknown) {

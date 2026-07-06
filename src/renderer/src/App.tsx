@@ -169,6 +169,20 @@ export default function App() {
     return () => window.clearInterval(interval);
   }, [activeSessionId, runningVisibleSessionIds, showArchivedSessions]);
 
+  // 订阅后台进度推送：main 在每次 runner 进度事件时广播整个 session，
+  // 收到后直接更新 sessions 列表里对应条目（activeSession 是从 sessions 派生的 useMemo，
+  // 会自动跟随）。避免依赖 3s 轮询才能看到"在跑"。轮询仍保留作兜底（冷启动/推送丢失）。
+  useEffect(() => {
+    const unsubscribe = window.aiCoder.onSessionProgress((updated: AgentSession) => {
+      setSessions((prev) =>
+        prev.some((s) => s.id === updated.id)
+          ? prev.map((s) => (s.id === updated.id ? updated : s))
+          : prev
+      );
+    });
+    return unsubscribe;
+  }, []);
+
   async function refreshRuntimeStatus() {
     setRuntimeStatus(await window.aiCoder.getAgentRuntimeStatus());
   }
@@ -1290,16 +1304,22 @@ export default function App() {
               )}
               <div className="timeline">
                 {timeline.map((event: TimelineEvent) => (
-                  <article key={event.id} className={`timeline-item ${event.type}`}>
+                  <article
+                    key={event.id}
+                    className={`timeline-item ${event.type}${event.transient ? " transient" : ""}`}
+                  >
                     <div className="timeline-meta">
                       <time>{formatTimestamp(event.timestamp)}</time>
                       {event.status && <span className="timeline-status">{formatStatus(event.status)}</span>}
                     </div>
                     <div className="timeline-body">
                       <strong>{event.title}</strong>
-                      {event.detail && (
-                        <MarkdownContent>{event.detail}</MarkdownContent>
-                      )}
+                      {event.detail &&
+                        (event.transient ? (
+                          <small className="muted">{event.detail}</small>
+                        ) : (
+                          <MarkdownContent>{event.detail}</MarkdownContent>
+                        ))}
                     </div>
                   </article>
                 ))}

@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { AppApi, Attachment, ResolveWorkflowInput, StartSessionInput } from "../shared/types.js";
+import type { IpcRendererEvent } from "electron";
+import type { AgentSession, AppApi, Attachment, ResolveWorkflowInput, StartSessionInput } from "../shared/types.js";
 
 const api: AppApi = {
   selectProjectDirectory: () => ipcRenderer.invoke("project:select"),
@@ -31,7 +32,14 @@ const api: AppApi = {
   listProjectFiles: (projectPath: string, query?: string) =>
     ipcRenderer.invoke("project:list-files", projectPath, query),
   readProjectFile: (projectPath: string, filePath: string) =>
-    ipcRenderer.invoke("project:read-file", projectPath, filePath)
+    ipcRenderer.invoke("project:read-file", projectPath, filePath),
+  onSessionProgress: (cb: (session: AgentSession) => void) => {
+    const handler = (_event: IpcRendererEvent, session: AgentSession) => cb(session);
+    ipcRenderer.on("session:progress", handler);
+    return () => {
+      ipcRenderer.removeListener("session:progress", handler);
+    };
+  }
 };
 
 contextBridge.exposeInMainWorld("aiCoder", api);

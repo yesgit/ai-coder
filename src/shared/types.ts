@@ -538,4 +538,6 @@ export interface AppApi {
   deleteSession(sessionId: string): Promise<void>;
   listProjectFiles(projectPath: string, query?: string): Promise<string[]>;
   readProjectFile(projectPath: string, filePath: string): Promise<string>;
+  /** 订阅后台会话进度推送（main 在每次 runner 进度事件时广播整个 session）。返回取消订阅函数。 */
+  onSessionProgress(cb: (session: AgentSession) => void): () => void;
 }

@@ -1155,6 +1155,24 @@ textarea {
   background: #7f56d9;
 }
 
+/* 瞬时进度（SDK 消息/工具决策/重试中）：灰显 + 小圆点，与 milestone 区分，
+   让用户看到"在跑"而不喧宾夺主。 */
+.timeline-item.transient {
+  opacity: 0.62;
+}
+
+.timeline-item.transient::before {
+  background: #9ca3af;
+  width: 6px;
+  height: 6px;
+  top: 4px;
+  left: -5px;
+}
+
+.timeline-item.transient .timeline-body strong {
+  font-weight: 500;
+}
+
 .timeline-meta {
   display: flex;
   min-width: 0;

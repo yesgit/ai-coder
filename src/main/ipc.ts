@@ -4,7 +4,7 @@ import { join, resolve, relative, extname, basename, sep } from "node:path";
 import { pdfToImages } from "./pdfToImages.js";
 import { BrowserWindow, dialog, ipcMain } from "electron";
 import type { OpenDialogOptions } from "electron";
-import type { Attachment, ProjectOnboardingStatus, ResolveWorkflowInput, SessionOnboardingSnapshot, SessionRoutingSnapshot, StartSessionInput } from "../shared/types.js";
+import type { AgentSession, Attachment, ProjectOnboardingStatus, ResolveWorkflowInput, SessionOnboardingSnapshot, SessionRoutingSnapshot, StartSessionInput } from "../shared/types.js";
 import { ClaudeAgentRunner } from "./agent/claudeAgentRunner.js";
 import { getClaudeRuntimeStatus } from "./agent/claudeRuntime.js";
 import { OnboardingStore } from "./onboarding/onboardingStore.js";
@@ -455,14 +455,34 @@ function runSessionInBackground(
       workflow,
       onProgress: async (updated) => {
         await sessions.save(updated);
+        broadcastSessionProgress(updated);
       }
     })
-    .then((updated) => sessions.save(updated))
+    .then(async (updated) => {
+      await sessions.save(updated);
+      broadcastSessionProgress(updated);
+    })
     .catch(async (error) => {
       session.status = "failed";
       session.error = error instanceof Error ? error.message : String(error);
       await sessions.save(session);
+      broadcastSessionProgress(session);
     });
+}
+
+/**
+ * 把会话进度推送给所有渲染窗口。后台 runner 脱离 IPC handler 上下文（拿不到 event.sender），
+ * 故用 BrowserWindow.getAllWindows() 广播——单窗口 app 等价于直送，多窗口也正确。
+ *
+ * 渲染端收到后按 sessionId 匹配更新对应会话，避免依赖 3s 轮询才能看到"在跑"。
+ * 推送整个 session 对象：onProgress 频率中等（每个 SDK 消息/工具决策/状态变化一次），
+ * 渲染端直接更新对应 session 条目（React 自动 batch，timeline rebuild 开销可控）。
+ * 若后续 session 体积变大或频率升高导致 IPC 压力，可改为增量 payload + 渲染端 debounce。
+ */
+function broadcastSessionProgress(session: AgentSession): void {
+  for (const win of BrowserWindow.getAllWindows()) {
+    win.webContents.send("session:progress", session);
+  }
 }
 
 function normalizeRoutingSnapshot(input: StartSessionInput): SessionRoutingSnapshot {
