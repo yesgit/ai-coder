@@ -218,10 +218,16 @@ export async function approveOrDenyToolUse(
  * 这层让 investigate 的 git log/grep 不再每个都 interrupt（审批后重跑 stage 循环卡死的根因）。
  */
 const READONLY_SHELL_PREFIXES = [
-  "cd ", "git log", "git diff", "git show", "git blame", "git status", "git ls-files", "git ls-tree",
+  // git 只读操作
+  "git log", "git diff", "git show", "git blame", "git status", "git ls-files", "git ls-tree",
   "git remote -v", "git branch", "git config --get", "git rev-parse", "git grep",
-  "grep", "rg", "ls", "cat", "head", "tail", "wc", "find", "echo", "test", "which",
-  "file", "stat", "pwd", "whoami", "uname", "df", "du", "env", "printenv", "date"
+  "git describe", "git tag -l", "git name-rev", "git merge-base", "git log ",
+  // 目录/文件浏览
+  "cd ", "ls ", "pwd", "find ", "du ", "df ", "stat ", "file ", "head ", "tail ", "cat ", "wc ",
+  // 搜索/文本处理
+  "grep ", "rg ", "echo ", "test ", "which ", "type ", "uname ", "env", "printenv", "date",
+  // 网络只读（不写文件）
+  "curl -s", "curl -I", "wget -q", "wget --spider"
 ];
 
 /**
