@@ -245,19 +245,28 @@ export function isReadOnlyShellCommand(command: string): boolean {
   const trimmed = command.trim().toLowerCase();
   if (!trimmed) return false;
 
-  // 快速拒绝：含危险语法（重定向/命令替换/分号/单独管道）
+  // 快速拒绝：含危险语法（重定向/命令替换/分号）
   if (/[<>;`$()]/.test(trimmed)) return false;
-  // 管道 | 单独查（排除 ||）
-  if (/[^|]\|[^|]/.test(trimmed)) return false;
 
-  // 按 && 和 || 分割成段
-  const segments: string[] = trimmed.split(/\s*(?:&&|\|\|)\s*/).filter(s => s.trim().length > 0);
+  // 按 && / || 分割成段，逐段检查
+  const segments = trimmed.split(/\s*(?:&&|\|\|)\s*/).filter(s => s.trim().length > 0);
   if (segments.length === 0) return false;
 
-  // 逐段检查：每段必须以 read-only 前缀开头
   for (const seg of segments) {
-    const isReadonlyPrefix = READONLY_SHELL_PREFIXES.some((prefix) => seg.startsWith(prefix));
-    if (!isReadonlyPrefix) return false;
+    // 每段内如果有管道 |，检查管道右边是否是安全过滤器（head/tail/wc/grep 等）
+    const pipeParts = seg.split(/\s*\|\s*/).filter(p => p.trim().length > 0);
+    for (let i = 0; i < pipeParts.length; i++) {
+      const part = pipeParts[i].trim();
+      // 第一段必须是 read-only 前缀
+      if (i === 0) {
+        const isReadonlyPrefix = READONLY_SHELL_PREFIXES.some((prefix) => part.startsWith(prefix));
+        if (!isReadonlyPrefix) return false;
+      } else {
+        // 管道后的段必须是安全过滤器
+        const safeFilters = ['head', 'tail', 'wc', 'grep', 'rg', 'less', 'more', 'cat', 'sort', 'uniq', 'cut', 'awk', 'sed', 'tee'];
+        if (!safeFilters.some(f => part.startsWith(f))) return false;
+      }
+    }
   }
 
   return true;

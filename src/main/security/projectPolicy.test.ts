@@ -225,7 +225,7 @@ describe("isReadOnlyShellCommand", () => {
   });
 
   it("含管道/重定向/分隔符的命令需审批（即使首词是 read-only）", () => {
-    expect(isReadOnlyShellCommand("git log | head")).toBe(false);
+    expect(isReadOnlyShellCommand("git log | head")).toBe(true); // 管道后是 head/tail/wc/grep 放行
     expect(isReadOnlyShellCommand("git diff > patch.txt")).toBe(false);
     expect(isReadOnlyShellCommand("grep foo; rm bar")).toBe(false);
     expect(isReadOnlyShellCommand("echo $(rm x)")).toBe(false);
@@ -235,5 +235,9 @@ describe("isReadOnlyShellCommand", () => {
     // 允许 cd && git 复合命令（常见安全模式）
     expect(isReadOnlyShellCommand("cd /home/user/projects && git branch --show-current")).toBe(true);
     expect(isReadOnlyShellCommand("cd /home/user/projects && git status && git branch --show-current")).toBe(true);
+    // 管道后接只读过滤器放行
+    expect(isReadOnlyShellCommand("git branch -a | head -20")).toBe(true);
+    expect(isReadOnlyShellCommand("git log --oneline | tail -5")).toBe(true);
+    expect(isReadOnlyShellCommand("ls -la | grep test")).toBe(true);
   });
 });
