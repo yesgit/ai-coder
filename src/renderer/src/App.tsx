@@ -266,8 +266,11 @@ export default function App() {
   }
 
   async function selectSession(session: AgentSession) {
+    setPendingRouting(null);
+    setConfirmationWorkflowId("");
     if (session.project_path === projectPath) {
       setActiveSessionId(session.id);
+      setTaskWorkflowId(session.workflow_id);
       return;
     }
     setBusy(true);
@@ -276,11 +279,11 @@ export default function App() {
       const authorizedPath = await window.aiCoder.authorizeSessionProject(session.project_path);
       setProjectPath(authorizedPath);
       setOnboardingOverride(false);
-      setPendingRouting(null);
       setExpandedProjectPaths((current) => new Set([...current, authorizedPath]));
       await refreshWorkflows(authorizedPath);
       await refreshOnboardingStatus(authorizedPath);
       await refreshSessions(session.id, { projectPath: authorizedPath, preferLatestForWorkflow: false });
+      setTaskWorkflowId(session.workflow_id);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -654,7 +657,7 @@ export default function App() {
     if (!files || files.length === 0) return;
     const setAttachments = target === "chat" ? setChatAttachments : setTaskAttachments;
     const MAX_IMAGE_SIZE = 5 * 1024 * 1024; // 5MB
-    for (const file of Array.from(files)) {
+    for (const file of files) {
       if (file.type.startsWith("image/")) {
         if (file.size > MAX_IMAGE_SIZE) {
           setError(`图片 ${file.name} 过大（${Math.round(file.size / 1024)}KB），上限 5MB`);
@@ -695,10 +698,10 @@ export default function App() {
     } else {
       setTaskPrompt(value);
     }
-    // 检测 @ 模式触发文件提及
+    // @ 模式触发文件提及
     if (!projectPath) return;
-    const cursorPos = cursorPosition ?? value.length;
-    const textBeforeCursor = value.slice(0, cursorPos);
+    const pos = cursorPosition ?? value.length;
+    const textBeforeCursor = value.slice(0, pos);
     const atIndex = textBeforeCursor.lastIndexOf("@");
     if (atIndex === -1 || (atIndex > 0 && textBeforeCursor[atIndex - 1] !== " " && textBeforeCursor[atIndex - 1] !== "\n")) {
       setShowFileMention(false);
@@ -872,297 +875,287 @@ export default function App() {
           </div>
         </header>
         <p className="path" title={projectPath}>{projectPath || "尚未选择项目"}</p>
+
         {onboardingStatus && <section className="onboarding-box compact">
           <div className="onboarding-status-row"><strong>项目画像</strong><span className={`status-pill ${onboardingStatus.status}`}>{formatStatus(onboardingStatus.status)}</span></div>
           {onboardingStatus.claude_md_exists && onboardingStatus.status !== "confirmed" && <button className="secondary" disabled={busy} onClick={confirmOnboarding}>确认项目画像</button>}
         </section>}
-        <div className={`composer${dragOverTarget === "task" ? " drag-over" : ""}`}
-          onDragOver={(e) => handleDragOver(e, "task")}
-          onDragLeave={(e) => handleDragLeave(e, "task")}
-          onDrop={(e) => handleDrop(e, "task")}>
-          <div>
-            <h2>{taskWorkflow ? formatWorkflowName(taskWorkflow.id, taskWorkflow.name) : "自动选择工作流"}</h2>
-            <p>
-              {taskWorkflow
-                ? formatWorkflowDescription(taskWorkflow.id, taskWorkflow.description)
-                : projectPath
-                  ? "系统会根据任务意图选择已启用自动路由的工作流。"
-                  : "选择项目后开始任务。"}
-              {runtimeStatus && <span className={`runtime-mode ${runtimeStatus.mode}`}>{formatStatus(runtimeStatus.mode)}模式</span>}
-            </p>
-            {runtimeStatus && (
-              <div className="runtime-diagnostics">
-                <span className={runtimeStatus.sdk_available ? "diagnostic ok" : "diagnostic warn"}>SDK</span>
-                <span className={runtimeStatus.node_runtime_available ? "diagnostic ok" : "diagnostic warn"}>Node 运行时</span>
-                <span className={runtimeStatus.auth_env_available ? "diagnostic ok" : "diagnostic warn"}>Claude 凭据</span>
-              </div>
-            )}
-          </div>
-          <label className="workflow-picker">工作流
-            <select value={taskWorkflowId} onChange={(event) => { setTaskWorkflowId(event.target.value); setPendingRouting(null); }}>
-              <option value="">自动选择</option>
-              {workflows.map((workflow) => <option key={`${workflow.source.type}:${workflow.id}`} value={workflow.id}>{formatWorkflowName(workflow.id, workflow.name)} · {formatWorkflowSource(workflow.source.type)}</option>)}
-            </select>
-          </label>
-          {taskAttachments.length > 0 && (
-            <div className="attachment-strip">
-              {taskAttachments.map((att, i) => (
-                <div key={attachmentKey(att, i)} className="attachment-chip">
-                  {att.type === "image" ? (
-                    <img src={`data:${att.media_type};base64,${att.data_base64}`} alt={att.display_name} className="attachment-thumb" />
-                  ) : (
-                    <span className="attachment-file-icon">📄</span>
-                  )}
-                  <span className="attachment-name">{att.display_name}</span>
-                  <button className="attachment-remove" onClick={() => removeAttachment("task", i)}>×</button>
-                </div>
-              ))}
-            </div>
-          )}
-          <textarea
-            value={taskPrompt}
-            onChange={(event) => {
-              setPendingRouting(null);
-              handleTextareaChange(event.target.value, "task", event.target.selectionStart ?? undefined);
-            }}
-            onPaste={(e) => handlePaste(e, "task")}
-            placeholder="描述要执行的编码任务... (可粘贴图片、拖入文件、@引用项目文件)"
-          />
-          {showFileMention && mentionTarget === "task" && fileMentionResults.length > 0 && (
-            <div className="file-mention-dropdown">
-              {fileMentionResults.map((filePath) => (
-                <button key={filePath} className="file-mention-item" onClick={() => selectFileMention(filePath, "task")}>
-                  {filePath}
-                </button>
-              ))}
-            </div>
-          )}
-          <div className="actions">
-            <button className="icon-btn" title="添加附件" onClick={() => taskFileInputRef.current?.click()}>📎</button>
-            <button className="primary" disabled={!canStart} onClick={startSession}>
-              {busy ? "运行中..." : "启动 Agent"}
-            </button>
-            {error && <span className="error">{error}</span>}
-          </div>
-          <input type="file" ref={taskFileInputRef} style={{ display: "none" }} multiple
-            onChange={(e) => handleFileSelect(e, "task")} />
-          {pendingRouting && <div className="routing-confirmation">
-            <strong>{pendingRouting.status === "no_candidates" ? "请选择工作流" : "确认推荐的工作流"}</strong>
-            <p>{pendingRouting.reason}</p>
-            {pendingRouting.candidates.length > 0 && <small>{pendingRouting.candidates.map((candidate) => `${candidate.name} ${Math.round(candidate.score * 100)}%`).join(" · ")}</small>}
-            <div className="actions"><select value={confirmationWorkflowId} onChange={(event) => setConfirmationWorkflowId(event.target.value)}>{workflows.map((workflow) => <option key={workflow.id} value={workflow.id}>{formatWorkflowName(workflow.id, workflow.name)}</option>)}</select><button className="primary" disabled={!confirmationWorkflowId || busy} onClick={() => void confirmPendingRouting()}>确认并启动</button><button className="secondary" onClick={() => setPendingRouting(null)}>取消</button></div>
-          </div>}
-          {showOnboardingWarning && (
-            <div className="admission-warning">
-              <span>项目画像尚未确认。请先运行项目画像，或确认已有画像入口。</span>
-              <label className="override-option">
-                <input
-                  type="checkbox"
-                  checked={onboardingOverride}
-                  onChange={(event) => setOnboardingOverride(event.target.checked)}
-                />
-                未确认入职也继续运行
-              </label>
-            </div>
-          )}
-        </div>
 
-        {activeWorkflow && (
-          <div className="stages">
-            {workflowStageDisplays.map(({ stage, status, attempt, isCurrent }) => (
-              <div key={stage.id} className={`stage ${status}${isCurrent ? " current" : ""}`}>
-                <div>
-                  <span>{formatStageName(stage.id, stage.name)}</span>
-                  <small>
-                    {formatStatus(status)}
-                    {attempt ? ` · 第 ${attempt} 次` : ""}
-                    {stage.approval_required ? " · 需审批" : ""}
-                  </small>
-                </div>
-                <span className={`stage-indicator ${status}`} aria-label={formatStatus(status)} />
-              </div>
-            ))}
-          </div>
-        )}
-
-        <section className="session-detail" key={activeSession?.id ?? "empty-session"}>
-          {activeSession ? (
-            <>
-              <div className="session-header">
-                <div>
-                  <h2>{activeSession.task_prompt}</h2>
+        {/* 主内容区：左侧任务/聊天，右侧阶段状态和活动流 */}
+        <div className={`main-content-grid${activeWorkflow ? " has-stages" : ""}`}>
+          {/* 左侧：任务输入 + 会话详情 */}
+          <div className="left-panel">
+            {/* 任务输入区（Composer） */}
+            <div className={`composer${dragOverTarget === "task" ? " drag-over" : ""}`}
+              onDragOver={(e) => handleDragOver(e, "task")}
+              onDragLeave={(e) => handleDragLeave(e, "task")}
+              onDrop={(e) => handleDrop(e, "task")}>
+              <div className="composer-header-horizontal">
+                <div className="composer-info">
+                  <h2>{taskWorkflow ? formatWorkflowName(taskWorkflow.id, taskWorkflow.name) : "自动选择工作流"}</h2>
                   <p>
-                    {formatStatus(activeSession.status)} · {formatWorkflowName(activeSession.workflow_id, activeSession.workflow_id)} ·{" "}
-                    {formatStageName(activeSession.current_stage)}
+                    {taskWorkflow
+                      ? formatWorkflowDescription(taskWorkflow.id, taskWorkflow.description)
+                      : projectPath
+                        ? "系统会根据任务意图选择已启用自动路由的工作流。"
+                        : "选择项目后开始任务。"}
+                    {runtimeStatus && <span className={`runtime-mode ${runtimeStatus.mode}`}>{formatStatus(runtimeStatus.mode)}模式</span>}
                   </p>
-                  {activeSession.routing && <p>选择原因：{activeSession.routing.reason}</p>}
-                  {activeSession.onboarding && (
-                    <p>
-                      入职状态 {formatStatus(activeSession.onboarding.status)}
-                      {activeSession.onboarding.override ? " · 已跳过门禁" : ""}
-                    </p>
+                  {runtimeStatus && (
+                    <div className="runtime-diagnostics">
+                      <span className={runtimeStatus.sdk_available ? "diagnostic ok" : "diagnostic warn"}>SDK</span>
+                      <span className={runtimeStatus.node_runtime_available ? "diagnostic ok" : "diagnostic warn"}>Node 运行时</span>
+                      <span className={runtimeStatus.auth_env_available ? "diagnostic ok" : "diagnostic warn"}>Claude 凭据</span>
+                    </div>
                   )}
                 </div>
-                {(activeSession.status === "running" ||
-                  activeSession.status === "waiting_approval" ||
-                  activeSession.status === "failed" ||
-                  activeSession.status === "blocked" ||
-                  activeSession.status === "interrupted") && (
-                  <div className="session-actions">
-                    {(activeSession.status === "running" || activeSession.status === "waiting_approval") && (
-                      <button className="secondary" disabled={busy} onClick={() => abortSession(activeSession)}>
-                        停止
-                      </button>
-                    )}
-                    {activeSession.status === "waiting_approval" && (
-                      <>
-                        {activeSession.approvals.some(
-                          (approval) => approval.kind === "stage" && approval.status === "pending"
-                        ) && (
-                          <button className="primary" disabled={busy} onClick={() => approvePendingStage(activeSession)}>
-                            批准阶段
-                          </button>
-                        )}
-                        {approvedToolCalls.length > 0 && (
-                          <button
-                            className="secondary"
-                            disabled={busy}
-                            onClick={() => continueSession(activeSession)}
-                          >
-                            继续
-                          </button>
-                        )}
-                      </>
-                    )}
-                    {(activeSession.status === "failed" ||
-                      activeSession.status === "blocked" ||
-                      activeSession.status === "interrupted") && (
-                      <button className="primary" disabled={busy} onClick={() => resumeSession(activeSession)}>
-                        断点恢复
-                      </button>
-                    )}
-                    {/* 重新开始任务：从第一个阶段重新执行 */}
-                    <button
-                      className="secondary"
-                      disabled={busy}
-                      onClick={() => {
-                        if (confirm(`确定要重新开始任务 "${activeSession.task_prompt}" 吗？这将清空当前的执行进度并从第一个阶段重新开始。`)) {
-                          void restartSession(activeSession);
-                        }
-                      }}
-                      title="从工作流的第一个阶段重新开始执行"
-                    >
-                      重新开始
-                    </button>
-                  </div>
-                )}
+                <label className="workflow-picker-horizontal">
+                  <span>工作流</span>
+                  <select value={taskWorkflowId} onChange={(event) => { setTaskWorkflowId(event.target.value); setPendingRouting(null); }}>
+                    <option value="">自动选择</option>
+                    {workflows.map((workflow) => <option key={`${workflow.source.type}:${workflow.id}`} value={workflow.id}>{formatWorkflowName(workflow.id, workflow.name)} · {formatWorkflowSource(workflow.source.type)}</option>)}
+                  </select>
+                </label>
               </div>
-              <div className={`activity-strip ${activeSession.status}`}>
-                <span className="activity-dot" />
-                <div>
-                  <strong>{buildActivityTitle(activeSession)}</strong>
-                  <small>
-                    {latestProgress?.message ?? "等待下一条运行事件。"} · 最近更新 {formatTimestamp(activeSession.updated_at)}
-                  </small>
-                </div>
-              </div>
-              {pendingToolCalls.length > 0 && (
-                <div className="tool-approvals">
-                  {pendingToolCalls.map((toolCall: ToolCallRecord) => (
-                    <article key={toolCall.id} className="tool-approval">
-                      <div>
-                        <strong>{toolCall.tool}</strong>
-                        <small>{formatStageName(toolCall.stage_id)}</small>
-                      </div>
-                      <div className="markdown-content">
-                        <MarkdownContent>{`\`\`\`json\n${JSON.stringify(toolCall.input, null, 2)}\n\`\`\``}</MarkdownContent>
-                      </div>
-                      <div className="actions">
-                        <button className="primary" disabled={busy} onClick={() => approveToolCall(activeSession, toolCall)}>
-                          批准
-                        </button>
-                        <button className="secondary" disabled={busy} onClick={() => denyToolCall(activeSession, toolCall)}>
-                          拒绝
-                        </button>
-                      </div>
-                    </article>
+              {taskAttachments.length > 0 && (
+                <div className="attachment-strip">
+                  {taskAttachments.map((att, i) => (
+                    <div key={attachmentKey(att, i)} className="attachment-chip">
+                      {att.type === "image" ? (
+                        <img src={`data:${att.media_type};base64,${att.data_base64}`} alt={att.display_name} className="attachment-thumb" />
+                      ) : (
+                        <span className="attachment-file-icon">📄</span>
+                      )}
+                      <span className="attachment-name">{att.display_name}</span>
+                      <button className="attachment-remove" onClick={() => removeAttachment("task", i)}>×</button>
+                    </div>
                   ))}
                 </div>
               )}
-              {pendingHumanQuestions.length > 0 && (
-                <div className="human-questions">
-                  {pendingHumanQuestions.map((q: HumanQuestion) => {
-                    const currentAnswer = questionAnswers[q.id];
-                    const otherText = questionOtherTexts[q.id] ?? "";
-                    const trimmedOther = otherText.trim();
-                    // 单选/多选默认追加"其他"虚拟选项；text 不需要
-                    const showOtherInput =
-                      (q.question_type === "single" && currentAnswer === OTHER_OPTION_VALUE) ||
-                      (q.question_type === "multi" &&
-                        Array.isArray(currentAnswer) &&
-                        currentAnswer.includes(OTHER_OPTION_VALUE));
-                    let isValid: boolean;
-                    if (q.question_type === "multi") {
-                      if (!Array.isArray(currentAnswer) || currentAnswer.length === 0) {
-                        isValid = false;
-                      } else if (currentAnswer.includes(OTHER_OPTION_VALUE) && trimmedOther.length === 0) {
-                        // 选了"其他"但没填文本：只要还有别的真实选项就允许提交
-                        isValid = currentAnswer.some((v) => v !== OTHER_OPTION_VALUE);
-                      } else {
-                        isValid = true;
-                      }
-                    } else if (q.question_type === "single") {
-                      if (typeof currentAnswer !== "string" || currentAnswer.length === 0) {
-                        isValid = false;
-                      } else if (currentAnswer === OTHER_OPTION_VALUE) {
-                        isValid = trimmedOther.length > 0;
-                      } else {
-                        isValid = true;
-                      }
-                    } else {
-                      isValid = typeof currentAnswer === "string" && currentAnswer.trim().length > 0;
-                    }
-                    return (
-                      <article key={q.id} className="human-question">
-                        <div className="question-header">
-                          <strong>助手提问</strong>
-                          <small>
-                            {q.question_type === "single" ? "单选" : q.question_type === "multi" ? "多选" : "文本"}
-                            {" · "}
-                            {formatStageName(q.stage_id)}
-                          </small>
-                        </div>
-                        <div className="question-body">
-                          <MarkdownContent>{q.question}</MarkdownContent>
-                        </div>
-                        {q.question_type === "single" && q.options && (
-                          <div className="question-options">
-                            {q.options.map((opt) => (
-                              <label key={opt.value} className="question-option">
-                                <input
-                                  type="radio"
-                                  name={q.id}
-                                  checked={currentAnswer === opt.value}
-                                  onChange={() => setQuestionAnswers((prev) => ({ ...prev, [q.id]: opt.value }))}
-                                />
-                                <span>{opt.label}</span>
-                              </label>
-                            ))}
-                            <label className="question-option">
-                              <input
-                                type="radio"
-                                name={q.id}
-                                checked={currentAnswer === OTHER_OPTION_VALUE}
-                                onChange={() =>
-                                  setQuestionAnswers((prev) => ({ ...prev, [q.id]: OTHER_OPTION_VALUE }))
-                                }
-                              />
-                              <span>其他（自行输入）</span>
-                            </label>
-                          </div>
+              <textarea
+                value={taskPrompt}
+                onChange={(event) => {
+                  setPendingRouting(null);
+                  handleTextareaChange(event.target.value, "task", event.target.selectionStart ?? undefined);
+                }}
+                onPaste={(e) => handlePaste(e, "task")}
+                placeholder="描述要执行的编码任务... (可粘贴图片、拖入文件、@引用项目文件)"
+              />
+              {showFileMention && mentionTarget === "task" && fileMentionResults.length > 0 && (
+                <div className="file-mention-dropdown">
+                  {fileMentionResults.map((filePath) => (
+                    <button key={filePath} className="file-mention-item" onClick={() => selectFileMention(filePath, "task")}>
+                      {filePath}
+                    </button>
+                  ))}
+                </div>
+              )}
+              <div className="actions">
+                <button className="icon-btn" title="添加附件" onClick={() => taskFileInputRef.current?.click()}>📎</button>
+                <button className="primary" disabled={!canStart} onClick={startSession}>
+                  {busy ? "运行中..." : "启动 Agent"}
+                </button>
+                {error && <span className="error">{error}</span>}
+              </div>
+              <input type="file" ref={taskFileInputRef} style={{ display: "none" }} multiple
+                onChange={(e) => handleFileSelect(e, "task")} />
+              {pendingRouting && <div className="routing-confirmation">
+                <strong>{pendingRouting.status === "no_candidates" ? "请选择工作流" : "确认推荐的工作流"}</strong>
+                <p>{pendingRouting.reason}</p>
+                {pendingRouting.candidates.length > 0 && <small>{pendingRouting.candidates.map((candidate) => `${candidate.name} ${Math.round(candidate.score * 100)}%`).join(" · ")}</small>}
+                <div className="actions"><select value={confirmationWorkflowId} onChange={(event) => setConfirmationWorkflowId(event.target.value)}>{workflows.map((workflow) => <option key={workflow.id} value={workflow.id}>{formatWorkflowName(workflow.id, workflow.name)}</option>)}</select><button className="primary" disabled={!confirmationWorkflowId || busy} onClick={() => void confirmPendingRouting()}>确认并启动</button><button className="secondary" onClick={() => setPendingRouting(null)}>取消</button></div>
+              </div>}
+              {showOnboardingWarning && (
+                <div className="admission-warning">
+                  <span>项目画像尚未确认。请先运行项目画像，或确认已有画像入口。</span>
+                  <label className="override-option">
+                    <input
+                      type="checkbox"
+                      checked={onboardingOverride}
+                      onChange={(event) => setOnboardingOverride(event.target.checked)}
+                    />
+                    未确认入职也继续运行
+                  </label>
+                </div>
+              )}
+            </div>
+
+            {/* 会话详情区 */}
+            <section className="session-detail" key={activeSession?.id ?? "empty-session"}>
+              {activeSession ? (
+                <>
+                  <div className="session-header">
+                    <div>
+                      <h2>{activeSession.task_prompt}</h2>
+                      <p>
+                        {formatStatus(activeSession.status)} · {formatWorkflowName(activeSession.workflow_id, activeSession.workflow_id)} ·{" "}
+                        {formatStageName(activeSession.current_stage)}
+                      </p>
+                      {activeSession.routing && <p>选择原因：{activeSession.routing.reason}</p>}
+                      {activeSession.onboarding && (
+                        <p>
+                          入职状态 {formatStatus(activeSession.onboarding.status)}
+                          {activeSession.onboarding.override ? " · 已跳过门禁" : ""}
+                        </p>
+                      )}
+                    </div>
+                    {(activeSession.status === "running" ||
+                      activeSession.status === "waiting_approval" ||
+                      activeSession.status === "failed" ||
+                      activeSession.status === "blocked" ||
+                      activeSession.status === "interrupted") && (
+                      <div className="session-actions">
+                        {(activeSession.status === "running" || activeSession.status === "waiting_approval") && (
+                          <button className="secondary" disabled={busy} onClick={() => abortSession(activeSession)}>
+                            停止
+                          </button>
                         )}
-                        {q.question_type === "multi" && q.options && (
-                          <div className="question-options">
+                        {activeSession.status === "waiting_approval" && (
+                          <>
+                            {activeSession.approvals.some(
+                              (approval) => approval.kind === "stage" && approval.status === "pending"
+                            ) && (
+                              <button className="primary" disabled={busy} onClick={() => approvePendingStage(activeSession)}>
+                                批准阶段
+                              </button>
+                            )}
+                            {approvedToolCalls.length > 0 && (
+                              <button
+                                className="secondary"
+                                disabled={busy}
+                                onClick={() => continueSession(activeSession)}
+                              >
+                                继续
+                              </button>
+                            )}
+                          </>
+                        )}
+                        {(activeSession.status === "failed" ||
+                          activeSession.status === "blocked" ||
+                          activeSession.status === "interrupted") && (
+                          <button className="primary" disabled={busy} onClick={() => resumeSession(activeSession)}>
+                            断点恢复
+                          </button>
+                        )}
+                        <button
+                          className="secondary"
+                          disabled={busy}
+                          onClick={() => {
+                            if (confirm(`确定要重新开始任务 "${activeSession.task_prompt}" 吗？这将清空当前的执行进度并从第一个阶段重新开始。`)) {
+                              void restartSession(activeSession);
+                            }
+                          }}
+                          title="从工作流的第一个阶段重新开始执行"
+                        >
+                          重新开始
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                  <div className={`activity-strip ${activeSession.status}`}>
+                    <span className="activity-dot" />
+                    <div>
+                      <strong>{buildActivityTitle(activeSession)}</strong>
+                      <small>
+                        {latestProgress?.message ?? "等待下一条运行事件。"} · 最近更新 {formatTimestamp(activeSession.updated_at)}
+                      </small>
+                    </div>
+                  </div>
+                  {pendingToolCalls.length > 0 && (
+                    <div className="tool-approvals">
+                      {pendingToolCalls.map((toolCall: ToolCallRecord) => (
+                        <article key={toolCall.id} className="tool-approval">
+                          <div>
+                            <strong>{toolCall.tool}</strong>
+                            <small>{formatStageName(toolCall.stage_id)}</small>
+                          </div>
+                          <div className="markdown-content">
+                            <MarkdownContent>{`\`\`\`json\n${JSON.stringify(toolCall.input, null, 2)}\n\`\`\``}</MarkdownContent>
+                          </div>
+                          <div className="actions">
+                            <button className="primary" disabled={busy} onClick={() => approveToolCall(activeSession, toolCall)}>
+                              批准
+                            </button>
+                            <button className="secondary" disabled={busy} onClick={() => denyToolCall(activeSession, toolCall)}>
+                              拒绝
+                            </button>
+                          </div>
+                        </article>
+                      ))}
+                    </div>
+                  )}
+                  {pendingHumanQuestions.length > 0 && (
+                    <div className="human-questions">
+                      {pendingHumanQuestions.map((q: HumanQuestion) => {
+                        const currentAnswer = questionAnswers[q.id];
+                        const otherText = questionOtherTexts[q.id] ?? "";
+                        const trimmedOther = otherText.trim();
+                        const showOtherInput =
+                          (q.question_type === "single" && currentAnswer === OTHER_OPTION_VALUE) ||
+                          (q.question_type === "multi" &&
+                            Array.isArray(currentAnswer) &&
+                            currentAnswer.includes(OTHER_OPTION_VALUE));
+                        let isValid: boolean;
+                        if (q.question_type === "multi") {
+                          if (!Array.isArray(currentAnswer) || currentAnswer.length === 0) {
+                            isValid = false;
+                          } else if (currentAnswer.includes(OTHER_OPTION_VALUE) && trimmedOther.length === 0) {
+                            isValid = currentAnswer.some((v) => v !== OTHER_OPTION_VALUE);
+                          } else {
+                            isValid = true;
+                          }
+                        } else if (q.question_type === "single") {
+                          if (typeof currentAnswer !== "string" || currentAnswer.length === 0) {
+                            isValid = false;
+                          } else if (currentAnswer === OTHER_OPTION_VALUE) {
+                            isValid = trimmedOther.length > 0;
+                          } else {
+                            isValid = true;
+                          }
+                        } else {
+                          isValid = typeof currentAnswer === "string" && currentAnswer.trim().length > 0;
+                        }
+                        return (
+                          <article key={q.id} className="human-question">
+                            <div className="question-header">
+                              <strong>助手提问</strong>
+                              <small>
+                                {q.question_type === "single" ? "单选" : q.question_type === "multi" ? "多选" : "文本"}
+                                {" · "}
+                                {formatStageName(q.stage_id)}
+                              </small>
+                            </div>
+                            <div className="question-body">
+                              <MarkdownContent>{q.question}</MarkdownContent>
+                            </div>
+                            {q.question_type === "single" && q.options && (
+                              <div className="question-options">
+                                {q.options.map((opt) => (
+                                  <label key={opt.value} className="question-option">
+                                    <input
+                                      type="radio"
+                                      name={q.id}
+                                      checked={currentAnswer === opt.value}
+                                      onChange={() => setQuestionAnswers((prev) => ({ ...prev, [q.id]: opt.value }))}
+                                    />
+                                    <span>{opt.label}</span>
+                                  </label>
+                                ))}
+                                <label className="question-option">
+                                  <input
+                                    type="radio"
+                                    name={q.id}
+                                    checked={currentAnswer === OTHER_OPTION_VALUE}
+                                    onChange={() =>
+                                      setQuestionAnswers((prev) => ({ ...prev, [q.id]: OTHER_OPTION_VALUE }))
+                                    }
+                                  />
+                                  <span>其他（自行输入）</span>
+                                </label>
+                              </div>
+                            )}
+                            {q.question_type === "multi" && q.options && (
+                              <div className="question-options">
                             {q.options.map((opt) => {
                               const arr = Array.isArray(currentAnswer) ? currentAnswer : [];
                               const checked = arr.includes(opt.value);
@@ -1197,226 +1190,255 @@ export default function App() {
                               <span>其他（自行输入）</span>
                             </label>
                           </div>
-                        )}
-                        {showOtherInput && (
-                          <textarea
-                            className="question-textarea"
-                            rows={2}
-                            value={otherText}
-                            onChange={(event) =>
-                              setQuestionOtherTexts((prev) => ({ ...prev, [q.id]: event.target.value }))
-                            }
-                            placeholder="输入你的其他意见..."
-                          />
-                        )}
-                        {q.question_type === "text" && (
-                          <textarea
-                            className="question-textarea"
-                            rows={3}
-                            value={typeof currentAnswer === "string" ? currentAnswer : ""}
-                            onChange={(event) => setQuestionAnswers((prev) => ({ ...prev, [q.id]: event.target.value }))}
-                            placeholder="输入你的回答..."
-                          />
-                        )}
-                        <div className="actions">
-                          <button
-                            className="primary"
-                            disabled={busy || !isValid}
-                            onClick={() => {
-                              let ans: string | string[];
-                              if (q.question_type === "multi") {
-                                const arr = Array.isArray(currentAnswer) ? currentAnswer : [];
-                                ans = arr
-                                  .map((v) => (v === OTHER_OPTION_VALUE ? trimmedOther : v))
-                                  .filter((v) => v.length > 0);
-                              } else if (q.question_type === "single") {
-                                const v = (currentAnswer as string) || "";
-                                ans = v === OTHER_OPTION_VALUE ? trimmedOther : v;
-                              } else {
-                                ans = ((currentAnswer as string) || "").trim();
-                              }
-                              void answerHumanQuestion(activeSession, q.id, ans);
-                            }}
-                          >
-                            提交回答
-                          </button>
-                        </div>
-                      </article>
-                    );
-                  })}
-                </div>
-              )}
-              <div className="run-panels">
-                <section className="run-panel">
-                  <div className="panel-heading">
-                    <h3>阶段执行</h3>
-                    <small>{stageRuns.length} 次尝试</small>
-                  </div>
-                  {stageRuns.length > 0 ? (
-                    <div className="stage-run-list">
-                      {stageRuns.map((stageRun: StageRun) => (
-                        <article
-                          key={stageRun.id}
-                          className={stageRun.stage_id === activeSession.current_stage ? "stage-run current" : "stage-run"}
-                        >
-                          <div className="stage-run-title">
-                            <strong>{formatStageName(stageRun.stage_id)}</strong>
-                            <span className={`status-pill ${stageRun.status}`}>{formatStatus(stageRun.status)}</span>
-                          </div>
-                          <small>第 {stageRun.attempt} 次尝试</small>
-                          <p className="markdown-content">
-                            <MarkdownContent>{stageRun.output_summary ?? stageRun.input_summary}</MarkdownContent>
-                          </p>
-                        </article>
-                      ))}
-                    </div>
-                  ) : (
-                    <p className="muted">暂无阶段执行记录。</p>
-                  )}
-                </section>
-
-                <section className="run-panel">
-                  <div className="panel-heading">
-                    <h3>返工请求</h3>
-                    <small>{reworkRequests.length} 个请求</small>
-                  </div>
-                  {reworkRequests.length > 0 ? (
-                    <div className="rework-list">
-                      {reworkRequests.map((request: ReworkRequest) => (
-                        <article key={request.id} className="rework-request">
-                          <div className="stage-run-title">
-                            <strong>
-                              {formatStageName(request.from_stage_id)} -&gt; {formatStageName(request.target_stage_id)}
-                            </strong>
-                            <span className={`status-pill ${request.status}`}>{formatStatus(request.status)}</span>
-                          </div>
-                          <p className="markdown-content">
-                            <MarkdownContent>{request.reason}</MarkdownContent>
-                          </p>
-                          {request.status === "pending" && (
+                            )}
+                            {showOtherInput && (
+                              <textarea
+                                className="question-textarea"
+                                rows={2}
+                                value={otherText}
+                                onChange={(event) =>
+                                  setQuestionOtherTexts((prev) => ({ ...prev, [q.id]: event.target.value }))
+                                }
+                                placeholder="输入你的其他意见..."
+                              />
+                            )}
+                            {q.question_type === "text" && (
+                              <textarea
+                                className="question-textarea"
+                                rows={3}
+                                value={typeof currentAnswer === "string" ? currentAnswer : ""}
+                                onChange={(event) => setQuestionAnswers((prev) => ({ ...prev, [q.id]: event.target.value }))}
+                                placeholder="输入你的回答..."
+                              />
+                            )}
                             <div className="actions">
-                              <button className="primary" disabled={busy} onClick={() => approveReworkRequest(activeSession, request)}>
-                                批准返工
+                              <button
+                                className="primary"
+                                disabled={busy || !isValid}
+                                onClick={() => {
+                                  let ans: string | string[];
+                                  if (q.question_type === "multi") {
+                                    const arr = Array.isArray(currentAnswer) ? currentAnswer : [];
+                                    ans = arr
+                                      .map((v) => (v === OTHER_OPTION_VALUE ? trimmedOther : v))
+                                      .filter((v) => v.length > 0);
+                                  } else if (q.question_type === "single") {
+                                    const v = (currentAnswer as string) || "";
+                                    ans = v === OTHER_OPTION_VALUE ? trimmedOther : v;
+                                  } else {
+                                    ans = ((currentAnswer as string) || "").trim();
+                                  }
+                                  void answerHumanQuestion(activeSession, q.id, ans);
+                                }}
+                              >
+                                提交回答
                               </button>
                             </div>
-                          )}
-                        </article>
-                      ))}
+                          </article>
+                        );
+                      })}
                     </div>
-                  ) : (
-                    <p className="muted">暂无返工请求。</p>
                   )}
-                </section>
-              </div>
-              {pendingReworkRequests.length > 0 && (
-                <div className="pending-banner">{pendingReworkRequests.length} 个返工请求等待审批。</div>
-              )}
-              {activityEvents.length > 0 && (
-                <section className="activity-stream">
-                  <div className="activity-stream-header">实时活动（滚动）</div>
-                  <div className="activity-stream-body" ref={activityStreamRef}>
-                    {activityEvents.map((p) => (
-                      <div key={p.id} className="activity-item">
-                        <time>{formatTimestamp(p.created_at)}</time>
-                        <span className="muted">{p.message}</span>
+                  <div className="run-panels">
+                    <section className="run-panel">
+                      <div className="panel-heading">
+                        <h3>阶段执行</h3>
+                        <small>{stageRuns.length} 次尝试</small>
                       </div>
+                      {stageRuns.length > 0 ? (
+                        <div className="stage-run-list">
+                          {stageRuns.map((stageRun: StageRun) => (
+                            <article
+                              key={stageRun.id}
+                              className={stageRun.stage_id === activeSession.current_stage ? "stage-run current" : "stage-run"}
+                            >
+                              <div className="stage-run-title">
+                                <strong>{formatStageName(stageRun.stage_id)}</strong>
+                                <span className={`status-pill ${stageRun.status}`}>{formatStatus(stageRun.status)}</span>
+                              </div>
+                              <small>第 {stageRun.attempt} 次尝试</small>
+                              <p className="markdown-content">
+                                <MarkdownContent>{stageRun.output_summary ?? stageRun.input_summary}</MarkdownContent>
+                              </p>
+                            </article>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="muted">暂无阶段执行记录。</p>
+                      )}
+                    </section>
+
+                    <section className="run-panel">
+                      <div className="panel-heading">
+                        <h3>返工请求</h3>
+                        <small>{reworkRequests.length} 个请求</small>
+                      </div>
+                      {reworkRequests.length > 0 ? (
+                        <div className="rework-list">
+                          {reworkRequests.map((request: ReworkRequest) => (
+                            <article key={request.id} className="rework-request">
+                              <div className="stage-run-title">
+                                <strong>
+                                  {formatStageName(request.from_stage_id)} -&gt; {formatStageName(request.target_stage_id)}
+                                </strong>
+                                <span className={`status-pill ${request.status}`}>{formatStatus(request.status)}</span>
+                              </div>
+                              <p className="markdown-content">
+                                <MarkdownContent>{request.reason}</MarkdownContent>
+                              </p>
+                              {request.status === "pending" && (
+                                <div className="actions">
+                                  <button className="primary" disabled={busy} onClick={() => approveReworkRequest(activeSession, request)}>
+                                    批准返工
+                                  </button>
+                                </div>
+                              )}
+                            </article>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="muted">暂无返工请求。</p>
+                      )}
+                    </section>
+                  </div>
+                  {pendingReworkRequests.length > 0 && (
+                    <div className="pending-banner">{pendingReworkRequests.length} 个返工请求等待审批。</div>
+                  )}
+                  {/* 实时活动流 - 移到这里，在阶段执行和返工请求下方 */}
+                  {activityEvents.length > 0 && (
+                    <section className="activity-stream">
+                      <div className="activity-stream-header">实时活动（滚动）</div>
+                      <div className="activity-stream-body" ref={activityStreamRef}>
+                        {activityEvents.map((p) => (
+                          <div key={p.id} className="activity-item">
+                            <time>{formatTimestamp(p.created_at)}</time>
+                            <span className="muted">{p.message}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </section>
+                  )}
+                  {(activeSession?.workflow_id === "chat" || activeSession?.status === "completed") && (
+                    <div className={`chat-input-box${dragOverTarget === "chat" ? " drag-over" : ""}`}
+                      onDragOver={(e) => handleDragOver(e, "chat")}
+                      onDragLeave={(e) => handleDragLeave(e, "chat")}
+                      onDrop={(e) => handleDrop(e, "chat")}>
+                      <div className="chat-input-header">
+                        <h3>继续对话</h3>
+                        <small>(会话：{summarizeSessionTitle(activeSession.task_prompt)})</small>
+                      </div>
+                      {chatAttachments.length > 0 && (
+                        <div className="attachment-strip">
+                          {chatAttachments.map((att, i) => (
+                            <div key={attachmentKey(att, i)} className="attachment-chip">
+                              {att.type === "image" ? (
+                                <img src={`data:${att.media_type};base64,${att.data_base64}`} alt={att.display_name} className="attachment-thumb" />
+                              ) : (
+                                <span className="attachment-file-icon">📄</span>
+                              )}
+                              <span className="attachment-name">{att.display_name}</span>
+                              <button className="attachment-remove" onClick={() => removeAttachment("chat", i)}>×</button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      <textarea
+                        value={chatInput}
+                        onChange={(event) => handleTextareaChange(event.target.value, "chat", event.target.selectionStart ?? undefined)}
+                        onPaste={(e) => handlePaste(e, "chat")}
+                        placeholder="输入消息... (可粘贴图片、拖入文件、@引用项目文件)"
+                        rows={2}
+                      />
+                      {showFileMention && mentionTarget === "chat" && fileMentionResults.length > 0 && (
+                        <div className="file-mention-dropdown">
+                          {fileMentionResults.map((filePath) => (
+                            <button key={filePath} className="file-mention-item" onClick={() => selectFileMention(filePath, "chat")}>
+                              {filePath}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                      <div className="actions">
+                        <button className="icon-btn" title="添加附件" onClick={() => fileInputRef.current?.click()}>📎</button>
+                        <button
+                          className="primary"
+                          disabled={(!chatInput.trim() && chatAttachments.length === 0) || busy}
+                          onClick={() => {
+                            if (activeSession && (chatInput.trim() || chatAttachments.length > 0)) {
+                              void sendMessage(activeSession, chatInput.trim(), chatAttachments.length > 0 ? chatAttachments : undefined);
+                              setChatInput("");
+                              setChatAttachments([]);
+                            }
+                          }}
+                        >
+                          发送
+                        </button>
+                      </div>
+                      <input type="file" ref={fileInputRef} style={{ display: "none" }} multiple
+                        onChange={(e) => handleFileSelect(e, "chat")} />
+                    </div>
+                  )}
+                  <div className="timeline">
+                    {timeline.map((event: TimelineEvent) => (
+                      <article key={event.id} className={`timeline-item ${event.type}`}>
+                        <div className="timeline-meta">
+                          <time>{formatTimestamp(event.timestamp)}</time>
+                          {event.status && <span className="timeline-status">{formatStatus(event.status)}</span>}
+                        </div>
+                        <div className="timeline-body">
+                          <strong>{event.title}</strong>
+                          {event.detail && (
+                            <MarkdownContent>{event.detail}</MarkdownContent>
+                          )}
+                        </div>
+                      </article>
                     ))}
                   </div>
-                </section>
-              )}
-              <div className="timeline">
-                {timeline.map((event: TimelineEvent) => (
-                  <article key={event.id} className={`timeline-item ${event.type}`}>
-                    <div className="timeline-meta">
-                      <time>{formatTimestamp(event.timestamp)}</time>
-                      {event.status && <span className="timeline-status">{formatStatus(event.status)}</span>}
-                    </div>
-                    <div className="timeline-body">
-                      <strong>{event.title}</strong>
-                      {event.detail && (
-                        <MarkdownContent>{event.detail}</MarkdownContent>
-                      )}
-                    </div>
-                  </article>
-                ))}
-              </div>
-              {showMoreTimeline && (
-                <div className="timeline-more">
-                  <button className="secondary" onClick={() => setTimelineLimit((n) => n + 50)}>
-                    加载更多（显示更多 50 条）
-                  </button>
-                </div>
-              )}
-              {/* 闲聊工作流或会话已完成时显示继续对话输入框 */}
-              {(activeSession?.workflow_id === "chat" || activeSession?.status === "completed") && (
-                <div className={`chat-input-box${dragOverTarget === "chat" ? " drag-over" : ""}`}
-                  onDragOver={(e) => handleDragOver(e, "chat")}
-                  onDragLeave={(e) => handleDragLeave(e, "chat")}
-                  onDrop={(e) => handleDrop(e, "chat")}>
-                  {chatAttachments.length > 0 && (
-                    <div className="attachment-strip">
-                      {chatAttachments.map((att, i) => (
-                        <div key={attachmentKey(att, i)} className="attachment-chip">
-                          {att.type === "image" ? (
-                            <img src={`data:${att.media_type};base64,${att.data_base64}`} alt={att.display_name} className="attachment-thumb" />
-                          ) : (
-                            <span className="attachment-file-icon">📄</span>
-                          )}
-                          <span className="attachment-name">{att.display_name}</span>
-                          <button className="attachment-remove" onClick={() => removeAttachment("chat", i)}>×</button>
-                        </div>
-                      ))}
+                  {showMoreTimeline && (
+                    <div className="timeline-more">
+                      <button className="secondary" onClick={() => setTimelineLimit((n) => n + 50)}>
+                        加载更多（显示更多 50 条）
+                      </button>
                     </div>
                   )}
-                  <textarea
-                    value={chatInput}
-                    onChange={(event) => handleTextareaChange(event.target.value, "chat", event.target.selectionStart ?? undefined)}
-                    onPaste={(e) => handlePaste(e, "chat")}
-                    placeholder="输入消息继续对话... (可粘贴图片、拖入文件、@引用项目文件)"
-                    rows={2}
-                  />
-                  {showFileMention && mentionTarget === "chat" && fileMentionResults.length > 0 && (
-                    <div className="file-mention-dropdown">
-                      {fileMentionResults.map((filePath) => (
-                        <button key={filePath} className="file-mention-item" onClick={() => selectFileMention(filePath, "chat")}>
-                          {filePath}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                  <div className="actions">
-                    <button className="icon-btn" title="添加附件" onClick={() => fileInputRef.current?.click()}>📎</button>
-                    <button
-                      className="primary"
-                      disabled={(!chatInput.trim() && chatAttachments.length === 0) || busy}
-                      onClick={() => {
-                        if (activeSession && (chatInput.trim() || chatAttachments.length > 0)) {
-                          void sendMessage(activeSession, chatInput.trim(), chatAttachments.length > 0 ? chatAttachments : undefined);
-                          setChatInput("");
-                          setChatAttachments([]);
-                        }
-                      }}
-                    >
-                      发送
+              </>
+              ) : (
+                <div className="empty-state">
+                  <h3>{projectPath ? "暂无当前项目会话" : "尚未选择项目"}</h3>
+                  <p>{projectPath ? "选择工作流并提交任务后，运行状态会显示在这里。" : "选择一个项目后，工作流和会话会显示在这里。"}</p>
+                  {!projectPath && (
+                    <button className="secondary" disabled={busy} onClick={chooseProject}>
+                      选择项目
                     </button>
-                  </div>
-                  <input type="file" ref={fileInputRef} style={{ display: "none" }} multiple
-                    onChange={(e) => handleFileSelect(e, "chat")} />
+                  )}
                 </div>
               )}
-            </>
-          ) : (
-            <div className="empty-state">
-              <h3>{projectPath ? "暂无当前项目会话" : "尚未选择项目"}</h3>
-              <p>{projectPath ? "选择工作流并提交任务后，运行状态会显示在这里。" : "选择一个项目后，工作流和会话会显示在这里。"}</p>
-              {!projectPath && (
-                <button className="secondary" disabled={busy} onClick={chooseProject}>
-                  选择项目
-                </button>
-              )}
+            </section>
+          </div>
+
+          {activeWorkflow && (
+            <div className="right-panel">
+              <div className="stages-panel">
+                <h3>阶段状态</h3>
+                <div className="stages stages-stepper">
+                  {workflowStageDisplays.map(({ stage, status, attempt, isCurrent }) => (
+                    <div key={stage.id} className={`stage ${status}${isCurrent ? " current" : ""}`}>
+                      <span className={`stage-indicator ${status}`} aria-label={formatStatus(status)} />
+                      <div>
+                        <span>{formatStageName(stage.id, stage.name)}</span>
+                        <small>
+                          {formatStatus(status)}
+                          {attempt ? ` · 第 ${attempt} 次` : ""}
+                          {stage.approval_required ? " · 需审批" : ""}
+                        </small>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
             </div>
           )}
-        </section>
+        </div>
       </section>
     </main>
   );
@@ -1491,8 +1513,6 @@ function JsonValue({ value }: { value: unknown }) {
   }
   if (typeof value === "string") {
     const trimmed = value.trim();
-    // 包含 Markdown 标记的字符串用 Markdown 渲染（复用 MarkdownContent 以保持与其他渲染入口一致：
-    // 例如 ```json``` 代码块会同样走 JSON 美化）
     if (hasMarkdown(trimmed)) {
       return (
         <div className="json-markdown-value">
@@ -1542,7 +1562,7 @@ function hasMarkdown(text: string): boolean {
   return /[*_~`#>|[\-]{2,}/.test(text) || text.includes("\n");
 }
 
-/** 共享的 remark 插件数组：提到模块作用域，避免每次 render 重建破坏 react-markdown 的浅比较缓存 */
+/** 共享的 remark 插件数组 */
 const REMARK_PLUGINS = [remarkGfm];
 
 /** 自定义 Markdown 组件：JSON 代码块用美化渲染 */
@@ -1551,7 +1571,6 @@ const markdownComponents: Components = {
     const language = className?.replace("language-", "");
     const text = String(children).replace(/\n$/, "");
 
-    // JSON 代码块：解析并美化渲染
     if (language === "json") {
       try {
         const parsed = JSON.parse(text);
@@ -1565,7 +1584,6 @@ const markdownComponents: Components = {
       }
     }
 
-    // 非代码块内的内联 code
     if (!className) {
       return (
         <code className={className} {...props}>
@@ -1574,7 +1592,6 @@ const markdownComponents: Components = {
       );
     }
 
-    // 其他语言的代码块
     return (
       <pre>
         <code className={className} {...props}>
