@@ -1239,6 +1239,20 @@ export default function App() {
                       })}
                     </div>
                   )}
+                  {/* 实时活动流：放在阶段执行和返工请求上方，优先展示当前状态。 */}
+                  {activityEvents.length > 0 && (
+                    <section className="activity-stream">
+                      <div className="activity-stream-header">实时活动（滚动）</div>
+                      <div className="activity-stream-body" ref={activityStreamRef}>
+                        {activityEvents.map((p) => (
+                          <div key={p.id} className="activity-item">
+                            <time>{formatTimestamp(p.created_at)}</time>
+                            <span className="muted">{p.message}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </section>
+                  )}
                   <div className="run-panels">
                     <section className="run-panel">
                       <div className="panel-heading">
@@ -1303,20 +1317,6 @@ export default function App() {
                   </div>
                   {pendingReworkRequests.length > 0 && (
                     <div className="pending-banner">{pendingReworkRequests.length} 个返工请求等待审批。</div>
-                  )}
-                  {/* 实时活动流 - 移到这里，在阶段执行和返工请求下方 */}
-                  {activityEvents.length > 0 && (
-                    <section className="activity-stream">
-                      <div className="activity-stream-header">实时活动（滚动）</div>
-                      <div className="activity-stream-body" ref={activityStreamRef}>
-                        {activityEvents.map((p) => (
-                          <div key={p.id} className="activity-item">
-                            <time>{formatTimestamp(p.created_at)}</time>
-                            <span className="muted">{p.message}</span>
-                          </div>
-                        ))}
-                      </div>
-                    </section>
                   )}
                   {(activeSession?.workflow_id === "chat" || activeSession?.status === "completed") && (
                     <div className={`chat-input-box${dragOverTarget === "chat" ? " drag-over" : ""}`}
