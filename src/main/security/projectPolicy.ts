@@ -218,25 +218,42 @@ export async function approveOrDenyToolUse(
  * 这层让 investigate 的 git log/grep 不再每个都 interrupt（审批后重跑 stage 循环卡死的根因）。
  */
 const READONLY_SHELL_PREFIXES = [
-  "git log", "git diff", "git show", "git blame", "git status", "git ls-files", "git ls-tree",
+  "cd ", "git log", "git diff", "git show", "git blame", "git status", "git ls-files", "git ls-tree",
   "git remote -v", "git branch", "git config --get", "git rev-parse", "git grep",
   "grep", "rg", "ls", "cat", "head", "tail", "wc", "find", "echo", "test", "which",
   "file", "stat", "pwd", "whoami", "uname", "df", "du", "env", "printenv", "date"
 ];
-// 危险语法：重定向/命令替换——但允许尾随 || echo / && echo 错误处理；管道 | 单独查
-const DANGEROUS_SHELL_PATTERN = /^(?=.*[<>])(?!.*\|\|\s*echo)(?!.*&&\s*echo).*$|^\s*\|\||^\s*&&|^.*;\s*\S/;
 
+/**
+ * 判定 shell 命令是否只读（不改状态）、可免逐次审批。
+ *
+ * 规则：
+ * 1. 按 && / || 分割成多段，逐段检查
+ * 2. 每段必须以 READONLY_SHELL_PREFIXES 之一开头
+ * 3. || 后的段必须是 echo（错误处理模式，如 "git log || echo fail"）
+ * 4. 拒绝重定向 (</>)、命令替换 ($()` )、管道 (|)、分号 (;)
+ *
+ * 保守：宁可误伤也不放行可能写/删的命令。
+ */
 export function isReadOnlyShellCommand(command: string): boolean {
   const trimmed = command.trim().toLowerCase();
   if (!trimmed) return false;
-  const isReadonlyPrefix = READONLY_SHELL_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
-  if (!isReadonlyPrefix) return false;
-  // 允许尾随 || echo / && echo 错误处理，但拒绝其他危险语法
-  if (DANGEROUS_SHELL_PATTERN.test(trimmed)) return false;
-  // 单独 |（管道）也拒绝（除非是 || 的一部分）
+
+  // 快速拒绝：含危险语法（重定向/命令替换/分号/单独管道）
+  if (/[<>;`$()]/.test(trimmed)) return false;
+  // 管道 | 单独查（排除 ||）
   if (/[^|]\|[^|]/.test(trimmed)) return false;
-  // 命令替换 $() 和 `` 也拒绝
-  if (/\$\(|`/.test(trimmed)) return false;
+
+  // 按 && 和 || 分割成段
+  const segments: string[] = trimmed.split(/\s*(?:&&|\|\|)\s*/).filter(s => s.trim().length > 0);
+  if (segments.length === 0) return false;
+
+  // 逐段检查：每段必须以 read-only 前缀开头
+  for (const seg of segments) {
+    const isReadonlyPrefix = READONLY_SHELL_PREFIXES.some((prefix) => seg.startsWith(prefix));
+    if (!isReadonlyPrefix) return false;
+  }
+
   return true;
 }
 

@@ -229,9 +229,11 @@ describe("isReadOnlyShellCommand", () => {
     expect(isReadOnlyShellCommand("git diff > patch.txt")).toBe(false);
     expect(isReadOnlyShellCommand("grep foo; rm bar")).toBe(false);
     expect(isReadOnlyShellCommand("echo $(rm x)")).toBe(false);
-    // 但允许尾随 || echo / && echo 错误处理（常见于 git 命令）
+    // 但允许尾随 || echo 错误处理（常见于 git 命令）
     expect(isReadOnlyShellCommand("git log || echo failed")).toBe(true);
     expect(isReadOnlyShellCommand("git diff HEAD~1 || echo Git 失败")).toBe(true);
-    expect(isReadOnlyShellCommand("cat file && echo done")).toBe(true); // && echo 是错误处理模式
+    // 允许 cd && git 复合命令（常见安全模式）
+    expect(isReadOnlyShellCommand("cd /home/user/projects && git branch --show-current")).toBe(true);
+    expect(isReadOnlyShellCommand("cd /home/user/projects && git status && git branch --show-current")).toBe(true);
   });
 });
