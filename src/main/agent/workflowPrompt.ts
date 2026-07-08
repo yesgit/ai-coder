@@ -12,7 +12,12 @@ export function buildStageInstructions(input: StageAgentInput): string {
     .join("\n");
 
   const previousStageLines = input.previous_stage_summaries
-    .map((summary) => `- ${summary.stage_id} attempt ${summary.attempt}: ${summary.output_summary ?? summary.status}`)
+    .map((summary) => {
+      const requiredOutputs = summary.required_outputs && Object.keys(summary.required_outputs).length > 0
+        ? `\n  required_outputs: ${JSON.stringify(summary.required_outputs)}`
+        : "";
+      return `- ${summary.stage_id} attempt ${summary.attempt}: ${summary.output_summary ?? summary.status}${requiredOutputs}`;
+    })
     .join("\n");
 
   const retrySection = input.retry_context
@@ -20,7 +25,13 @@ export function buildStageInstructions(input: StageAgentInput): string {
         "",
         `本次为当前阶段的重试（上次为第 ${input.retry_context.previous_attempt} 次尝试）：`,
         `- 上次失败原因/总结：${input.retry_context.output_summary}`,
-        "请认真分析失败原因，避免重复同样的错误，优先采取与上次不同的策略或更小的改动。"
+        "请认真分析失败原因，避免重复同样的错误，优先采取与上次不同的策略或更小的改动。",
+        ...(needsStrictJsonRetry(input.retry_context.output_summary)
+          ? [
+              "这次重试命中过 JSON/必填字段问题：结束时不要先写解释、清单、Markdown 或代码块，再补 JSON。",
+              "请先在脑内组装完整对象，确认双引号、括号、逗号都合法，再一次性输出单一 JSON 对象。"
+            ]
+          : [])
       ].join("\n")
     : "";
 
@@ -87,13 +98,16 @@ export function buildStageInstructions(input: StageAgentInput): string {
     "不要用文字审批请求代替工具调用，也不要仅因为 shell 命令或文件写入需要审批就把阶段标记为 failed。",
     "如果当前阶段发现需要返工到更早阶段，请说明目标阶段和原因，不要自行改变工作流状态。",
     "入境验收（重要）：如果存在前序阶段摘要（即非首阶段），动手当前阶段工作之前必须先核对前序阶段产出是否满足本阶段的输入要求——",
-    "  - 核对维度：前序阶段的 output_summary 是否覆盖了它声明的 required_outputs / 必写核心段；内容是否具体可用（不是空话套话）；是否与当前阶段任务衔接。",
+    "  - 核对维度：前序阶段的 output_summary 与 required_outputs 是否覆盖了它声明的 required_outputs / 必写核心段；内容是否具体可用（不是空话套话）；是否与当前阶段任务衔接。",
+    "  - 优先消费前序阶段 required_outputs 中的结构化状态（如 DoD、证据、调用方假设、成功标准、验证计划、改动核对），不要只靠 output_summary 重新猜测。",
     "  - 不合格时：把当前阶段 status 写成 needs_rework、rework_target_stage_id 指向不合格的前序阶段、rework_reason 用一两句中文写明哪里不合格、缺了什么。",
     "  - 合格时：继续当前阶段工作，无需在 output_summary 里专门说明验收通过。",
     "  - 这不是挑刺，是'我能基于前序产出继续推进吗'的诚实自检——前序产出有缺口却硬推进，只会把问题留到 self_review 才暴露，成本更高。",
     "如果阶段要求输出结构化字段，请让 required_outputs 中的字段内容具体、可复用，并包含支撑判断的事实或路径。",
     "使用任何工具后，或在不需要工具时完成阶段工作后，请通过且仅通过一个符合下方协议的 JSON 对象结束当前阶段。",
     "最终 JSON 对象前后不要添加额外说明文字。",
+    "禁止输出“先解释一下”“下面是 JSON”“根据分析如下”等前导语；也禁止在 JSON 后补充说明、再贴第二个对象，或把 JSON 放进 ```json 代码块。",
+    "输出前自行做一次严格自检：最外层必须是单个对象；所有 key/字符串都用双引号；没有未闭合的引号/花括号/方括号；没有尾随逗号；required_outputs 必须是对象而不是数组或字符串。",
     "",
     "工作流概览：",
     stageLines,
@@ -143,6 +157,11 @@ export function buildStageInstructions(input: StageAgentInput): string {
     "对话历史：",
     messageHistory || "无"
   ].join("\n");
+}
+
+function needsStrictJsonRetry(summary: string | undefined): boolean {
+  if (!summary) return false;
+  return /json parse|missing required outputs|单一合法对象|required_outputs/i.test(summary);
 }
 
 /**

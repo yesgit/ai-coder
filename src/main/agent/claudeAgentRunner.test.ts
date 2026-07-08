@@ -182,7 +182,130 @@ describe("ClaudeAgentRunner", () => {
       output_summary: expect.stringContaining("Invalid API key")
     });
   });
+
+  it("waits inside the active SDK tool callback until a pending tool approval is resolved", async () => {
+    let permissionResult: unknown;
+    async function* query(params: unknown) {
+      const canUseTool = (params as {
+        options: {
+          canUseTool: (
+            toolName: string,
+            input: Record<string, unknown>,
+            options: { toolUseID: string }
+          ) => Promise<unknown>;
+        };
+      }).options.canUseTool;
+      permissionResult = await canUseTool("Bash", { command: "node script.js" }, { toolUseID: "tool-await" });
+      yield {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: JSON.stringify({
+          status: "completed",
+          output_summary: "Executed after approval"
+        })
+      };
+    }
+
+    const session: AgentSession = {
+      id: "00000000-0000-4000-8000-000000000020",
+      project_path: "/tmp/project",
+      workflow_id: workflow.id,
+      task_prompt: "Run tests",
+      status: "running",
+      current_stage: "execute",
+      messages: [],
+      tool_calls: [],
+      file_changes: [],
+      approvals: [],
+      stage_runs: [
+        {
+          id: "00000000-0000-4000-8000-000000000021",
+          stage_id: "execute",
+          attempt: 1,
+          status: "running",
+          input_summary: "Approved plan",
+          started_at: new Date().toISOString()
+        }
+      ],
+      rework_requests: [],
+      progress_events: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+
+    const runner = new ClaudeAgentRunner(query);
+    const run = runner.run({ session, workflow });
+    await waitFor(() => session.tool_calls.some((toolCall) => toolCall.id === "tool-await" && toolCall.status === "pending_approval"));
+
+    expect(session.status).toBe("waiting_approval");
+    expect(runner.resolveToolApproval(session.id, "tool-await", "approved")).toBe(true);
+
+    const updated = await run;
+    expect(permissionResult).toMatchObject({ behavior: "allow", updatedInput: { command: "node script.js" } });
+    expect(updated.tool_calls.find((toolCall) => toolCall.id === "tool-await")).toMatchObject({ status: "completed" });
+    expect(updated.status).toBe("completed");
+  });
+
+  it("does not record transient sdk_message progress for assistant messages without visible content", async () => {
+    async function* query() {
+      yield {
+        type: "assistant",
+        message: { content: [] }
+      };
+      yield {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: JSON.stringify({
+          status: "completed",
+          output_summary: "Done"
+        })
+      };
+    }
+
+    const session: AgentSession = {
+      id: "00000000-0000-4000-8000-000000000030",
+      project_path: "/tmp/project",
+      workflow_id: workflow.id,
+      task_prompt: "Run something",
+      status: "running",
+      current_stage: "execute",
+      messages: [],
+      tool_calls: [],
+      file_changes: [],
+      approvals: [],
+      stage_runs: [
+        {
+          id: "00000000-0000-4000-8000-000000000031",
+          stage_id: "execute",
+          attempt: 1,
+          status: "running",
+          input_summary: "Approved plan",
+          started_at: new Date().toISOString()
+        }
+      ],
+      rework_requests: [],
+      progress_events: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+
+    const updated = await new ClaudeAgentRunner(query).run({ session, workflow });
+
+    expect(updated.progress_events?.some((event) => event.type === "sdk_message" && event.message === "助手消息（无文本）")).toBe(false);
+  });
 });
+
+async function waitFor(assertion: () => boolean): Promise<void> {
+  const started = Date.now();
+  while (!assertion()) {
+    if (Date.now() - started > 1000) {
+      throw new Error("Timed out waiting for condition");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
 
 describe("describeSdkMessageSnippet", () => {
   it("assistant 文本 block 提取前 80 字", () => {

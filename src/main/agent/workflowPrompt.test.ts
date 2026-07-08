@@ -44,6 +44,42 @@ describe("buildStageInstructions", () => {
     expect(prompt).toContain("宿主应用会拦截工具调用、创建审批项并暂停执行");
     expect(prompt).toContain("不要用文字审批请求代替工具调用");
     expect(prompt).toContain("最终 JSON 协议");
+    expect(prompt).toContain("禁止输出“先解释一下”");
+  });
+
+  it("adds strict JSON retry guidance when the previous attempt failed on parse or missing outputs", () => {
+    const input: StageAgentInput = {
+      workflow: {
+        id: "careful-coder-v2",
+        name: "谨慎程序员 v2",
+        description: "",
+        stages: [{ id: "design", name: "方案", approval_required: false, required_outputs: ["selected_plan"], required_checks: [], gates: [] }]
+      },
+      previous_stage_summaries: [],
+      current_stage: {
+        id: "design",
+        name: "方案",
+        instructions: "输出方案 JSON",
+        approval_required: false,
+        required_outputs: ["selected_plan"]
+      },
+      task_prompt: "修一个问题",
+      project_path: "/tmp/project",
+      allowed_tools: [],
+      required_outputs: ["selected_plan"],
+      gates: [],
+      retry_context: {
+        previous_attempt: 2,
+        output_summary: "Missing required outputs: selected_plan (JSON parse 失败诊断：bracket_balance=1)"
+      },
+      recent_messages: [],
+      human_qa_history: []
+    };
+
+    const prompt = buildStageInstructions(input);
+
+    expect(prompt).toContain("这次重试命中过 JSON/必填字段问题");
+    expect(prompt).toContain("请先在脑内组装完整对象");
   });
 
   it("hook sections: pre_tool_use 与 post_output_assertions 分别使用各自的 header（不混淆 deny/retry 语义）", () => {
@@ -95,6 +131,52 @@ describe("buildStageInstructions", () => {
     const postIdx = prompt.indexOf("本阶段产物校验");
     expect(preIdx).toBeGreaterThan(0);
     expect(postIdx).toBeGreaterThan(preIdx);
+  });
+
+  it("renders previous required_outputs as reusable stage state", () => {
+    const input: StageAgentInput = {
+      workflow: {
+        id: "careful-coder-v2",
+        name: "谨慎程序员 v2",
+        description: "",
+        stages: [
+          { id: "design", name: "方案", approval_required: false, required_outputs: ["success_criteria"], required_checks: [], gates: [] },
+          { id: "implement", name: "实施", approval_required: false, required_outputs: ["delta_checks"], required_checks: [], gates: [] }
+        ]
+      },
+      previous_stage_summaries: [
+        {
+          stage_id: "design",
+          attempt: 1,
+          status: "completed",
+          output_summary: "采用最小改动",
+          required_outputs: {
+            success_criteria: ["修复崩溃", "测试覆盖未登录路径"],
+            test_plan: ["npm test"]
+          }
+        }
+      ],
+      current_stage: {
+        id: "implement",
+        name: "实施",
+        instructions: "按方案实施",
+        approval_required: false,
+        required_outputs: ["delta_checks"]
+      },
+      task_prompt: "",
+      project_path: "/tmp",
+      allowed_tools: [],
+      required_outputs: ["delta_checks"],
+      gates: [],
+      recent_messages: [],
+      human_qa_history: []
+    };
+
+    const prompt = buildStageInstructions(input);
+
+    expect(prompt).toContain("required_outputs:");
+    expect(prompt).toContain("\"success_criteria\":[\"修复崩溃\",\"测试覆盖未登录路径\"]");
+    expect(prompt).toContain("优先消费前序阶段 required_outputs 中的结构化状态");
   });
 
   it("hook sections: 只声明 post_output_assertions 时，不渲染 pre_tool_use header", () => {

@@ -246,13 +246,19 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
   });
 
   if (session.error) {
+    const errorTitle =
+      session.status === "blocked"
+        ? "会话已阻断"
+        : session.status === "interrupted"
+          ? "会话已中断"
+          : "会话失败";
     events.push({
       id: `${session.id}:error`,
       type: "error",
-      title: "会话失败",
+      title: errorTitle,
       detail: session.error,
       timestamp: session.updated_at,
-      status: "failed",
+      status: session.status,
       sort_order: 90
     });
   }

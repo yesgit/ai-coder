@@ -84,6 +84,23 @@ describe("buildSessionTimeline", () => {
     expect(events.find((event) => event.id === `${session.id}:status`)).toMatchObject({ type: "status", title: "会话失败" });
   });
 
+  it("labels blocked sessions as blocked instead of failed in the error event", () => {
+    const blockedSession: AgentSession = {
+      ...session,
+      status: "blocked",
+      error: "Missing required outputs after 3 attempts"
+    };
+
+    const events = buildSessionTimeline(blockedSession);
+
+    expect(events.find((event) => event.type === "error")).toMatchObject({
+      type: "error",
+      title: "会话已阻断",
+      detail: "Missing required outputs after 3 attempts",
+      status: "blocked"
+    });
+  });
+
   it("includes stage attempts and rework requests", () => {
     const reworkSession: AgentSession = {
       ...session,

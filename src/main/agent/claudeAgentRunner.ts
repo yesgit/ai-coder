@@ -20,11 +20,18 @@ export interface AgentRunInput {
 }
 
 type ClaudeQuery = (params: unknown) => AsyncIterable<unknown>;
+type ToolApprovalResolution = "approved" | "denied";
+
+interface PendingToolApproval {
+  session: AgentSession;
+  resolve: (status: ToolApprovalResolution) => void;
+}
 
 export class ClaudeAgentRunner {
   private readonly workflowEngine = new WorkflowEngine();
   private readonly maxStageIterations = 50;
   private readonly abortControllers = new Map<string, AbortController>();
+  private readonly pendingToolApprovals = new Map<string, Map<string, PendingToolApproval>>();
   private mcpServerCache: unknown | null = null;
 
   constructor(private readonly queryOverride?: ClaudeQuery) {}
@@ -36,6 +43,26 @@ export class ClaudeAgentRunner {
     }
     this.abortControllers.delete(sessionId);
     controller.abort();
+    return true;
+  }
+
+  resolveToolApproval(sessionId: string, toolCallId: string, status: ToolApprovalResolution): boolean {
+    const pendingForSession = this.pendingToolApprovals.get(sessionId);
+    const pending = pendingForSession?.get(toolCallId);
+    if (!pending) {
+      return false;
+    }
+    const toolCall = pending.session.tool_calls.find((item) => item.id === toolCallId && item.status === "pending_approval");
+    if (toolCall) {
+      toolCall.status = status;
+      toolCall.resolved_at = new Date().toISOString();
+      pending.session.status = status === "approved" ? "running" : "blocked";
+    }
+    pendingForSession?.delete(toolCallId);
+    if (pendingForSession?.size === 0) {
+      this.pendingToolApprovals.delete(sessionId);
+    }
+    pending.resolve(status);
     return true;
   }
 
@@ -133,16 +160,35 @@ export class ClaudeAgentRunner {
               }
             }
             const decision = await approveOrDenyToolUse(input.session, input.workflow, toolName, toolInput, options.toolUseID);
-            await this.recordProgress(input, "tool_policy", this.describeToolDecision(toolName, decision.allow), "milestone");
             if (decision.allow) {
+              await this.recordProgress(input, "tool_policy", this.describeToolDecision(toolName, true), "milestone");
               return { behavior: "allow", updatedInput: decision.updatedInput };
             }
+            if (this.hasPendingToolCall(input.session, options.toolUseID)) {
+              const approvalPromise = this.waitForToolApproval(input.session, options.toolUseID, abortController.signal);
+              await this.recordProgress(input, "tool_policy", this.describeToolDecision(toolName, false), "milestone");
+              const resolved = await approvalPromise;
+              if (resolved === "approved") {
+                const approvedDecision = await approveOrDenyToolUse(input.session, input.workflow, toolName, toolInput, options.toolUseID);
+                await this.recordProgress(input, "tool_policy", this.describeToolDecision(toolName, approvedDecision.allow), "milestone");
+                if (approvedDecision.allow) {
+                  input.session.status = "running";
+                  return { behavior: "allow", updatedInput: approvedDecision.updatedInput };
+                }
+                return { behavior: "deny", message: approvedDecision.message, interrupt: approvedDecision.interrupt };
+              }
+              return { behavior: "deny", message: "Tool call was denied by the user.", interrupt: true };
+            }
+            await this.recordProgress(input, "tool_policy", this.describeToolDecision(toolName, false), "milestone");
             return { behavior: "deny", message: decision.message, interrupt: decision.interrupt };
           }
         }
       } as never) as AsyncIterable<unknown>) {
         sdkMessages.push(message);
-        await this.recordProgress(input, "sdk_message", this.describeSdkMessage(message), "transient");
+        const snippet = this.describeSdkMessage(message);
+        if (isMeaningfulSdkProgress(snippet)) {
+          await this.recordProgress(input, "sdk_message", snippet, "transient");
+        }
       }
 
       // 若 abort 信号触发但 SDK 是优雅退出而不抛错，仍需走中止路径
@@ -335,8 +381,43 @@ export class ClaudeAgentRunner {
     return session.tool_calls.some((toolCall) => toolCall.status === "blocked" || toolCall.status === "denied");
   }
 
-  private hasPendingToolCall(session: AgentSession): boolean {
-    return session.tool_calls.some((toolCall) => toolCall.status === "pending_approval");
+  private hasPendingToolCall(session: AgentSession, toolCallId?: string): boolean {
+    return session.tool_calls.some(
+      (toolCall) => toolCall.status === "pending_approval" && (!toolCallId || toolCall.id === toolCallId)
+    );
+  }
+
+  private async waitForToolApproval(
+    session: AgentSession,
+    toolCallId: string,
+    signal: AbortSignal
+  ): Promise<ToolApprovalResolution> {
+    return new Promise<ToolApprovalResolution>((resolve) => {
+      if (signal.aborted) {
+        resolve("denied");
+        return;
+      }
+      const pendingForSession = this.pendingToolApprovals.get(session.id) ?? new Map<string, PendingToolApproval>();
+      pendingForSession.set(toolCallId, { session, resolve });
+      this.pendingToolApprovals.set(session.id, pendingForSession);
+      signal.addEventListener(
+        "abort",
+        () => {
+          const toolCall = session.tool_calls.find((item) => item.id === toolCallId && item.status === "pending_approval");
+          if (toolCall) {
+            toolCall.status = "cancelled";
+            toolCall.resolved_at = new Date().toISOString();
+          }
+          session.status = "interrupted";
+          pendingForSession.delete(toolCallId);
+          if (pendingForSession.size === 0) {
+            this.pendingToolApprovals.delete(session.id);
+          }
+          resolve("denied");
+        },
+        { once: true }
+      );
+    });
   }
 
   private buildHumanQuestion(session: AgentSession, toolInput: Record<string, unknown>, toolUseID: string): HumanQuestion | null {
@@ -534,4 +615,12 @@ function describeToolInputSnippet(input: unknown): string {
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isMeaningfulSdkProgress(snippet: string): boolean {
+  const trimmed = snippet.trim();
+  if (!trimmed) return false;
+  if (trimmed === "助手消息（无文本）") return false;
+  if (trimmed === "收到 Claude SDK 消息。") return false;
+  return true;
 }
