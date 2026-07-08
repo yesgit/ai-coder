@@ -299,6 +299,19 @@ export class WorkflowEngine {
     return session;
   }
 
+  startFollowUp(session: AgentSession, workflow: WorkflowTemplate, inputSummary: string): AgentSession {
+    if (this.getActiveStageRun(session)) {
+      return session;
+    }
+    const firstStage = workflow.stages[0];
+    if (!firstStage) {
+      throw new Error("Workflow has no stages");
+    }
+    session.error = undefined;
+    this.startStage(session, workflow, firstStage, inputSummary);
+    return session;
+  }
+
   private buildResumeInputSummary(
     session: AgentSession,
     workflow: WorkflowTemplate,

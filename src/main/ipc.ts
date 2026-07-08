@@ -19,6 +19,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
   const workflowEngine = new WorkflowEngine();
   const onboardingStore = new OnboardingStore();
   const workflowRouter = new WorkflowRouter();
+  const queuedUserMessages = new Map<string, AgentSession["messages"]>();
 
   // 应用启动时，从会话历史中恢复已授权的项目路径
   // 这样加载历史会话时不需要重新授权，除非项目路径已变化
@@ -113,7 +114,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     workflowEngine.approveStage(session, workflow, stageId);
     session.status = "running";
     await sessions.save(session);
-    runSessionInBackground(runner, sessions, session, workflow);
+    runSessionInBackground(runner, sessions, session, workflow, queuedUserMessages);
     return session;
   });
 
@@ -130,7 +131,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     workflowEngine.approveRework(session, workflow, requestId);
     session.status = "running";
     await sessions.save(session);
-    runSessionInBackground(runner, sessions, session, workflow);
+    runSessionInBackground(runner, sessions, session, workflow, queuedUserMessages);
     return session;
   });
 
@@ -142,7 +143,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     if (session.status === "running") {
       const workflow = await registry.get(session.workflow_id, session.project_path);
       if (workflow) {
-        runSessionInBackground(runner, sessions, session, workflow);
+        runSessionInBackground(runner, sessions, session, workflow, queuedUserMessages);
       }
     }
     return session;
@@ -167,7 +168,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     workflowEngine.ensureState(session, workflow);
     session.status = "running";
     await sessions.save(session);
-    runSessionInBackground(runner, sessions, session, workflow);
+    runSessionInBackground(runner, sessions, session, workflow, queuedUserMessages);
     return session;
   });
 
@@ -186,7 +187,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     }
     workflowEngine.resumeFromFailedStage(session, workflow);
     await sessions.save(session);
-    runSessionInBackground(runner, sessions, session, workflow);
+    runSessionInBackground(runner, sessions, session, workflow, queuedUserMessages);
     return session;
   });
 
@@ -244,7 +245,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     // 重新开始任务
     workflowEngine.restartFromBeginning(session, workflow);
     await sessions.save(session);
-    runSessionInBackground(runner, sessions, session, workflow);
+    runSessionInBackground(runner, sessions, session, workflow, queuedUserMessages);
     return session;
   });
 
@@ -297,7 +298,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     if (!stillPendingQuestion && !hasPendingToolApproval && !hasPendingStageApproval) {
       session.status = "running";
       await sessions.save(session);
-      runSessionInBackground(runner, sessions, session, workflow);
+      runSessionInBackground(runner, sessions, session, workflow, queuedUserMessages);
     } else {
       await sessions.save(session);
     }
@@ -338,7 +339,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     );
     session.status = "running";
     await sessions.save(session);
-    runSessionInBackground(runner, sessions, session, workflow);
+    runSessionInBackground(runner, sessions, session, workflow, queuedUserMessages);
     return { session };
   });
 
@@ -399,6 +400,9 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     if (!workflow) {
       throw new Error(`Workflow not found: ${session.workflow_id}`);
     }
+    if (session.status === "waiting_approval") {
+      throw new Error("Session is waiting for approval or a required answer.");
+    }
     // 处理附件：校验 + 图片保存到磁盘，转为文件引用
     let processedAttachments = attachments;
     if (attachments?.length) {
@@ -412,17 +416,36 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
         processedAttachments = await saveBinaryAttachments(attachments, session.project_path);
       }
     }
-    // 添加用户消息到会话
-    session.messages.push({
+    const userMessage: AgentSession["messages"][number] = {
       role: "user",
       content: message.trim(),
       created_at: new Date().toISOString(),
       attachments: processedAttachments
-    });
+    };
+    session.messages.push(userMessage);
+    if (session.status === "running") {
+      const queued = queuedUserMessages.get(session.id) ?? [];
+      queued.push(userMessage);
+      queuedUserMessages.set(session.id, queued);
+      session.progress_events ??= [];
+      session.progress_events.push({
+        id: randomUUID(),
+        type: "status",
+        message: "已收到用户消息，将在当前运行结束后继续处理。",
+        visibility: "milestone",
+        created_at: new Date().toISOString()
+      });
+      await sessions.save(session);
+      return session;
+    }
     // 将会话状态改为 running，触发新一轮执行
-    session.status = "running";
+    if (!workflowEngine.getActiveStageRun(session)) {
+      workflowEngine.startFollowUp(session, workflow, message.trim() || "Follow-up user message");
+    } else {
+      session.status = "running";
+    }
     await sessions.save(session);
-    runSessionInBackground(runner, sessions, session, workflow);
+    runSessionInBackground(runner, sessions, session, workflow, queuedUserMessages);
     return session;
   });
 
@@ -455,7 +478,8 @@ function runSessionInBackground(
   runner: ClaudeAgentRunner,
   sessions: SessionStore,
   session: Awaited<ReturnType<SessionStore["create"]>>,
-  workflow: NonNullable<Awaited<ReturnType<WorkflowRegistry["get"]>>>
+  workflow: NonNullable<Awaited<ReturnType<WorkflowRegistry["get"]>>>,
+  queuedUserMessages: Map<string, AgentSession["messages"]>
 ): void {
   void runner
     .run({
@@ -467,15 +491,61 @@ function runSessionInBackground(
       }
     })
     .then(async (updated) => {
+      const queued = queuedUserMessages.get(updated.id) ?? [];
+      if (queued.length > 0) {
+        queuedUserMessages.delete(updated.id);
+        appendMissingMessages(updated, queued);
+        updated.progress_events ??= [];
+        updated.progress_events.push({
+          id: randomUUID(),
+          type: "status",
+          message: `继续处理 ${queued.length} 条运行期间收到的用户消息。`,
+          visibility: "milestone",
+          created_at: new Date().toISOString()
+        });
+        if (updated.status !== "waiting_approval") {
+          const workflowEngine = new WorkflowEngine();
+          if (!workflowEngine.getActiveStageRun(updated)) {
+            workflowEngine.startFollowUp(updated, workflow, queued.at(-1)?.content || "Follow-up user message");
+          } else {
+            updated.status = "running";
+          }
+        }
+        await sessions.save(updated);
+        broadcastSessionProgress(updated);
+        if (updated.status === "running") {
+          runSessionInBackground(runner, sessions, updated, workflow, queuedUserMessages);
+        }
+        return;
+      }
       await sessions.save(updated);
       broadcastSessionProgress(updated);
     })
     .catch(async (error) => {
+      const queued = queuedUserMessages.get(session.id) ?? [];
+      if (queued.length > 0) {
+        queuedUserMessages.delete(session.id);
+        appendMissingMessages(session, queued);
+      }
       session.status = "failed";
       session.error = error instanceof Error ? error.message : String(error);
       await sessions.save(session);
       broadcastSessionProgress(session);
     });
+}
+
+function appendMissingMessages(session: AgentSession, messages: AgentSession["messages"]): void {
+  for (const message of messages) {
+    const exists = session.messages.some(
+      (item) =>
+        item.role === message.role &&
+        item.created_at === message.created_at &&
+        item.content === message.content
+    );
+    if (!exists) {
+      session.messages.push(message);
+    }
+  }
 }
 
 /**

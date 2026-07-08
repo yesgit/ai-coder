@@ -55,15 +55,12 @@ export default function App() {
   const [onboardingOverride, setOnboardingOverride] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const [chatInput, setChatInput] = useState("");
-  const [chatAttachments, setChatAttachments] = useState<Attachment[]>([]);
   const [taskAttachments, setTaskAttachments] = useState<Attachment[]>([]);
   const [showFileMention, setShowFileMention] = useState(false);
   const [fileMentionQuery, setFileMentionQuery] = useState("");
   const [fileMentionResults, setFileMentionResults] = useState<string[]>([]);
-  const [mentionTarget, setMentionTarget] = useState<"task" | "chat">("chat");
+  const [mentionTarget, setMentionTarget] = useState<"task" | "chat">("task");
   const [dragOverTarget, setDragOverTarget] = useState<"task" | "chat" | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
   const taskFileInputRef = useRef<HTMLInputElement>(null);
   const [questionAnswers, setQuestionAnswers] = useState<Record<string, string | string[]>>({});
   // 单选/多选中选择"其他"时的自定义文本草稿，按 question id 存放
@@ -335,6 +332,18 @@ export default function App() {
     }
   }
 
+  async function submitComposer() {
+    if (composerSession) {
+      if (!taskPrompt.trim() && taskAttachments.length === 0) return;
+      await sendMessage(composerSession, taskPrompt.trim(), taskAttachments.length > 0 ? taskAttachments : undefined);
+      setTaskPrompt("");
+      setTaskAttachments([]);
+      setPendingRouting(null);
+      return;
+    }
+    await startSession();
+  }
+
   async function createSession(workflowId: string, routing?: SessionRoutingSnapshot) {
     const result = await window.aiCoder.startSession({
       projectPath,
@@ -584,7 +593,6 @@ export default function App() {
     }
     if (imageItems.length === 0) return;
     e.preventDefault();
-    const setAttachments = target === "chat" ? setChatAttachments : setTaskAttachments;
     const MAX_IMAGE_SIZE = 5 * 1024 * 1024; // 5MB
     for (const item of imageItems) {
       const file = item.getAsFile();
@@ -598,7 +606,7 @@ export default function App() {
         const dataUrl = reader.result as string;
         const base64 = dataUrl.split(",")[1];
         const mediaType = item.type || "image/png";
-        setAttachments((prev) => [
+        setTaskAttachments((prev) => [
           ...prev,
           { type: "image", data_base64: base64, media_type: mediaType, display_name: file.name || "pasted-image.png" }
         ]);
@@ -612,7 +620,6 @@ export default function App() {
     setDragOverTarget(null);
     const files = Array.from(e.dataTransfer.files);
     if (files.length === 0) return;
-    const setAttachments = target === "chat" ? setChatAttachments : setTaskAttachments;
     for (const file of files) {
       if (file.type.startsWith("image/")) {
         const reader = new FileReader();
@@ -620,7 +627,7 @@ export default function App() {
           const dataUrl = reader.result as string;
           const base64 = dataUrl.split(",")[1];
           const mediaType = file.type || "image/png";
-          setAttachments((prev) => [
+          setTaskAttachments((prev) => [
             ...prev,
             { type: "image", data_base64: base64, media_type: mediaType, display_name: file.name }
           ]);
@@ -632,7 +639,7 @@ export default function App() {
           continue;
         }
         void readFileAsBase64(file).then((base64) => {
-          setAttachments((prev) => [
+          setTaskAttachments((prev) => [
             ...prev,
             { type: "file_upload", data_base64: base64, media_type: guessMediaType(file), display_name: file.name }
           ]);
@@ -655,7 +662,6 @@ export default function App() {
   function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>, target: "task" | "chat") {
     const files = e.target.files;
     if (!files || files.length === 0) return;
-    const setAttachments = target === "chat" ? setChatAttachments : setTaskAttachments;
     const MAX_IMAGE_SIZE = 5 * 1024 * 1024; // 5MB
     for (const file of files) {
       if (file.type.startsWith("image/")) {
@@ -668,7 +674,7 @@ export default function App() {
           const dataUrl = reader.result as string;
           const base64 = dataUrl.split(",")[1];
           const mediaType = file.type || "image/png";
-          setAttachments((prev) => [
+          setTaskAttachments((prev) => [
             ...prev,
             { type: "image", data_base64: base64, media_type: mediaType, display_name: file.name }
           ]);
@@ -680,7 +686,7 @@ export default function App() {
           continue;
         }
         void readFileAsBase64(file).then((base64) => {
-          setAttachments((prev) => [
+          setTaskAttachments((prev) => [
             ...prev,
             { type: "file_upload", data_base64: base64, media_type: guessMediaType(file), display_name: file.name }
           ]);
@@ -693,11 +699,7 @@ export default function App() {
   }
 
   function handleTextareaChange(value: string, target: "task" | "chat", cursorPosition?: number) {
-    if (target === "chat") {
-      setChatInput(value);
-    } else {
-      setTaskPrompt(value);
-    }
+    setTaskPrompt(value);
     // @ 模式触发文件提及
     if (!projectPath) return;
     const pos = cursorPosition ?? value.length;
@@ -720,14 +722,13 @@ export default function App() {
   }
 
   function selectFileMention(filePath: string, target: "task" | "chat") {
-    const setAttachments = target === "chat" ? setChatAttachments : setTaskAttachments;
-    setAttachments((prev) => [
+    setTaskAttachments((prev) => [
       ...prev,
       { type: "file_ref", path: filePath, display_name: filePath.split(/[/\\]/).pop() || filePath }
     ]);
     // 将 @query 替换为 @filePath
-    const currentValue = target === "chat" ? chatInput : taskPrompt;
-    const setter = target === "chat" ? setChatInput : setTaskPrompt;
+    const currentValue = taskPrompt;
+    const setter = setTaskPrompt;
     const lastAtIndex = currentValue.lastIndexOf("@");
     if (lastAtIndex !== -1) {
       setter(currentValue.slice(0, lastAtIndex) + `@${filePath} ` + currentValue.slice(lastAtIndex).replace(/@[\S]*/, ""));
@@ -737,14 +738,21 @@ export default function App() {
   }
 
   function removeAttachment(target: "task" | "chat", index: number) {
-    const setAttachments = target === "chat" ? setChatAttachments : setTaskAttachments;
-    setAttachments((prev) => prev.filter((_, i) => i !== index));
+    setTaskAttachments((prev) => prev.filter((_, i) => i !== index));
   }
 
+  const composerSession =
+    activeSession?.project_path === projectPath &&
+    (activeSession.status === "running" || activeSession.status === "completed")
+      ? activeSession
+      : null;
   const onboardingConfirmed = onboardingStatus?.status === "confirmed";
   const onboardingRequired = Boolean(projectPath && taskWorkflowId !== "project-onboarding" && !onboardingConfirmed);
   const onboardingAdmissionAllowed = !taskWorkflowId || !onboardingRequired || onboardingOverride;
   const canStart = Boolean(projectPath && taskPrompt.trim() && onboardingAdmissionAllowed && !busy);
+  const canSubmitComposer = composerSession
+    ? Boolean(projectPath && (taskPrompt.trim() || taskAttachments.length > 0) && !busy)
+    : canStart;
   const pendingToolCalls = activeSession?.tool_calls.filter((toolCall) => toolCall.status === "pending_approval") ?? [];
   const pendingHumanQuestions = activeSession?.pending_human_questions?.filter((q) => q.status === "pending") ?? [];
   const approvedToolCalls = activeSession?.tool_calls.filter((toolCall) => toolCall.status === "approved") ?? [];
@@ -774,7 +782,7 @@ export default function App() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [activityEvents]);
   const latestProgress = activeSession?.progress_events?.at(-1);
-  const showOnboardingWarning = onboardingRequired;
+  const showOnboardingWarning = !composerSession && onboardingRequired;
 
   if (page === "workflows") {
     return (
@@ -892,9 +900,19 @@ export default function App() {
               onDrop={(e) => handleDrop(e, "task")}>
               <div className="composer-header-horizontal">
                 <div className="composer-info">
-                  <h2>{taskWorkflow ? formatWorkflowName(taskWorkflow.id, taskWorkflow.name) : "自动选择工作流"}</h2>
+                  <h2>
+                    {composerSession
+                      ? `当前会话：${composerSession.title ?? summarizeSessionTitle(composerSession.task_prompt)}`
+                      : taskWorkflow
+                        ? formatWorkflowName(taskWorkflow.id, taskWorkflow.name)
+                        : "自动选择工作流"}
+                  </h2>
                   <p>
-                    {taskWorkflow
+                    {composerSession
+                      ? composerSession.status === "running"
+                        ? "消息会在当前运行结束后继续处理。"
+                        : "发送消息后继续这个会话。"
+                      : taskWorkflow
                       ? formatWorkflowDescription(taskWorkflow.id, taskWorkflow.description)
                       : projectPath
                         ? "系统会根据任务意图选择已启用自动路由的工作流。"
@@ -909,13 +927,27 @@ export default function App() {
                     </div>
                   )}
                 </div>
-                <label className="workflow-picker-horizontal">
-                  <span>工作流</span>
-                  <select value={taskWorkflowId} onChange={(event) => { setTaskWorkflowId(event.target.value); setPendingRouting(null); }}>
-                    <option value="">自动选择</option>
-                    {workflows.map((workflow) => <option key={`${workflow.source.type}:${workflow.id}`} value={workflow.id}>{formatWorkflowName(workflow.id, workflow.name)} · {formatWorkflowSource(workflow.source.type)}</option>)}
-                  </select>
-                </label>
+                {composerSession ? (
+                  <button
+                    className="secondary compact-action"
+                    onClick={() => {
+                      setActiveSessionId(null);
+                      setTaskPrompt("");
+                      setTaskAttachments([]);
+                      setPendingRouting(null);
+                    }}
+                  >
+                    新任务
+                  </button>
+                ) : (
+                  <label className="workflow-picker-horizontal">
+                    <span>工作流</span>
+                    <select value={taskWorkflowId} onChange={(event) => { setTaskWorkflowId(event.target.value); setPendingRouting(null); }}>
+                      <option value="">自动选择</option>
+                      {workflows.map((workflow) => <option key={`${workflow.source.type}:${workflow.id}`} value={workflow.id}>{formatWorkflowName(workflow.id, workflow.name)} · {formatWorkflowSource(workflow.source.type)}</option>)}
+                    </select>
+                  </label>
+                )}
               </div>
               {taskAttachments.length > 0 && (
                 <div className="attachment-strip">
@@ -939,7 +971,7 @@ export default function App() {
                   handleTextareaChange(event.target.value, "task", event.target.selectionStart ?? undefined);
                 }}
                 onPaste={(e) => handlePaste(e, "task")}
-                placeholder="描述要执行的编码任务... (可粘贴图片、拖入文件、@引用项目文件)"
+                placeholder={composerSession ? "给当前会话发送消息... (可粘贴图片、拖入文件、@引用项目文件)" : "描述要执行的编码任务... (可粘贴图片、拖入文件、@引用项目文件)"}
               />
               {showFileMention && mentionTarget === "task" && fileMentionResults.length > 0 && (
                 <div className="file-mention-dropdown">
@@ -952,8 +984,8 @@ export default function App() {
               )}
               <div className="actions">
                 <button className="icon-btn" title="添加附件" onClick={() => taskFileInputRef.current?.click()}>📎</button>
-                <button className="primary" disabled={!canStart} onClick={startSession}>
-                  {busy ? "运行中..." : "启动 Agent"}
+                <button className="primary" disabled={!canSubmitComposer} onClick={() => void submitComposer()}>
+                  {busy ? "处理中..." : "发送"}
                 </button>
                 {error && <span className="error">{error}</span>}
               </div>
@@ -1317,66 +1349,6 @@ export default function App() {
                   </div>
                   {pendingReworkRequests.length > 0 && (
                     <div className="pending-banner">{pendingReworkRequests.length} 个返工请求等待审批。</div>
-                  )}
-                  {(activeSession?.workflow_id === "chat" || activeSession?.status === "completed") && (
-                    <div className={`chat-input-box${dragOverTarget === "chat" ? " drag-over" : ""}`}
-                      onDragOver={(e) => handleDragOver(e, "chat")}
-                      onDragLeave={(e) => handleDragLeave(e, "chat")}
-                      onDrop={(e) => handleDrop(e, "chat")}>
-                      <div className="chat-input-header">
-                        <h3>继续对话</h3>
-                        <small>(会话：{summarizeSessionTitle(activeSession.task_prompt)})</small>
-                      </div>
-                      {chatAttachments.length > 0 && (
-                        <div className="attachment-strip">
-                          {chatAttachments.map((att, i) => (
-                            <div key={attachmentKey(att, i)} className="attachment-chip">
-                              {att.type === "image" ? (
-                                <img src={`data:${att.media_type};base64,${att.data_base64}`} alt={att.display_name} className="attachment-thumb" />
-                              ) : (
-                                <span className="attachment-file-icon">📄</span>
-                              )}
-                              <span className="attachment-name">{att.display_name}</span>
-                              <button className="attachment-remove" onClick={() => removeAttachment("chat", i)}>×</button>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                      <textarea
-                        value={chatInput}
-                        onChange={(event) => handleTextareaChange(event.target.value, "chat", event.target.selectionStart ?? undefined)}
-                        onPaste={(e) => handlePaste(e, "chat")}
-                        placeholder="输入消息... (可粘贴图片、拖入文件、@引用项目文件)"
-                        rows={2}
-                      />
-                      {showFileMention && mentionTarget === "chat" && fileMentionResults.length > 0 && (
-                        <div className="file-mention-dropdown">
-                          {fileMentionResults.map((filePath) => (
-                            <button key={filePath} className="file-mention-item" onClick={() => selectFileMention(filePath, "chat")}>
-                              {filePath}
-                            </button>
-                          ))}
-                        </div>
-                      )}
-                      <div className="actions">
-                        <button className="icon-btn" title="添加附件" onClick={() => fileInputRef.current?.click()}>📎</button>
-                        <button
-                          className="primary"
-                          disabled={(!chatInput.trim() && chatAttachments.length === 0) || busy}
-                          onClick={() => {
-                            if (activeSession && (chatInput.trim() || chatAttachments.length > 0)) {
-                              void sendMessage(activeSession, chatInput.trim(), chatAttachments.length > 0 ? chatAttachments : undefined);
-                              setChatInput("");
-                              setChatAttachments([]);
-                            }
-                          }}
-                        >
-                          发送
-                        </button>
-                      </div>
-                      <input type="file" ref={fileInputRef} style={{ display: "none" }} multiple
-                        onChange={(e) => handleFileSelect(e, "chat")} />
-                    </div>
                   )}
                   <div className="timeline">
                     {timeline.map((event: TimelineEvent) => (

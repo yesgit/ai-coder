@@ -1542,73 +1542,6 @@ pre {
 
 }
 
-/* 聊天输入框样式 */
-.chat-input-box {
-  position: sticky;
-  bottom: 0;
-  z-index: 3;
-  margin-top: 12px;
-  padding: 12px;
-  border: 1px solid #dde2e8;
-  border-radius: 8px;
-  background: #ffffff;
-  box-shadow: 0 -8px 18px rgba(16, 24, 40, 0.06);
-}
-
-.chat-input-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 8px;
-  padding-bottom: 8px;
-  border-bottom: 1px solid #e7ebf0;
-}
-
-.chat-input-header h3 {
-  font-size: 13px;
-  color: #344054;
-  margin: 0;
-  font-weight: 600;
-}
-
-.chat-input-header small {
-  font-size: 11px;
-  color: #667085;
-}
-
-.chat-input-box textarea {
-  width: 100%;
-  padding: 8px;
-  border: 1px solid #c5cbd1;
-  border-radius: 6px;
-  resize: vertical;
-  font-family: inherit;
-  font-size: 13px;
-}
-
-.chat-input-box textarea:focus {
-  outline: none;
-  border-color: #0066cc;
-  box-shadow: 0 0 0 2px rgba(0, 102, 204, 0.15);
-}
-
-.chat-input-box .actions {
-  margin-top: 8px;
-  display: flex;
-  justify-content: flex-end;
-  gap: 6px;
-  align-items: center;
-}
-
-@media (max-width: 620px) {
-  .chat-input-box {
-    position: relative;
-    bottom: auto;
-    box-shadow: none;
-  }
-}
-
 /* 附件预览条 */
 .attachment-strip {
   display: flex;
@@ -1663,7 +1596,6 @@ pre {
 }
 
 /* 拖拽覆盖效果 */
-.chat-input-box.drag-over,
 .composer.drag-over {
   border-color: #146c5f;
   background: #eef8f6;
