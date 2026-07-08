@@ -1,15 +1,17 @@
 id: careful-coder-v2
 name: 谨慎程序员 v2
-version: 2.0.0
+version: 2.1.0
 description: |
   按人类资深程序员的思维过程分阶段推进——理解、勘察、对齐、方案、实施、自审。
-  阶段内部靠提示词驱动落实心智，而非靠断言门控（断言只留结构性、自洽性与安全门）。
+  阶段内部靠提示词驱动落实心智，同时把关键认知状态写入 required_outputs 供下游阶段消费。
   发现问题可任意层回溯重做。v2.0 是"减架构"方向：把 v1.3 的 L3 扫标题断言与 L1 行为
   门控退场，改回 prompt 引导——避免"谨慎"退化为"满足检查项"的仪式。
+  v2.1 修正过度回摆：不恢复刷次数式行为门槛，但让 DoD、证据、调用方假设、成功标准、
+  验证计划与改动核对跨阶段结构化传递，避免阶段边界只剩 lossy summary。
 source:
   type: builtin
   id: careful-coder-v2
-  version: 2.0.0
+  version: 2.1.0
 permissions:
   filesystem:
     mode: project-only
@@ -37,18 +39,19 @@ rework:
     - implement
   approval_required: false
   invalidate_downstream: true
-# v2.0 设计笔记（承接 docs/workflow-design-principles.md 的反思）：
+# v2.1 设计笔记（承接 docs/workflow-design-principles.md 的反思）：
 # v1.0→v1.3 三轮都在"用产出形态/行为保证思维质量"的范畴错误里打转：L3 扫标题可被空壳糊弄，
 # L1 查行为虽难糊弄但把"动作发生"当成"谨慎发生"——两者都是用可观测代理指标保证不可观测心智。
-# v2.0 换路：保留人类思维的阶段骨架（人类本就分阶段思考），但阶段内部靠 prompt 落实心智，
-# 断言只留三类不可糊弄且不制造仪式的：
+# v2.0 换路：保留人类思维的阶段骨架（人类本就分阶段思考），但阶段内部靠 prompt 落实心智。
+# v2.1 承认单靠 prompt 会在阶段边界丢心智：关键状态必须进入 required_outputs，并由后续阶段消费。
+# 断言仍只留三类不可糊弄且不制造仪式的：
 #   1. 结构性（no_trailing_unparsed_payload / needs_rework_target_required）——防 JSON 烂尾、rework 缺字段
 #   2. L2 自洽性（review_self_consistency / hedged_findings_demoted / unknowns_present）——查可验证事实/自洽
 #   3. 安全门（不可逆操作 ask_human consent / rollback_plan）——安全，非谨慎仪式
 # L3 扫标题全退场；L1 behavior 门控（git log/git diff 的 retry/block）降回 prompt 提示——
 # "你应该跑 git log"是建议，不是"跑过才算调查过"的证据勒索。
-# 思维模板（候选方案/事前风险/置信度/调用方清单/delta_check）仍在 instructions 里作引导，
-# 但引擎不扫——靠 prompt 驱动模型像人类那样思考，而非填空壳过关。
+# 思维模板（候选方案/事前风险/置信度/调用方清单/delta_check）仍在 instructions 里作引导；
+# 承重信息进入 required_outputs，使 design/implement/self_review 有同一份可复用状态，而非靠重读摘要猜测。
 stages:
   - id: understand
     name: 理解
@@ -69,7 +72,7 @@ stages:
 
       必须输出且只能输出以下 JSON 结构：
       ```json
-      {"status":"completed","output_summary":"一句话总结","required_outputs":{"user_goal_restated":"用户想要什么","definition_of_done":"完成的标准","assumptions":[]}}
+      {"status":"completed","output_summary":"一句话总结","required_outputs":{"user_goal_restated":"用户想要什么","definition_of_done":["可观测完成标准 1"],"assumptions":[]}}
       ```
     allowed_tools:
       - read_file
@@ -113,6 +116,9 @@ stages:
 
       required_outputs（JSON 字段）保持精简：
         - similar_callsites: 覆盖"同类参考"+"调用方清单"两类，至少 3 条 path:line + 一句话作用
+        - evidence_findings: 已证实结论列表；每条包含结论、证据 path:line、置信度 high/medium/low、依据类型
+        - callsite_assumptions: 调用方语义假设清单；无目标符号写"本次无目标符号"
+        - boundary_cases: 已知需要处理或确认的边界与异常路径
         - unknowns: 未查清的事项（写"无"也可以，但不能省略——沉默不算回答）
 
       ⚠️ JSON 输出前请先 JSON.parse 验证——多余引号/未闭合括号会导致 retry。
@@ -121,6 +127,9 @@ stages:
       - shell
     required_outputs:
       - similar_callsites
+      - evidence_findings
+      - callsite_assumptions
+      - boundary_cases
       - unknowns
     auto_retry_limit: 3
     hooks:
@@ -138,6 +147,7 @@ stages:
       - 需求有歧义且代码/文档无法确认
       - 需要在多个合理方案中做选择（且没有明显最优解）
 
+      required_outputs.lateral_constraints 要写成可核对清单：每条包含约束、证据来源/同类位置、对本次改动的含义。
       output_summary 里写明：横向约束清单 + 已自主确认的事项 +（如有）需要用户决策的问题。
     allowed_tools:
       - read_file
@@ -167,9 +177,18 @@ stages:
       - **影响半径**（涉及公共接口/共享数据时）：改动波及的下游（含间接传递依赖）。
 
       避免过度抽象/过度工程：能用现有函数解决就不要新建。
+      required_outputs 必须提供：
+        - selected_plan: 选定方案的步骤清单；每步引用 investigate.evidence_findings 或 align.lateral_constraints 的证据
+        - success_criteria: 可验证完成标准；承接 understand.definition_of_done
+        - test_plan: 要跑/要新增/可接受跳过的验证；跳过必须写理由
+        - risk_register: 事前风险与预案；至少覆盖最易错处、最低置信处、回滚/返工触发条件
     allowed_tools:
       - read_file
-    required_outputs: []
+    required_outputs:
+      - selected_plan
+      - success_criteria
+      - test_plan
+      - risk_register
     auto_retry_limit: 1
     hooks:
       post_output_assertions:
@@ -198,6 +217,10 @@ stages:
       如果本次未改动任何文件，仍写一段说明原因。这是"过程中"的自审——不是等 self_review
       才发现走偏。每改完一个文件就对照 understand.user_goal_restated 与 design 成功标准核对，
       发现走偏及时 needs_rework 回 design。
+      required_outputs 必须提供：
+        - changed_files: 本阶段实际改动/未改动的文件清单与原因
+        - delta_checks: 每个改动文件推进了哪条 success_criteria、引入什么风险、如何验证
+        - validation_run: 已执行的验证命令/结果；未执行要写原因与残余风险
 
       **回滚预案**：涉及不可逆操作（rm/git reset/drop table/truncate 等）时，在对应文件的
       改动核对子段内写明回滚步骤（如何撤销本次不可逆操作）。
@@ -209,6 +232,10 @@ stages:
       - shell
     gates:
       - authorized_files_only
+    required_outputs:
+      - changed_files
+      - delta_checks
+      - validation_run
     auto_retry_limit: 1
     hooks:
       pre_tool_use:
@@ -234,8 +261,13 @@ stages:
     name: 自审
     instructions: |
       你现在是一个独立的、敌对的 code reviewer，**不是作者**，看不到 implement 阶段的辩解，只看代码事实。
-      逐条核对 align.lateral_constraints 与 investigate 的边界/调用方假设（在前序阶段 output_summary 中可读）
-      对应到当前 diff：
+      优先读取前序阶段 required_outputs，而不是只看 output_summary：
+        - understand.definition_of_done
+        - investigate.evidence_findings / callsite_assumptions / boundary_cases / unknowns
+        - align.lateral_constraints
+        - design.success_criteria / test_plan / risk_register
+        - implement.changed_files / delta_checks / validation_run
+      逐条核对这些结构化状态对应到当前 diff：
         - 漏覆盖的项目必须写明缺口；
         - 即使全部覆盖，也要在 review_findings 给出一份"逐项核对"清单（每条约束/边界 → 在 diff 哪里被处理）。
 
@@ -251,10 +283,10 @@ stages:
       **三条闭环核对**：
         - **优先核对低置信项**：investigate 标了置信度的 finding，优先核对 low 与 medium 项是否在
           本次 diff 中被验证或反驳。low/medium 项未核对就 pass 视为漏审。
-        - **核对调用方清单每处的语义假设**：investigate 列了每个调用方对目标符号的语义假设
+        - **核对调用方清单每处的语义假设**：investigate.callsite_assumptions 列了每个调用方对目标符号的语义假设
           （如"调用方假定返回非 null"）。逐条核对本次改动是否打破了这些假设——打破必须 needs_rework。
-        - **核对测试清单是否执行**：design 的"测试清单"（如有）列了需新增/修改的测试。核对是否在
-          implement 落地、self_review 跑过；未执行的测试必须在 review_findings 写明缺口。
+        - **核对测试清单是否执行**：design.test_plan 列了需新增/修改/运行的测试。核对是否在
+          implement.validation_run 落地、self_review 跑过；未执行的测试必须在 review_findings 写明缺口。
 
       返工触发协议：
         - 决定回炉时，最外层 JSON 必须 status="needs_rework"、rework_target_stage_id 是

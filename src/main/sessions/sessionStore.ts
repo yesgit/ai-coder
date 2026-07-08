@@ -26,15 +26,17 @@ export class SessionStore {
   ): Promise<AgentSession> {
     const now = new Date().toISOString();
     const firstStage = workflow.stages[0]?.id ?? "start";
+    const initialUserMessage = { role: "user" as const, content: taskPrompt, created_at: now, attachments };
     const session: AgentSession = {
       id: randomUUID(),
       project_path: projectPath,
       workflow_id: workflow.id,
       title: summarizeSessionTitle(taskPrompt),
       task_prompt: taskPrompt,
+      initial_user_message: initialUserMessage,
       status: "created",
       current_stage: firstStage,
-      messages: [{ role: "user", content: taskPrompt, created_at: now, attachments }],
+      messages: [initialUserMessage],
       tool_calls: [],
       file_changes: [],
       approvals: [],

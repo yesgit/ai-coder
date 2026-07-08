@@ -138,8 +138,10 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
   ipcMain.handle("sessions:approve-tool-call", async (_event, sessionId: string, toolCallId: string) => {
     const session = await sessions.approveToolCall(sessionId, toolCallId);
     await authorizedProjects.assertAuthorized(session.project_path);
-    // 审批通过后 session.status 已被设为 running——必须重新启动 runner，否则会话"假 running"
-    // 没人推进，卡在审批后很长时间（跨版本老 bug：v1.0/v2 都有）。deny 走 blocked 不恢复。
+    if (runner.resolveToolApproval(sessionId, toolCallId, "approved")) {
+      return session;
+    }
+    // 兼容旧的已中断会话：没有正在等待的 runner 时，审批后才重启执行。
     if (session.status === "running") {
       const workflow = await registry.get(session.workflow_id, session.project_path);
       if (workflow) {
@@ -152,6 +154,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
   ipcMain.handle("sessions:deny-tool-call", async (_event, sessionId: string, toolCallId: string) => {
     const session = await sessions.denyToolCall(sessionId, toolCallId);
     await authorizedProjects.assertAuthorized(session.project_path);
+    runner.resolveToolApproval(sessionId, toolCallId, "denied");
     return session;
   });
 

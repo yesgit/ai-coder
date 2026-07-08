@@ -10,9 +10,7 @@ const DANGEROUS_COMMANDS = [
   "rm -rf /",
   "sudo ",
   "mkfs",
-  "diskutil erase",
-  "git reset --hard",
-  "git clean -fd"
+  "diskutil erase"
 ];
 
 export async function assertPathInsideProject(projectPath: string, targetPath: string): Promise<void> {
@@ -162,9 +160,8 @@ export async function approveOrDenyToolUse(
     if (toolName === "Bash") {
       const command = String(input.command ?? "");
       assertCommandAllowed(command);
-      // read-only shell（git log/grep/ls/cat 等）免逐次审批——否则 investigate 阶段每个只读
-      // 命令都 interrupt + 重跑 stage，循环卡死（跨版本老 bug）。危险/写 shell 仍走审批。
-      if (requiresShellApproval(workflow) && !isReadOnlyShellCommand(command)) {
+      // 自主安全 shell（只读勘察 + 常见验证/构建检查）免逐次审批；危险或会改仓库状态的命令仍走审批/阻断。
+      if (requiresShellApproval(workflow) && !isAutonomousSafeShellCommand(command)) {
         record("pending_approval");
         session.status = "waiting_approval";
         return { allow: false, message: "Shell command is waiting for user approval.", interrupt: true };
@@ -180,7 +177,7 @@ export async function approveOrDenyToolUse(
         throw new Error(`Blocked path outside project: ${filePath}`);
       }
       const approvedExternal = session.approved_external_paths ?? [];
-      if (approvedExternal.includes(realTarget)) {
+      if (isApprovedExternalPath(realTarget, approvedExternal)) {
         continue;
       }
       record("pending_approval");
@@ -210,8 +207,8 @@ export async function approveOrDenyToolUse(
 /**
  * 判定 shell 命令是否只读（不改状态）、可免逐次审批。
  *
- * 命令首段命中 read-only 白名单（git log/diff/show/blame、grep/rg/ls/cat/head/tail/wc/find 等）
- * 且不含管道/重定向/命令分隔/命令替换——任一语法分隔符出现即视为非只读、回退审批。
+ * 命令首段命中 read-only 白名单（git log/diff/show/blame、grep/rg/ls/cat/head/tail/wc/find 等），
+ * 允许安全过滤管道和丢弃 stderr 到 /dev/null。其他重定向/命令分隔/命令替换仍回退审批。
  * 命令名本身（rm/mv/cp 等）不在白名单 → 首段不匹配 → 本就走审批，无需在此列举。
  *
  * 保守：宁可误伤（grep pattern 含 > 等少见情况）也不放行可能写/删的命令。
@@ -236,16 +233,23 @@ const READONLY_SHELL_PREFIXES = [
  * 规则：
  * 1. 按 && / || 分割成多段，逐段检查
  * 2. 每段必须以 READONLY_SHELL_PREFIXES 之一开头
- * 3. || 后的段必须是 echo（错误处理模式，如 "git log || echo fail"）
- * 4. 拒绝重定向 (</>)、命令替换 ($()` )、管道 (|)、分号 (;)
+ * 3. 允许安全过滤管道（head/tail/wc/grep 等）
+ * 4. 拒绝普通重定向 (</>)、命令替换 ($()` )、分号 (;)
  *
  * 保守：宁可误伤也不放行可能写/删的命令。
  */
 export function isReadOnlyShellCommand(command: string): boolean {
-  const trimmed = command.trim().toLowerCase();
+  return isAutonomousSafeShellCommand(command, { readonlyOnly: true });
+}
+
+export function isAutonomousSafeShellCommand(command: string, options: { readonlyOnly?: boolean } = {}): boolean {
+  let trimmed = command.trim().toLowerCase();
   if (!trimmed) return false;
 
-  // 快速拒绝：含危险语法（重定向/命令替换/分号）
+  trimmed = normalizeReadonlyShellCommand(trimmed);
+  if (!trimmed) return false;
+
+  // 快速拒绝：含危险语法（重定向/命令替换/分号）。管道在下面逐段校验。
   if (/[<>;`$()]/.test(trimmed)) return false;
 
   // 按 && / || 分割成段，逐段检查
@@ -259,17 +263,83 @@ export function isReadOnlyShellCommand(command: string): boolean {
       const part = pipeParts[i].trim();
       // 第一段必须是 read-only 前缀
       if (i === 0) {
-        const isReadonlyPrefix = READONLY_SHELL_PREFIXES.some((prefix) => part.startsWith(prefix));
-        if (!isReadonlyPrefix) return false;
+        if (!isSafeShellSegment(part, options.readonlyOnly ?? false)) return false;
       } else {
         // 管道后的段必须是安全过滤器
-        const safeFilters = ['head', 'tail', 'wc', 'grep', 'rg', 'less', 'more', 'cat', 'sort', 'uniq', 'cut', 'awk', 'sed', 'tee'];
+        const safeFilters = ['head', 'tail', 'wc', 'grep', 'rg', 'less', 'more', 'cat', 'sort', 'uniq', 'cut', 'awk', 'sed'];
         if (!safeFilters.some(f => part.startsWith(f))) return false;
       }
     }
   }
 
   return true;
+}
+
+function normalizeReadonlyShellCommand(command: string): string {
+  // 常见只读取证命令会把 stderr 静默到 /dev/null；只允许丢弃 stderr，不允许普通写重定向。
+  return command
+    .replace(/\s+2>\s*\/dev\/null\b/g, "")
+    .replace(/\s+2>>\s*\/dev\/null\b/g, "")
+    .replace(/\s+2>&1\b/g, "");
+}
+
+function isReadonlyShellSegment(segment: string): boolean {
+  if (READONLY_SHELL_PREFIXES.some((prefix) => segment.startsWith(prefix))) {
+    return true;
+  }
+  const gitMatch = segment.match(/^git\s+(.+)$/);
+  if (!gitMatch) return false;
+
+  const tokens = gitMatch[1].trim().split(/\s+/);
+  while (tokens[0] === "-c" || tokens[0] === "-C") {
+    if (tokens.length < 3) return false;
+    tokens.splice(0, 2);
+  }
+
+  const readonlyGitSubcommands = new Set([
+    "log",
+    "diff",
+    "show",
+    "blame",
+    "status",
+    "ls-files",
+    "ls-tree",
+    "remote",
+    "branch",
+    "config",
+    "rev-parse",
+    "grep",
+    "describe",
+    "tag",
+    "name-rev",
+    "merge-base"
+  ]);
+  return readonlyGitSubcommands.has(tokens[0]);
+}
+
+function isSafeShellSegment(segment: string, readonlyOnly: boolean): boolean {
+  if (isReadonlyShellSegment(segment)) {
+    return true;
+  }
+  return !readonlyOnly && isAutonomousWriteShellSegment(segment);
+}
+
+function isAutonomousWriteShellSegment(segment: string): boolean {
+  return (
+    /^(?:npm|yarn|pnpm|bun)\s+(?:test|run\s+(?:test|test:[\w:-]+|lint|lint:[\w:-]+|typecheck|type-check|check|build|build:[\w:-]+)\b)/.test(segment) ||
+    /^(?:npm|yarn|pnpm|bun)\s+(?:install|i|ci|add|remove|uninstall|update|publish)\b/.test(segment) ||
+    /^(?:npx|pnpm\s+exec|yarn\s+exec|bunx)\s+(?:vitest|jest|mocha|ava|tsc|vue-tsc|eslint|stylelint|biome|ruff|pytest)\b/.test(segment) ||
+    /^(?:npx|pnpm\s+exec|yarn\s+exec|bunx)\s+prettier\b.*\s--write\b/.test(segment) ||
+    /^\.\/node_modules\/\.bin\/(?:vitest|jest|mocha|ava|tsc|vue-tsc|eslint|stylelint|biome)\b/.test(segment) ||
+    /^node\s+--(?:test|check)\b/.test(segment) ||
+    /^python3?\s+-m\s+(?:pytest|unittest|mypy|ruff)\b/.test(segment) ||
+    /^(?:pytest|ruff\s+check|mypy|tox)\b/.test(segment) ||
+    /^(?:go\s+test|go\s+vet|go\s+build)\b/.test(segment) ||
+    /^(?:cargo\s+(?:test|check|clippy|build)|cargo\s+fmt\s+--check)\b/.test(segment) ||
+    /^(?:mvn|gradle|\.\/gradlew)\s+(?:test|check|build|verify)\b/.test(segment) ||
+    /^make\s+(?:test|check|lint|typecheck|build)\b/.test(segment) ||
+    /^git\s+(?:checkout|switch|stash|reset|clean)\b/.test(segment)
+  );
 }
 
 function extractFilePaths(input: Record<string, unknown>): string[] {
@@ -304,7 +374,7 @@ async function canSkipPerToolApproval(
   if (toolName === "Bash") {
     const command = String(input.command ?? "");
     if (DANGEROUS_COMMANDS.some((p) => command.toLowerCase().includes(p))) return false;
-    if (requiresShellApproval(workflow)) return false;
+    if (requiresShellApproval(workflow) && !isAutonomousSafeShellCommand(command)) return false;
     return true;
   }
   for (const filePath of extractFilePaths(input)) {
@@ -312,7 +382,7 @@ async function canSkipPerToolApproval(
     if (inside) continue;
     if (!isReadOnlyFileTool(toolName)) return false; // 写工具：项目外路径必须硬阻断
     const approvedExternal = session.approved_external_paths ?? [];
-    if (!approvedExternal.includes(realTarget)) return false; // 只读但未被加白名单：走 pending_approval
+    if (!isApprovedExternalPath(realTarget, approvedExternal)) return false; // 只读但未被加白名单：走 pending_approval
   }
   // 写工具落入项目内仍然可能需要逐文件审批——交给下面的 isWriteTool 分支处理：
   // 如果阶段没声明 edit_file 我们前面就不会走到这里；如果声明了，意味着 yaml 作者
@@ -328,6 +398,13 @@ const READ_ONLY_FILE_TOOLS = new Set(["Read", "Grep", "Glob", "LS", "NotebookRea
 
 function isReadOnlyFileTool(toolName: string): boolean {
   return READ_ONLY_FILE_TOOLS.has(toolName);
+}
+
+function isApprovedExternalPath(realTarget: string, approvedExternalPaths: string[]): boolean {
+  return approvedExternalPaths.some((approvedPath) => {
+    const relative = path.relative(approvedPath, realTarget);
+    return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  });
 }
 
 function sameToolCall(toolCall: ToolCallRecord, toolName: string, input: Record<string, unknown>): boolean {

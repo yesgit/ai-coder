@@ -29,6 +29,7 @@ describe("SessionStore", () => {
     expect(session.status).toBe("running");
     expect(session.title).toBe("Fix bug");
     expect(session.current_stage).toBe("plan");
+    expect(session.initial_user_message).toMatchObject({ role: "user", content: "Fix bug" });
     expect(session.approvals).toHaveLength(0);
     expect(session.stage_runs).toHaveLength(1);
     expect(session.stage_runs?.[0]).toMatchObject({ stage_id: "plan", attempt: 1, status: "running" });

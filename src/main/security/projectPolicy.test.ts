@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { approveOrDenyToolUse, isReadOnlyShellCommand } from "./projectPolicy.js";
+import { approveOrDenyToolUse, isAutonomousSafeShellCommand, isReadOnlyShellCommand } from "./projectPolicy.js";
 import type { AgentSession, WorkflowTemplate } from "../../shared/types.js";
 
 const workflow: WorkflowTemplate = {
@@ -34,10 +34,20 @@ function session(): AgentSession {
 }
 
 describe("project policy", () => {
-  it("creates pending approval for shell commands", async () => {
+  it("allows common validation shell commands without per-tool approval", async () => {
     const current = session();
 
     const decision = await approveOrDenyToolUse(current, workflow, "Bash", { command: "npm test" }, "tool-1");
+
+    expect(decision.allow).toBe(true);
+    expect(current.status).toBe("running");
+    expect(current.tool_calls[0].status).toBe("approved");
+  });
+
+  it("creates pending approval for shell commands outside the autonomous allowlist", async () => {
+    const current = session();
+
+    const decision = await approveOrDenyToolUse(current, workflow, "Bash", { command: "node script.js" }, "tool-1b");
 
     expect(decision.allow).toBe(false);
     expect(decision.allow === false ? decision.interrupt : false).toBe(true);
@@ -98,6 +108,28 @@ describe("project policy", () => {
     // 第三轮：同一会话内对同一路径的新 Read 自动放行
     const third = await approveOrDenyToolUse(current, workflow, "Read", { file_path: outsideFile }, "tool-read-3");
     expect(third.allow).toBe(true);
+    expect(current.tool_calls.at(-1)?.status).toBe("approved");
+  });
+
+  it("treats an approved external directory as covering later reads below it", async () => {
+    const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-project-"));
+    const outsideDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-outside-"));
+    const nestedDir = path.join(outsideDir, "uploads");
+    await fs.mkdir(nestedDir);
+    const nestedFile = path.join(nestedDir, "page-01.png");
+    await fs.writeFile(nestedFile, "png");
+    const current = { ...session(), project_path: projectDir };
+
+    await approveOrDenyToolUse(current, workflow, "Glob", { path: outsideDir, pattern: "**/*.png" }, "tool-glob-1");
+    current.tool_calls[0].status = "approved";
+    current.tool_calls[0].resolved_at = new Date().toISOString();
+    const approved = await approveOrDenyToolUse(current, workflow, "Glob", { path: outsideDir, pattern: "**/*.png" }, "tool-glob-1");
+
+    expect(approved.allow).toBe(true);
+    expect(current.approved_external_paths).toEqual([await fs.realpath(outsideDir)]);
+
+    const nested = await approveOrDenyToolUse(current, workflow, "Read", { file_path: nestedFile }, "tool-read-nested");
+    expect(nested.allow).toBe(true);
     expect(current.tool_calls.at(-1)?.status).toBe("approved");
   });
 
@@ -239,5 +271,39 @@ describe("isReadOnlyShellCommand", () => {
     expect(isReadOnlyShellCommand("git branch -a | head -20")).toBe(true);
     expect(isReadOnlyShellCommand("git log --oneline | tail -5")).toBe(true);
     expect(isReadOnlyShellCommand("ls -la | grep test")).toBe(true);
+    expect(isReadOnlyShellCommand('find /home/user/projects -name "page-*.png" 2>/dev/null | head -20')).toBe(true);
+    expect(isReadOnlyShellCommand('git -C /home/user/projects/huaxiafortune log --oneline -20 -- develop/aiAgentOpt 2>/dev/null || git -C /home/user/projects/huaxiafortune log --oneline -20 2>/dev/null || echo "Git 失败"')).toBe(true);
+  });
+});
+
+describe("isAutonomousSafeShellCommand", () => {
+  it("allows common project validation commands", () => {
+    expect(isAutonomousSafeShellCommand("npm test")).toBe(true);
+    expect(isAutonomousSafeShellCommand("npm run lint")).toBe(true);
+    expect(isAutonomousSafeShellCommand("npm run typecheck")).toBe(true);
+    expect(isAutonomousSafeShellCommand("npm run build")).toBe(true);
+    expect(isAutonomousSafeShellCommand("./node_modules/.bin/vitest run src/main/security/projectPolicy.test.ts")).toBe(true);
+    expect(isAutonomousSafeShellCommand("cd /home/user/projects && npm test")).toBe(true);
+    expect(isAutonomousSafeShellCommand("python -m pytest tests")).toBe(true);
+    expect(isAutonomousSafeShellCommand("go test ./...")).toBe(true);
+    expect(isAutonomousSafeShellCommand("cargo test")).toBe(true);
+  });
+
+  it("allows dependency, publish, formatting write, and repository-state commands", () => {
+    expect(isAutonomousSafeShellCommand("npm install")).toBe(true);
+    expect(isAutonomousSafeShellCommand("pnpm add react")).toBe(true);
+    expect(isAutonomousSafeShellCommand("npm publish")).toBe(true);
+    expect(isAutonomousSafeShellCommand("npx prettier --write src")).toBe(true);
+    expect(isAutonomousSafeShellCommand("git checkout develop")).toBe(true);
+    expect(isAutonomousSafeShellCommand("git stash")).toBe(true);
+    expect(isAutonomousSafeShellCommand("git reset --hard HEAD")).toBe(true);
+    expect(isAutonomousSafeShellCommand("git clean -fd")).toBe(true);
+    expect(isAutonomousSafeShellCommand("git stash && git checkout develop/aiAgent && git stash drop")).toBe(true);
+  });
+
+  it("still requires approval for commands outside the autonomous allowlist", () => {
+    expect(isAutonomousSafeShellCommand("node script.js")).toBe(false);
+    expect(isAutonomousSafeShellCommand("npx some-random-tool --write")).toBe(false);
+    expect(isAutonomousSafeShellCommand("mv a b")).toBe(false);
   });
 });

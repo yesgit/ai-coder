@@ -260,6 +260,7 @@ export interface StageSummary {
   attempt: number;
   status: StageRunStatus;
   output_summary?: string;
+  required_outputs?: Record<string, unknown>;
 }
 
 export interface WorkflowOverviewStage {
@@ -422,6 +423,7 @@ export interface AgentSession {
   workflow_id: string;
   title?: string;
   task_prompt: string;
+  initial_user_message?: AgentMessage;
   status: SessionStatus;
   current_stage: string;
   messages: AgentMessage[];

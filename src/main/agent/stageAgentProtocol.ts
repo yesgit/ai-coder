@@ -71,7 +71,8 @@ export function buildStageAgentInput(
         stage_id: stageRun.stage_id,
         attempt: stageRun.attempt,
         status: stageRun.status,
-        output_summary: stageRun.output_summary
+        output_summary: stageRun.output_summary,
+        required_outputs: stageRun.required_outputs
       })),
     current_stage: currentStage,
     task_prompt: session.task_prompt,
@@ -81,9 +82,26 @@ export function buildStageAgentInput(
     gates: currentStage.gates ?? [],
     retry_context: retryContext,
     rework_context: reworkContext,
-    recent_messages: session.messages.slice(-20),
+    recent_messages: selectContextMessages(session.messages, session.initial_user_message),
     human_qa_history: (session.pending_human_questions ?? []).filter((q) => q.status === "answered")
   };
+}
+
+function selectContextMessages(
+  messages: AgentSession["messages"],
+  initialUserMessage?: AgentSession["messages"][number]
+): AgentSession["messages"] {
+  const recentMessages = messages.slice(-20);
+  const seedMessage = initialUserMessage ?? messages.find((message) => message.role === "user");
+  if (!seedMessage) {
+    return recentMessages;
+  }
+  const hasSeedMessage = recentMessages.some((message) => sameMessage(message, seedMessage));
+  return hasSeedMessage ? recentMessages : [seedMessage, ...recentMessages];
+}
+
+function sameMessage(left: AgentSession["messages"][number], right: AgentSession["messages"][number]): boolean {
+  return left.role === right.role && left.created_at === right.created_at && left.content === right.content;
 }
 
 export function parseStageAgentResult(rawContent: string): StageAgentResult {

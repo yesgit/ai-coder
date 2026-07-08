@@ -35,6 +35,9 @@ const session: AgentSession = {
       status: "completed",
       input_summary: "Initial task",
       output_summary: "Use a narrow renderer change",
+      required_outputs: {
+        implementation_plan: ["Change renderer only"]
+      },
       started_at: new Date().toISOString(),
       completed_at: new Date().toISOString()
     }
@@ -49,9 +52,70 @@ describe("stage agent protocol", () => {
     const input = buildStageAgentInput(session, workflow, workflow.stages[1]);
 
     expect(input.workflow.stages).toHaveLength(2);
-    expect(input.previous_stage_summaries[0]).toMatchObject({ stage_id: "plan", output_summary: "Use a narrow renderer change" });
+    expect(input.previous_stage_summaries[0]).toMatchObject({
+      stage_id: "plan",
+      output_summary: "Use a narrow renderer change",
+      required_outputs: { implementation_plan: ["Change renderer only"] }
+    });
     expect(input.current_stage.id).toBe("execute");
     expect(input.allowed_tools).toEqual(["read_file", "edit_file"]);
+  });
+
+  it("keeps the initial user message with attachments when recent message history is long", () => {
+    const startedAt = "2026-01-01T00:00:00.000Z";
+    const longSession: AgentSession = {
+      ...session,
+      messages: [
+        {
+          role: "user",
+          content: "最初任务，包含附件上下文",
+          created_at: startedAt,
+          attachments: [{ type: "file_ref", path: ".ai-coder/uploads/page-001.png", display_name: "需求截图" }]
+        },
+        ...Array.from({ length: 25 }, (_, index) => ({
+          role: "assistant" as const,
+          content: `后续消息 ${index + 1}`,
+          created_at: `2026-01-01T00:00:${String(index + 1).padStart(2, "0")}.000Z`
+        }))
+      ]
+    };
+
+    const input = buildStageAgentInput(longSession, workflow, workflow.stages[1]);
+
+    expect(input.recent_messages[0]).toMatchObject({
+      role: "user",
+      content: "最初任务，包含附件上下文",
+      attachments: [{ type: "file_ref", path: ".ai-coder/uploads/page-001.png", display_name: "需求截图" }]
+    });
+    expect(input.recent_messages).toHaveLength(21);
+    expect(input.recent_messages.at(-1)?.content).toBe("后续消息 25");
+  });
+
+  it("prefers the persisted initial user message snapshot over later message mutations", () => {
+    const mutatedSession: AgentSession = {
+      ...session,
+      initial_user_message: {
+        role: "user",
+        content: "最初任务快照",
+        created_at: "2026-01-01T00:00:00.000Z",
+        attachments: [{ type: "file_ref", path: ".ai-coder/uploads/original.png", display_name: "原始附件" }]
+      },
+      messages: [
+        {
+          role: "assistant",
+          content: "后来被改写的历史消息",
+          created_at: "2026-01-01T00:01:00.000Z"
+        }
+      ]
+    };
+
+    const input = buildStageAgentInput(mutatedSession, workflow, workflow.stages[1]);
+
+    expect(input.recent_messages[0]).toMatchObject({
+      role: "user",
+      content: "最初任务快照",
+      attachments: [{ type: "file_ref", path: ".ai-coder/uploads/original.png", display_name: "原始附件" }]
+    });
   });
 
   it("builds rework_context when an approved rework_request targets the current stage", () => {

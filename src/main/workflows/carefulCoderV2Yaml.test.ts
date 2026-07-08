@@ -3,9 +3,10 @@ import path from "node:path";
 import { WorkflowRegistry } from "./workflowRegistry.js";
 
 /**
- * careful-coder-v2 yaml 快照——减架构方向：
+ * careful-coder-v2 yaml 快照——减架构 + 结构化状态传递方向：
  * L3 扫标题断言全退场、L1 behavior 门控（git log/git diff 的 retry/block）降为 prompt 提示，
  * 只留结构性 + L2 自洽性 + 安全门（不可逆操作 ask_human / rollback）。
+ * v2.1 通过 required_outputs 传递承重认知状态，避免阶段边界只剩 output_summary。
  * 与 v1.3 并存作对比基线，routing.auto_start=false（手动选）。
  */
 describe("careful-coder-v2.yaml (减架构)", () => {
@@ -23,7 +24,7 @@ describe("careful-coder-v2.yaml (减架构)", () => {
 
   it("parses cleanly and does not auto-start", async () => {
     const v2 = await loadV2();
-    expect(v2.version).toBe("2.0.0");
+    expect(v2.version).toBe("2.1.0");
     expect(v2.routing?.auto_start).toBe(false);
   });
 
@@ -61,8 +62,33 @@ describe("careful-coder-v2.yaml (减架构)", () => {
       "unknowns_present",
       "no_trailing_unparsed_payload"
     ]);
-    // required_outputs 精简：去 git_history_summary（改为 prompt 提示跑 git log）
-    expect(inv.required_outputs).toEqual(["similar_callsites", "unknowns"]);
+    // required_outputs 承载证据状态：去 git_history_summary（改为 prompt 提示跑 git log），
+    // 但保留下游需要消费的 finding / 调用方假设 / 边界。
+    expect(inv.required_outputs).toEqual([
+      "similar_callsites",
+      "evidence_findings",
+      "callsite_assumptions",
+      "boundary_cases",
+      "unknowns"
+    ]);
+  });
+
+  it("design / implement 产出可被下游消费的结构化状态", async () => {
+    const v2 = await loadV2();
+    const design = v2.stages.find((s) => s.id === "design")!;
+    expect(design.required_outputs).toEqual([
+      "selected_plan",
+      "success_criteria",
+      "test_plan",
+      "risk_register"
+    ]);
+
+    const impl = v2.stages.find((s) => s.id === "implement")!;
+    expect(impl.required_outputs).toEqual([
+      "changed_files",
+      "delta_checks",
+      "validation_run"
+    ]);
   });
 
   it("implement 只留不可逆操作安全门(去掉读≥3次硬门控,避免刷次数)", async () => {
