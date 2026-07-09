@@ -84,6 +84,7 @@ export class WorkflowRegistry {
 }
 
 const stringArraySchema = z.array(z.string().min(1)).default([]);
+const outputSchema = z.record(z.string().min(1), z.unknown()).optional();
 const postOutputAssertionSchema = z.enum([
   "review_self_consistency",
   "needs_rework_target_required",
@@ -213,10 +214,34 @@ const workflowSchema = z.object({
         approval_required: z.boolean().default(false),
         allowed_tools: stringArraySchema,
         required_outputs: stringArraySchema,
+        output_schema: outputSchema,
         required_checks: stringArraySchema,
         gates: stringArraySchema,
         auto_retry_limit: z.number().int().min(0).optional(),
         hooks: stageHooksSchema
+      }).superRefine((stage, ctx) => {
+        if (!stage.output_schema) return;
+        const schemaKeys = Object.keys(stage.output_schema);
+        const required = new Set(stage.required_outputs);
+        const schemaKeySet = new Set(schemaKeys);
+        for (const key of stage.required_outputs) {
+          if (!schemaKeySet.has(key)) {
+            ctx.addIssue({
+              code: "custom",
+              path: ["output_schema"],
+              message: `required_outputs key must be declared in output_schema: ${key}`
+            });
+          }
+        }
+        for (const key of schemaKeys) {
+          if (!required.has(key)) {
+            ctx.addIssue({
+              code: "custom",
+              path: ["output_schema", key],
+              message: `output_schema key must also be listed in required_outputs: ${key}`
+            });
+          }
+        }
       })
     )
     .min(1)
@@ -252,6 +277,7 @@ function normalizeWorkflow(input: unknown, sourceType: WorkflowSourceType, fileP
       approval_required: stage.approval_required,
       allowed_tools: stage.allowed_tools,
       required_outputs: stage.required_outputs,
+      output_schema: stage.output_schema,
       required_checks: stage.required_checks,
       gates: stage.gates,
       auto_retry_limit: stage.auto_retry_limit,

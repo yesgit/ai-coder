@@ -3,41 +3,54 @@ import path from "node:path";
 import { WorkflowRegistry } from "./workflowRegistry.js";
 
 /**
- * careful-coder-v2 yaml 快照——减架构 + 结构化状态传递方向：
+ * 谨慎程序员 yaml 快照——项目画像前置 + 结构化状态传递方向：
  * L3 扫标题断言全退场、L1 behavior 门控（git log/git diff 的 retry/block）降为 prompt 提示，
  * 只留结构性 + L2 自洽性 + 安全门（不可逆操作 ask_human / rollback）。
  * v2.1 通过 required_outputs 传递承重认知状态，避免阶段边界只剩 output_summary。
  * 与 v1.3 并存作对比基线，routing.auto_start=false（手动选）。
  */
-describe("careful-coder-v2.yaml (减架构)", () => {
+describe("careful-coder.yaml latest", () => {
   const workflowsDir = path.resolve(__dirname, "../../../workflows");
 
   async function loadV2() {
     const r = new WorkflowRegistry(workflowsDir);
     const result = await r.listWithIssues();
-    const issues = result.issues.filter((i) => i.path.includes("careful-coder-v2"));
+    const issues = result.issues.filter((i) => i.path.includes("careful-coder"));
     expect(issues, JSON.stringify(issues)).toEqual([]);
-    const v2 = result.workflows.find((w) => w.id === "careful-coder-v2");
+    const v2 = result.workflows.find((w) => w.id === "careful-coder");
     expect(v2).toBeDefined();
     return v2!;
   }
 
-  it("parses cleanly and does not auto-start", async () => {
+  it("parses cleanly and auto-starts as the only cautious workflow", async () => {
+    const registry = new WorkflowRegistry(workflowsDir);
+    const listed = await registry.list();
+    expect(listed.map((workflow) => workflow.id)).toEqual(["careful-coder"]);
+
     const v2 = await loadV2();
-    expect(v2.version).toBe("2.1.0");
-    expect(v2.routing?.auto_start).toBe(false);
+    expect(v2.version).toBe("3.0.0");
+    expect(v2.name).toBe("谨慎程序员");
+    expect(v2.routing?.auto_start).toBe(true);
   });
 
   it("rework 覆盖所有前置阶段（任意层回溯）", async () => {
     const v2 = await loadV2();
     expect(v2.rework?.enabled).toBe(true);
     expect(v2.rework?.allowed_targets).toEqual([
+      "scan_project",
+      "update_project_profile",
       "understand",
       "investigate",
       "align",
       "design",
       "implement"
     ]);
+  });
+
+  it("项目画像阶段位于编码阶段之前", async () => {
+    const v2 = await loadV2();
+    expect(v2.stages.slice(0, 2).map((s) => s.id)).toEqual(["scan_project", "update_project_profile"]);
+    expect(v2.stages[2].id).toBe("understand");
   });
 
   it("design 阶段只留结构性断言（L3 扫标题全退场）", async () => {
@@ -89,6 +102,16 @@ describe("careful-coder-v2.yaml (减架构)", () => {
       "delta_checks",
       "validation_run"
     ]);
+  });
+
+  it("每个 required_outputs 都有同名 output_schema，作为跨阶段唯一口径", async () => {
+    const v2 = await loadV2();
+    for (const stage of v2.stages) {
+      const schema = stage.output_schema ?? {};
+      for (const field of stage.required_outputs ?? []) {
+        expect(schema, `${stage.id}.${field} 缺少 output_schema`).toHaveProperty(field);
+      }
+    }
   });
 
   it("implement 只留不可逆操作安全门(去掉读≥3次硬门控,避免刷次数)", async () => {

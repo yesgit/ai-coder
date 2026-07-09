@@ -1,15 +1,15 @@
 {
-  "name": "ai-coder",
+  "name": "careful-coder",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "author": {
-    "name": "AI Coder",
+    "name": "谨慎程序员",
     "email": "aicoder@example.com"
   },
-  "description": "Desktop AI coding agent with pluggable local workflows.",
+  "description": "谨慎程序员桌面编码 Agent。",
   "main": "dist/main/main.js",
-  "desktopName": "ai-coder.desktop",
+  "desktopName": "careful-coder.desktop",
   "scripts": {
     "build:main": "tsc -p tsconfig.main.json",
     "build:icon": "node scripts/make-icon.cjs",
@@ -22,7 +22,7 @@
   },
   "build": {
     "appId": "com.aicoder.desktop",
-    "productName": "AI Coder",
+    "productName": "谨慎程序员",
     "directories": {
       "output": "release"
     },

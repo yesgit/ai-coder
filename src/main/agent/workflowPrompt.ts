@@ -5,9 +5,12 @@ export function buildStageInstructions(input: StageAgentInput): string {
   const stageLines = input.workflow.stages
     .map((stage, index) => {
       const outputs = stage.required_outputs?.length ? ` outputs=${stage.required_outputs.join(",")}` : "";
+      const schema = stage.output_schema && Object.keys(stage.output_schema).length > 0
+        ? ` schema=${JSON.stringify(stage.output_schema)}`
+        : "";
       const checks = stage.required_checks?.length ? ` checks=${stage.required_checks.join(",")}` : "";
       const approval = stage.approval_required ? " approval_required=true" : "";
-      return `${index + 1}. ${stage.id}: ${stage.name}${approval}${outputs}${checks}`;
+      return `${index + 1}. ${stage.id}: ${stage.name}${approval}${outputs}${schema}${checks}`;
     })
     .join("\n");
 
@@ -29,7 +32,8 @@ export function buildStageInstructions(input: StageAgentInput): string {
         ...(needsStrictJsonRetry(input.retry_context.output_summary)
           ? [
               "这次重试命中过 JSON/必填字段问题：结束时不要先写解释、清单、Markdown 或代码块，再补 JSON。",
-              "请先在脑内组装完整对象，确认双引号、括号、逗号都合法，再一次性输出单一 JSON 对象。"
+              "请先在脑内组装完整对象，确认双引号、括号、逗号都合法，再一次性输出单一 JSON 对象。",
+              "特别注意：required_outputs 后面只能是一个对象，写成 \"required_outputs\": { ... }，不要写成 \"required_outputs\": {{ ... }}。"
             ]
           : [])
       ].join("\n")
@@ -52,6 +56,7 @@ export function buildStageInstructions(input: StageAgentInput): string {
   const requiredOutputs = input.required_outputs.length ? input.required_outputs.join(", ") : "concise stage summary";
   const gates = input.gates.length ? input.gates.join(", ") : "none";
   const hookSections = describeStageHooks(input.current_stage.hooks);
+  const outputShapeHints = describeRequiredOutputShapes(input.required_outputs, input.current_stage.output_schema);
 
   const messageHistory = input.recent_messages
     .filter((m) => isMeaningfulAgentText(m.content) || m.attachments?.length)
@@ -98,9 +103,9 @@ export function buildStageInstructions(input: StageAgentInput): string {
     "不要用文字审批请求代替工具调用，也不要仅因为 shell 命令或文件写入需要审批就把阶段标记为 failed。",
     "如果当前阶段发现需要返工到更早阶段，请说明目标阶段和原因，不要自行改变工作流状态。",
     "入境验收（重要）：如果存在前序阶段摘要（即非首阶段），动手当前阶段工作之前必须先核对前序阶段产出是否满足本阶段的输入要求——",
-    "  - 核对维度：前序阶段的 output_summary 与 required_outputs 是否覆盖了它声明的 required_outputs / 必写核心段；内容是否具体可用（不是空话套话）；是否与当前阶段任务衔接。",
-    "  - 优先消费前序阶段 required_outputs 中的结构化状态（如 DoD、证据、调用方假设、成功标准、验证计划、改动核对），不要只靠 output_summary 重新猜测。",
-    "  - 不合格时：把当前阶段 status 写成 needs_rework、rework_target_stage_id 指向不合格的前序阶段、rework_reason 用一两句中文写明哪里不合格、缺了什么。",
+    "  - 核对维度：以前序阶段的文义是否足够支撑当前阶段为根本；综合阅读 output_summary 与已有 required_outputs，不要只因某个结构字段缺失就机械打回。",
+    "  - 优先消费前序阶段 required_outputs 中的结构化状态（如 DoD、证据、调用方假设、成功标准、验证计划、改动核对）；结构字段缺失但 output_summary 已清楚表达同等信息时，可以继续推进并在本阶段摘要里说明采用了文义依据。",
+    "  - 不合格时：把当前阶段 status 写成 needs_rework、rework_target_stage_id 指向不合格的直接前序阶段、rework_reason 用一两句中文写明哪里不合格、缺了什么；如果该前序阶段重做后仍发现缺更上游信息，再由它继续回溯。",
     "  - 合格时：继续当前阶段工作，无需在 output_summary 里专门说明验收通过。",
     "  - 这不是挑刺，是'我能基于前序产出继续推进吗'的诚实自检——前序产出有缺口却硬推进，只会把问题留到 self_review 才暴露，成本更高。",
     "如果阶段要求输出结构化字段，请让 required_outputs 中的字段内容具体、可复用，并包含支撑判断的事实或路径。",
@@ -144,6 +149,13 @@ export function buildStageInstructions(input: StageAgentInput): string {
       null,
       2
     ),
+    ...(outputShapeHints
+      ? [
+          "",
+          "required_outputs 字段形状提示（必须仍然嵌在上面的单一 JSON 对象内；不要输出裸 key/value 清单；如有 JSON Schema，以它为唯一口径）：",
+          outputShapeHints
+        ]
+      : []),
     "",
     "可用扩展工具：",
     "- mcp__ai_coder__ask_human(question: string, type: \"single\"|\"multi\"|\"text\", options?: [{value,label}])",
@@ -162,6 +174,41 @@ export function buildStageInstructions(input: StageAgentInput): string {
 function needsStrictJsonRetry(summary: string | undefined): boolean {
   if (!summary) return false;
   return /json parse|missing required outputs|单一合法对象|required_outputs/i.test(summary);
+}
+
+function describeRequiredOutputShapes(requiredOutputs: string[], outputSchema?: Record<string, unknown>): string | null {
+  if (outputSchema && Object.keys(outputSchema).length > 0) {
+    return [
+      "当前阶段 required_outputs JSON Schema:",
+      JSON.stringify(outputSchema, null, 2)
+    ].join("\n");
+  }
+
+  const lines: string[] = [];
+  if (requiredOutputs.includes("lateral_constraints")) {
+    lines.push(
+      "- lateral_constraints: JSON 数组；每一项必须是对象，形如 {\"constraint\":\"约束\",\"evidence\":\"证据来源/同类位置\",\"implication\":\"对本次改动的含义\"}。"
+    );
+  }
+  if (requiredOutputs.includes("clarifications_asked")) {
+    lines.push("- clarifications_asked: JSON 数组；未询问用户时写 []。");
+  }
+  if (requiredOutputs.includes("changed_files")) {
+    lines.push(
+      "- changed_files: JSON 数组；每项是对象，形如 {\"file\":\"相对路径\",\"changes\":[\"改动点\"],\"reason\":\"未改动时写原因，可省略\"}。"
+    );
+  }
+  if (requiredOutputs.includes("delta_checks")) {
+    lines.push(
+      "- delta_checks: JSON 数组；每项是对象，形如 {\"file\":\"相对路径\",\"success_criteria_addressed\":[\"标准\"],\"new_risks\":[\"风险\"],\"verification\":\"如何验证\"}。"
+    );
+  }
+  if (requiredOutputs.includes("validation_run")) {
+    lines.push(
+      "- validation_run: JSON 对象，形如 {\"commands_executed\":[\"命令\"],\"results\":\"结果摘要\",\"skipped_validations\":[\"跳过项及原因\"],\"residual_risks\":\"残余风险\"}。"
+    );
+  }
+  return lines.length ? lines.join("\n") : null;
 }
 
 /**

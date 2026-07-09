@@ -178,6 +178,7 @@ export interface WorkflowStage {
   approval_required?: boolean;
   allowed_tools?: string[];
   required_outputs?: string[];
+  output_schema?: Record<string, unknown>;
   required_checks?: string[];
   gates?: string[];
   auto_retry_limit?: number;
@@ -268,6 +269,7 @@ export interface WorkflowOverviewStage {
   name: string;
   approval_required: boolean;
   required_outputs: string[];
+  output_schema?: Record<string, unknown>;
   required_checks: string[];
   gates: string[];
 }
@@ -533,6 +535,7 @@ export interface AppApi {
   resumeSession(sessionId: string): Promise<AgentSession>;
   abortSession(sessionId: string): Promise<AgentSession>;
   restartSession(sessionId: string): Promise<AgentSession>;
+  resetSessionContext(sessionId: string): Promise<AgentSession>;
   answerHumanQuestion(sessionId: string, questionId: string, answer: string | string[]): Promise<AgentSession>;
   sendMessage(sessionId: string, message: string, attachments?: Attachment[]): Promise<AgentSession>;
   setSessionPinned(sessionId: string, pinned: boolean): Promise<AgentSession>;

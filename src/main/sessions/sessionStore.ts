@@ -154,7 +154,7 @@ export class SessionStore {
     }
     toolCall.status = status;
     toolCall.resolved_at = new Date().toISOString();
-    session.status = status === "approved" ? "running" : "blocked";
+    session.status = "running";
     await this.save(session);
     return session;
   }

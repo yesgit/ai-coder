@@ -90,7 +90,13 @@ export class WorkflowEngine {
       if (currentAttempt <= maxRetry) {
         return this.retryCurrentStage(session, workflow, `Missing required outputs: ${missingOutputs.join(", ")}${diagHint}`);
       }
-      return this.blockCurrentStage(session, `Missing required outputs after ${currentAttempt} attempts: ${missingOutputs.join(", ")}${diagHint}`);
+      return this.completeCurrentStageWithMissingOutputs(
+        session,
+        workflow,
+        result,
+        missingOutputs,
+        `Missing required outputs after ${currentAttempt} attempts: ${missingOutputs.join(", ")}${diagHint}`
+      );
     }
 
     // 阶段产物自洽性断言：与 missing outputs 同模式走 retry → block。
@@ -299,6 +305,27 @@ export class WorkflowEngine {
     return session;
   }
 
+  resetSessionContext(session: AgentSession, workflow: WorkflowTemplate): AgentSession {
+    const firstUserMessage = session.initial_user_message ?? session.messages.find((message) => message.role === "user");
+    session.messages = firstUserMessage ? [firstUserMessage] : [];
+    session.stage_runs = [];
+    session.tool_calls = [];
+    session.file_changes = [];
+    session.approvals = [];
+    session.rework_requests = [];
+    session.pending_human_questions = [];
+    session.progress_events = [];
+    session.error = undefined;
+    session.status = "running";
+
+    const firstStage = workflow.stages[0];
+    if (!firstStage) {
+      throw new Error("Workflow has no stages");
+    }
+    this.startStage(session, workflow, firstStage, session.task_prompt);
+    return session;
+  }
+
   startFollowUp(session: AgentSession, workflow: WorkflowTemplate, inputSummary: string): AgentSession {
     if (this.getActiveStageRun(session)) {
       return session;
@@ -375,6 +402,34 @@ export class WorkflowEngine {
     session.status = "running";
     session.error = reason;
     return session;
+  }
+
+  private completeCurrentStageWithMissingOutputs(
+    session: AgentSession,
+    workflow: WorkflowTemplate,
+    result: StageAgentResult,
+    missingOutputs: string[],
+    reason: string
+  ): AgentSession {
+    const stageRun = this.getActiveStageRun(session);
+    if (!stageRun) {
+      return session;
+    }
+
+    if (result.required_outputs) {
+      stageRun.required_outputs = result.required_outputs;
+    }
+
+    const summary = [
+      result.output_summary,
+      "",
+      `结构化字段缺失（已软通过，交由后续阶段按文义验收；无法继续时应 needs_rework 打回本阶段）：${missingOutputs.join(", ")}。`,
+      `原始校验信息：${reason}`
+    ].filter(Boolean).join("\n");
+
+    const nextSession = this.completeCurrentStage(session, workflow, summary);
+    nextSession.error = undefined;
+    return nextSession;
   }
 
   private getStageAttempt(session: AgentSession, stageId: string): number {

@@ -100,7 +100,7 @@ export async function approveOrDenyToolUse(
     return { allow: true, updatedInput: input };
   }
   if (existingToolCall?.status === "denied") {
-    return { allow: false, message: "Tool call was denied by the user.", interrupt: true };
+    return { allow: false, message: "Tool call was denied by the user. Continue without this tool or choose an allowed alternative.", interrupt: false };
   }
   if (existingToolCall?.status === "pending_approval") {
     return { allow: false, message: "Tool call is waiting for user approval.", interrupt: true };
@@ -200,7 +200,11 @@ export async function approveOrDenyToolUse(
     return { allow: true, updatedInput: input };
   } catch (error) {
     record("blocked");
-    return { allow: false, message: error instanceof Error ? error.message : String(error), interrupt: true };
+    return {
+      allow: false,
+      message: `${error instanceof Error ? error.message : String(error)}. Continue without this tool or choose an allowed alternative.`,
+      interrupt: false
+    };
   }
 }
 

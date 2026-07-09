@@ -22,6 +22,7 @@ const api: AppApi = {
   resumeSession: (sessionId: string) => ipcRenderer.invoke("sessions:resume", sessionId),
   abortSession: (sessionId: string) => ipcRenderer.invoke("sessions:abort", sessionId),
   restartSession: (sessionId: string) => ipcRenderer.invoke("sessions:restart", sessionId),
+  resetSessionContext: (sessionId: string) => ipcRenderer.invoke("sessions:reset-context", sessionId),
   answerHumanQuestion: (sessionId: string, questionId: string, answer: string | string[]) =>
     ipcRenderer.invoke("sessions:answer-human-question", sessionId, questionId, answer),
   sendMessage: (sessionId: string, message: string, attachments?: Attachment[]) =>

@@ -133,6 +133,14 @@ export class ClaudeAgentRunner {
           // permissionMode 不设置，使用 SDK 默认行为。工具调用的审批逻辑在 canUseTool 回调中实现
           settingSources: ["user", "project", "local"],
           canUseTool: async (toolName: string, toolInput: Record<string, unknown>, options: { toolUseID: string }) => {
+            if (isUnsupportedDocumentRead(toolName, toolInput)) {
+              await this.recordProgress(input, "tool_policy", "拦截 PDF Read：请读取已拆页 PNG 或用 shell 文本工具查看，不要直接 Read PDF。", "milestone");
+              return {
+                behavior: "deny",
+                message: "当前后端不支持 PDF document content block。PDF 上传时已拆成 .ai-coder/uploads/.../page-*.png，请改用 Read 读取对应 PNG 页面，或用只读 shell 工具提取文本后继续。",
+                interrupt: false
+              };
+            }
             // 拦截 ask_human：作为 HumanQuestion 挂起，等待用户回答后继续
             if (toolName === "mcp__ai_coder__ask_human") {
               const question = this.buildHumanQuestion(input.session, toolInput, options.toolUseID);
@@ -177,7 +185,8 @@ export class ClaudeAgentRunner {
                 }
                 return { behavior: "deny", message: approvedDecision.message, interrupt: approvedDecision.interrupt };
               }
-              return { behavior: "deny", message: "Tool call was denied by the user.", interrupt: true };
+              input.session.status = "running";
+              return { behavior: "deny", message: "Tool call was denied by the user. Continue without this tool or choose an allowed alternative.", interrupt: false };
             }
             await this.recordProgress(input, "tool_policy", this.describeToolDecision(toolName, false), "milestone");
             return { behavior: "deny", message: decision.message, interrupt: decision.interrupt };
@@ -220,7 +229,7 @@ export class ClaudeAgentRunner {
           created_at: new Date().toISOString()
         });
       }
-      if (this.hasPendingToolCall(input.session) || this.hasBlockedToolCall(input.session) || this.hasPendingHumanQuestion(input.session)) {
+      if (this.hasPendingToolCall(input.session) || this.hasPendingHumanQuestion(input.session)) {
         input.session.status = this.resolveInterruptedStatus(input.session);
         await this.recordProgress(input, "status", `阶段已中断：${input.session.status}`, "milestone");
         return input.session;
@@ -459,9 +468,6 @@ export class ClaudeAgentRunner {
     if (this.hasPendingToolCall(session) || this.hasPendingHumanQuestion(session)) {
       return "waiting_approval";
     }
-    if (this.hasBlockedToolCall(session)) {
-      return "blocked";
-    }
     return "completed";
   }
 
@@ -569,6 +575,12 @@ function isAbortError(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
   const name = (error as { name?: unknown }).name;
   return name === "AbortError";
+}
+
+function isUnsupportedDocumentRead(toolName: string, toolInput: Record<string, unknown>): boolean {
+  if (toolName !== "Read") return false;
+  const filePath = String(toolInput.file_path ?? toolInput.path ?? "");
+  return /\.pdf(?:$|[?#])/i.test(filePath);
 }
 
 /**

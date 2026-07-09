@@ -1,32 +1,15 @@
 id: careful-coder
 name: 谨慎程序员
-version: 1.3.0
-description: 把人类资深开发者的"强制例程"软化为可读的纪律——取证、对齐、敌对自审，让模型像谨慎的同事一样工作。
+version: 3.0.0
+description: |
+  唯一内置工作流：先根据项目情况执行全量或增量项目画像，建立或调整长期上下文；
+  再按理解、勘察、对齐、方案、实施、自审推进编码任务。
+  所有阶段通过统一 output_schema 传递结构化状态，后续阶段按同一口径消费前序产物，
+  缺口通过 needs_rework 回溯修正。
 source:
   type: builtin
   id: careful-coder
-  version: 1.3.0
-routing:
-  enabled: true
-  auto_start: true
-  # 与 software-engineering / plan-execute 错开：careful-coder 是"需要更谨慎"的语义触发器。
-  # 直接的"修 bug / 实现功能"应该走 software-engineering 走得更快；只有用户显式说
-  # "认真改"、"小心改"、"谨慎"、"敏感模块" 这类时，careful-coder 才胜出。
-  keywords:
-    - 谨慎
-    - 严谨
-    - 小心改
-    - 认真改
-    - 敏感
-    - 高风险
-    - 不要漏
-    - careful
-    - high stakes
-    - production critical
-  examples:
-    - 谨慎地修一下未登录访问 /settings 崩溃的问题（涉及鉴权别漏）
-    - 严谨地把 parseConfig 改为接收路径而不是字符串，并修所有调用方
-    - 这块是敏感模块，请仔细对照同类实现再动手
+  version: 3.0.0
 permissions:
   filesystem:
     mode: project-only
@@ -34,9 +17,21 @@ permissions:
     approval_required: true
   network:
     enabled: false
+routing:
+  enabled: true
+  auto_start: true
+  # v2 与 v1.3 并存做对比基线；暂不自动接管，手动选用。验证 v2 更优后可切换 auto_start。
+  keywords:
+    - 谨慎 v2
+    - careful v2
+  examples:
+    - 谨慎地修一下未登录访问 /settings 崩溃的问题
+    - 严谨地把 parseConfig 改为接收路径而不是字符串，并修所有调用方
 rework:
   enabled: true
   allowed_targets:
+    - scan_project
+    - update_project_profile
     - understand
     - investigate
     - align
@@ -44,36 +39,136 @@ rework:
     - implement
   approval_required: false
   invalidate_downstream: true
-# v1.1 设计笔记（写给后来者）：
-# v1.0 曾经用 required_outputs 强制 LLM 一次性产出 5 个对象数组（investigation_tasks /
-# hypotheses / findings / plan_steps / phase_1_self_check 等）+ 跨阶段血脉断言。
-# 实证结果：LLM 在长 prompt 下 JSON 频繁烂尾（candidate_count=9, bracket_balance=3），
-# 无法在 retry 内自我修复，引擎层卡死。
-# v1.1 回归软引导——instructions 描述思维例程、required_outputs 只留少量简单字段，
-# 断言只保留扫文本/查结构存在性的低复杂度规则。思想仍在，硬约束让位给 LLM 的实际能力。
-#
-# v1.2 设计笔记（人类谨慎思维工程化）：
-# 在 v1.1 软引导基础上新增 11 条思维例程 + 9 个扫标题/扫词断言，把"人类资深开发者的内在思维"
-# （而非仅外在例程）工程化。仍守软约束——不新增任何 required_outputs 字段，断言只做扫标题/扫词存在性。
-# - investigate：markdown 模板从 4 标题扩到 7 标题（+同类参考/调用方清单/边界与异常路径），
-#   每条 finding 标置信度 [high/medium/low + 依据]，low 项须尝试第二证据源交叉验证。
-# - design：必写核心 3 段（候选方案≥2 对照/方案评估四维/事前风险预演），按需写 6 段
-#   （design_summary/adversarial_critique 降级/consistency_audit/success_criteria/测试清单/影响半径）。
-# - implement：delta_check 每文件一段（推进哪条 success_criteria + 新风险）+ 不可逆操作回滚预案。
-# - self_review：3 条闭环核对（优先核对 low/medium 置信项 + 调用方语义假设 + 测试清单执行）。
-# design 段分必写/按需写以控 output_summary 长度，降低 JSON 烂尾风险。
-# 烂尾回退策略：A 删 adversarial_critique；B 合并同类参考与调用方清单；C 放宽候选方案为≥1。
-#
-# v1.3 设计笔记（行为即证据——形式断言退场）：
-# v1.2 的 9 个扫标题/扫词断言实证为"形式合规"——模型填空壳 markdown 标题就能过，是仪式不是谨慎。
-# v1.3 把 investigate 的 4 条标题断言（investigate_structure_present / callsites_inventory_present /
-# boundary_enumeration_present / confidence_levels_present）退场，改用 post_output_checks 查 tool_calls：
-# 本阶段必须真跑过 git log。行为即证据——模型没法假装跑过一个没跑过的命令。
-# verify(self_review) 同理新增"必须真跑过 git diff"——敌对自审的前提是真看了 diff，不是口头说"应该通过"。
-# 思维模板仍留在 instructions 作引导，但不再被引擎扫；真正的谨慎由行为闸门保证。
-# 这是"把人类程序员心智切实落实"大方向的第一步（L1 行为校验下沉为引擎一等能力），后续相位见
-# docs/workflow-design-principles.md：外化认知状态 + 检查点观察 + 任意层 rework。
+# v2.1 设计笔记（承接 docs/workflow-design-principles.md 的反思）：
+# v1.0→v1.3 三轮都在"用产出形态/行为保证思维质量"的范畴错误里打转：L3 扫标题可被空壳糊弄，
+# L1 查行为虽难糊弄但把"动作发生"当成"谨慎发生"——两者都是用可观测代理指标保证不可观测心智。
+# v2.0 换路：保留人类思维的阶段骨架（人类本就分阶段思考），但阶段内部靠 prompt 落实心智。
+# v2.1 承认单靠 prompt 会在阶段边界丢心智：关键状态必须进入 required_outputs，并由后续阶段消费。
+# 断言仍只留三类不可糊弄且不制造仪式的：
+#   1. 结构性（no_trailing_unparsed_payload / needs_rework_target_required）——防 JSON 烂尾、rework 缺字段
+#   2. L2 自洽性（review_self_consistency / hedged_findings_demoted / unknowns_present）——查可验证事实/自洽
+#   3. 安全门（不可逆操作 ask_human consent / rollback_plan）——安全，非谨慎仪式
+# L3 扫标题全退场；L1 behavior 门控（git log/git diff 的 retry/block）降回 prompt 提示——
+# "你应该跑 git log"是建议，不是"跑过才算调查过"的证据勒索。
+# 思维模板（候选方案/事前风险/置信度/调用方清单/delta_check）仍在 instructions 里作引导；
+# 承重信息进入 required_outputs，使 design/implement/self_review 有同一份可复用状态，而非靠重读摘要猜测。
 stages:
+  - id: scan_project
+    name: 扫描项目画像
+    instructions: |
+      这是所有开发任务的前置阶段：先判断当前项目画像是否存在、是否过期，以及本次应做全量画像还是增量画像。
+      检查项目根目录和 .claude/ 目录下是否已有 CLAUDE.md、.claude/CLAUDE.md、CLAUDE.local.md、.claude/rules/、.claude/skills/、.claude/settings.json、.mcp.json、AGENTS.md、其他工具规则文件。
+      若项目没有画像资产，执行全量画像扫描：阅读 README、包清单、主要配置、关键源码入口、测试/CI/脚本目录，建立项目地图。
+      若已有画像资产，或用户要求刷新/调整画像，优先执行增量画像：阅读已有画像资产、git status、近期 diff/提交摘要、本次任务直接相关文件，判断哪些画像内容需要更新。
+      避开密钥、凭证、生成依赖目录、大型构建产物和二进制文件。PDF/图片附件按宿主提供的 file_ref 或拆页 PNG 读取，不要直接读取原始 PDF。
+      不要为了画像而无边界扫描；以“后续编码阶段是否有足够项目上下文”为判断标准。
+    allowed_tools:
+      - read_file
+      - shell
+    required_outputs:
+      - profile_mode
+      - existing_profile_assets
+      - inspected_files
+      - project_facts
+      - profile_update_needed
+    output_schema:
+      profile_mode:
+        type: string
+        enum:
+          - full
+          - incremental
+          - none
+        description: full=无画像或结构大变需全量画像；incremental=已有画像且只需局部调整；none=画像足够且本次无需更新
+      existing_profile_assets:
+        type: array
+        items: string
+        description: 已发现的画像资产路径；没有则 []
+      inspected_files:
+        type: array
+        items:
+          type: object
+          properties:
+            file: string
+            evidence: string
+        description: 本阶段实际阅读/检查的文件及提供的事实
+      project_facts:
+        type: array
+        items: string
+        description: 后续编码必须知道的稳定项目事实
+      profile_update_needed:
+        type: array
+        items: string
+        description: 需要建立或调整画像的事项；无需更新则 ["无"]
+    auto_retry_limit: 1
+    hooks:
+      post_output_assertions:
+        - no_trailing_unparsed_payload
+  - id: update_project_profile
+    name: 建立或调整项目画像
+    instructions: |
+      根据 scan_project 的结论建立或调整项目画像。全量模式下创建简洁、可维护、适合作为长期上下文的 CLAUDE.md；增量模式下只修改受近期变化影响的画像内容；none 模式下不写文件，只说明无需更新依据。
+      主 CLAUDE.md 应聚焦长期稳定事实：项目概览、技术栈、架构边界、常用命令、验证路径、开发规则、安全边界、容易误导代理的陷阱、画像更新策略。
+      如已有 CLAUDE.md/rules/skills/settings，必须保留仍然正确的团队规则；只修正过期或缺失内容，不做无关重排。
+      .claude/rules 只用于有明确路径作用域的规则；.claude/skills 只用于重复、多步骤、长期有价值的流程；settings 只建议团队共享配置，不写密钥、个人偏好、本机绝对路径。
+      如需要写文件，使用最小改动，并在 validation 中说明读取/写入/未执行的验证。无法写入时不要中断后续编码阶段，把缺口写入 required_outputs。
+    allowed_tools:
+      - read_file
+      - edit_file
+      - shell
+    gates:
+      - authorized_files_only
+    required_outputs:
+      - profile_changes
+      - profile_paths
+      - retained_rules
+      - validation
+      - residual_profile_risks
+    output_schema:
+      profile_changes:
+        type: array
+        items:
+          type: object
+          properties:
+            action: string
+            target: string
+            reason: string
+        description: 建立/更新/跳过画像的动作清单
+      profile_paths:
+        type: array
+        items: string
+        description: 已创建或更新的画像资产路径；无改动则 []
+      retained_rules:
+        type: array
+        items: string
+        description: 明确保留的已有团队规则或画像内容
+      validation:
+        type: object
+        properties:
+          commands_executed: array<string>
+          results: string
+          skipped_validations: array<string>
+        description: 已执行验证和跳过原因
+      residual_profile_risks:
+        type: array
+        items: string
+        description: 画像仍需人工确认的事项；没有则 ["无"]
+    auto_retry_limit: 1
+    hooks:
+      pre_tool_use:
+        - when:
+            tool: Bash
+            command_contains:
+              - "rm "
+              - "git reset"
+              - "git clean"
+              - "drop table"
+              - "truncate"
+          require:
+            ask_human_consent: true
+          on_fail: "这是不可逆操作，必须先通过 ask_human 取得用户明确确认。"
+      post_output_assertions:
+        - rollback_plan_when_irreversible
+        - no_trailing_unparsed_payload
   - id: understand
     name: 理解
     instructions: |
@@ -93,7 +188,7 @@ stages:
 
       必须输出且只能输出以下 JSON 结构：
       ```json
-      {"status":"completed","output_summary":"一句话总结","required_outputs":{"user_goal_restated":"用户想要什么","definition_of_done":"完成的标准","assumptions":[]}}
+      {"status":"completed","output_summary":"一句话总结","required_outputs":{"user_goal_restated":"用户想要什么","definition_of_done":["可观测完成标准 1"],"assumptions":[]}}
       ```
     allowed_tools:
       - read_file
@@ -102,55 +197,46 @@ stages:
       - user_goal_restated
       - definition_of_done
       - assumptions
+    output_schema:
+      user_goal_restated:
+        type: string
+        description: 用户真实诉求的一句话复述
+      definition_of_done:
+        type: array
+        items: string
+        description: 可观测完成标准列表
+      assumptions:
+        type: array
+        items: string
+        description: 自主推断的保守假设；没有则 []
     auto_retry_limit: 5
     hooks:
       post_output_assertions:
         - no_trailing_unparsed_payload
   - id: investigate
-    name: 取证
+    name: 勘察
     instructions: |
-      像资深开发者接手陌生模块的反射动作——**先拟定调查任务、逐条取证、复盘是否方案无虞、
-      不放心就补任务再调查**。这是 Plan loop 的内循环；走完才允许下结论。
+      像资深开发者接手陌生模块的反射动作——**带着假设边看边修正**。不是先列一张调查任务清单
+      逐条打勾，而是形成一个初步假设，去代码/历史里验证，验证结果修正假设，再去看下一处。
+      走完才允许下结论。
 
       **自主查证原则**：
       - 能 grep/read_file/git log 查到的信息，不要问用户
       - unknowns 里写的是"代码里没有明确答案"的事项，不是"我没去查"的事项
       - 如果查证后发现用户任务描述与实际代码不符，以代码为准，在 output_summary 里说明
 
-      ⚠️ **output_summary（自然语言总结）建议按以下 markdown 模板写**（引导思维，不是形式要求——
-      引擎不再扫这些标题，改为按 tool_calls 核对你**本阶段真跑过 git log**：调查的真证据是行为，不是标题）：
+      像人类那样思考（写进 output_summary 自然语言总结，引擎不扫这些形态——靠你自觉）：
+      - **调查任务与假设**：你打算查什么、初始假设是什么、查证后假设成立/推翻/需修正
+      - **同类参考**：同类实现怎么写的，给 ≥2 条 path:line + 模式说明
+      - **调用方清单**：目标符号的所有调用方 + 每处对其行为的语义假设
+        （如"src/router/index.ts:88 调用 parseConfig，假定返回非 null"）；无目标符号写"本次无目标符号"
+      - **已证实的结论**：每条给证据 `file:line` + 置信度 [high/medium/low] + 依据类型（代码直读/git log/推断）
+      - **边界与异常路径**：已知需要处理的边缘情况（空/零/负/并发/超时/失败/超大输入）
 
-      ```markdown
-      ## 调查任务清单
-      1. [ ] task_1: ... → [已查/未查]
+      **建议跑 `git log`/`git blame` 看历史**——了解这段代码为什么长成现在这样，常常比读当前代码
+      更能避免重复历史错误。这是建议而非硬性要求（引擎不核对你是否跑过），但资深开发者几乎不会跳过。
 
-      ## 假设与验证
-      - H1: ... → [证实/证伪/inconclusive]
-      （标 low 置信度的 finding 必须尝试第二证据源交叉验证，如 grep + git log + 测试三路印证；
-       仍无法确认才标 low——交叉验证是"我尽力查了"的证明，不是可选项）
-
-      ## 同类参考
-      - 同类实现怎么写的：≥2 条 path:line + 模式说明
-      （如"login.ts:42 用了 redirect-after-auth 模式"）
-
-      ## 调用方清单
-      - 目标符号的所有调用方 + 每处对其行为的语义假设
-      （如"src/router/index.ts:88 调用 parseConfig，假定返回非 null"）
-      - 无明确目标符号的任务（如新建文件）写"本次无目标符号"
-
-      ## 已证实的结论
-      1. f1: ...（证据：`file:line`，置信度：[high/medium/low] + 依据类型：代码直读/git log/推断）
-      2. f2: ...
-
-      ## 边界与异常路径
-      - 已知需要处理的边缘情况：空/零/负/并发/超时/失败/超大输入
-      （与 unknowns 互补：unknowns 是没查清的，boundary 是已知需处理的）
-
-      ## 仍未确定的事项
-      - ...（置信度：low + 为什么没查清）
-      ```
-
-      **置信度分级**（每条 finding 必标）：
+      **置信度分级**（每条结论必标）：
       - **high**：代码直读确认 / git log 明确记录 / 测试跑过
       - **medium**：推断但有间接证据 / 同类代码风格类推
       - **low**：纯推断 / 未读到关键代码 / 依赖假设
@@ -158,8 +244,10 @@ stages:
 
       required_outputs（JSON 字段）保持精简：
         - similar_callsites: 覆盖"同类参考"+"调用方清单"两类，至少 3 条 path:line + 一句话作用
-        - git_history_summary: 跑过的 git log/blame 关键结论（含 commit hash）
-        - unknowns: 未查清的事项（写"无"也可以，但不能省略）
+        - evidence_findings: 已证实结论列表；每条包含结论、证据 path:line、置信度 high/medium/low、依据类型
+        - callsite_assumptions: 调用方语义假设清单；无目标符号写"本次无目标符号"
+        - boundary_cases: 已知需要处理或确认的边界与异常路径
+        - unknowns: 未查清的事项（写"无"也可以，但不能省略——沉默不算回答）
 
       ⚠️ JSON 输出前请先 JSON.parse 验证——多余引号/未闭合括号会导致 retry。
     allowed_tools:
@@ -167,24 +255,47 @@ stages:
       - shell
     required_outputs:
       - similar_callsites
-      - git_history_summary
+      - evidence_findings
+      - callsite_assumptions
+      - boundary_cases
       - unknowns
+    output_schema:
+      similar_callsites:
+        type: array
+        items:
+          type: object
+          properties:
+            path_line: string
+            pattern: string
+        description: 同类参考与调用方清单，至少 3 条 path:line + 模式说明
+      evidence_findings:
+        type: array
+        items:
+          type: object
+          properties:
+            finding: string
+            evidence: string
+            confidence: high | medium | low
+            basis: 代码直读 | git log | 测试 | 推断
+        description: 已证实结论列表
+      callsite_assumptions:
+        type: array
+        items: string
+        description: 调用方语义假设清单；无目标符号写 ["本次无目标符号"]
+      boundary_cases:
+        type: array
+        items: string
+        description: 已知需要处理或确认的边界与异常路径
+      unknowns:
+        type: array
+        items: string
+        description: 未查清事项；没有则 ["无"]
     auto_retry_limit: 3
     hooks:
-      # v1.3：4 条扫标题的形式断言（investigate_structure_present / callsites_inventory_present /
-      # boundary_enumeration_present / confidence_levels_present）退场——它们只校验 markdown 标题字面存在，
-      # 模型填空壳就能过，是仪式不是谨慎。改为 post_output_checks 查 tool_calls：本阶段真跑过 git log
-      # 才算调查过。行为即证据，不可糊弄。模板仍留在 instructions 作思维引导。
       post_output_assertions:
         - needs_rework_target_required
-        - hedged_findings_demoted
         - unknowns_present
         - no_trailing_unparsed_payload
-      post_output_checks:
-        - require:
-            commands_run:
-              - "git log "
-          on_fail: "investigate 必须真跑过 git log（宿主按 tool_calls 核对，写文字不算数）——本轮调查的行为证据"
   - id: align
     name: 对齐
     instructions: |
@@ -195,103 +306,125 @@ stages:
       - 需求有歧义且代码/文档无法确认
       - 需要在多个合理方案中做选择（且没有明显最优解）
 
+      required_outputs.lateral_constraints 要写成可核对清单：必须是合法 JSON 数组；每条是对象，包含 constraint、evidence、implication 三个字符串字段，分别表示约束、证据来源/同类位置、对本次改动的含义。不要输出裸 key/value 清单。
       output_summary 里写明：横向约束清单 + 已自主确认的事项 +（如有）需要用户决策的问题。
     allowed_tools:
       - read_file
       - shell
     required_outputs:
       - lateral_constraints
-      - clarifications_asked
+    output_schema:
+      lateral_constraints:
+        type: array
+        items:
+          type: object
+          properties:
+            constraint: string
+            evidence: string
+            implication: string
+        description: 横向一致性约束清单；每项包含约束、证据来源/同类位置、对本次改动的含义
     auto_retry_limit: 1
     hooks:
       post_output_assertions:
         - needs_rework_target_required
         - no_trailing_unparsed_payload
   - id: design
-    name: 设计
+    name: 方案
     instructions: |
-      把 investigate 阶段查实的结论翻成可执行步骤——**每一步都要引用对应的取证证据**，
-      不允许凭空设计。
+      把 investigate 勘实的结论翻成可执行步骤——**每一步都要引用对应的取证证据**，不允许凭空设计。
 
-      **必写核心段（output_summary 必须含以下 3 个 markdown 标题，断言会校验）**：
+      像人类资深开发者那样在 output_summary 里把设计思考写清楚（引擎不扫标题形态，靠你自觉把
+      思考过程写明白，而非填空壳）：
 
-      1. **## 候选方案**：先列 ≥2 候选方案并排比较，再写选定理由。写法：
-         ```markdown
-         ## 候选方案
-         - 方案 A：...（要点 + 取舍维度：复杂度/风险/可逆性）
-         - 方案 B：...（要点 + 同样维度）
-         选定：方案 X，理由：...
-         ```
-         不允许只写一个方案就跳到下一项——"比较"本身就是思维过程，不是"先定再辩护"。
-
-      2. **## 方案评估**：对**选定方案**给性能/安全/扩展/可维护四维简评（每维一两句 + 风险等级 high/med/low）。
-         与候选方案的取舍矩阵互补——前者是方案间横向比较，后者是选定方案的纵深审视。
-         ```markdown
-         ## 方案评估
-         - 性能：...（风险：low）
-         - 安全：...（风险：med）
-         - 扩展：...（风险：low）
-         - 可维护：...（风险：low）
-         ```
-
-      3. **## 事前风险**：动手前预演失败——最易出错的两三处、最没把握的反例 + 预案。写法：
-         ```markdown
-         ## 事前风险
-         - 风险 1：...（最易出错的点 + 触发条件 + 预案）
-         - 风险 2：...（最没把握的反例 + 验证手段）
-         ```
-         这是"事前预演"，不是事后挑刺——挑的是"我自己心里都没底的地方"。
-
-      **按需写段（软约束，不强制作断言；涉及就写，靠 self_review 兜底）**：
-      - **design_summary**：方案要点（要做什么、怎么做、涉及哪些文件）
-      - **adversarial_critique**：敌对自审——reviewer 视角会怎么打回？至少 3 条具体反驳并答辩
-        （与事前风险+方案评估有重叠，按需写，避免 output_summary 过长）
-      - **consistency_audit**：一致性自审——同类条目要么全做要么全不做；任何偏离写出理由
-      - **success_criteria**（推荐写）：完成的样子，便于 self_review 核对
-      - **测试清单**：涉及逻辑改动时列需新增/修改的测试 + 覆盖哪条 success_criteria
-      - **影响半径**：涉及公共接口/共享数据时列改动波及的下游（含间接传递依赖）
+      - **候选方案对照**：先列 ≥2 候选并排比较（取舍维度：复杂度/风险/可逆性），再写选定理由。
+        不允许只写一个方案就跳到实施——"比较"本身就是思维过程，不是"先定再辩护"。
+      - **方案评估**：对选定方案给性能/安全/扩展/可维护四维简评（每维一两句 + 风险等级 high/med/low）。
+      - **事前风险预演**：动手前预演失败——最易出错的两三处、最没把握的反例 + 预案。
+        这是"事前预演"，不是事后挑刺——挑的是"我自己心里都没底的地方"。
+      - **成功标准**（推荐）：完成的样子，便于 self_review 核对。
+      - **测试清单**（涉及逻辑改动时）：需新增/修改的测试 + 覆盖哪条成功标准。
+      - **影响半径**（涉及公共接口/共享数据时）：改动波及的下游（含间接传递依赖）。
 
       避免过度抽象/过度工程：能用现有函数解决就不要新建。
+      required_outputs 必须提供：
+        - selected_plan: 选定方案的步骤清单；每步引用 investigate.evidence_findings 或 align.lateral_constraints 的证据
+        - success_criteria: 可验证完成标准；承接 understand.definition_of_done
+        - test_plan: 要跑/要新增/可接受跳过的验证；跳过必须写理由
+        - risk_register: 事前风险与预案；至少覆盖最易错处、最低置信处、回滚/返工触发条件
     allowed_tools:
       - read_file
-    required_outputs: []
+    required_outputs:
+      - selected_plan
+      - success_criteria
+      - test_plan
+      - risk_register
+    output_schema:
+      selected_plan:
+        type: array
+        items:
+          type: object
+          properties:
+            step: string
+            evidence_refs: array<string>
+        description: 选定方案步骤清单；每步引用 investigate.evidence_findings 或 align.lateral_constraints
+      success_criteria:
+        type: array
+        items: string
+        description: 可验证完成标准，承接 understand.definition_of_done
+      test_plan:
+        type: array
+        items:
+          type: object
+          properties:
+            check: string
+            covers: string
+            skip_reason: string
+        description: 要跑/要新增/可接受跳过的验证；跳过必须写 skip_reason
+      risk_register:
+        type: array
+        items:
+          type: object
+          properties:
+            risk: string
+            mitigation: string
+            trigger: string
+        description: 事前风险与预案，覆盖最易错处、最低置信处、回滚/返工触发条件
     auto_retry_limit: 1
     hooks:
       post_output_assertions:
-        - design_alternatives_present
-        - design_quadrant_eval_present
-        - preflight_risks_present
         - needs_rework_target_required
         - no_trailing_unparsed_payload
   - id: implement
     name: 实施
     instructions: |
       严格按 design 实施最小改动；偏离 design 必须 needs_rework 回到 design。
-      改任何一个文件之前，先确保你真的读过它（不只是 grep 过 basename）：
-        - 同一目标文件的 Read/Grep 次数 ≥ 3；
-        - 本会话内对该文件跑过一次 git log；
-        - 涉及不可逆 shell 操作时，先 ask_human 取得用户同意。
-      宿主会在工具调用前强制校验上述前置条件，未达到会被 deny 并要求你补齐。这不是平台限制，
-      是"先看后改"的纪律。
 
-      **改动核对（delta_check，必写）**：每改完一个文件，在 output_summary 里用 markdown 分段
-      写一段 delta_check——推进了哪条 success_criteria + 引入了什么新风险。写法：
+      **任务点驱动（基于真实需要，不刷次数）**：
+      动手前先想清楚——总体目标（understand.user_goal_restated）和本阶段目标（design 成功标准）是什么？
+      基于真实需要列出本次要做的 Points（要读哪些文件、改哪些、跑什么验证），逐步执行，每步对照目标自检：
+        - 这个 Point 做完了吗？还偏离总体目标吗？需要回 design 吗？
+        - "看几次"由真实需要决定——理解了就不必再读，没理解就读到理解为止。不为凑次数而刷 Read。
+        - 涉及不可逆 shell 操作（rm/git reset/drop table/truncate）时，先 ask_human 取得用户同意（宿主强制）。
+      "先看后改"是纪律，但次数不硬性门控（那会让模型为凑次数而形式读取）。改由你自检是否真的理解了目标文件。
+
+      **边写边核对**：每改完一个文件，在 output_summary 里写一段"改动核对"——推进了哪条
+      success_criteria + 引入了什么新风险。写法：
       ```markdown
-      ## 改动核对
       ### src/auth/login.ts
       - 推进：success_criteria 第 2 条（未登录跳转 /settings）
       - 新风险：引入了 redirect 时序依赖，需 self_review 跑一遍 e2e
-      ### src/router/index.ts
-      - 推进：success_criteria 第 1 条
-      - 新风险：无
       ```
-      如果本次未改动任何文件，仍要写一段"## 改动核对：本次未改动，原因：..."。
-      这是"过程中"的自审——不是等 self_review 才发现走偏。每改完一个文件就对照
-      understand.user_goal_restated 与 design.success_criteria 核对，发现走偏及时 needs_rework
-      回 design，不要等到 self_review 阶段才发现。
+      如果本次未改动任何文件，仍写一段说明原因。这是"过程中"的自审——不是等 self_review
+      才发现走偏。每改完一个文件就对照 understand.user_goal_restated 与 design 成功标准核对，
+      发现走偏及时 needs_rework 回 design。
+      required_outputs 必须提供：
+        - changed_files: JSON 数组；本阶段实际改动/未改动的文件清单与原因；每项是对象，至少包含 file、changes
+        - delta_checks: JSON 数组；每个改动文件推进了哪条 success_criteria、引入什么风险、如何验证；每项是对象，至少包含 file、success_criteria_addressed、new_risks、verification
+        - validation_run: JSON 对象；已执行的验证命令/结果；未执行要写原因与残余风险；至少包含 commands_executed、results、skipped_validations、residual_risks
+      required_outputs 后面只能有一个对象：写成 "required_outputs": { ... }，不要写成 "required_outputs": {{ ... }}。
 
       **回滚预案**：涉及不可逆操作（rm/git reset/drop table/truncate 等）时，在对应文件的
-      delta_check 子段内写明回滚步骤（如何撤销本次不可逆操作）。
+      改动核对子段内写明回滚步骤（如何撤销本次不可逆操作）。
 
       改动尽量小、贴近原代码风格。坚决不顺手"清理无关代码"。
     allowed_tools:
@@ -300,21 +433,44 @@ stages:
       - shell
     gates:
       - authorized_files_only
+    required_outputs:
+      - changed_files
+      - delta_checks
+      - validation_run
+    output_schema:
+      changed_files:
+        type: array
+        items:
+          type: object
+          properties:
+            file: string
+            changes: array<string>
+            reason: string
+        description: 本阶段实际改动/未改动的文件清单与原因
+      delta_checks:
+        type: array
+        items:
+          type: object
+          properties:
+            file: string
+            success_criteria_addressed: array<string>
+            new_risks: array<string>
+            verification: string
+        description: 每个改动文件推进的成功标准、引入风险、验证方式
+      validation_run:
+        type: object
+        properties:
+          commands_executed: array<string>
+          results: string
+          skipped_validations: array<string>
+          residual_risks: string
+        description: 已执行验证命令/结果；未执行写原因与残余风险
     auto_retry_limit: 1
     hooks:
       pre_tool_use:
-        # 注意：Write 不在此列。Write 主要用于新建文件，目标路径还不存在时无法
-        # "先 Read/Grep 3 次"，硬挂会让"新建文件"类任务卡死或刷形式次数。
-        # Write 的纪律靠 design + self_review 兜底。
-        - when:
-            tool:
-              - Edit
-              - MultiEdit
-          require:
-            same_file_reads_min: 3
-            shell_must_have_run:
-              - "git log "
-          on_fail: "改既有代码之前请先充分了解上下文：对目标文件至少 Read/Grep 3 次，并对它跑过一次 git log。"
+        # v2.1：去掉 same_file_reads_min + shell_must_have_run 的"读≥3次+跑过git log"硬门控——
+        # 它是 Goodhart 源：模型为凑次数而形式刷 Read，而非基于真实需要理解文件。改为 prompt
+        # 引导任务点驱动 + 自检（见 instructions）。只保留不可逆操作的 ask_human consent（安全门）。
         - when:
             tool: Bash
             command_contains:
@@ -327,7 +483,6 @@ stages:
             ask_human_consent: true
           on_fail: "这是不可逆操作，必须先在本阶段通过 ask_human 取得用户明确确认。"
       post_output_assertions:
-        - implement_delta_check_present
         - rollback_plan_when_irreversible
         - needs_rework_target_required
         - no_trailing_unparsed_payload
@@ -335,25 +490,32 @@ stages:
     name: 自审
     instructions: |
       你现在是一个独立的、敌对的 code reviewer，**不是作者**，看不到 implement 阶段的辩解，只看代码事实。
-      逐条核对 align.lateral_constraints 与 align.boundary_questions（在前序阶段 output_summary 中可读）
-      对应到当前 diff：
+      优先读取前序阶段 required_outputs，而不是只看 output_summary：
+        - understand.definition_of_done
+        - investigate.evidence_findings / callsite_assumptions / boundary_cases / unknowns
+        - align.lateral_constraints
+        - design.success_criteria / test_plan / risk_register
+        - implement.changed_files / delta_checks / validation_run
+      逐条核对这些结构化状态对应到当前 diff：
         - 漏覆盖的项目必须写明缺口；
         - 即使全部覆盖，也要在 review_findings 给出一份"逐项核对"清单（每条约束/边界 → 在 diff 哪里被处理）。
 
       review 的内功（写在 output_summary 里，不强制结构化字段）：
         - 真去跑测试/构建/lint——不允许只口头说"应该通过"；如果跑了，把命令与结果摘要写在 review_findings；
+        - **建议跑 `git diff` 看本次改动**——敌对自审的前提是真看了 diff，不是口头说"应该通过"。
+          这是建议而非硬性要求（引擎不核对），但没看 diff 就 pass 是空审。
         - 三维度挑刺：性能 / 安全 / 扩展性——发现 high 级风险时不允许 pass；
         - 自洽性纪律：一旦 review_findings/residual_risks 出现"blocker / critical / 严重不一致 / 安全问题 /
           高优先级问题"这类阻塞类描述，就**不允许**把 rework_decision 写成 pass——
           要么改描述（已修复 + diff 位置）、要么改 needs_rework。引擎会自动判定不自洽并回炉重做。
 
-      **三条闭环核对（v1.2 新增，必须执行）**：
-        - **优先核对低置信项**：investigate 阶段标了置信度（high/medium/low）的 finding，
-          优先核对 low 与 medium 项是否在本次 diff 中被验证或反驳。low/medium 项未核对就 pass 视为漏审。
-        - **核对调用方清单每处的语义假设**：investigate 的"## 调用方清单"列了每个调用方对目标符号的
-          语义假设（如"调用方假定返回非 null"）。逐条核对本次改动是否打破了这些假设——打破必须 needs_rework。
-        - **核对测试清单是否执行**：design 阶段的"测试清单"（如有）列了需新增/修改的测试。核对是否在
-          implement 落地、self_review 跑过；未执行的测试必须在 review_findings 写明缺口。
+      **三条闭环核对**：
+        - **优先核对低置信项**：investigate 标了置信度的 finding，优先核对 low 与 medium 项是否在
+          本次 diff 中被验证或反驳。low/medium 项未核对就 pass 视为漏审。
+        - **核对调用方清单每处的语义假设**：investigate.callsite_assumptions 列了每个调用方对目标符号的语义假设
+          （如"调用方假定返回非 null"）。逐条核对本次改动是否打破了这些假设——打破必须 needs_rework。
+        - **核对测试清单是否执行**：design.test_plan 列了需新增/修改/运行的测试。核对是否在
+          implement.validation_run 落地、self_review 跑过；未执行的测试必须在 review_findings 写明缺口。
 
       返工触发协议：
         - 决定回炉时，最外层 JSON 必须 status="needs_rework"、rework_target_stage_id 是
@@ -369,6 +531,27 @@ stages:
       - review_findings
       - rework_decision
       - residual_risks
+    output_schema:
+      review_findings:
+        type: array
+        items:
+          type: object
+          properties:
+            item: string
+            finding: string
+            evidence: string
+            severity: info | low | medium | high | critical
+        description: 逐项核对清单；每条约束/边界/测试项对应 diff 或验证证据
+      rework_decision:
+        type: string
+        enum:
+          - pass
+          - needs_rework
+        description: 通过写 pass；需要返工时最外层 status 也必须是 needs_rework
+      residual_risks:
+        type: array
+        items: string
+        description: 剩余风险；没有则 ["无"]
     auto_retry_limit: 1
     hooks:
       post_output_assertions:
@@ -376,12 +559,3 @@ stages:
         - needs_rework_target_required
         - hedged_findings_demoted
         - no_trailing_unparsed_payload
-      # v1.3：自审(self_review)必须真跑过 git diff——敌对自审的前提是真看了 diff，不是口头说"应该通过"。
-      # 这把 instructions 里"真去跑测试/构建/lint，不允许只口头说"从口号变成可糊弄不过的硬约束。
-      # 注：needle 用 "git diff"（无尾空格）——裸 `git diff` 是最常见形式，加尾空格会漏掉它；
-      # 代价是 `git difftool`/`git diff-tree` 等子串也命中，但作为逃逸手段极不可能，可接受。
-      post_output_checks:
-        - require:
-            commands_run:
-              - "git diff"
-          on_fail: "自审必须真跑过 git diff 看本次改动（宿主按 tool_calls 核对）——没看 diff 就 pass 是空审"
