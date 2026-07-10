@@ -77,7 +77,14 @@ stages:
 
       4. **输出**：给出完整的 required_outputs。不要散文报告——给 update_project_profile 阶段可以直接消费的结构化清单。
 
-      **扫描纪律**：避开密钥、凭证、生成依赖目录、大型构建产物和二进制文件。PDF/图片附件按宿主提供的 file_ref 或拆页 PNG 读取，不要直接读取原始 PDF。不要为了画像而无边界扫描；以”后续编码阶段是否有足够项目上下文”为判断标准。
+      **扫描纪律**：避开密钥、凭证、生成依赖目录、大型构建产物和二进制文件。不要为了画像而无边界扫描；以”后续编码阶段是否有足够项目上下文”为判断标准。
+
+      **任务边界（重要）**：
+      - “总体任务”是给后续阶段执行的——你**不要**去理解、分析或尝试解决它
+      - **不要**阅读总体任务附带的 PDF/图片附件（这些是业务需求文档，不是项目配置——业务需求理解是后面 `understand` 阶段的职责）
+      - **不要**根据业务需求去判断项目结构——只记录”是什么”，不判断”能不能做”
+      - 你的唯一产出是五个 required_outputs：profile_mode + existing_profile_assets + inspected_files + project_facts + profile_update_needed
+      - 你不是在解决用户的任务——你只是在为后续阶段准备项目上下文
     allowed_tools:
       - read_file
       - shell
@@ -245,6 +252,13 @@ stages:
       - settings 只建议团队共享配置，不写密钥、个人偏好、本机绝对路径
       - 必须保留仍然正确的团队规则；只修正过期或缺失内容
       - 无法写入时不要中断后续编码阶段，把缺口写入 required_outputs
+
+      **任务边界（重要）**：
+      - "总体任务"是给后续阶段执行的——你**不要**去理解、分析或尝试解决它
+      - **不要**阅读总体任务附带的 PDF/图片附件——你的唯一输入是 scan_project 阶段的 required_outputs
+      - 你的唯一职责是基于 scan_project 的结论建立或调整项目画像文件（CLAUDE.md 等）
+      - **不要**因为看到业务需求就去"顺便"做编码相关的准备工作
+      - 产出 required_outputs（profile_changes + profile_paths + retained_rules + validation + residual_profile_risks）即可
     allowed_tools:
       - read_file
       - edit_file
@@ -416,6 +430,13 @@ stages:
 
       **输出**：给出完整的 required_outputs。不要散文报告。
 
+      **任务边界（重要）**：
+      - 你的职责是**理解**用户任务——提取核心意图、定义完成标准、记录假设
+      - **可以**阅读总体任务附带的 PDF/图片附件来理解需求（这是唯一需要读附件的阶段）
+      - **不要**开始执行任务——不要写代码、不要改文件、不要创建分支、不要运行构建
+      - 产出 required_outputs（user_goal_restated + definition_of_done + assumptions）即可
+      - 后续阶段（investigate/design/implement）会基于你的产出推进——你不用替它们做
+
       **输出格式（非常重要）**：
       1. 直接输出 JSON 对象，**不要**包裹在 ```json 或 ``` 代码块里
       2. 键名必须用双引号包裹，如 `"status"` 不是 `status`
@@ -542,6 +563,13 @@ stages:
       5. **输出**：required_outputs 中给出结构化调查结论。不要散文报告——给 implement 阶段可以直接消费的、逐目标的事实清单。
 
       **搜索纪律**：grep 时尝试常见变体——驼峰/下划线互转、笔误、单复数。搜不到不要直接下"不存在"的结论——检查是否有命名接近的符号。
+
+      **任务边界（重要）**：
+      - 你的调查范围来自 `understand` 阶段的 user_goal_restated 和 definition_of_done——基于它们确定调查目标
+      - **不要**重新阅读原始业务需求的 PDF/图片附件——`understand` 阶段已经完成了需求理解
+      - **不要**自己推断"用户可能还需要……"然后扩大调查范围——聚焦于当前任务需要的符号和模块
+      - 聚焦于代码事实：调用方、前置检查、封装层、边界条件、未知项
+      - 产出 required_outputs 即可，**不要**动手改代码
 
       required_outputs（JSON 字段）：
         - similar_callsites: 覆盖"同类参考"+"调用方清单"两类，至少 3 条 path:line + 一句话作用
@@ -750,6 +778,12 @@ stages:
          output_summary 里写明：横向约束清单 + 已自主确认的事项 +（如有）需要用户决策的问题。
 
       **自主决策原则**：能查代码确认的就不要问用户。只有涉及不可逆操作、需求有歧义且代码无法确认、需要在多个合理方案中做选择时才 ask_human。
+
+      **任务边界（重要）**：
+      - 你的输入是前序阶段（understand/investigate）的 required_outputs——基于它们确定横向对比范围
+      - **不要**重新阅读原始业务需求的 PDF/图片附件——前序阶段已经提取了关键信息
+      - 聚焦于一致性扫描：鉴权模式、代码风格、改动半径基准
+      - 产出 lateral_constraints 即可，**不要**动手改代码
     allowed_tools:
       - read_file
       - shell
@@ -943,6 +977,13 @@ stages:
       3. **输出**：`selected_plan` 每步引用 investigate.evidence_findings 或 align.lateral_constraints；`success_criteria` 承接 understand.definition_of_done；`test_plan` 跳过必须写理由；`risk_register` 覆盖最易错处、最低置信处、回滚触发条件。
 
       **保守原则**：evidence_findings 中标了 low 置信度的事项，选改动最小的路径。不确定加不加的东西，不加。同类改动没引入的抽象层，本次也不引入。
+
+      **任务边界（重要）**：
+      - 你的输入是前序阶段（understand/investigate/align）的 required_outputs——基于它们设计方案
+      - **不要**重新阅读原始业务需求的 PDF/图片附件——前序阶段已经完成了需求理解
+      - 聚焦于方案设计：候选方案对比、选定理由、事前风险预演
+      - 产出 required_outputs（selected_plan + success_criteria + test_plan + risk_register）即可
+      - **不要**动手写实现代码——那是 `implement` 阶段的职责
     allowed_tools:
       - read_file
     required_outputs:
@@ -1159,6 +1200,12 @@ stages:
       改动核对子段内写明回滚步骤（如何撤销本次不可逆操作）。
 
       改动尽量小、贴近原代码风格。坚决不顺手"清理无关代码"。如果发现现有代码有明显问题但不是本次目标，记录到 output_summary 的"改动核对"段落（标注为"已知问题，非本次目标"），不要顺手修——"顺手"是 bug 的第一来源。改动的每一行都要有明确理由——能对自己说清楚"这一行为什么必须变"。
+
+      **任务边界（重要）**：
+      - 严格按 `design` 阶段的 selected_plan 实施——不要偏离方案，不要加"顺便"的改动
+      - **不要**重新阅读原始业务需求的 PDF/图片附件——理解 → 勘察 → 对齐 → 方案 四个阶段已经完成了充分的上下文准备
+      - 如果发现方案有问题或不可行，用 needs_rework 回到 design，不要自己"灵活调整"
+      - 产出 required_outputs（changed_files + delta_checks + validation_run）
     allowed_tools:
       - read_file
       - edit_file
@@ -1255,6 +1302,12 @@ stages:
          - 最终裁决——三个 reviewer 可能有分歧，你做最终判断
 
       **仅允许只读工具：Read 看 diff、shell 跑 git diff/test/build/lint，禁止 edit。**
+
+      **任务边界（重要）**：
+      - 你的审查依据是前序阶段的 required_outputs（understand.DoD、investigate 证据/边界、align 约束、design 方案/风险、implement 改动核对）——对照它们审 diff
+      - **不要**重新阅读原始业务需求的 PDF/图片附件——审查的是"改动是否符合既定方案和约束"，不是"改动是否符合你对需求的重新理解"
+      - 聚焦于三个维度：安全性（鉴权一致性）、正确性（边界覆盖 + 证据对齐）、简洁性（无超出方案的改动）
+      - 产出 review_findings + rework_decision + residual_risks
     allowed_tools:
       - read_file
       - shell

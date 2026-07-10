@@ -171,6 +171,13 @@ export interface StageHooksConfig {
   post_output_checks?: PostOutputBehaviorCheck[];
 }
 
+export interface WorkflowStageAgentDefinition {
+  description: string;
+  tools?: string[];
+  prompt: string;
+  model?: string;
+}
+
 export interface WorkflowStage {
   id: string;
   name: string;
@@ -184,6 +191,8 @@ export interface WorkflowStage {
   auto_retry_limit?: number;
   /** 可选；仅在显式声明时由 hookEnforcer 评估，否则该阶段零额外约束（向后兼容）。 */
   hooks?: StageHooksConfig;
+  /** SDK sub-agent 定义；主 Agent 可通过 Task 工具调用。key 为 agent 名称。 */
+  agents?: Record<string, WorkflowStageAgentDefinition>;
 }
 
 export interface WorkflowTemplate {
@@ -442,6 +451,8 @@ export interface AgentSession {
   routing?: SessionRoutingSnapshot;
   pinned_at?: string;
   archived_at?: string;
+  /** 自动审批模式：为 true 时跳过逐工具审批（硬安全规则仍生效） */
+  auto_approve?: boolean;
   created_at: string;
   updated_at: string;
   error?: string;
@@ -540,9 +551,20 @@ export interface AppApi {
   sendMessage(sessionId: string, message: string, attachments?: Attachment[]): Promise<AgentSession>;
   setSessionPinned(sessionId: string, pinned: boolean): Promise<AgentSession>;
   setSessionArchived(sessionId: string, archived: boolean): Promise<AgentSession>;
+  toggleAutoApprove(sessionId: string): Promise<AgentSession>;
   deleteSession(sessionId: string): Promise<void>;
   listProjectFiles(projectPath: string, query?: string): Promise<string[]>;
   readProjectFile(projectPath: string, filePath: string): Promise<string>;
   /** 订阅后台会话进度推送（main 在每次 runner 进度事件时广播整个 session）。返回取消订阅函数。 */
   onSessionProgress(cb: (session: AgentSession) => void): () => void;
+  /** 终端：在 projectPath 下启动 shell。返回终端 ID。 */
+  terminalStart(projectPath: string, cols: number, rows: number): Promise<string>;
+  /** 终端：向终端写入输入。 */
+  terminalWrite(terminalId: string, data: string): void;
+  /** 终端：调整终端大小。 */
+  terminalResize(terminalId: string, cols: number, rows: number): void;
+  /** 终端：销毁终端。 */
+  terminalDestroy(terminalId: string): void;
+  /** 终端：订阅终端输出。返回取消订阅函数。 */
+  onTerminalData(terminalId: string, cb: (data: string) => void): () => void;
 }

@@ -218,7 +218,18 @@ const workflowSchema = z.object({
         required_checks: stringArraySchema,
         gates: stringArraySchema,
         auto_retry_limit: z.number().int().min(0).optional(),
-        hooks: stageHooksSchema
+        hooks: stageHooksSchema,
+        agents: z
+          .record(
+            z.string(),
+            z.object({
+              description: z.string().min(1),
+              tools: stringArraySchema,
+              prompt: z.string().min(1),
+              model: z.string().optional()
+            })
+          )
+          .optional()
       }).superRefine((stage, ctx) => {
         if (!stage.output_schema) return;
         const schemaKeys = Object.keys(stage.output_schema);
@@ -281,7 +292,8 @@ function normalizeWorkflow(input: unknown, sourceType: WorkflowSourceType, fileP
       required_checks: stage.required_checks,
       gates: stage.gates,
       auto_retry_limit: stage.auto_retry_limit,
-      hooks: stage.hooks
+      hooks: stage.hooks,
+      agents: stage.agents
     }))
   };
 }

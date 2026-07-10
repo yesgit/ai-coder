@@ -25,6 +25,7 @@ import {
   formatWorkflowDescription,
   formatWorkflowName
 } from "./labels.js";
+import TerminalPanel from "./TerminalPanel.js";
 import "./styles.css";
 
 // 单选/多选时 UI 自动追加的"其他"虚拟选项值——选中后提交前会被替换成用户输入的自定义文本，
@@ -53,6 +54,7 @@ export default function App() {
   const [fileMentionResults, setFileMentionResults] = useState<string[]>([]);
   const [mentionTarget, setMentionTarget] = useState<"task" | "chat">("task");
   const [dragOverTarget, setDragOverTarget] = useState<"task" | "chat" | null>(null);
+  const [showTerminal, setShowTerminal] = useState(false);
   const taskFileInputRef = useRef<HTMLInputElement>(null);
   const [questionAnswers, setQuestionAnswers] = useState<Record<string, string | string[]>>({});
   // 单选/多选中选择"其他"时的自定义文本草稿，按 question id 存放
@@ -392,6 +394,20 @@ export default function App() {
       const denied = await window.aiCoder.denyToolCall(session.id, toolCall.id);
       upsertSession(denied);
       await refreshSessions(denied.id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggleAutoApprove(session: AgentSession) {
+    setBusy(true);
+    setError("");
+    try {
+      const updated = await window.aiCoder.toggleAutoApprove(session.id);
+      upsertSession(updated);
+      await refreshSessions(updated.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -822,6 +838,7 @@ export default function App() {
           <div className="topbar-actions">
             <button className="secondary" onClick={() => setHistoryOpen((open) => !open)}>会话历史</button>
             <button className="secondary" disabled={busy} onClick={chooseProject}>{busy ? "选择中..." : "选择项目"}</button>
+            <button className={`secondary${showTerminal ? " terminal-active" : ""}`} disabled={!projectPath} onClick={() => setShowTerminal((s) => !s)} title="Claude 终端">{">_"}</button>
           </div>
         </header>
         <p className="path" title={projectPath}>{projectPath || "尚未选择项目"}</p>
@@ -971,6 +988,16 @@ export default function App() {
                         {(activeSession.status === "running" || activeSession.status === "waiting_approval") && (
                           <button className="secondary" disabled={busy} onClick={() => abortSession(activeSession)}>
                             停止
+                          </button>
+                        )}
+                        {(activeSession.status === "running" || activeSession.status === "waiting_approval") && (
+                          <button
+                            className={activeSession.auto_approve ? "primary" : "secondary"}
+                            disabled={busy}
+                            onClick={() => toggleAutoApprove(activeSession)}
+                            title={activeSession.auto_approve ? "当前：自动审批 — 点击切换为手动审批" : "当前：手动审批 — 点击切换为自动审批"}
+                          >
+                            {activeSession.auto_approve ? "自动审批" : "手动审批"}
                           </button>
                         )}
                         {activeSession.status === "waiting_approval" && (
@@ -1329,6 +1356,12 @@ export default function App() {
                 </div>
               )}
             </section>
+            {showTerminal && projectPath && (
+              <TerminalPanel
+                projectPath={projectPath}
+                onClose={() => setShowTerminal(false)}
+              />
+            )}
           </div>
 
           {activeWorkflow && (

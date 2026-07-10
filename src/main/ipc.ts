@@ -13,12 +13,14 @@ import { SessionStore } from "./sessions/sessionStore.js";
 import { WorkflowEngine } from "./workflows/workflowEngine.js";
 import { WorkflowRegistry } from "./workflows/workflowRegistry.js";
 import { WorkflowRouter } from "./workflows/workflowRouter.js";
+import { PtyManager } from "./ptyManager.js";
 
 export function registerIpcHandlers(registry: WorkflowRegistry, sessions: SessionStore, runner: ClaudeAgentRunner): void {
   const authorizedProjects = new AuthorizedProjects();
   const workflowEngine = new WorkflowEngine();
   const onboardingStore = new OnboardingStore();
   const workflowRouter = new WorkflowRouter();
+  const ptyManager = new PtyManager();
   const queuedUserMessages = new Map<string, AgentSession["messages"]>();
 
   // 应用启动时，从会话历史中恢复已授权的项目路径
@@ -155,6 +157,12 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     const session = await sessions.denyToolCall(sessionId, toolCallId);
     await authorizedProjects.assertAuthorized(session.project_path);
     runner.resolveToolApproval(sessionId, toolCallId, "denied");
+    return session;
+  });
+
+  ipcMain.handle("sessions:toggle-auto-approve", async (_event, sessionId: string) => {
+    const session = await sessions.toggleAutoApprove(sessionId);
+    await authorizedProjects.assertAuthorized(session.project_path);
     return session;
   });
 
@@ -492,6 +500,30 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     if (!session) throw new Error(`Session not found: ${sessionId}`);
     await authorizedProjects.assertAuthorized(session.project_path);
     return sessions.setArchived(sessionId, Boolean(archived));
+  });
+
+  // Terminal PTY handlers
+  ipcMain.handle("terminal:start", async (_event, projectPath: string, cols: number, rows: number) => {
+    const authorizedProjectPath = await authorizedProjects.assertAuthorized(projectPath);
+    const terminalId = randomUUID();
+    ptyManager.create(terminalId, authorizedProjectPath, cols, rows, (data: string) => {
+      for (const win of BrowserWindow.getAllWindows()) {
+        win.webContents.send("terminal:data", terminalId, data);
+      }
+    });
+    return terminalId;
+  });
+
+  ipcMain.on("terminal:write", (_event, terminalId: string, data: string) => {
+    ptyManager.write(terminalId, data);
+  });
+
+  ipcMain.on("terminal:resize", (_event, terminalId: string, cols: number, rows: number) => {
+    ptyManager.resize(terminalId, cols, rows);
+  });
+
+  ipcMain.on("terminal:destroy", (_event, terminalId: string) => {
+    ptyManager.destroy(terminalId);
   });
 }
 

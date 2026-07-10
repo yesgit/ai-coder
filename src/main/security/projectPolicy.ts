@@ -71,6 +71,11 @@ export function buildAllowedClaudeTools(workflow: WorkflowTemplate, stage?: Work
     tools.add("Bash");
   }
 
+  // 当阶段定义了 sub-agent 时，允许 Task 工具
+  if (stage?.agents && Object.keys(stage.agents).length > 0) {
+    tools.add("Task");
+  }
+
   return [...tools];
 }
 
@@ -141,6 +146,32 @@ export async function approveOrDenyToolUse(
         return { allow: true, updatedInput: input };
       }
     }
+  }
+
+  // 自动审批模式：跳过逐工具审批，但硬安全规则（危险命令/项目外写入）永远生效
+  if (session.auto_approve) {
+    if (toolName === "Bash") {
+      assertCommandAllowed(String(input.command ?? ""));
+    }
+    for (const filePath of extractFilePaths(input)) {
+      const { inside } = await checkPathInsideProject(session.project_path, filePath);
+      if (!inside && !isReadOnlyFileTool(toolName)) {
+        throw new Error(`Blocked path outside project: ${filePath}`);
+      }
+    }
+    const toolCall: ToolCallRecord = {
+      id: toolUseId,
+      stage_id: session.current_stage,
+      tool: toolName,
+      input,
+      status: "approved",
+      created_at: now,
+      resolved_at: now
+    };
+    session.tool_calls.push(toolCall);
+    recordFileChangesForTool(session, toolName, input, true, now);
+    await rememberApprovedExternalReads(session, toolName, input);
+    return { allow: true, updatedInput: input };
   }
 
   const record = (status: ToolCallRecord["status"]) => {

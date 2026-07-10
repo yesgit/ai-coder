@@ -29,6 +29,7 @@ const api: AppApi = {
     ipcRenderer.invoke("sessions:send-message", sessionId, message, attachments),
   setSessionPinned: (sessionId: string, pinned: boolean) => ipcRenderer.invoke("sessions:set-pinned", sessionId, pinned),
   setSessionArchived: (sessionId: string, archived: boolean) => ipcRenderer.invoke("sessions:set-archived", sessionId, archived),
+  toggleAutoApprove: (sessionId: string) => ipcRenderer.invoke("sessions:toggle-auto-approve", sessionId),
   deleteSession: (sessionId: string) => ipcRenderer.invoke("sessions:delete", sessionId),
   listProjectFiles: (projectPath: string, query?: string) =>
     ipcRenderer.invoke("project:list-files", projectPath, query),
@@ -39,6 +40,23 @@ const api: AppApi = {
     ipcRenderer.on("session:progress", handler);
     return () => {
       ipcRenderer.removeListener("session:progress", handler);
+    };
+  },
+  terminalStart: (projectPath: string, cols: number, rows: number) =>
+    ipcRenderer.invoke("terminal:start", projectPath, cols, rows),
+  terminalWrite: (terminalId: string, data: string) =>
+    ipcRenderer.send("terminal:write", terminalId, data),
+  terminalResize: (terminalId: string, cols: number, rows: number) =>
+    ipcRenderer.send("terminal:resize", terminalId, cols, rows),
+  terminalDestroy: (terminalId: string) =>
+    ipcRenderer.send("terminal:destroy", terminalId),
+  onTerminalData: (terminalId: string, cb: (data: string) => void) => {
+    const handler = (_event: IpcRendererEvent, tid: string, data: string) => {
+      if (tid === terminalId) cb(data);
+    };
+    ipcRenderer.on("terminal:data", handler);
+    return () => {
+      ipcRenderer.removeListener("terminal:data", handler);
     };
   }
 };
