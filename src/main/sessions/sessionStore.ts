@@ -12,6 +12,7 @@ export class SessionStore {
     string,
     { pinned_at?: string | null; archived_at?: string | null }
   >();
+  private readonly autoApproveOverrides = new Map<string, boolean>();
   private readonly deletedSessionIds = new Set<string>();
 
   constructor(private readonly storeDir = path.join(os.homedir(), ".ai-coder", "sessions")) {}
@@ -94,6 +95,17 @@ export class SessionStore {
     return this.updateSessionFlag(id, "archived_at", archived);
   }
 
+  async toggleAutoApprove(id: string): Promise<AgentSession> {
+    const session = await this.get(id);
+    if (!session) {
+      throw new Error(`Session not found: ${id}`);
+    }
+    session.auto_approve = !session.auto_approve;
+    this.autoApproveOverrides.set(id, session.auto_approve);
+    await this.save(session);
+    return session;
+  }
+
   async approveStage(id: string, stageId: string): Promise<AgentSession> {
     assertSessionId(id);
     const session = await this.get(id);
@@ -154,7 +166,7 @@ export class SessionStore {
     }
     toolCall.status = status;
     toolCall.resolved_at = new Date().toISOString();
-    session.status = status === "approved" ? "running" : "blocked";
+    session.status = "running";
     await this.save(session);
     return session;
   }
@@ -189,6 +201,7 @@ export class SessionStore {
         await fs.unlink(filePath);
         this.deletedSessionIds.add(id);
         this.organizationOverrides.delete(id);
+        this.autoApproveOverrides.delete(id);
       } catch (error) {
         if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
           throw new Error(`Session not found: ${id}`);
@@ -200,12 +213,17 @@ export class SessionStore {
 
   private applyOrganizationOverrides(session: AgentSession): void {
     const overrides = this.organizationOverrides.get(session.id);
-    if (!overrides) return;
-    for (const field of ["pinned_at", "archived_at"] as const) {
-      if (!Object.prototype.hasOwnProperty.call(overrides, field)) continue;
-      const value = overrides[field];
-      if (value) session[field] = value;
-      else delete session[field];
+    if (overrides) {
+      for (const field of ["pinned_at", "archived_at"] as const) {
+        if (!Object.prototype.hasOwnProperty.call(overrides, field)) continue;
+        const value = overrides[field];
+        if (value) session[field] = value;
+        else delete session[field];
+      }
+    }
+    const autoApprove = this.autoApproveOverrides.get(session.id);
+    if (autoApprove !== undefined) {
+      session.auto_approve = autoApprove;
     }
   }
 

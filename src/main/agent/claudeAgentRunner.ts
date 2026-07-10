@@ -120,8 +120,22 @@ export class ClaudeAgentRunner {
       await this.recordProgress(input, "runner", `开始执行阶段：${currentStage.name || currentStage.id}`, "milestone");
       const nodeInfo = await resolveNodeExecutable();
       const sdkEnv = nodeInfo?.env ? { ...process.env, ...nodeInfo.env } : undefined;
+
+      // 构建 SDK agents 配置：将 YAML 中定义的 sub-agent 映射为 SDK AgentDefinition
+      const sdkAgents: Record<string, { description: string; tools?: string[]; prompt: string; model?: string }> = {};
+      if (currentStage.agents) {
+        for (const [name, def] of Object.entries(currentStage.agents)) {
+          sdkAgents[name] = {
+            description: def.description,
+            prompt: def.prompt,
+            ...(def.tools && def.tools.length > 0 ? { tools: def.tools } : {}),
+            ...(def.model ? { model: def.model } : {})
+          };
+        }
+      }
+
       for await (const message of query({
-        prompt: `${instructions}\n\n任务：\n${input.session.task_prompt}`,
+        prompt: instructions,
         options: {
           cwd: input.session.project_path,
           executable: nodeInfo?.command ?? undefined,
@@ -132,7 +146,22 @@ export class ClaudeAgentRunner {
           disallowedTools: buildDisallowedClaudeTools(input.workflow),
           // permissionMode 不设置，使用 SDK 默认行为。工具调用的审批逻辑在 canUseTool 回调中实现
           settingSources: ["user", "project", "local"],
+          ...(Object.keys(sdkAgents).length > 0 ? { agents: sdkAgents } : {}),
           canUseTool: async (toolName: string, toolInput: Record<string, unknown>, options: { toolUseID: string }) => {
+            // SDK 原生 Task 工具：sub-agent 调用由 SDK 内部管理，直接放行
+            if (toolName === "Task") {
+              await this.recordProgress(input, "tool_policy", "允许 Task（sub-agent）调用", "transient");
+              return { behavior: "allow" };
+            }
+
+            if (isUnsupportedDocumentRead(toolName, toolInput)) {
+              await this.recordProgress(input, "tool_policy", "拦截 PDF Read：请读取已拆页 PNG 或用 shell 文本工具查看，不要直接 Read PDF。", "milestone");
+              return {
+                behavior: "deny",
+                message: "当前后端不支持 PDF document content block。PDF 上传时已拆成 .ai-coder/uploads/.../page-*.png，请改用 Read 读取对应 PNG 页面，或用只读 shell 工具提取文本后继续。",
+                interrupt: false
+              };
+            }
             // 拦截 ask_human：作为 HumanQuestion 挂起，等待用户回答后继续
             if (toolName === "mcp__ai_coder__ask_human") {
               const question = this.buildHumanQuestion(input.session, toolInput, options.toolUseID);
@@ -177,7 +206,8 @@ export class ClaudeAgentRunner {
                 }
                 return { behavior: "deny", message: approvedDecision.message, interrupt: approvedDecision.interrupt };
               }
-              return { behavior: "deny", message: "Tool call was denied by the user.", interrupt: true };
+              input.session.status = "running";
+              return { behavior: "deny", message: "Tool call was denied by the user. Continue without this tool or choose an allowed alternative.", interrupt: false };
             }
             await this.recordProgress(input, "tool_policy", this.describeToolDecision(toolName, false), "milestone");
             return { behavior: "deny", message: decision.message, interrupt: decision.interrupt };
@@ -220,7 +250,7 @@ export class ClaudeAgentRunner {
           created_at: new Date().toISOString()
         });
       }
-      if (this.hasPendingToolCall(input.session) || this.hasBlockedToolCall(input.session) || this.hasPendingHumanQuestion(input.session)) {
+      if (this.hasPendingToolCall(input.session) || this.hasPendingHumanQuestion(input.session)) {
         input.session.status = this.resolveInterruptedStatus(input.session);
         await this.recordProgress(input, "status", `阶段已中断：${input.session.status}`, "milestone");
         return input.session;
@@ -459,9 +489,6 @@ export class ClaudeAgentRunner {
     if (this.hasPendingToolCall(session) || this.hasPendingHumanQuestion(session)) {
       return "waiting_approval";
     }
-    if (this.hasBlockedToolCall(session)) {
-      return "blocked";
-    }
     return "completed";
   }
 
@@ -569,6 +596,12 @@ function isAbortError(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
   const name = (error as { name?: unknown }).name;
   return name === "AbortError";
+}
+
+function isUnsupportedDocumentRead(toolName: string, toolInput: Record<string, unknown>): boolean {
+  if (toolName !== "Read") return false;
+  const filePath = String(toolInput.file_path ?? toolInput.path ?? "");
+  return /\.pdf(?:$|[?#])/i.test(filePath);
 }
 
 /**

@@ -60,21 +60,9 @@ const SOURCE_LABELS: Record<WorkflowSourceType, string> = {
 };
 
 const WORKFLOW_LABELS: Record<string, { name: string; description?: string }> = {
-  "plan-execute": {
-    name: "计划执行",
-    description: "适用于通用任务：先理解和计划，经确认后执行、验证并总结。"
-  },
-  "software-engineering": {
-    name: "软件工程",
-    description: "适用于本地编码任务：需求、读代码、影响分析、计划、实现、测试和总结。"
-  },
-  "code-review": {
-    name: "代码审查",
-    description: "读取本地变更，识别正确性、安全性、可维护性和测试风险。"
-  },
-  "project-onboarding": {
-    name: "项目画像",
-    description: "扫描当前项目，创建或增量更新 Claude 项目画像，包括 CLAUDE.md、rules、skills 和团队设置建议。"
+  "careful-coder": {
+    name: "谨慎程序员",
+    description: "先建立或调整项目画像，再按理解、勘察、对齐、方案、实施、自审推进编码任务。"
   }
 };
 
@@ -92,7 +80,8 @@ const STAGE_LABELS: Record<string, string> = {
   collect_context: "收集上下文",
   identify_risks: "识别风险",
   report: "报告",
-  scan_project: "扫描项目",
+  scan_project: "扫描项目画像",
+  update_project_profile: "建立或调整项目画像",
   understand_project: "理解项目",
   draft_memory: "起草项目画像",
   write_memory: "写入项目画像",

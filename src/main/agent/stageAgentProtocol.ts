@@ -61,6 +61,7 @@ export function buildStageAgentInput(
         name: stage.name,
         approval_required: stage.approval_required ?? false,
         required_outputs: stage.required_outputs ?? [],
+        output_schema: stage.output_schema,
         required_checks: stage.required_checks ?? [],
         gates: stage.gates ?? []
       }))
@@ -91,8 +92,10 @@ function selectContextMessages(
   messages: AgentSession["messages"],
   initialUserMessage?: AgentSession["messages"][number]
 ): AgentSession["messages"] {
-  const recentMessages = messages.slice(-20);
-  const seedMessage = initialUserMessage ?? messages.find((message) => message.role === "user");
+  const sanitizedMessages = messages.map(sanitizeAgentMessage);
+  const sanitizedInitial = initialUserMessage ? sanitizeAgentMessage(initialUserMessage) : undefined;
+  const recentMessages = sanitizedMessages.slice(-20);
+  const seedMessage = sanitizedInitial ?? sanitizedMessages.find((message) => message.role === "user");
   if (!seedMessage) {
     return recentMessages;
   }
@@ -104,6 +107,33 @@ function sameMessage(left: AgentSession["messages"][number], right: AgentSession
   return left.role === right.role && left.created_at === right.created_at && left.content === right.content;
 }
 
+function sanitizeAgentMessage(message: AgentSession["messages"][number]): AgentSession["messages"][number] {
+  return {
+    ...message,
+    content: normalizeMessageContent((message as { content?: unknown }).content),
+    attachments: message.attachments?.filter((attachment) => attachment.type === "file_ref")
+  };
+}
+
+function normalizeMessageContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map(describeContentBlock).filter(Boolean).join("\n");
+  }
+  if (content === null || content === undefined) return "";
+  return String(content);
+}
+
+function describeContentBlock(block: unknown): string {
+  if (!isRecord(block)) return String(block);
+  const type = typeof block.type === "string" ? block.type : "block";
+  if (typeof block.text === "string") return block.text;
+  if (typeof block.content === "string") return block.content;
+  if (type === "document") return "[document block omitted; use file_ref/PNG pages instead]";
+  if (type === "tool_result") return "[tool_result]";
+  return `[${type}]`;
+}
+
 export function parseStageAgentResult(rawContent: string): StageAgentResult {
   const ranges = extractJsonObjectRanges(rawContent);
   const candidates = ranges
@@ -112,10 +142,20 @@ export function parseStageAgentResult(rawContent: string): StageAgentResult {
 
   // direct parse 既适用于 "整段就是单个 JSON 对象" 也适用于 "整段是数组 / 包了一层 wrapper"
   const direct = parseCandidate(rawContent);
+  const repairedRawContent = direct ? null : repairCommonStageJsonTypos(rawContent);
+  const repairedDirect = repairedRawContent ? parseCandidate(repairedRawContent) : null;
+  const relaxed = !direct && !repairedDirect && candidates.length === 0 ? parseRelaxedStageResult(rawContent) : null;
   const parsed =
-    findLastStageResultCandidate(candidates) ?? candidates.at(-1) ?? direct ?? null;
+    findLastStageResultCandidate(candidates) ?? candidates.at(-1) ?? direct ?? repairedDirect ?? relaxed ?? null;
 
-  const diagnostics = analyzeRawForJsonBreakage(rawContent, ranges, candidates.length, parsed);
+  const diagnosticsSource = parsed === repairedDirect && repairedRawContent ? repairedRawContent : rawContent;
+  const diagnosticsRanges = diagnosticsSource === rawContent ? ranges : extractJsonObjectRanges(diagnosticsSource);
+  const diagnostics = analyzeRawForJsonBreakage(
+    diagnosticsSource,
+    diagnosticsRanges,
+    diagnosticsSource === rawContent ? candidates.length : 1,
+    parsed
+  );
 
   if (!parsed) {
     return {
@@ -168,6 +208,66 @@ function parseCandidate(candidate: string): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+function repairCommonStageJsonTypos(rawContent: string): string | null {
+  const repaired = rawContent.replace(/"required_outputs"\s*:\s*\{\s*\{/, "\"required_outputs\": {");
+  return repaired === rawContent ? null : repaired;
+}
+
+function parseRelaxedStageResult(rawContent: string): Record<string, unknown> | null {
+  if (!/\bstatus\s*:|\boutput_summary\s*:|\brequired_outputs\s*:/i.test(rawContent)) {
+    return null;
+  }
+
+  const statusMatch = rawContent.match(/\bstatus\s*:\s*(completed|failed|needs_rework)\b/i);
+  const outputSummary = extractRelaxedField(rawContent, "output_summary");
+  const requiredSection = rawContent.split(/\brequired_outputs\s*:/i).at(-1) ?? "";
+  const requiredOutputs: Record<string, unknown> = {};
+  for (const name of [
+    "user_goal_restated",
+    "definition_of_done",
+    "assumptions",
+    "similar_callsites",
+    "evidence_findings",
+    "callsite_assumptions",
+    "boundary_cases",
+    "unknowns",
+    "lateral_constraints",
+    "selected_plan",
+    "success_criteria",
+    "test_plan",
+    "risk_register",
+    "changed_files",
+    "delta_checks",
+    "validation_run",
+    "review_findings",
+    "rework_decision",
+    "residual_risks"
+  ]) {
+    const value = extractRelaxedField(requiredSection, name);
+    if (value) {
+      requiredOutputs[name] = value;
+    }
+  }
+
+  if (!statusMatch && !outputSummary && Object.keys(requiredOutputs).length === 0) {
+    return null;
+  }
+
+  return {
+    status: statusMatch?.[1]?.toLowerCase() ?? "completed",
+    output_summary: outputSummary ?? summarize(rawContent),
+    required_outputs: Object.keys(requiredOutputs).length > 0 ? requiredOutputs : undefined
+  };
+}
+
+function extractRelaxedField(content: string, field: string): string | undefined {
+  const escaped = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`\\b${escaped}\\s*:\\s*([\\s\\S]*?)(?=\\n\\s*[a-zA-Z_][\\w]*\\s*:|\\n\\d{2}:\\d{2}:\\d{2}\\b|$)`, "i");
+  const match = content.match(pattern);
+  const value = match?.[1]?.trim().replace(/^["']|["']$/g, "").trim();
+  return value || undefined;
 }
 
 /** 与既有 extractJsonObjectCandidates 同样的扫描，但返回 [start,end] 范围而非字符串。 */

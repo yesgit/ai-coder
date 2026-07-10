@@ -118,6 +118,45 @@ describe("stage agent protocol", () => {
     });
   });
 
+  it("sanitizes non-string history message content before injecting it into prompts", () => {
+    const weirdContent = [
+      { type: "tool_result", content: "PDF file read: /tmp/spec.pdf", tool_use_id: "call-1" },
+      { type: "document", source: { media_type: "application/pdf", data: "JVBERi0=" } }
+    ] as unknown as string;
+    const weirdSession: AgentSession = {
+      ...session,
+      initial_user_message: {
+        role: "user",
+        content: weirdContent,
+        created_at: "2024-01-01T00:00:00.000Z",
+        attachments: [
+          { type: "file_ref", path: ".ai-coder/uploads/page-001.png", display_name: "第 1 页" },
+          { type: "image", data_base64: "abc", media_type: "image/png", display_name: "raw image" }
+        ]
+      },
+      messages: [
+        {
+          role: "user",
+          content: weirdContent,
+          created_at: "2024-01-01T00:00:00.000Z",
+          attachments: [
+            { type: "file_ref", path: ".ai-coder/uploads/page-001.png", display_name: "第 1 页" },
+            { type: "image", data_base64: "abc", media_type: "image/png", display_name: "raw image" }
+          ]
+        }
+      ]
+    };
+
+    const input = buildStageAgentInput(weirdSession, workflow, workflow.stages[0]);
+
+    expect(typeof input.recent_messages[0].content).toBe("string");
+    expect(input.recent_messages[0].content).toContain("PDF file read");
+    expect(input.recent_messages[0].content).toContain("document block omitted");
+    expect(input.recent_messages[0].attachments).toEqual([
+      { type: "file_ref", path: ".ai-coder/uploads/page-001.png", display_name: "第 1 页" }
+    ]);
+  });
+
   it("builds rework_context when an approved rework_request targets the current stage", () => {
     // execute 发现 plan 产出有缺口 → 回 needs_rework 指向 plan → applyRework 把 plan 旧 run 置 superseded、execute 置 needs_rework → 重做 plan
     const reworkSession: AgentSession = {
@@ -319,6 +358,68 @@ describe("stage agent protocol", () => {
     expect(result.parse_diagnostics!.had_unparsed_tail).toBe(true);
     // 起码包括 raw 末尾的未闭合 `{`
     expect(result.parse_diagnostics!.bracket_balance).toBeGreaterThan(0);
+  });
+
+  it("repairs a duplicated opening brace after required_outputs", () => {
+    const result = parseStageAgentResult(`{
+  "status": "completed",
+  "output_summary": "done",
+  "required_outputs": {{
+    "changed_files": [
+      {"file": "src/a.ts", "changes": ["updated redirect"]}
+    ],
+    "delta_checks": [],
+    "validation_run": {
+      "commands_executed": [],
+      "results": "not run",
+      "skipped_validations": ["no node"],
+      "residual_risks": "compile not verified"
+    }
+  }
+}`);
+
+    expect(result.status).toBe("completed");
+    expect(result.required_outputs).toEqual({
+      changed_files: [{ file: "src/a.ts", changes: ["updated redirect"] }],
+      delta_checks: [],
+      validation_run: {
+        commands_executed: [],
+        results: "not run",
+        skipped_validations: ["no node"],
+        residual_risks: "compile not verified"
+      }
+    });
+    expect(result.parse_diagnostics?.had_unparsed_tail).toBe(false);
+  });
+
+  it("parses relaxed pseudo-structured stage output when JSON was omitted", () => {
+    const result = parseStageAgentResult(`
+status
+:
+completed
+output_summary
+:
+"理解阶段完成。用户诉求：基于 develop/aiAgent 创建新 feature 分支。"
+required_outputs
+:
+user_goal_restated
+:
+基于 develop/aiAgent 创建新 feature 分支，重新实现页面跳转。
+definition_of_done
+:
+创建分支；实现跳转；完成验证。
+assumptions
+:
+使用现有登录校验模式。
+`);
+
+    expect(result.status).toBe("completed");
+    expect(result.output_summary).toContain("理解阶段完成");
+    expect(result.required_outputs).toMatchObject({
+      user_goal_restated: expect.stringContaining("develop/aiAgent"),
+      definition_of_done: expect.stringContaining("创建分支"),
+      assumptions: expect.stringContaining("登录校验")
+    });
   });
 
   it("clean single-object JSON: had_unparsed_tail=false", () => {

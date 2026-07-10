@@ -247,6 +247,123 @@ describe("ClaudeAgentRunner", () => {
     expect(updated.status).toBe("completed");
   });
 
+  it("does not block the session when a tool call is denied by policy", async () => {
+    let permissionResult: unknown;
+    async function* query(params: unknown) {
+      const canUseTool = (params as {
+        options: {
+          canUseTool: (
+            toolName: string,
+            input: Record<string, unknown>,
+            options: { toolUseID: string }
+          ) => Promise<unknown>;
+        };
+      }).options.canUseTool;
+      permissionResult = await canUseTool("Bash", { command: "rm -rf /" }, { toolUseID: "tool-blocked" });
+      yield {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: JSON.stringify({
+          status: "completed",
+          output_summary: "Continued without the blocked command"
+        })
+      };
+    }
+
+    const session: AgentSession = {
+      id: "00000000-0000-4000-8000-000000000040",
+      project_path: "/tmp/project",
+      workflow_id: workflow.id,
+      task_prompt: "Run something risky",
+      status: "running",
+      current_stage: "execute",
+      messages: [],
+      tool_calls: [],
+      file_changes: [],
+      approvals: [],
+      stage_runs: [
+        {
+          id: "00000000-0000-4000-8000-000000000041",
+          stage_id: "execute",
+          attempt: 1,
+          status: "running",
+          input_summary: "Approved plan",
+          started_at: new Date().toISOString()
+        }
+      ],
+      rework_requests: [],
+      progress_events: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+
+    const updated = await new ClaudeAgentRunner(query).run({ session, workflow });
+
+    expect(permissionResult).toMatchObject({ behavior: "deny", interrupt: false });
+    expect(updated.tool_calls.find((toolCall) => toolCall.id === "tool-blocked")).toMatchObject({ status: "blocked" });
+    expect(updated.status).toBe("completed");
+    expect(updated.error).toBeUndefined();
+  });
+
+  it("denies direct PDF Read so unsupported document blocks are not sent to the backend", async () => {
+    let permissionResult: unknown;
+    async function* query(params: unknown) {
+      const canUseTool = (params as {
+        options: {
+          canUseTool: (
+            toolName: string,
+            input: Record<string, unknown>,
+            options: { toolUseID: string }
+          ) => Promise<unknown>;
+        };
+      }).options.canUseTool;
+      permissionResult = await canUseTool("Read", { file_path: ".ai-coder/uploads/spec.pdf" }, { toolUseID: "read-pdf" });
+      yield {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: JSON.stringify({
+          status: "completed",
+          output_summary: "Read PNG pages instead"
+        })
+      };
+    }
+
+    const session: AgentSession = {
+      id: "00000000-0000-4000-8000-000000000050",
+      project_path: "/tmp/project",
+      workflow_id: workflow.id,
+      task_prompt: "Read a PDF",
+      status: "running",
+      current_stage: "execute",
+      messages: [],
+      tool_calls: [],
+      file_changes: [],
+      approvals: [],
+      stage_runs: [
+        {
+          id: "00000000-0000-4000-8000-000000000051",
+          stage_id: "execute",
+          attempt: 1,
+          status: "running",
+          input_summary: "Approved plan",
+          started_at: new Date().toISOString()
+        }
+      ],
+      rework_requests: [],
+      progress_events: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+
+    const updated = await new ClaudeAgentRunner(query).run({ session, workflow });
+
+    expect(permissionResult).toMatchObject({ behavior: "deny", interrupt: false });
+    expect(JSON.stringify(permissionResult)).toContain("不支持 PDF document content block");
+    expect(updated.status).toBe("completed");
+  });
+
   it("does not record transient sdk_message progress for assistant messages without visible content", async () => {
     async function* query() {
       yield {

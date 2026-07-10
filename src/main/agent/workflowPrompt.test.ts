@@ -6,9 +6,9 @@ describe("buildStageInstructions", () => {
   it("includes current stage instructions", () => {
     const input: StageAgentInput = {
       workflow: {
-        id: "project-onboarding",
-        name: "Project Onboarding",
-        description: "Create project memory",
+        id: "careful-coder",
+        name: "谨慎程序员",
+        description: "Project-aware coding",
         stages: [
           {
             id: "draft_memory",
@@ -50,7 +50,7 @@ describe("buildStageInstructions", () => {
   it("adds strict JSON retry guidance when the previous attempt failed on parse or missing outputs", () => {
     const input: StageAgentInput = {
       workflow: {
-        id: "careful-coder-v2",
+        id: "careful-coder",
         name: "谨慎程序员 v2",
         description: "",
         stages: [{ id: "design", name: "方案", approval_required: false, required_outputs: ["selected_plan"], required_checks: [], gates: [] }]
@@ -80,6 +80,131 @@ describe("buildStageInstructions", () => {
 
     expect(prompt).toContain("这次重试命中过 JSON/必填字段问题");
     expect(prompt).toContain("请先在脑内组装完整对象");
+  });
+
+  it("describes JSON-safe shapes for structured required outputs", () => {
+    const input: StageAgentInput = {
+      workflow: {
+        id: "careful-coder",
+        name: "谨慎程序员 v2",
+        description: "",
+        stages: [{ id: "align", name: "对齐", approval_required: false, required_outputs: ["lateral_constraints"], required_checks: [], gates: [] }]
+      },
+      previous_stage_summaries: [],
+      current_stage: {
+        id: "align",
+        name: "对齐",
+        instructions: "列出横向约束",
+        approval_required: false,
+        required_outputs: ["lateral_constraints"]
+      },
+      task_prompt: "修一个问题",
+      project_path: "/tmp/project",
+      allowed_tools: [],
+      required_outputs: ["lateral_constraints"],
+      gates: [],
+      recent_messages: [],
+      human_qa_history: []
+    };
+
+    const prompt = buildStageInstructions(input);
+
+    expect(prompt).toContain("required_outputs 字段形状提示");
+    expect(prompt).toContain("lateral_constraints: JSON 数组");
+    expect(prompt).toContain("{\"constraint\":\"约束\",\"evidence\":\"证据来源/同类位置\",\"implication\":\"对本次改动的含义\"}");
+    expect(prompt).toContain("不要输出裸 key/value 清单");
+  });
+
+  it("describes JSON-safe shapes for implement required outputs", () => {
+    const input: StageAgentInput = {
+      workflow: {
+        id: "careful-coder",
+        name: "谨慎程序员 v2",
+        description: "",
+        stages: [{ id: "implement", name: "实施", approval_required: false, required_outputs: ["changed_files", "delta_checks", "validation_run"], required_checks: [], gates: [] }]
+      },
+      previous_stage_summaries: [],
+      current_stage: {
+        id: "implement",
+        name: "实施",
+        instructions: "实施改动",
+        approval_required: false,
+        required_outputs: ["changed_files", "delta_checks", "validation_run"]
+      },
+      task_prompt: "修一个问题",
+      project_path: "/tmp/project",
+      allowed_tools: [],
+      required_outputs: ["changed_files", "delta_checks", "validation_run"],
+      gates: [],
+      retry_context: {
+        previous_attempt: 2,
+        output_summary: "Missing required outputs: changed_files, delta_checks, validation_run (JSON parse 失败诊断：bracket_balance=1)"
+      },
+      recent_messages: [],
+      human_qa_history: []
+    };
+
+    const prompt = buildStageInstructions(input);
+
+    expect(prompt).toContain("changed_files: JSON 数组");
+    expect(prompt).toContain("delta_checks: JSON 数组");
+    expect(prompt).toContain("validation_run: JSON 对象");
+    expect(prompt).toContain("不要写成 \"required_outputs\": {{ ... }}");
+  });
+
+  it("renders current stage output_schema as the authoritative required_outputs contract", () => {
+    const input: StageAgentInput = {
+      workflow: {
+        id: "careful-coder",
+        name: "谨慎程序员 v2",
+        description: "",
+        stages: [
+          {
+            id: "implement",
+            name: "实施",
+            approval_required: false,
+            required_outputs: ["changed_files"],
+            output_schema: {
+              changed_files: {
+                type: "array",
+                items: { type: "object", properties: { file: "string", changes: "array<string>" } }
+              }
+            },
+            required_checks: [],
+            gates: []
+          }
+        ]
+      },
+      previous_stage_summaries: [],
+      current_stage: {
+        id: "implement",
+        name: "实施",
+        instructions: "实施改动",
+        approval_required: false,
+        required_outputs: ["changed_files"],
+        output_schema: {
+          changed_files: {
+            type: "array",
+            items: { type: "object", properties: { file: "string", changes: "array<string>" } }
+          }
+        }
+      },
+      task_prompt: "修一个问题",
+      project_path: "/tmp/project",
+      allowed_tools: [],
+      required_outputs: ["changed_files"],
+      gates: [],
+      recent_messages: [],
+      human_qa_history: []
+    };
+
+    const prompt = buildStageInstructions(input);
+
+    expect(prompt).toContain("当前阶段 required_outputs JSON Schema");
+    expect(prompt).toContain("\"changed_files\"");
+    expect(prompt).toContain("\"array\"");
+    // schema 不再内联在阶段概览行中，而是在 outputShapeHints 区域以 JSON Schema 形式呈现
+    expect(prompt).toContain("required_outputs 字段形状提示");
   });
 
   it("hook sections: pre_tool_use 与 post_output_assertions 分别使用各自的 header（不混淆 deny/retry 语义）", () => {
@@ -136,7 +261,7 @@ describe("buildStageInstructions", () => {
   it("renders previous required_outputs as reusable stage state", () => {
     const input: StageAgentInput = {
       workflow: {
-        id: "careful-coder-v2",
+        id: "careful-coder",
         name: "谨慎程序员 v2",
         description: "",
         stages: [

@@ -117,12 +117,15 @@ describe("WorkflowEngine", () => {
     expect(session.stage_runs?.[0]).toMatchObject({ stage_id: "understand", status: "completed" });
   });
 
-  it("blocks a stage agent result missing required outputs", () => {
+  it("soft-completes a stage agent result missing required outputs when retry is exhausted", () => {
     const engine = new WorkflowEngine();
     const session = createSession();
     const workflowWithRequiredOutput: WorkflowTemplate = {
       ...workflow,
-      stages: [{ id: "understand", name: "Understand", required_outputs: ["task_summary"] }]
+      stages: [
+        { id: "understand", name: "Understand", required_outputs: ["task_summary"] },
+        { id: "plan", name: "Plan" }
+      ]
     };
 
     engine.ensureState(session, workflowWithRequiredOutput);
@@ -131,8 +134,12 @@ describe("WorkflowEngine", () => {
       output_summary: "Done"
     });
 
-    expect(session.status).toBe("blocked");
-    expect(session.error).toContain("Missing required outputs after 1 attempts");
+    expect(session.status).toBe("running");
+    expect(session.current_stage).toBe("plan");
+    expect(session.error).toBeUndefined();
+    expect(session.stage_runs?.[0]).toMatchObject({ stage_id: "understand", status: "completed" });
+    expect(session.stage_runs?.[0].output_summary).toContain("结构化字段缺失");
+    expect(session.stage_runs?.[0].output_summary).toContain("task_summary");
   });
 
   it("applies a needs_rework stage agent result", () => {
@@ -258,12 +265,15 @@ describe("WorkflowEngine", () => {
     expect(session.error).toContain("Missing required outputs");
   });
 
-  it("blocks after exceeding auto-retry limit for missing outputs", () => {
+  it("soft-completes after exceeding auto-retry limit for missing outputs", () => {
     const engine = new WorkflowEngine();
     const session = createSession();
     const workflowWithRetry: WorkflowTemplate = {
       ...workflow,
-      stages: [{ id: "understand", name: "Understand", required_outputs: ["task_summary"], auto_retry_limit: 1 }]
+      stages: [
+        { id: "understand", name: "Understand", required_outputs: ["task_summary"], auto_retry_limit: 1 },
+        { id: "plan", name: "Plan" }
+      ]
     };
 
     engine.ensureState(session, workflowWithRetry);
@@ -272,22 +282,28 @@ describe("WorkflowEngine", () => {
       status: "completed",
       output_summary: "Done"
     });
-    // 第二次尝试：仍然 missing output，应该 block（因为 auto_retry_limit=1）
+    // 第二次尝试：仍然 missing output，应该软通过，把缺口交给下游入境验收
     engine.applyStageResult(session, workflowWithRetry, {
       status: "completed",
       output_summary: "Done"
     });
 
-    expect(session.status).toBe("blocked");
-    expect(session.error).toContain("Missing required outputs after 2 attempts");
+    expect(session.status).toBe("running");
+    expect(session.current_stage).toBe("plan");
+    expect(session.error).toBeUndefined();
+    expect(session.stage_runs?.[0].output_summary).toContain("结构化字段缺失");
+    expect(session.stage_runs?.[0].output_summary).toContain("task_summary");
   });
 
-  it("blocks immediately when stage has no auto_retry_limit", () => {
+  it("soft-completes immediately when stage has no auto_retry_limit", () => {
     const engine = new WorkflowEngine();
     const session = createSession();
     const workflowWithoutRetry: WorkflowTemplate = {
       ...workflow,
-      stages: [{ id: "understand", name: "Understand", required_outputs: ["task_summary"] }]
+      stages: [
+        { id: "understand", name: "Understand", required_outputs: ["task_summary"] },
+        { id: "plan", name: "Plan" }
+      ]
     };
 
     engine.ensureState(session, workflowWithoutRetry);
@@ -296,8 +312,10 @@ describe("WorkflowEngine", () => {
       output_summary: "Done"
     });
 
-    expect(session.status).toBe("blocked");
-    expect(session.error).toContain("Missing required outputs after 1 attempts");
+    expect(session.status).toBe("running");
+    expect(session.current_stage).toBe("plan");
+    expect(session.error).toBeUndefined();
+    expect(session.stage_runs?.[0].output_summary).toContain("结构化字段缺失");
   });
 
   it("post_output_assertions: review_self_consistency 命中 → 走 retry → 超限 block", () => {

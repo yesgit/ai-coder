@@ -73,8 +73,8 @@ describe("WorkflowRouter", () => {
 
   it("falls back to confirmation when model output is invalid", async () => {
     const router = new WorkflowRouter(async () => "not json");
-    const result = await router.resolve("未知任务", [workflow("plan-execute")], "/tmp");
-    expect(result).toMatchObject({ status: "needs_confirmation", recommended_workflow_id: "plan-execute" });
+    const result = await router.resolve("未知任务", [workflow("careful-coder")], "/tmp");
+    expect(result).toMatchObject({ status: "needs_confirmation", recommended_workflow_id: "careful-coder" });
   });
 
   it("reports when no workflows opt into routing", async () => {

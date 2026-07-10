@@ -54,7 +54,7 @@ export class WorkflowRouter {
         : await this.classifyWithClaude(taskPrompt, candidates, projectPath);
       return this.buildModelDecision(raw, candidates);
     } catch (error) {
-      const fallback = candidates.find((workflow) => workflow.id === "plan-execute") ?? candidates[0];
+      const fallback = candidates.find((workflow) => workflow.id === "careful-coder") ?? candidates[0];
       return {
         status: "needs_confirmation",
         method: "model",

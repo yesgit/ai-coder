@@ -144,4 +144,25 @@ describe("SessionStore", () => {
     expect(approved.tool_calls[0].status).toBe("approved");
     expect(approved.status).toBe("running");
   });
+
+  it("keeps the session runnable when a pending tool call is denied", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-sessions-"));
+    const store = new SessionStore(dir);
+    const session = await store.create("/tmp/project", workflow, "Fix bug");
+    session.status = "waiting_approval";
+    session.tool_calls.push({
+      id: "tool-2",
+      stage_id: "execute",
+      tool: "Bash",
+      input: { command: "npm test" },
+      status: "pending_approval",
+      created_at: new Date().toISOString()
+    });
+    await store.save(session);
+
+    const denied = await store.denyToolCall(session.id, "tool-2");
+
+    expect(denied.tool_calls[0].status).toBe("denied");
+    expect(denied.status).toBe("running");
+  });
 });
