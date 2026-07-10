@@ -203,7 +203,8 @@ describe("buildStageInstructions", () => {
     expect(prompt).toContain("当前阶段 required_outputs JSON Schema");
     expect(prompt).toContain("\"changed_files\"");
     expect(prompt).toContain("\"array\"");
-    expect(prompt).toContain("schema={\"changed_files\"");
+    // schema 不再内联在阶段概览行中，而是在 outputShapeHints 区域以 JSON Schema 形式呈现
+    expect(prompt).toContain("required_outputs 字段形状提示");
   });
 
   it("hook sections: pre_tool_use 与 post_output_assertions 分别使用各自的 header（不混淆 deny/retry 语义）", () => {

@@ -2,15 +2,15 @@ import type { PostOutputBehaviorCheck, StageAgentInput, StageHooksConfig } from 
 import { isMeaningfulAgentText } from "../../shared/agentMessages.js";
 
 export function buildStageInstructions(input: StageAgentInput): string {
-  const stageLines = input.workflow.stages
+  const completedStageIds = new Set(input.previous_stage_summaries.map((s) => s.stage_id));
+  const stageProgressLines = input.workflow.stages
     .map((stage, index) => {
-      const outputs = stage.required_outputs?.length ? ` outputs=${stage.required_outputs.join(",")}` : "";
-      const schema = stage.output_schema && Object.keys(stage.output_schema).length > 0
-        ? ` schema=${JSON.stringify(stage.output_schema)}`
-        : "";
-      const checks = stage.required_checks?.length ? ` checks=${stage.required_checks.join(",")}` : "";
-      const approval = stage.approval_required ? " approval_required=true" : "";
-      return `${index + 1}. ${stage.id}: ${stage.name}${approval}${outputs}${schema}${checks}`;
+      const isCurrent = stage.id === input.current_stage.id;
+      const isCompleted = completedStageIds.has(stage.id);
+      let marker = "";
+      if (isCurrent) marker = "  ← 当前阶段";
+      else if (isCompleted) marker = "  ✅";
+      return `${index + 1}. ${stage.id}: ${stage.name}${marker}`;
     })
     .join("\n");
 
@@ -91,6 +91,13 @@ export function buildStageInstructions(input: StageAgentInput): string {
     "像一名谨慎的人类开发者一样推进：先理解意图，再查看证据，形成假设，比较方案，实施最小改动，并用验证结果校准判断。",
     "优先解决真实用户问题，而不是机械完成字段；如果流程字段与问题本质有张力，请在阶段输出中解释取舍。",
     "每个阶段都要把判断建立在可观察事实上：代码、配置、测试、错误信息、用户明确要求或前序阶段摘要。",
+    "",
+    "## 总体任务",
+    input.task_prompt,
+    "",
+    `## 工作流阶段（共 ${input.workflow.stages.length} 个）`,
+    stageProgressLines,
+    "",
     "工作流引擎负责控制阶段流转。你只需要完成当前阶段。",
     "你可以参考工作流概览和此前阶段摘要，但不要执行后续阶段。",
     "严格遵守当前阶段的阶段指令、allowed_tools、required_outputs 和 gates；如果它们与用户任务冲突，请说明冲突并请求返工。",
@@ -114,18 +121,13 @@ export function buildStageInstructions(input: StageAgentInput): string {
     "禁止输出“先解释一下”“下面是 JSON”“根据分析如下”等前导语；也禁止在 JSON 后补充说明、再贴第二个对象，或把 JSON 放进 ```json 代码块。",
     "输出前自行做一次严格自检：最外层必须是单个对象；所有 key/字符串都用双引号；没有未闭合的引号/花括号/方括号；没有尾随逗号；required_outputs 必须是对象而不是数组或字符串。",
     "",
-    "工作流概览：",
-    stageLines,
-    "",
     "此前阶段摘要：",
     previousStageLines || "无",
     retrySection,
     reworkSection,
     "",
-    "当前阶段：",
-    `id: ${input.current_stage.id}`,
-    `名称: ${input.current_stage.name}`,
-    input.current_stage.instructions ? `阶段指令:\n${input.current_stage.instructions}` : "阶段指令: 无",
+    `## 当前阶段：${input.current_stage.name}（${input.current_stage.id}）`,
+    input.current_stage.instructions ? `${input.current_stage.instructions}` : "（无阶段指令）",
     `allowed_tools: ${allowedTools}`,
     `required_outputs: ${requiredOutputs}`,
     `gates: ${gates}`,
@@ -135,6 +137,10 @@ export function buildStageInstructions(input: StageAgentInput): string {
     ...(hookSections.postOutput
       ? ["", "本阶段产物校验（输出落地后由宿主评估：自洽性断言扫产出文本、行为校验按 tool_calls 核对真动作；未通过按 auto_retry_limit 重试，超限走 blocked）：", hookSections.postOutput]
       : []),
+    "",
+    "---",
+    "⚠️ 你只需要完成「当前阶段」的工作。总体任务会在后续阶段中逐步推进，不要在當前階段执行。",
+    "---",
     "",
     "最终 JSON 协议：",
     JSON.stringify(
@@ -161,6 +167,18 @@ export function buildStageInstructions(input: StageAgentInput): string {
     "- mcp__ai_coder__ask_human(question: string, type: \"single\"|\"multi\"|\"text\", options?: [{value,label}])",
     "  向用户提问并暂停执行。single/multi 时 options 必填。仅在你确实需要用户的偏好、选择或缺失信息时使用，不要因为可以求助就回避自己应该做的判断。",
     "  调用该工具后工作流会暂停；用户回答后下一轮指令的\"人类问答历史\"部分会包含答案。",
+    "",
+    ...(input.current_stage.agents && Object.keys(input.current_stage.agents).length > 0
+      ? [
+          "",
+          "可用 Sub-Agent（通过 Task 工具调用，每个 sub-agent 只调查一个目标符号）：",
+          ...Object.entries(input.current_stage.agents).map(
+            ([name, def]) => `- **${name}**：${def.description}`
+          ),
+          "调用方式：Task({ subagent_type: \"${name}\", description: \"调查 XXX\", prompt: \"调查目标符号 YYY 的...\" })",
+          "一次只调查一个目标符号。不要在一次 Task 调用中塞多个目标。可并行调用多个 Task。"
+        ]
+      : []),
     "",
     "人类问答历史（你之前向用户提的问题及回答）：",
     humanQaHistory || "无",

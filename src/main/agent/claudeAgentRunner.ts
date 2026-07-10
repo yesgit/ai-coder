@@ -120,8 +120,22 @@ export class ClaudeAgentRunner {
       await this.recordProgress(input, "runner", `开始执行阶段：${currentStage.name || currentStage.id}`, "milestone");
       const nodeInfo = await resolveNodeExecutable();
       const sdkEnv = nodeInfo?.env ? { ...process.env, ...nodeInfo.env } : undefined;
+
+      // 构建 SDK agents 配置：将 YAML 中定义的 sub-agent 映射为 SDK AgentDefinition
+      const sdkAgents: Record<string, { description: string; tools?: string[]; prompt: string; model?: string }> = {};
+      if (currentStage.agents) {
+        for (const [name, def] of Object.entries(currentStage.agents)) {
+          sdkAgents[name] = {
+            description: def.description,
+            prompt: def.prompt,
+            ...(def.tools && def.tools.length > 0 ? { tools: def.tools } : {}),
+            ...(def.model ? { model: def.model } : {})
+          };
+        }
+      }
+
       for await (const message of query({
-        prompt: `${instructions}\n\n任务：\n${input.session.task_prompt}`,
+        prompt: instructions,
         options: {
           cwd: input.session.project_path,
           executable: nodeInfo?.command ?? undefined,
@@ -132,7 +146,14 @@ export class ClaudeAgentRunner {
           disallowedTools: buildDisallowedClaudeTools(input.workflow),
           // permissionMode 不设置，使用 SDK 默认行为。工具调用的审批逻辑在 canUseTool 回调中实现
           settingSources: ["user", "project", "local"],
+          ...(Object.keys(sdkAgents).length > 0 ? { agents: sdkAgents } : {}),
           canUseTool: async (toolName: string, toolInput: Record<string, unknown>, options: { toolUseID: string }) => {
+            // SDK 原生 Task 工具：sub-agent 调用由 SDK 内部管理，直接放行
+            if (toolName === "Task") {
+              await this.recordProgress(input, "tool_policy", "允许 Task（sub-agent）调用", "transient");
+              return { behavior: "allow" };
+            }
+
             if (isUnsupportedDocumentRead(toolName, toolInput)) {
               await this.recordProgress(input, "tool_policy", "拦截 PDF Read：请读取已拆页 PNG 或用 shell 文本工具查看，不要直接 Read PDF。", "milestone");
               return {
