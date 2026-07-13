@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { evaluateHook, checkCommandSafety } from "./stageHookEnforcer.js";
+import type { HookDecision } from "./stageHookEnforcer.js";
 import type { AgentSession, ToolCallRecord, WorkflowStage, HumanQuestion } from "../../shared/types.js";
+
+function expectDenied(result: HookDecision): asserts result is { allow: false; message: string } {
+  expect(result.allow).toBe(false);
+}
 
 function makeStage(hooks?: WorkflowStage["hooks"]): WorkflowStage {
   return {
@@ -310,7 +315,7 @@ describe("stageHookEnforcer.checkCommandSafety", () => {
     const result = checkCommandSafety("implement", "Bash", {
       command: "sed -i 's/old/new/' /path/to/file.js"
     });
-    expect(result.allow).toBe(false);
+    expectDenied(result);
     expect(result.message).toContain("sed -i");
   });
 
@@ -318,7 +323,7 @@ describe("stageHookEnforcer.checkCommandSafety", () => {
     const result = checkCommandSafety("implement", "Bash", {
       command: "sed --in-place 's/old/new/' file.js"
     });
-    expect(result.allow).toBe(false);
+    expectDenied(result);
     expect(result.message).toContain("sed");
   });
 
@@ -326,7 +331,7 @@ describe("stageHookEnforcer.checkCommandSafety", () => {
     const result = checkCommandSafety("implement", "Bash", {
       command: "sed -i '776s/.*/foo/' file.js"
     });
-    expect(result.allow).toBe(false);
+    expectDenied(result);
   });
 
   it("sed 不带 -i 放行（只预览）", () => {
@@ -340,7 +345,7 @@ describe("stageHookEnforcer.checkCommandSafety", () => {
     const result = checkCommandSafety("self_review", "Bash", {
       command: "grep 'foo' file.js > /tmp/output.txt"
     });
-    expect(result.allow).toBe(false);
+    expectDenied(result);
     expect(result.message).toContain("输出重定向");
   });
 
@@ -348,7 +353,7 @@ describe("stageHookEnforcer.checkCommandSafety", () => {
     const result = checkCommandSafety("investigate", "Bash", {
       command: "cat file.js > other.js"
     });
-    expect(result.allow).toBe(false);
+    expectDenied(result);
   });
 
   it(">> 追加重定向在只读阶段被拒绝", () => {
@@ -405,7 +410,7 @@ describe("stageHookEnforcer.checkCommandSafety", () => {
     const result = checkCommandSafety("self_review", "Bash", {
       command: 'grep -n "SHOW_WAKE_UP_SCREEN_PAGE" /home/p> /home/user/projects/huaxiafortune/lib/views/AIAgentComponent/chatProvider.js | head -40'
     });
-    expect(result.allow).toBe(false);
+    expectDenied(result);
     expect(result.message).toContain("输出重定向");
   });
 
