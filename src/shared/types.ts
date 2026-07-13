@@ -239,6 +239,8 @@ export type StageRunStatus =
 export interface StageRun {
   id: string;
   stage_id: string;
+  /** 阶段展示名（从 WorkflowStage.name 复制，便于 UI 不依赖 workflow template 即可展示） */
+  stage_name?: string;
   attempt: number;
   status: StageRunStatus;
   input_summary: string;
@@ -406,6 +408,8 @@ export interface FileChangeRecord {
   path: string;
   operation: "create" | "update" | "delete";
   approved: boolean;
+  /** 归属阶段 ID，便于按阶段过滤文件变更 */
+  stage_id?: string;
   created_at: string;
 }
 
@@ -493,6 +497,7 @@ export interface SessionOnboardingSnapshot {
   status: ProjectOnboardingStatus["status"];
   claude_md_hash?: string;
   override: boolean;
+  project_profile_enabled?: boolean;
   checked_at: string;
 }
 
@@ -501,6 +506,7 @@ export interface StartSessionInput {
   workflowId: string;
   taskPrompt: string;
   onboardingOverride?: boolean;
+  includeProjectProfile?: boolean;
   attachments?: Attachment[];
   routing?: SessionRoutingSnapshot;
 }
@@ -545,8 +551,8 @@ export interface AppApi {
   continueSession(sessionId: string): Promise<AgentSession>;
   resumeSession(sessionId: string): Promise<AgentSession>;
   abortSession(sessionId: string): Promise<AgentSession>;
-  restartSession(sessionId: string): Promise<AgentSession>;
-  resetSessionContext(sessionId: string): Promise<AgentSession>;
+  restartSession(sessionId: string, options?: { includeProjectProfile?: boolean }): Promise<AgentSession>;
+  resetSessionContext(sessionId: string, options?: { includeProjectProfile?: boolean }): Promise<AgentSession>;
   answerHumanQuestion(sessionId: string, questionId: string, answer: string | string[]): Promise<AgentSession>;
   sendMessage(sessionId: string, message: string, attachments?: Attachment[]): Promise<AgentSession>;
   setSessionPinned(sessionId: string, pinned: boolean): Promise<AgentSession>;

@@ -87,15 +87,24 @@ export class WorkflowEngine {
       const diagHint = diag?.had_unparsed_tail
         ? ` (JSON parse 失败诊断：bracket_balance=${diag.bracket_balance}, tail_length=${diag.tail_length}, candidate_count=${diag.candidate_count}——最外层 JSON 大概率有未闭合字符串/花括号/多余引号。请本地 JSON.parse 验证一遍再回传，整段写成单一合法对象。)`
         : "";
+      const shapeHint =
+        " 请把整段回复写成单一合法 JSON 对象，最外层必须包含 status、output_summary、required_outputs；不要只输出 required_outputs 内部字段，不要把 JSON 嵌入 Markdown 或 ```json 代码块。";
+      const criticalMissing = missingOutputs.filter((name) => isCriticalRequiredOutput(stage, name));
       if (currentAttempt <= maxRetry) {
-        return this.retryCurrentStage(session, workflow, `Missing required outputs: ${missingOutputs.join(", ")}${diagHint}`);
+        return this.retryCurrentStage(session, workflow, `Missing required outputs: ${missingOutputs.join(", ")}${diagHint}${shapeHint}`);
+      }
+      if (criticalMissing.length > 0) {
+        return this.blockCurrentStage(
+          session,
+          `Critical required outputs missing after ${currentAttempt} attempts: ${criticalMissing.join(", ")}${diagHint}${shapeHint}`
+        );
       }
       return this.completeCurrentStageWithMissingOutputs(
         session,
         workflow,
         result,
         missingOutputs,
-        `Missing required outputs after ${currentAttempt} attempts: ${missingOutputs.join(", ")}${diagHint}`
+        `Missing required outputs after ${currentAttempt} attempts: ${missingOutputs.join(", ")}${diagHint}${shapeHint}`
       );
     }
 
@@ -288,7 +297,7 @@ export class WorkflowEngine {
     return session;
   }
 
-  restartFromBeginning(session: AgentSession, workflow: WorkflowTemplate): AgentSession {
+  restartFromBeginning(session: AgentSession, workflow: WorkflowTemplate, startStageId?: string): AgentSession {
     // 完全清理旧状态，重新开始
     session.stage_runs = [];
     session.rework_requests = [];
@@ -296,16 +305,18 @@ export class WorkflowEngine {
     session.error = undefined;
     session.status = "running";
 
-    const firstStage = workflow.stages[0];
+    const firstStage = startStageId
+      ? workflow.stages.find((stage) => stage.id === startStageId)
+      : workflow.stages[0];
     if (!firstStage) {
-      throw new Error("Workflow has no stages");
+      throw new Error(startStageId ? `Workflow stage not found: ${startStageId}` : "Workflow has no stages");
     }
 
     this.startStage(session, workflow, firstStage, session.task_prompt);
     return session;
   }
 
-  resetSessionContext(session: AgentSession, workflow: WorkflowTemplate): AgentSession {
+  resetSessionContext(session: AgentSession, workflow: WorkflowTemplate, startStageId?: string): AgentSession {
     const firstUserMessage = session.initial_user_message ?? session.messages.find((message) => message.role === "user");
     session.messages = firstUserMessage ? [firstUserMessage] : [];
     session.stage_runs = [];
@@ -318,9 +329,11 @@ export class WorkflowEngine {
     session.error = undefined;
     session.status = "running";
 
-    const firstStage = workflow.stages[0];
+    const firstStage = startStageId
+      ? workflow.stages.find((stage) => stage.id === startStageId)
+      : workflow.stages[0];
     if (!firstStage) {
-      throw new Error("Workflow has no stages");
+      throw new Error(startStageId ? `Workflow stage not found: ${startStageId}` : "Workflow has no stages");
     }
     this.startStage(session, workflow, firstStage, session.task_prompt);
     return session;
@@ -482,6 +495,7 @@ export class WorkflowEngine {
     const stageRun: StageRun = {
       id: randomUUID(),
       stage_id: stage.id,
+      stage_name: stage.name,
       attempt: this.nextAttempt(session, stage.id),
       status: "running",
       input_summary: inputSummary,
@@ -545,4 +559,9 @@ export class WorkflowEngine {
 
 function hasRequiredOutput(result: StageAgentResult, name: string): boolean {
   return Object.hasOwn(result.required_outputs ?? {}, name);
+}
+
+function isCriticalRequiredOutput(stage: WorkflowStage | undefined, name: string): boolean {
+  const schema = stage?.output_schema?.[name];
+  return typeof schema === "object" && schema !== null && !Array.isArray(schema) && (schema as { critical?: unknown }).critical === true;
 }

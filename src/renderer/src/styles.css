@@ -502,9 +502,14 @@ small {
 
 .workflow-picker-horizontal {
   display: flex;
-  flex-direction: column;
-  gap: 4px;
+  align-items: center;
+  gap: 12px;
   flex-shrink: 0;
+}
+
+.workflow-picker-horizontal > div {
+  display: grid;
+  gap: 4px;
 }
 
 .workflow-picker-horizontal span {
@@ -516,6 +521,21 @@ small {
 .workflow-picker-horizontal select {
   min-height: 34px;
   font-size: 12px;
+}
+
+.profile-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  white-space: nowrap;
+  color: #344054;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.profile-toggle input {
+  margin: 0;
 }
 
 select {

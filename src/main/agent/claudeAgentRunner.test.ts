@@ -1,3 +1,6 @@
+import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { ClaudeAgentRunner, describeSdkMessageSnippet } from "./claudeAgentRunner.js";
 import type { AgentSession, WorkflowTemplate } from "../../shared/types.js";
@@ -74,6 +77,7 @@ describe("ClaudeAgentRunner", () => {
     expect(updated.current_stage).toBe("plan");
     expect(updated.stage_runs?.[0]).toMatchObject({ stage_id: "requirements", status: "completed" });
     expect(updated.stage_runs?.at(-1)).toMatchObject({ stage_id: "plan", status: "waiting_approval" });
+    expect(updated.messages.some((message) => message.content.includes("阶段重试"))).toBe(false);
   });
 
   it("waits for stage approval before live or mock execution", async () => {
@@ -364,6 +368,87 @@ describe("ClaudeAgentRunner", () => {
     expect(updated.status).toBe("completed");
   });
 
+  it("caps PDF page image reads in a stage so large documents do not exhaust context", async () => {
+    const permissionResults: unknown[] = [];
+    const projectPath = await mkdtemp(path.join(tmpdir(), "ai-coder-runner-"));
+    const uploadPath = path.join(projectPath, ".ai-coder", "uploads", "spec");
+    await mkdir(uploadPath, { recursive: true });
+    for (let page = 1; page <= 9; page += 1) {
+      const padded = String(page).padStart(2, "0");
+      await writeFile(path.join(uploadPath, `page-${padded}.png`), "");
+    }
+
+    async function* query(params: unknown) {
+      const canUseTool = (params as {
+        options: {
+          canUseTool: (
+            toolName: string,
+            input: Record<string, unknown>,
+            options: { toolUseID: string }
+          ) => Promise<unknown>;
+        };
+      }).options.canUseTool;
+
+      for (let page = 1; page <= 9; page += 1) {
+        const padded = String(page).padStart(2, "0");
+        permissionResults.push(
+          await canUseTool(
+            "Read",
+            { file_path: path.join(uploadPath, `page-${padded}.png`) },
+            { toolUseID: `read-page-${padded}` }
+          )
+        );
+      }
+
+      yield {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: JSON.stringify({
+          status: "completed",
+          output_summary: "Summarized visible PDF pages"
+        })
+      };
+    }
+
+    const session: AgentSession = {
+      id: "00000000-0000-4000-8000-000000000080",
+      project_path: projectPath,
+      workflow_id: workflow.id,
+      task_prompt: "Understand a long PDF",
+      status: "running",
+      current_stage: "execute",
+      messages: [],
+      tool_calls: [],
+      file_changes: [],
+      approvals: [],
+      stage_runs: [
+        {
+          id: "00000000-0000-4000-8000-000000000081",
+          stage_id: "execute",
+          attempt: 1,
+          status: "running",
+          input_summary: "Approved plan",
+          started_at: new Date().toISOString()
+        }
+      ],
+      rework_requests: [],
+      progress_events: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+
+    const updated = await new ClaudeAgentRunner(query).run({ session, workflow });
+
+    expect(permissionResults).toHaveLength(9);
+    expect(permissionResults.slice(0, 8).every((result) => JSON.stringify(result).includes("\"allow\""))).toBe(true);
+    const deniedResult = permissionResults.find((result) => JSON.stringify(result).includes("\"deny\""));
+    expect(deniedResult).toMatchObject({ behavior: "deny", interrupt: false });
+    expect(JSON.stringify(deniedResult)).toContain("本阶段已读取 8 张 PDF 拆页图片");
+    expect(updated.progress_events?.some((event) => event.message.includes("限制 PDF 拆页读取"))).toBe(true);
+    expect(updated.status).toBe("completed");
+  });
+
   it("does not record transient sdk_message progress for assistant messages without visible content", async () => {
     async function* query() {
       yield {
@@ -411,6 +496,96 @@ describe("ClaudeAgentRunner", () => {
     const updated = await new ClaudeAgentRunner(query).run({ session, workflow });
 
     expect(updated.progress_events?.some((event) => event.type === "sdk_message" && event.message === "助手消息（无文本）")).toBe(false);
+  });
+
+  it("does not run or append messages for a terminal session", async () => {
+    let called = false;
+    async function* query() {
+      called = true;
+      yield {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: JSON.stringify({ status: "completed", output_summary: "Should not run" })
+      };
+    }
+
+    const session: AgentSession = {
+      id: "00000000-0000-4000-8000-000000000060",
+      project_path: "/tmp/project",
+      workflow_id: workflow.id,
+      task_prompt: "Already done",
+      status: "completed",
+      current_stage: "execute",
+      messages: [{ role: "assistant", content: "Final answer", created_at: new Date().toISOString() }],
+      tool_calls: [],
+      file_changes: [],
+      approvals: [],
+      stage_runs: [
+        {
+          id: "00000000-0000-4000-8000-000000000061",
+          stage_id: "execute",
+          attempt: 1,
+          status: "completed",
+          input_summary: "Approved plan",
+          output_summary: "Final answer",
+          started_at: new Date().toISOString(),
+          completed_at: new Date().toISOString()
+        }
+      ],
+      rework_requests: [],
+      progress_events: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+
+    const updated = await new ClaudeAgentRunner(query).run({ session, workflow });
+
+    expect(called).toBe(false);
+    expect(updated.messages).toHaveLength(1);
+    expect(updated.messages[0].content).toBe("Final answer");
+  });
+
+  it("deduplicates identical assistant transcripts in recent history", async () => {
+    async function* query() {
+      yield {
+        type: "assistant",
+        message: { content: [{ type: "text", text: "Repeated answer" }] }
+      };
+    }
+
+    const session: AgentSession = {
+      id: "00000000-0000-4000-8000-000000000070",
+      project_path: "/tmp/project",
+      workflow_id: workflow.id,
+      task_prompt: "Repeat",
+      status: "running",
+      current_stage: "execute",
+      messages: [{ role: "assistant", content: "Repeated   answer", created_at: new Date().toISOString() }],
+      tool_calls: [],
+      file_changes: [],
+      approvals: [],
+      stage_runs: [
+        {
+          id: "00000000-0000-4000-8000-000000000071",
+          stage_id: "execute",
+          attempt: 1,
+          status: "running",
+          input_summary: "Approved plan",
+          started_at: new Date().toISOString()
+        }
+      ],
+      rework_requests: [],
+      progress_events: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+
+    const updated = await new ClaudeAgentRunner(query).run({ session, workflow });
+
+    expect(updated.status).toBe("completed");
+    expect(updated.messages).toHaveLength(1);
+    expect(updated.messages[0].content).toBe("Repeated   answer");
   });
 });
 

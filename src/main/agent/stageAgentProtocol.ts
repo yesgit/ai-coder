@@ -12,6 +12,7 @@ export function buildStageAgentInput(
   workflow: WorkflowTemplate,
   currentStage: WorkflowStage
 ): StageAgentInput {
+  const isolateInitialTaskContext = shouldIsolateInitialTaskContext(currentStage);
   const currentStageRun = [...(session.stage_runs ?? [])]
     .reverse()
     .find((stageRun) => stageRun.stage_id === currentStage.id && (stageRun.status === "running" || stageRun.status === "waiting_approval"));
@@ -68,6 +69,7 @@ export function buildStageAgentInput(
     },
     previous_stage_summaries: (session.stage_runs ?? [])
       .filter((stageRun) => stageRun.status === "completed")
+      .filter((stageRun) => !(isolateInitialTaskContext && isProjectProfileStage(stageRun.stage_id)))
       .map((stageRun) => ({
         stage_id: stageRun.stage_id,
         attempt: stageRun.attempt,
@@ -83,24 +85,38 @@ export function buildStageAgentInput(
     gates: currentStage.gates ?? [],
     retry_context: retryContext,
     rework_context: reworkContext,
-    recent_messages: selectContextMessages(session.messages, session.initial_user_message),
+    recent_messages: selectContextMessages(session.messages, session.initial_user_message, {
+      initialOnly: isolateInitialTaskContext
+    }),
     human_qa_history: (session.pending_human_questions ?? []).filter((q) => q.status === "answered")
   };
 }
 
 function selectContextMessages(
   messages: AgentSession["messages"],
-  initialUserMessage?: AgentSession["messages"][number]
+  initialUserMessage?: AgentSession["messages"][number],
+  options: { initialOnly?: boolean } = {}
 ): AgentSession["messages"] {
   const sanitizedMessages = messages.map(sanitizeAgentMessage);
   const sanitizedInitial = initialUserMessage ? sanitizeAgentMessage(initialUserMessage) : undefined;
-  const recentMessages = sanitizedMessages.slice(-20);
   const seedMessage = sanitizedInitial ?? sanitizedMessages.find((message) => message.role === "user");
+  if (options.initialOnly) {
+    return seedMessage ? [seedMessage] : [];
+  }
+  const recentMessages = sanitizedMessages.slice(-20);
   if (!seedMessage) {
     return recentMessages;
   }
   const hasSeedMessage = recentMessages.some((message) => sameMessage(message, seedMessage));
   return hasSeedMessage ? recentMessages : [seedMessage, ...recentMessages];
+}
+
+function shouldIsolateInitialTaskContext(stage: WorkflowStage): boolean {
+  return stage.id === "understand";
+}
+
+function isProjectProfileStage(stageId: string): boolean {
+  return stageId === "scan_project" || stageId === "update_project_profile";
 }
 
 function sameMessage(left: AgentSession["messages"][number], right: AgentSession["messages"][number]): boolean {
@@ -211,7 +227,16 @@ function parseCandidate(candidate: string): Record<string, unknown> | null {
 }
 
 function repairCommonStageJsonTypos(rawContent: string): string | null {
-  const repaired = rawContent.replace(/"required_outputs"\s*:\s*\{\s*\{/, "\"required_outputs\": {");
+  let repaired = rawContent;
+  // 双重花括号: "required_outputs": { { → "required_outputs": {
+  repaired = repaired.replace(/"required_outputs"\s*:\s*\{\s*\{/g, "\"required_outputs\": {");
+  // 多余逗号后紧跟 } 或 ]: ,} → }  ,] → ]
+  repaired = repaired.replace(/,(\s*[}\]])/g, "$1");
+  // 尾部多余引号 + 花括号: }" → } (常见于 JSON 后面多写了引号)
+  // 仅在尾部闭合花括号后出现多余引号时修复
+  if (/\}"\s*$/.test(repaired) && !/"\s*\}\s*"\s*$/.test(repaired)) {
+    repaired = repaired.replace(/\}"\s*$/, "}");
+  }
   return repaired === rawContent ? null : repaired;
 }
 
@@ -225,9 +250,30 @@ function parseRelaxedStageResult(rawContent: string): Record<string, unknown> | 
   const requiredSection = rawContent.split(/\brequired_outputs\s*:/i).at(-1) ?? "";
   const requiredOutputs: Record<string, unknown> = {};
   for (const name of [
+    // understand 阶段
     "user_goal_restated",
     "definition_of_done",
     "assumptions",
+    // scan_project 阶段
+    "profile_mode",
+    "existing_profile_assets",
+    "inspected_files",
+    "project_facts",
+    "profile_update_needed",
+    // update_project_profile 阶段
+    "profile_changes",
+    "profile_paths",
+    "retained_rules",
+    "validation",
+    "residual_profile_risks",
+    // decompose 阶段
+    "task_items",
+    // implement 阶段
+    "task_results",
+    "summary",
+    // verify 阶段
+    "verification_results",
+    // 旧版字段（保留向后兼容）
     "similar_callsites",
     "evidence_findings",
     "callsite_assumptions",

@@ -262,6 +262,8 @@ describe("WorkflowEngine", () => {
     // 第一次重试：attempt=2，应该继续 running
     expect(session.status).toBe("running");
     expect(session.stage_runs?.[0]).toMatchObject({ stage_id: "understand", attempt: 2, status: "running", retry_reason: expect.stringContaining("Missing required outputs") });
+    expect(session.stage_runs?.[0].retry_reason).toContain("不要只输出 required_outputs 内部字段");
+    expect(session.stage_runs?.[0].retry_reason).toContain("不要把 JSON 嵌入 Markdown");
     expect(session.error).toContain("Missing required outputs");
   });
 
@@ -293,6 +295,62 @@ describe("WorkflowEngine", () => {
     expect(session.error).toBeUndefined();
     expect(session.stage_runs?.[0].output_summary).toContain("结构化字段缺失");
     expect(session.stage_runs?.[0].output_summary).toContain("task_summary");
+  });
+
+  it("can restart from a specified stage", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+    const profiledWorkflow: WorkflowTemplate = {
+      ...workflow,
+      stages: [
+        { id: "scan_project", name: "Scan" },
+        { id: "update_project_profile", name: "Profile" },
+        { id: "understand", name: "Understand" }
+      ]
+    };
+
+    engine.ensureState(session, profiledWorkflow);
+    engine.restartFromBeginning(session, profiledWorkflow, "understand");
+
+    expect(session.status).toBe("running");
+    expect(session.current_stage).toBe("understand");
+    expect(session.stage_runs).toHaveLength(1);
+    expect(session.stage_runs?.[0]).toMatchObject({ stage_id: "understand", stage_name: "Understand" });
+  });
+
+  it("blocks instead of soft-completing when a critical required output is still missing", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+    const workflowWithCriticalOutput: WorkflowTemplate = {
+      ...workflow,
+      stages: [
+        {
+          id: "decompose",
+          name: "Decompose",
+          required_outputs: ["task_items"],
+          output_schema: {
+            task_items: { type: "array", critical: true }
+          },
+          auto_retry_limit: 1
+        },
+        { id: "implement", name: "Implement" }
+      ]
+    };
+
+    engine.ensureState(session, workflowWithCriticalOutput);
+    engine.applyStageResult(session, workflowWithCriticalOutput, {
+      status: "completed",
+      output_summary: "Done without task_items"
+    });
+    engine.applyStageResult(session, workflowWithCriticalOutput, {
+      status: "completed",
+      output_summary: "Still missing task_items"
+    });
+
+    expect(session.status).toBe("blocked");
+    expect(session.current_stage).toBe("decompose");
+    expect(session.error).toContain("Critical required outputs missing");
+    expect(session.error).toContain("task_items");
   });
 
   it("soft-completes immediately when stage has no auto_retry_limit", () => {

@@ -8,7 +8,7 @@ describe("buildStageInstructions", () => {
       workflow: {
         id: "careful-coder",
         name: "谨慎程序员",
-        description: "Project-aware coding",
+        description: "基本人设：谨慎程序员先保护既有行为。\n- 事实优先\n- 克制交付",
         stages: [
           {
             id: "draft_memory",
@@ -40,11 +40,62 @@ describe("buildStageInstructions", () => {
     const prompt = buildStageInstructions(input);
 
     expect(prompt).toContain("保留有价值的团队规则");
+    expect(prompt).toContain("## 工作流人设与原则");
+    expect(prompt).toContain("基本人设：谨慎程序员先保护既有行为");
+    expect(prompt).toContain("事实优先");
+    expect(prompt).toContain("克制交付");
     expect(prompt).toContain("请始终使用简体中文回答");
     expect(prompt).toContain("宿主应用会拦截工具调用、创建审批项并暂停执行");
     expect(prompt).toContain("不要用文字审批请求代替工具调用");
     expect(prompt).toContain("最终 JSON 协议");
     expect(prompt).toContain("禁止输出“先解释一下”");
+  });
+
+  it("places the strict final JSON protocol at the end of the prompt", () => {
+    const input: StageAgentInput = {
+      workflow: {
+        id: "careful-coder",
+        name: "谨慎程序员",
+        description: "",
+        stages: [
+          {
+            id: "scan_project",
+            name: "扫描项目画像",
+            approval_required: false,
+            required_outputs: ["profile_mode", "project_facts"],
+            required_checks: [],
+            gates: []
+          }
+        ]
+      },
+      previous_stage_summaries: [],
+      current_stage: {
+        id: "scan_project",
+        name: "扫描项目画像",
+        instructions: "输出当前阶段结果。",
+        approval_required: false,
+        required_outputs: ["profile_mode", "project_facts"]
+      },
+      task_prompt: "优化画像流程",
+      project_path: "/tmp/project",
+      allowed_tools: [],
+      required_outputs: ["profile_mode", "project_facts"],
+      gates: [],
+      recent_messages: [],
+      human_qa_history: []
+    };
+
+    const prompt = buildStageInstructions(input);
+    const finalProtocolIndex = prompt.lastIndexOf("最终 JSON 协议（最后一条消息必须只包含这个 JSON 对象）");
+
+    expect(finalProtocolIndex).toBeGreaterThan(0);
+    expect(prompt.slice(finalProtocolIndex)).toContain("\"required_outputs\": {");
+    expect(prompt.slice(finalProtocolIndex)).toContain("\"profile_mode\": \"<profile_mode>\"");
+    expect(prompt.slice(finalProtocolIndex)).toContain("不要输出 Markdown、代码块、标题、列表或解释文字");
+    expect(prompt.slice(finalProtocolIndex)).toContain("不要把 JSON 放进 ```json 代码块");
+    expect(prompt.slice(finalProtocolIndex)).toContain("不要只输出 required_outputs 内部字段");
+    expect(prompt.slice(finalProtocolIndex)).toContain("sub-agent prompt 中的 JSON 示例只用于说明子任务返回格式");
+    expect(prompt.trim().endsWith("如果你需要在 output_summary 或 required_outputs 字符串中包含 Markdown，请把它作为 JSON 字符串值转义后放入对象内部。")).toBe(true);
   });
 
   it("adds strict JSON retry guidance when the previous attempt failed on parse or missing outputs", () => {
@@ -80,6 +131,50 @@ describe("buildStageInstructions", () => {
 
     expect(prompt).toContain("这次重试命中过 JSON/必填字段问题");
     expect(prompt).toContain("请先在脑内组装完整对象");
+  });
+
+  it("treats understand as initial task understanding instead of consuming profile stage outputs", () => {
+    const input: StageAgentInput = {
+      workflow: {
+        id: "careful-coder",
+        name: "谨慎程序员",
+        description: "",
+        stages: [
+          { id: "scan_project", name: "扫描项目画像", approval_required: false, required_outputs: ["project_facts"], required_checks: [], gates: [] },
+          { id: "update_project_profile", name: "建立或调整项目画像", approval_required: false, required_outputs: ["profile_changes"], required_checks: [], gates: [] },
+          { id: "understand", name: "理解", approval_required: false, required_outputs: ["user_goal_restated"], required_checks: [], gates: [] }
+        ]
+      },
+      previous_stage_summaries: [],
+      current_stage: {
+        id: "understand",
+        name: "理解",
+        instructions: "理解用户任务。",
+        approval_required: false,
+        required_outputs: ["user_goal_restated"]
+      },
+      task_prompt: "修复登录页跳转问题",
+      project_path: "/tmp/project",
+      allowed_tools: ["read_file"],
+      required_outputs: ["user_goal_restated"],
+      gates: [],
+      recent_messages: [
+        {
+          role: "user",
+          content: "修复登录页跳转问题",
+          created_at: "2026-01-01T00:00:00.000Z"
+        }
+      ],
+      human_qa_history: []
+    };
+
+    const prompt = buildStageInstructions(input);
+
+    expect(prompt).toContain("当前是 understand 阶段");
+    expect(prompt).toContain("用户本次提交的原始任务");
+    expect(prompt).toContain("scan_project / update_project_profile 是独立的项目背景预处理");
+    expect(prompt).toContain("画像阶段摘要不是本阶段输入");
+    expect(prompt).not.toContain("前序阶段的 required_outputs 是你最重要的输入");
   });
 
   it("describes JSON-safe shapes for structured required outputs", () => {

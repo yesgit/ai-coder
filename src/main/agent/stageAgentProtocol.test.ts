@@ -118,6 +118,88 @@ describe("stage agent protocol", () => {
     });
   });
 
+  it("isolates understand stage from project profile stage outputs and assistant history", () => {
+    const profileWorkflow: WorkflowTemplate = {
+      ...workflow,
+      stages: [
+        { id: "scan_project", name: "扫描项目画像", required_outputs: ["project_facts"] },
+        { id: "update_project_profile", name: "建立或调整项目画像", required_outputs: ["profile_changes"] },
+        { id: "understand", name: "理解", required_outputs: ["user_goal_restated"] },
+        { id: "decompose", name: "拆分", required_outputs: ["task_items"] }
+      ]
+    };
+    const profileSession: AgentSession = {
+      ...session,
+      current_stage: "understand",
+      initial_user_message: {
+        role: "user",
+        content: "修复登录页跳转问题",
+        created_at: "2026-01-01T00:00:00.000Z",
+        attachments: [{ type: "file_ref", path: ".ai-coder/uploads/spec/page-01.png", display_name: "需求.pdf · 第 1 页 / 共 2 页" }]
+      },
+      messages: [
+        {
+          role: "user",
+          content: "修复登录页跳转问题",
+          created_at: "2026-01-01T00:00:00.000Z",
+          attachments: [{ type: "file_ref", path: ".ai-coder/uploads/spec/page-01.png", display_name: "需求.pdf · 第 1 页 / 共 2 页" }]
+        },
+        {
+          role: "assistant",
+          content: "扫描项目画像完成：这是画像阶段总结，不应成为理解阶段任务目标。",
+          created_at: "2026-01-01T00:01:00.000Z"
+        },
+        {
+          role: "assistant",
+          content: "画像已更新：这是项目背景维护输出，不是用户需求。",
+          created_at: "2026-01-01T00:02:00.000Z"
+        }
+      ],
+      stage_runs: [
+        {
+          id: "scan-run-1",
+          stage_id: "scan_project",
+          attempt: 1,
+          status: "completed",
+          input_summary: "Profile scan",
+          output_summary: "画像扫描完成",
+          required_outputs: { project_facts: ["项目是 Electron 应用"] },
+          started_at: new Date().toISOString(),
+          completed_at: new Date().toISOString()
+        },
+        {
+          id: "profile-run-1",
+          stage_id: "update_project_profile",
+          attempt: 1,
+          status: "completed",
+          input_summary: "Profile update",
+          output_summary: "画像更新完成",
+          required_outputs: { profile_changes: ["更新 CLAUDE.md"] },
+          started_at: new Date().toISOString(),
+          completed_at: new Date().toISOString()
+        },
+        {
+          id: "understand-run-1",
+          stage_id: "understand",
+          attempt: 1,
+          status: "running",
+          input_summary: "Initial task",
+          started_at: new Date().toISOString()
+        }
+      ]
+    };
+
+    const input = buildStageAgentInput(profileSession, profileWorkflow, profileWorkflow.stages[2]);
+
+    expect(input.previous_stage_summaries).toEqual([]);
+    expect(input.recent_messages).toHaveLength(1);
+    expect(input.recent_messages[0]).toMatchObject({
+      role: "user",
+      content: "修复登录页跳转问题",
+      attachments: [{ type: "file_ref", path: ".ai-coder/uploads/spec/page-01.png", display_name: "需求.pdf · 第 1 页 / 共 2 页" }]
+    });
+  });
+
   it("sanitizes non-string history message content before injecting it into prompts", () => {
     const weirdContent = [
       { type: "tool_result", content: "PDF file read: /tmp/spec.pdf", tool_use_id: "call-1" },

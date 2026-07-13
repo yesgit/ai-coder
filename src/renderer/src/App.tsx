@@ -45,7 +45,7 @@ export default function App() {
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<AgentRuntimeStatus | null>(null);
   const [onboardingStatus, setOnboardingStatus] = useState<ProjectOnboardingStatus | null>(null);
-  const [onboardingOverride, setOnboardingOverride] = useState(false);
+  const [includeProjectProfile, setIncludeProjectProfile] = useState(true);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [taskAttachments, setTaskAttachments] = useState<Attachment[]>([]);
@@ -237,7 +237,7 @@ export default function App() {
       const selected = await window.aiCoder.selectProjectDirectory();
       if (selected) {
         setProjectPath(selected);
-        setOnboardingOverride(false);
+        setIncludeProjectProfile(true);
         setExpandedProjectPaths((current) => new Set([...current, selected]));
         await refreshWorkflows(selected);
         await refreshOnboardingStatus(selected);
@@ -264,7 +264,7 @@ export default function App() {
     try {
       const authorizedPath = await window.aiCoder.authorizeSessionProject(session.project_path);
       setProjectPath(authorizedPath);
-      setOnboardingOverride(false);
+      setIncludeProjectProfile(session.onboarding?.project_profile_enabled !== false);
       setExpandedProjectPaths((current) => new Set([...current, authorizedPath]));
       await refreshWorkflows(authorizedPath);
       await refreshOnboardingStatus(authorizedPath);
@@ -284,19 +284,6 @@ export default function App() {
       else next.add(groupProjectPath);
       return next;
     });
-  }
-
-  async function confirmOnboarding() {
-    if (!projectPath) return;
-    setBusy(true);
-    setError("");
-    try {
-      setOnboardingStatus(await window.aiCoder.confirmProjectOnboarding(projectPath));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
   }
 
   async function startSession() {
@@ -331,7 +318,7 @@ export default function App() {
       projectPath,
       workflowId,
       taskPrompt,
-      onboardingOverride,
+      includeProjectProfile,
       attachments: taskAttachments.length > 0 ? taskAttachments : undefined
     });
     upsertSession(result.session);
@@ -461,7 +448,7 @@ export default function App() {
     setBusy(true);
     setError("");
     try {
-      const updated = await window.aiCoder.restartSession(session.id);
+      const updated = await window.aiCoder.restartSession(session.id, { includeProjectProfile });
       upsertSession(updated);
       await refreshSessions(updated.id);
     } catch (err) {
@@ -475,7 +462,8 @@ export default function App() {
     setBusy(true);
     setError("");
     try {
-      const updated = await window.aiCoder.resetSessionContext(session.id);
+      setIncludeProjectProfile(true);
+      const updated = await window.aiCoder.resetSessionContext(session.id, { includeProjectProfile: true });
       upsertSession(updated);
       await refreshSessions(updated.id);
       setTimelineLimit(50);
@@ -740,9 +728,7 @@ export default function App() {
     (activeSession.status === "running" || activeSession.status === "completed")
       ? activeSession
       : null;
-  const onboardingRequired = false;
-  const onboardingAdmissionAllowed = !taskWorkflowId || !onboardingRequired || onboardingOverride;
-  const canStart = Boolean(projectPath && taskPrompt.trim() && workflows.length > 0 && onboardingAdmissionAllowed && !busy);
+  const canStart = Boolean(projectPath && taskPrompt.trim() && workflows.length > 0 && !busy);
   const canSubmitComposer = composerSession
     ? Boolean(projectPath && (taskPrompt.trim() || taskAttachments.length > 0) && !busy)
     : canStart;
@@ -775,7 +761,6 @@ export default function App() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [activityEvents]);
   const latestProgress = activeSession?.progress_events?.at(-1);
-  const showOnboardingWarning = !composerSession && onboardingRequired;
 
   return (
     <main className={`app-shell${historyOpen ? " history-open" : ""}`}>
@@ -845,7 +830,6 @@ export default function App() {
 
         {onboardingStatus && <section className="onboarding-box compact">
           <div className="onboarding-status-row"><strong>项目画像</strong><span className={`status-pill ${onboardingStatus.status}`}>{formatStatus(onboardingStatus.status)}</span></div>
-          {onboardingStatus.claude_md_exists && onboardingStatus.status !== "confirmed" && <button className="secondary" disabled={busy} onClick={confirmOnboarding}>确认项目画像</button>}
         </section>}
 
         {/* 主内容区：左侧任务/聊天，右侧阶段状态和活动流 */}
@@ -899,8 +883,19 @@ export default function App() {
                   </button>
                 ) : (
                   <div className="workflow-picker-horizontal">
-                    <span>工作流</span>
-                    <strong>{taskWorkflow ? formatWorkflowName(taskWorkflow.id, taskWorkflow.name) : "谨慎程序员"}</strong>
+                    <div>
+                      <span>工作流</span>
+                      <strong>{taskWorkflow ? formatWorkflowName(taskWorkflow.id, taskWorkflow.name) : "谨慎程序员"}</strong>
+                    </div>
+                    <label className="profile-toggle" title="自动检查并增量更新项目上下文">
+                      <input
+                        type="checkbox"
+                        checked={includeProjectProfile}
+                        disabled={busy || (taskWorkflow?.id ?? "careful-coder") !== "careful-coder"}
+                        onChange={(event) => setIncludeProjectProfile(event.target.checked)}
+                      />
+                      项目画像
+                    </label>
                   </div>
                 )}
               </div>
@@ -945,19 +940,6 @@ export default function App() {
               </div>
               <input type="file" ref={taskFileInputRef} style={{ display: "none" }} multiple
                 onChange={(e) => handleFileSelect(e, "task")} />
-              {showOnboardingWarning && (
-                <div className="admission-warning">
-                  <span>项目画像尚未确认。请先运行项目画像，或确认已有画像入口。</span>
-                  <label className="override-option">
-                    <input
-                      type="checkbox"
-                      checked={onboardingOverride}
-                      onChange={(event) => setOnboardingOverride(event.target.checked)}
-                    />
-                    未确认入职也继续运行
-                  </label>
-                </div>
-              )}
             </div>
 
             {/* 会话详情区 */}
@@ -975,7 +957,7 @@ export default function App() {
                       {activeSession.onboarding && (
                         <p>
                           项目画像 {formatStatus(activeSession.onboarding.status)}
-                          {activeSession.onboarding.override ? " · 已跳过门禁" : ""}
+                          {activeSession.onboarding.project_profile_enabled === false ? " · 已跳过画像" : ""}
                         </p>
                       )}
                     </div>
@@ -983,7 +965,8 @@ export default function App() {
                       activeSession.status === "waiting_approval" ||
                       activeSession.status === "failed" ||
                       activeSession.status === "blocked" ||
-                      activeSession.status === "interrupted") && (
+                      activeSession.status === "interrupted" ||
+                      activeSession.status === "completed") && (
                       <div className="session-actions">
                         {(activeSession.status === "running" || activeSession.status === "waiting_approval") && (
                           <button className="secondary" disabled={busy} onClick={() => abortSession(activeSession)}>

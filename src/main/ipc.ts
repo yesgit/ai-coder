@@ -228,7 +228,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     return refreshed ?? session;
   });
 
-  ipcMain.handle("sessions:restart", async (_event, sessionId: string) => {
+  ipcMain.handle("sessions:restart", async (_event, sessionId: string, options?: { includeProjectProfile?: boolean }) => {
     const session = await sessions.get(sessionId);
     if (!session) {
       throw new Error(`Session not found: ${sessionId}`);
@@ -254,13 +254,16 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
       }
     }
     // 重新开始任务
-    workflowEngine.restartFromBeginning(session, workflow);
+    workflowEngine.restartFromBeginning(session, workflow, resolveStartStageId(workflow, options?.includeProjectProfile));
+    if (session.onboarding) {
+      session.onboarding.project_profile_enabled = options?.includeProjectProfile !== false;
+    }
     await sessions.save(session);
     runSessionInBackground(runner, sessions, session, workflow, queuedUserMessages);
     return session;
   });
 
-  ipcMain.handle("sessions:reset-context", async (_event, sessionId: string) => {
+  ipcMain.handle("sessions:reset-context", async (_event, sessionId: string, options?: { includeProjectProfile?: boolean }) => {
     const session = await sessions.get(sessionId);
     if (!session) {
       throw new Error(`Session not found: ${sessionId}`);
@@ -271,7 +274,10 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
       throw new Error(`Workflow not found: ${session.workflow_id}`);
     }
     runner.abort(sessionId);
-    workflowEngine.resetSessionContext(session, workflow);
+    workflowEngine.resetSessionContext(session, workflow, resolveStartStageId(workflow, options?.includeProjectProfile));
+    if (session.onboarding) {
+      session.onboarding.project_profile_enabled = options?.includeProjectProfile !== false;
+    }
     await sessions.save(session);
     queuedUserMessages.delete(session.id);
     runSessionInBackground(runner, sessions, session, workflow, queuedUserMessages);
@@ -345,6 +351,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     }
     const onboardingStatus = await onboardingStore.getStatus(projectPath);
     enforceOnboardingAdmission(workflow.id, onboardingStatus, Boolean(input.onboardingOverride));
+    const includeProjectProfile = input.includeProjectProfile !== false;
     // 处理附件：校验 + 图片/文件保存到磁盘，转为文件引用
     let processedAttachments = input.attachments;
     if (input.attachments?.length) {
@@ -362,10 +369,14 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
       projectPath,
       workflow,
       input.taskPrompt.trim(),
-      buildOnboardingSnapshot(onboardingStatus, Boolean(input.onboardingOverride)),
+      buildOnboardingSnapshot(onboardingStatus, Boolean(input.onboardingOverride), includeProjectProfile),
       processedAttachments,
       normalizeRoutingSnapshot(input)
     );
+    const startStageId = resolveStartStageId(workflow, includeProjectProfile);
+    if (startStageId) {
+      workflowEngine.restartFromBeginning(session, workflow, startStageId);
+    }
     session.status = "running";
     await sessions.save(session);
     runSessionInBackground(runner, sessions, session, workflow, queuedUserMessages);
@@ -648,14 +659,22 @@ function enforceOnboardingAdmission(
 
 function buildOnboardingSnapshot(
   onboardingStatus: ProjectOnboardingStatus,
-  onboardingOverride: boolean
+  onboardingOverride: boolean,
+  includeProjectProfile = true
 ): SessionOnboardingSnapshot {
   return {
     status: onboardingStatus.status,
     claude_md_hash: onboardingStatus.claude_md_hash,
     override: onboardingOverride,
+    project_profile_enabled: includeProjectProfile,
     checked_at: new Date().toISOString()
   };
+}
+
+function resolveStartStageId(workflow: NonNullable<Awaited<ReturnType<WorkflowRegistry["get"]>>>, includeProjectProfile = true): string | undefined {
+  if (includeProjectProfile) return undefined;
+  if (workflow.id !== "careful-coder") return undefined;
+  return workflow.stages.find((stage) => stage.id === "understand")?.id;
 }
 
 async function saveBinaryAttachments(attachments: Attachment[], projectPath: string): Promise<Attachment[]> {

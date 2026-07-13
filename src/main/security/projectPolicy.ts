@@ -476,12 +476,14 @@ function recordFileChangesForTool(
     );
     if (existing) {
       existing.approved = approved;
+      if (!existing.stage_id) existing.stage_id = session.current_stage;
       continue;
     }
     session.file_changes.push({
       path: filePath,
       operation,
       approved,
+      stage_id: session.current_stage,
       created_at: createdAt
     });
   }

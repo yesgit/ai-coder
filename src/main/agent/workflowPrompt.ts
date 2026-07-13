@@ -7,6 +7,7 @@ const MAX_STRING_LENGTH = 200;
 const RECENT_STAGE_COUNT = 2; // 最近 N 个阶段保留截断后的 required_outputs，更早的只保留 output_summary
 
 export function buildStageInstructions(input: StageAgentInput): string {
+  const isTaskUnderstandingStage = input.current_stage.id === "understand";
   const completedStageIds = new Set(input.previous_stage_summaries.map((s) => s.stage_id));
   const stageProgressLines = input.workflow.stages
     .map((stage, index) => {
@@ -29,6 +30,9 @@ export function buildStageInstructions(input: StageAgentInput): string {
 
   const staticPrefix = [
     `你正在执行「${input.workflow.name}」工作流。`,
+    ...(input.workflow.description.trim()
+      ? ["", "## 工作流人设与原则", input.workflow.description.trim()]
+      : []),
     "请始终使用简体中文回答，包括阶段总结、问题说明、审批请求和最终 JSON 中的自然语言内容。",
     "像一名谨慎的人类开发者一样推进：先理解意图，再查看证据，形成假设，比较方案，实施最小改动，并用验证结果校准判断。",
     "优先解决真实用户问题，而不是机械完成字段；如果流程字段与问题本质有张力，请在阶段输出中解释取舍。",
@@ -52,12 +56,19 @@ export function buildStageInstructions(input: StageAgentInput): string {
     "当策略要求审批时，仍然要正常发起对应工具调用；宿主应用会拦截工具调用、创建审批项并暂停执行。",
     "不要用文字审批请求代替工具调用，也不要仅因为 shell 命令或文件写入需要审批就把阶段标记为 failed。",
     "如果当前阶段发现需要返工到更早阶段，请说明目标阶段和原因，不要自行改变工作流状态。",
-    "入境验收（重要）：如果存在前序阶段摘要（即非首阶段），动手当前阶段工作之前必须先核对前序阶段产出是否满足本阶段的输入要求——",
-    "  - 核对维度：以前序阶段的文义是否足够支撑当前阶段为根本；综合阅读 output_summary 与已有 required_outputs，不要只因某个结构字段缺失就机械打回。",
-    "  - 优先消费前序阶段 required_outputs 中的结构化状态（如 DoD、证据、调用方假设、成功标准、验证计划、改动核对）；结构字段缺失但 output_summary 已清楚表达同等信息时，可以继续推进并在本阶段摘要里说明采用了文义依据。",
-    "  - 不合格时：把当前阶段 status 写成 needs_rework、rework_target_stage_id 指向不合格的直接前序阶段、rework_reason 用一两句中文写明哪里不合格、缺了什么；如果该前序阶段重做后仍发现缺更上游信息，再由它继续回溯。",
-    "  - 合格时：继续当前阶段工作，无需在 output_summary 里专门说明验收通过。",
-    "  - 这不是挑刺，是'我能基于前序产出继续推进吗'的诚实自检——前序产出有缺口却硬推进，只会把问题留到 self_review 才暴露，成本更高。",
+    ...(isTaskUnderstandingStage
+      ? [
+          "当前是 understand 阶段：你的任务语义输入是用户本次提交的原始任务、附件和后续明确回答。",
+          "scan_project / update_project_profile 是独立的项目背景预处理，不是本次用户任务的语义上游；不要把画像阶段总结、画像更新事项或画像 required_outputs 当作用户需求、验收标准或待办。"
+        ]
+      : [
+          "入境验收（重要）：如果存在前序阶段摘要（即非首阶段），动手当前阶段工作之前必须先核对前序阶段产出是否满足本阶段的输入要求——",
+          "  - 核对维度：以前序阶段的文义是否足够支撑当前阶段为根本；综合阅读 output_summary 与已有 required_outputs，不要只因某个结构字段缺失就机械打回。",
+          "  - 优先消费前序阶段 required_outputs 中的结构化状态（如 DoD、证据、调用方假设、成功标准、验证计划、改动核对）；结构字段缺失但 output_summary 已清楚表达同等信息时，可以继续推进并在本阶段摘要里说明采用了文义依据。",
+          "  - 不合格时：把当前阶段 status 写成 needs_rework、rework_target_stage_id 指向不合格的直接前序阶段、rework_reason 用一两句中文写明哪里不合格、缺了什么；如果该前序阶段重做后仍发现缺更上游信息，再由它继续回溯。",
+          "  - 合格时：继续当前阶段工作，无需在 output_summary 里专门说明验收通过。",
+          "  - 这不是挑刺，是'我能基于前序产出继续推进吗'的诚实自检——前序产出有缺口却硬推进，只会把问题留到 self_review 才暴露，成本更高。"
+        ]),
     "如果阶段要求输出结构化字段，请让 required_outputs 中的字段内容具体、可复用，并包含支撑判断的事实或路径。",
     "使用任何工具后，或在不需要工具时完成阶段工作后，请通过且仅通过一个符合下方协议的 JSON 对象结束当前阶段。",
     "最终 JSON 对象前后不要添加额外说明文字。",
@@ -172,6 +183,29 @@ export function buildStageInstructions(input: StageAgentInput): string {
     })
     .join("\n");
 
+  const finalJsonProtocol = [
+    "最终 JSON 协议（最后一条消息必须只包含这个 JSON 对象）：",
+    JSON.stringify(
+      {
+        status: "completed | failed | needs_rework",
+        output_summary: "用简体中文简要总结当前阶段结果",
+        required_outputs: Object.fromEntries(input.required_outputs.map((name) => [name, `<${name}>`])),
+        rework_target_stage_id: "仅当 status 为 needs_rework 时填写",
+        rework_reason: "仅当 status 为 needs_rework 时填写，并使用简体中文说明原因",
+        error: "仅当 status 为 failed 时填写，并使用简体中文说明错误"
+      },
+      null,
+      2
+    ),
+    "",
+    "硬性输出规则：",
+    "- 最后一条回复只能是上面的单一 JSON 对象，不要输出 Markdown、代码块、标题、列表或解释文字。",
+    "- 不要把 JSON 放进 ```json 代码块。",
+    "- 不要只输出 required_outputs 内部字段；必须保留最外层 status、output_summary、required_outputs。",
+    "- 阶段指令或 sub-agent prompt 中的 JSON 示例只用于说明子任务返回格式，不是当前阶段最终输出格式。",
+    "- 如果你需要在 output_summary 或 required_outputs 字符串中包含 Markdown，请把它作为 JSON 字符串值转义后放入对象内部。"
+  ].join("\n");
+
   // ── 组装：静态前缀 + 阶段元信息 + sub-agent 定义 + 尾部上下文 ──
   // 尾部构建为函数：正常模式含 reviewChangeSummary，激进压缩模式不含
 
@@ -183,23 +217,11 @@ export function buildStageInstructions(input: StageAgentInput): string {
       "1. **你只需要完成「当前阶段」的工作**。总体任务会在后续阶段中逐步推进，不要在當前階段执行。",
       "2. **不要阅读总体任务附带的 PDF/图片附件**——除非当前阶段指令明确允许（只有 `understand` 阶段需要读附件理解需求；其他阶段的输入是前序阶段的 required_outputs，不是原始附件）。",
       "3. **每个阶段都有明确的 required_outputs**——聚焦于产出这些字段，不要做阶段职责之外的事。不是你的产出就不要做。",
-      "4. **前序阶段的 required_outputs 是你最重要的输入**——优先消费它们，而不是回到原始任务描述重新理解。原始任务描述只是背景，不是你的行动指令。",
+      isTaskUnderstandingStage
+        ? "4. **当前 understand 阶段必须从初始用户任务和附件理解需求**。项目画像文件只能作为背景证据按需读取；画像阶段摘要不是本阶段输入。"
+        : "4. **前序阶段的 required_outputs 是你最重要的输入**——优先消费它们，而不是回到原始任务描述重新理解。原始任务描述只是背景，不是你的行动指令。",
       "5. **如果你发现自己在读 PDF 或思考「用户想要什么」而不是「我该产出什么」**——停下来，回到当前阶段的 required_outputs 清单。",
       "---",
-      "",
-      "最终 JSON 协议：",
-      JSON.stringify(
-        {
-          status: "completed | failed | needs_rework",
-          output_summary: "用简体中文简要总结当前阶段结果",
-          required_outputs: Object.fromEntries(input.required_outputs.map((name) => [name, `<${name}>`])),
-          rework_target_stage_id: "仅当 status 为 needs_rework 时填写",
-          rework_reason: "仅当 status 为 needs_rework 时填写，并使用简体中文说明原因",
-          error: "仅当 status 为 failed 时填写，并使用简体中文说明错误"
-        },
-        null,
-        2
-      ),
       "",
       "可用扩展工具：",
       "- mcp__ai_coder__ask_human(question: string, type: \"single\"|\"multi\"|\"text\", options?: [{value,label}])",
@@ -219,7 +241,10 @@ export function buildStageInstructions(input: StageAgentInput): string {
       reworkSection,
       "",
       "对话历史：",
-      messageHistory || "无"
+      messageHistory || "无",
+      "",
+      "---",
+      finalJsonProtocol
     ].join("\n");
 
   const dynamicTail = buildTail({ lines: previousStageLines, includeReviewSummary: true });

@@ -53,12 +53,13 @@ export function extractClaudeStageOutput(messages: unknown[]): ClaudeStageOutput
 
 export function formatClaudeTranscript(messages: unknown[]): string {
   const output = extractClaudeStageOutput(messages);
-  if (output.assistantText && output.resultText && output.assistantText !== output.resultText) {
-    return [output.assistantText, output.resultText].join("\n\n");
-  }
-  // 优先返回 resultText 或 assistantText，如果没有则返回空字符串
-  // 不要返回 JSON 字符串，因为那会产生无意义的 "(no content)" 等占位内容
-  return output.resultText || output.assistantText || "";
+  const parts = [output.assistantText, output.resultText]
+    .filter(Boolean)
+    .filter((text) => !isNoContentBlock(text));
+  if (parts.length === 0) return "";
+  // 去重：assistantText 和 resultText 相同时只保留一份
+  if (parts.length === 2 && parts[0] === parts[1]) return parts[0];
+  return parts.join("\n\n");
 }
 
 function extractAssistantText(message: Record<string, unknown>): string[] {
@@ -70,9 +71,16 @@ function extractAssistantText(message: Record<string, unknown>): string[] {
   return assistantMessage.content
     .filter((block): block is AssistantContentBlock => isRecord(block))
     .filter((block) => block.type === "text" && typeof block.text === "string")
+    .filter((block) => !isNoContentBlock(String(block.text)))
     .map((block) => String(block.text));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** SDK 内部占位文本块——没有任何信息量，应被过滤掉 */
+function isNoContentBlock(text: string): boolean {
+  const trimmed = text.trim();
+  return trimmed === "(no content)" || trimmed === "(no content)\n" || /^\(no content\)\s*$/.test(trimmed);
 }

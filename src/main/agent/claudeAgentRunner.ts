@@ -30,6 +30,7 @@ interface PendingToolApproval {
 export class ClaudeAgentRunner {
   private readonly workflowEngine = new WorkflowEngine();
   private readonly maxStageIterations = 50;
+  private readonly maxPdfPageImageReadsPerStage = 8;
   private readonly abortControllers = new Map<string, AbortController>();
   private readonly pendingToolApprovals = new Map<string, Map<string, PendingToolApproval>>();
   private mcpServerCache: unknown | null = null;
@@ -67,6 +68,10 @@ export class ClaudeAgentRunner {
   }
 
   async run(input: AgentRunInput): Promise<AgentSession> {
+    if (input.session.status !== "created" && input.session.status !== "running") {
+      return input.session;
+    }
+
     for (let iteration = 0; iteration < this.maxStageIterations; iteration += 1) {
       const updated = await this.runCurrentStage(input);
       if (updated.status !== "running") {
@@ -110,6 +115,7 @@ export class ClaudeAgentRunner {
     }
 
     const sdkMessages: unknown[] = [];
+    const pdfPageImageReads = new Set<string>();
     const abortController = new AbortController();
     this.abortControllers.set(input.session.id, abortController);
     try {
@@ -154,6 +160,20 @@ export class ClaudeAgentRunner {
               return { behavior: "allow" };
             }
 
+            if (isPdfPageImageRead(toolName, toolInput)) {
+              const filePath = String(toolInput.file_path ?? toolInput.path ?? "");
+              pdfPageImageReads.add(filePath);
+              if (pdfPageImageReads.size > this.maxPdfPageImageReadsPerStage) {
+                const message = [
+                  `本阶段已读取 ${this.maxPdfPageImageReadsPerStage} 张 PDF 拆页图片，继续读取会导致模型上下文过大。`,
+                  "请停止继续 Read page-*.png，基于已读取页面完成当前阶段 required_outputs；",
+                  "未覆盖的页码或需求请写入 assumptions/unknown，不要为了补全而继续读图。"
+                ].join("");
+                await this.recordProgress(input, "tool_policy", `限制 PDF 拆页读取：${filePath}`, "milestone");
+                return { behavior: "deny", message, interrupt: false };
+              }
+            }
+
             if (isUnsupportedDocumentRead(toolName, toolInput)) {
               await this.recordProgress(input, "tool_policy", "拦截 PDF Read：请读取已拆页 PNG 或用 shell 文本工具查看，不要直接 Read PDF。", "milestone");
               return {
@@ -166,6 +186,20 @@ export class ClaudeAgentRunner {
             if (toolName === "mcp__ai_coder__ask_human") {
               const question = this.buildHumanQuestion(input.session, toolInput, options.toolUseID);
               if (question) {
+                // 去重：相同 question 文本 + 相同 stage_id 不重复创建
+                const existing = (input.session.pending_human_questions ?? []).find(
+                  (q) => q.question === question.question && q.stage_id === question.stage_id
+                );
+                if (existing) {
+                  if (existing.status === "answered") {
+                    // 已经回答过：不重复问，不中断，让模型继续
+                    await this.recordProgress(input, "tool_policy", `重复问题已跳过（已回答）：${question.question.slice(0, 60)}`, "transient");
+                    return { behavior: "deny", message: "此问题已回答，请基于已有回答继续。", interrupt: false };
+                  }
+                  // 仍在 pending：不创建新问题，但仍需中断等待用户回答
+                  await this.recordProgress(input, "tool_policy", `重复问题等待中：${question.question.slice(0, 60)}`, "transient");
+                  return { behavior: "deny", message: "等待用户回答，已暂停执行", interrupt: true };
+                }
                 input.session.pending_human_questions = [
                   ...(input.session.pending_human_questions ?? []),
                   question
@@ -232,14 +266,7 @@ export class ClaudeAgentRunner {
       if (abortController.signal.aborted) {
         if (sdkMessages.length > 0) {
           const transcript = formatClaudeTranscript(sdkMessages);
-          // 仅当 transcript 含有真正内容时才写入消息，避免 (no content) / SDK 内部 transcript 污染
-          if (isMeaningfulAgentText(transcript)) {
-            input.session.messages.push({
-              role: "assistant",
-              content: transcript,
-              created_at: new Date().toISOString()
-            });
-          }
+          this.appendAssistantMessage(input.session, transcript);
         }
         input.session.status = this.resolveInterruptedStatus(input.session);
         if (input.session.status === "completed") input.session.status = "interrupted";
@@ -249,15 +276,10 @@ export class ClaudeAgentRunner {
 
       const stageOutput = extractClaudeStageOutput(sdkMessages);
       const transcript = formatClaudeTranscript(sdkMessages);
-      // 仅当 transcript 含有真正内容时才写入消息，避免 (no content) / SDK 内部 transcript 污染
-      if (isMeaningfulAgentText(transcript)) {
-        input.session.messages.push({
-          role: "assistant",
-          content: transcript,
-          created_at: new Date().toISOString()
-        });
-      }
+
       if (this.hasPendingToolCall(input.session) || this.hasPendingHumanQuestion(input.session)) {
+        // 有待审批工具/问题：push transcript 后中断
+        this.appendAssistantMessage(input.session, transcript);
         input.session.status = this.resolveInterruptedStatus(input.session);
         await this.recordProgress(input, "status", `阶段已中断：${input.session.status}`, "milestone");
         return input.session;
@@ -268,7 +290,26 @@ export class ClaudeAgentRunner {
         await this.recordProgress(input, "status", "阶段执行失败。", "milestone");
         return input.session;
       }
+
+      // 先 applyStageResult（可能触发 retry 或推进到下一阶段），再根据实际状态变化决定 push 什么消息
+      const activeRunBeforeApply = this.workflowEngine.getActiveStageRun(input.session);
       this.workflowEngine.applyStageResult(input.session, input.workflow, parseStageAgentResult(stageOutput.resultText || transcript));
+      const statusAfterApply = input.session.status;
+      const activeRunAfterApply = this.workflowEngine.getActiveStageRun(input.session);
+      const isRetryOfSameStage =
+        statusAfterApply === "running" &&
+        Boolean(activeRunAfterApply?.retry_reason) &&
+        activeRunAfterApply?.id === activeRunBeforeApply?.id;
+
+      // 终态（completed/waiting_approval/blocked/failed）：push 完整 transcript
+      // 正常推进到下一阶段也可能是 running，此时仍应保留当前阶段真实 transcript。
+      // 只有同一 stageRun 原地 retry 时才 push 简短摘要，避免重复塞入大段无效输出。
+      if (isRetryOfSameStage) {
+        const retryReason = input.session.error ?? "required_outputs 缺失或断言失败";
+        this.appendAssistantMessage(input.session, `[阶段重试：${retryReason}]`);
+      } else {
+        this.appendAssistantMessage(input.session, transcript);
+      }
       // 阶段终态决定 milestone 文案：completed / waiting_approval 是正向终态；
       // blocked / failed 是异常终态（断言挡回、超过 retry 限、缺必填等），需要明确告诉用户。
       // running 是 retry 中——只是无声继续到下一轮，无需 milestone。
@@ -292,14 +333,7 @@ export class ClaudeAgentRunner {
       if (abortController.signal.aborted || isAbortError(error)) {
         if (sdkMessages.length > 0) {
           const transcript = formatClaudeTranscript(sdkMessages);
-          // 仅当 transcript 含有真正内容时才写入消息，避免 (no content) / SDK 内部 transcript 污染
-          if (isMeaningfulAgentText(transcript)) {
-            input.session.messages.push({
-              role: "assistant",
-              content: transcript,
-              created_at: new Date().toISOString()
-            });
-          }
+          this.appendAssistantMessage(input.session, transcript);
         }
         const resolved = this.resolveInterruptedStatus(input.session);
         input.session.status = resolved === "completed" ? "interrupted" : resolved;
@@ -321,11 +355,7 @@ export class ClaudeAgentRunner {
     const result = createMockStageAgentResult(stageAgentInput);
     const content = JSON.stringify(result, null, 2);
     // Mock 模式下写入阶段结果摘要，而不是原始 JSON
-    input.session.messages.push({
-      role: "assistant",
-      content: result.output_summary,
-      created_at: new Date().toISOString()
-    });
+    this.appendAssistantMessage(input.session, result.output_summary);
     this.workflowEngine.applyStageResult(input.session, input.workflow, result);
     return input.session;
   }
@@ -342,13 +372,7 @@ export class ClaudeAgentRunner {
     input.session.status = "waiting_approval";
     input.session.current_stage = approval?.stage_id ?? input.session.current_stage;
     const content = `已为"${input.session.task_prompt}"准备工作流计划。等待审批后继续执行${stage?.name ?? "下一阶段"}。`;
-    if (!input.session.messages.some((message) => message.role === "assistant" && message.content === content)) {
-      input.session.messages.push({
-        role: "assistant",
-        content,
-        created_at: new Date().toISOString()
-      });
-    }
+    this.appendAssistantMessage(input.session, content);
     return true;
   }
 
@@ -379,13 +403,23 @@ export class ClaudeAgentRunner {
     input.session.status = "waiting_approval";
 
     const content = `阶段"${stage.name}"需要授权才能继续执行。该阶段将使用文件编辑工具写入项目文件，请审批。`;
-    input.session.messages.push({
+    this.appendAssistantMessage(input.session, content);
+
+    return input.session;
+  }
+
+  private appendAssistantMessage(session: AgentSession, content: string): void {
+    if (!isMeaningfulAgentText(content)) return;
+    const normalized = normalizeAssistantMessageContent(content);
+    const recentDuplicate = session.messages
+      .slice(-10)
+      .some((message) => message.role === "assistant" && normalizeAssistantMessageContent(message.content) === normalized);
+    if (recentDuplicate) return;
+    session.messages.push({
       role: "assistant",
       content,
       created_at: new Date().toISOString()
     });
-
-    return input.session;
   }
 
   private async recordProgress(
@@ -517,11 +551,7 @@ export class ClaudeAgentRunner {
       const transcript = formatClaudeTranscript(sdkMessages);
       // 仅当 transcript 含有真正内容时才写入消息，避免 (no content) / SDK 内部 transcript 污染
       if (isMeaningfulAgentText(transcript)) {
-        input.session.messages.push({
-          role: "assistant",
-          content: transcript,
-          created_at: new Date().toISOString()
-        });
+        this.appendAssistantMessage(input.session, transcript);
       }
       this.workflowEngine.applyStageResult(input.session, input.workflow, {
         status: "failed",
@@ -609,6 +639,16 @@ function isUnsupportedDocumentRead(toolName: string, toolInput: Record<string, u
   if (toolName !== "Read") return false;
   const filePath = String(toolInput.file_path ?? toolInput.path ?? "");
   return /\.pdf(?:$|[?#])/i.test(filePath);
+}
+
+function isPdfPageImageRead(toolName: string, toolInput: Record<string, unknown>): boolean {
+  if (toolName !== "Read") return false;
+  const filePath = String(toolInput.file_path ?? toolInput.path ?? "");
+  return /(?:^|[/\\])\.ai-coder[/\\]uploads[/\\].*[/\\]page-\d+\.(?:png|jpe?g|webp)$/i.test(filePath);
+}
+
+function normalizeAssistantMessageContent(content: string): string {
+  return content.trim().replace(/\s+/g, " ");
 }
 
 /**
