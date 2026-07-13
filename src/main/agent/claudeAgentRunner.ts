@@ -8,7 +8,7 @@ import {
 } from "../security/projectPolicy.js";
 import { WorkflowEngine } from "../workflows/workflowEngine.js";
 import { buildStageInstructions } from "./workflowPrompt.js";
-import { evaluateHook } from "./stageHookEnforcer.js";
+import { evaluateHook, checkCommandSafety } from "./stageHookEnforcer.js";
 import { buildStageAgentInput, createMockStageAgentResult, parseStageAgentResult } from "./stageAgentProtocol.js";
 import { extractClaudeStageOutput, formatClaudeTranscript } from "./claudeMessageAdapter.js";
 import { resolveNodeExecutable, shouldUseClaudeSdk } from "./claudeRuntime.js";
@@ -178,6 +178,13 @@ export class ClaudeAgentRunner {
               input.session.error = "ask_human 工具输入格式错误（缺少 question / type / options）";
               await this.recordProgress(input, "status", input.session.error, "milestone");
               return { behavior: "deny", message: input.session.error, interrupt: true };
+            }
+            // ── 引擎层 Bash 命令安全拦截（硬编码，不依赖 YAML 配置）──
+            // 在阶段 hooks 之前执行——这是因果致效层的约束，不是 prompt 建议。
+            const safetyCheck = checkCommandSafety(currentStage.id, toolName, toolInput);
+            if (!safetyCheck.allow) {
+              await this.recordProgress(input, "tool_policy", `安全拦截：${safetyCheck.message}`, "milestone");
+              return { behavior: "deny", message: safetyCheck.message, interrupt: false };
             }
             // 阶段级工序闸门：仅当 stage.hooks 显式声明时生效；与 approveOrDenyToolUse（策略层）解耦。
             // 失败时 interrupt:false——让模型读到拒绝原因后自行补齐前置步骤，不打断整个会话。

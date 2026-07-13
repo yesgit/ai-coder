@@ -1,15 +1,17 @@
 id: careful-coder
 name: 谨慎程序员
-version: 3.0.0
+version: 4.0.0
 description: |
-  唯一内置工作流：先根据项目情况执行全量或增量项目画像，建立或调整长期上下文；
-  再按理解、勘察、对齐、方案、实施、自审推进编码任务。
-  所有阶段通过统一 output_schema 传递结构化状态，后续阶段按同一口径消费前序产物，
-  缺口通过 needs_rework 回溯修正。
+  唯一内置工作流：先建立项目画像，再分解用户任务为原子级子任务（每个子任务带改动前行为快照），
+  逐个子任务以 fresh sub-agent 实施并用机械核对清单验证。
+  每个子任务的上下文被精心整理——只有该 task 需要的一组参数、一个业务函数、一个跳转目标。
+  不需要在 11 套数据间切换注意力，因为每次只有 1 套。
+
+  哲学：不靠"让 LLM 更谨慎"，靠"让任务小到不可能错"。
 source:
   type: builtin
   id: careful-coder
-  version: 3.0.0
+  version: 4.0.0
 permissions:
   filesystem:
     mode: project-only
@@ -20,10 +22,10 @@ permissions:
 routing:
   enabled: true
   auto_start: true
-  # v2 与 v1.3 并存做对比基线；暂不自动接管，手动选用。验证 v2 更优后可切换 auto_start。
   keywords:
     - 谨慎 v2
     - careful v2
+    - 谨慎 v4
   examples:
     - 谨慎地修一下未登录访问 /settings 崩溃的问题
     - 严谨地把 parseConfig 改为接收路径而不是字符串，并修所有调用方
@@ -33,25 +35,29 @@ rework:
     - scan_project
     - update_project_profile
     - understand
-    - investigate
-    - align
-    - design
+    - decompose
     - implement
   approval_required: false
   invalidate_downstream: true
-# v2.1 设计笔记（承接 docs/workflow-design-principles.md 的反思）：
-# v1.0→v1.3 三轮都在"用产出形态/行为保证思维质量"的范畴错误里打转：L3 扫标题可被空壳糊弄，
-# L1 查行为虽难糊弄但把"动作发生"当成"谨慎发生"——两者都是用可观测代理指标保证不可观测心智。
-# v2.0 换路：保留人类思维的阶段骨架（人类本就分阶段思考），但阶段内部靠 prompt 落实心智。
-# v2.1 承认单靠 prompt 会在阶段边界丢心智：关键状态必须进入 required_outputs，并由后续阶段消费。
-# 断言仍只留三类不可糊弄且不制造仪式的：
-#   1. 结构性（no_trailing_unparsed_payload / needs_rework_target_required）——防 JSON 烂尾、rework 缺字段
-#   2. L2 自洽性（review_self_consistency / hedged_findings_demoted / unknowns_present）——查可验证事实/自洽
-#   3. 安全门（不可逆操作 ask_human consent / rollback_plan）——安全，非谨慎仪式
-# L3 扫标题全退场；L1 behavior 门控（git log/git diff 的 retry/block）降回 prompt 提示——
-# "你应该跑 git log"是建议，不是"跑过才算调查过"的证据勒索。
-# 思维模板（候选方案/事前风险/置信度/调用方清单/delta_check）仍在 instructions 里作引导；
-# 承重信息进入 required_outputs，使 design/implement/self_review 有同一份可复用状态，而非靠重读摘要猜测。
+# v4.0 设计笔记（v3.0 执行日志驱动的重构）：
+#
+# v3.0 的一次完整执行揭示了三个致命问题：
+# 1. self_review（"只读"审查者）用 shell 重定向毁灭了 chatProvider.js（1146 行）
+# 2. 巨型任务（11 个 pageName case）不经拆分直接单次 implement，上下文过载导致参数丢失和错误合并
+# 3. 从 design 开始 JSON 产出全崩溃，软通过让残缺数据级联恶化
+#
+# v4.0 的根本哲学转变：
+# - 不再试图让 LLM "谨慎"——LLM 没有元认知能力。把 LLM 放在它能赢的位置上：接收精确输入、在小范围执行、产出可机械验证的输出
+# - 精细拆分替代全局推理：11 个 case 不是 1 个 implement 处理，是 11 个独立 implement，每个只有 1 组参数
+# - 机械验证替代判断性审查：verify 不判断"好不好"，只核对"参数还在吗、函数还调吗、文件改对了吗"
+# - 引擎层安全替代 prompt 层约束："你是只读的"不是靠 prompt 说的，是靠引擎硬拦截 > 重定向做到的
+#
+# 砍掉的阶段：
+# - investigate → 融入 decompose（拆分时自然调查现有行为，每个 task 的 pre_behavior 就是调查结论）
+# - align → 融入 decompose（项目惯例在拆分时被编码进 acceptance_criteria）
+# - design → 融入 decompose（每个 task 就是设计的原子单元）
+# - self_review → 替代为 verify（每 task 的机械核对，PASS/FAIL，不判断）
+
 stages:
   - id: scan_project
     name: 扫描项目画像
@@ -77,12 +83,12 @@ stages:
 
       4. **输出**：给出完整的 required_outputs。不要散文报告——给 update_project_profile 阶段可以直接消费的结构化清单。
 
-      **扫描纪律**：避开密钥、凭证、生成依赖目录、大型构建产物和二进制文件。不要为了画像而无边界扫描；以”后续编码阶段是否有足够项目上下文”为判断标准。
+      **扫描纪律**：避开密钥、凭证、生成依赖目录、大型构建产物和二进制文件。不要为了画像而无边界扫描；以"后续编码阶段是否有足够项目上下文"为判断标准。
 
       **任务边界（重要）**：
-      - “总体任务”是给后续阶段执行的——你**不要**去理解、分析或尝试解决它
+      - "总体任务"是给后续阶段执行的——你**不要**去理解、分析或尝试解决它
       - **不要**阅读总体任务附带的 PDF/图片附件（这些是业务需求文档，不是项目配置——业务需求理解是后面 `understand` 阶段的职责）
-      - **不要**根据业务需求去判断项目结构——只记录”是什么”，不判断”能不能做”
+      - **不要**根据业务需求去判断项目结构——只记录"是什么"，不判断"能不能做"
       - 你的唯一产出是五个 required_outputs：profile_mode + existing_profile_assets + inspected_files + project_facts + profile_update_needed
       - 你不是在解决用户的任务——你只是在为后续阶段准备项目上下文
     allowed_tools:
@@ -121,7 +127,7 @@ stages:
       profile_update_needed:
         type: array
         items: string
-        description: 需要建立或调整画像的事项；无需更新则 [“无”]
+        description: 需要建立或调整画像的事项；无需更新则 ["无"]
     auto_retry_limit: 1
     hooks:
       post_output_assertions:
@@ -152,17 +158,17 @@ stages:
           **输出格式**（JSON）：
           ```json
           {
-            “existing_profile_assets”: [“路径1”, “路径2”],
-            “asset_details”: [
+            "existing_profile_assets": ["路径1", "路径2"],
+            "asset_details": [
               {
-                “path”: “路径”,
-                “exists”: true,
-                “content_summary”: “一句话描述内容”,
-                “is_stale”: true,
-                “issues”: [“问题1（如含本机绝对路径）”]
+                "path": "路径",
+                "exists": true,
+                "content_summary": "一句话描述内容",
+                "is_stale": true,
+                "issues": ["问题1（如含本机绝对路径）"]
               }
             ],
-            “overall_assessment”: “画像资产整体评估：齐全 / 部分缺失 / 严重不足”
+            "overall_assessment": "画像资产整体评估：齐全 / 部分缺失 / 严重不足"
           }
           ```
 
@@ -188,77 +194,57 @@ stages:
           **输出格式**（JSON）：
           ```json
           {
-            “project_type”: “web app / cli / library / Electron app / ...”,
-            “tech_stack”: {
-              “runtime”: “Node.js 22”,
-              “framework”: “Electron + React + TypeScript”,
-              “key_dependencies”: [“关键依赖名”],
-              “package_manager”: “npm”
+            "project_type": "web app / cli / library / Electron app / ...",
+            "tech_stack": {
+              "runtime": "Node.js 22",
+              "framework": "Electron + React + TypeScript",
+              "key_dependencies": ["关键依赖名"],
+              "package_manager": "npm"
             },
-            “source_layout”: {
-              “main_entry”: “src/main/index.ts”,
-              “renderer_entry”: “src/renderer/src/main.tsx”,
-              “shared”: “src/shared/”,
-              “key_modules”: [“模块说明”]
+            "source_layout": {
+              "main_entry": "src/main/index.ts",
+              "source_dirs": ["src/main", "src/renderer"],
+              "test_dir": "src/__tests__",
+              "key_modules": ["模块概述"]
             },
-            “test_setup”: {
-              “directories”: [“tests/”],
-              “framework”: “vitest”,
-              “run_command”: “npm test”
-            },
-            “ci_scripts”: [“.github/workflows/ci.yml”],
-            “project_facts”: [
-              “这是 Electron 桌面应用，主进程和渲染进程分离”,
-              “前后端通过 IPC 通信”,
-              “使用 Anthropic Claude Agent SDK 做 AI 推理”
-            ],
-            “inspected_files”: [
-              {“file”: “package.json”, “evidence”: “项目名 ai-coder，依赖 Electron + React + Claude Agent SDK”}
-            ],
-            “profile_update_needed_hints”: [“技术栈描述”, “构建命令”]
+            "test_commands": ["npm test", "npm run lint"],
+            "ci_scripts": [".github/workflows/ci.yml"],
+            "architecture_notes": ["关键架构说明"],
+            "inspected_files": [{"file": "路径", "evidence": "从此文件了解到什么"}]
           }
           ```
 
           **约束**：
           - 只读，不写任何文件
-          - 聚焦长期稳定事实，不是临时状态或一次性的调试信息
-          - 避开密钥、凭证、token
+          - 重要记，不确定的标"推断"
+
   - id: update_project_profile
     name: 建立或调整项目画像
     instructions: |
-      你是项目画像更新的**协调者**。你的任务不是自己逐文件评估和起草——而是把分析和起草工作分派给 2 个专门的 sub-agent，收集它们的结果，做出最终决策后写入文件。
+      你是画像更新阶段的**协调者**。你的任务是根据 `scan_project` 阶段的发现，评估、起草并实际写入项目画像文件。
 
       **协调流程**：
 
-      1. **并行委派 sub-agent**：根据 scan_project 的结论（profile_mode），同时启动以下 2 个 sub-agent：
-         - `profile-content-evaluator`：阅读已有画像内容，评估每项是否仍然正确、是否过期、是否应保留
-         - `profile-drafter`：基于 scan_project 的 project_facts 和 profile_update_needed，起草新的或更新的画像内容
+      1. **并行委派 sub-agent**：同时启动以下 2 个 sub-agent（通过 Task 工具并行调用）：
+         - `profile-content-evaluator`：基于当前画像内容 + scan_project 发现，评估每个部分的保留/丢弃/更新决策
+         - `profile-drafter`：基于 scan_project.project_facts 和评估决策，起草新的画像内容
 
-      2. **收集中和决策**：收到两个 sub-agent 的结果后：
-         - 对比 evaluator 的保留建议和 drafter 的新内容草案
-         - 确认哪些内容保留、哪些更新、哪些新增、哪些删除
-         - 全量模式：基于 drafter 草案创建完整画像
-         - 增量模式：只修改 evaluator 标记为过期或缺失的部分
-         - none 模式：不写文件，只在 output_summary 说明无需更新依据
+      2. **收集并综合**：收到两个 sub-agent 的结果后：
+         - content-evaluator 告诉你"什么该留、什么该丢、什么该补"
+         - drafter 基于评估结论给出画像正文草稿
+         - 你做最终裁决——合并两者的产出为 `profile_changes`
+         - 确定要写入的文件路径 `profile_paths`
+         - 记录保留的规则 `retained_rules`
+         - 验证画像内容 `validation`
+         - 列出残余风险 `residual_profile_risks`
 
-      3. **写入文件**：使用 edit_file 执行实际的画像文件变更。只改必要的部分，不做无关重排。
-
-      4. **验证**：如可能，跑相关命令验证画像内容（如检查配置是否有效）。
-
-      **画像规范**：
-      - 主 CLAUDE.md 聚焦长期稳定事实：项目概览、技术栈、架构边界、常用命令、验证路径、开发规则、安全边界、容易误导代理的陷阱、画像更新策略
-      - .claude/rules 只用于有明确路径作用域的规则
-      - .claude/skills 只用于重复、多步骤、长期有价值的流程
-      - settings 只建议团队共享配置，不写密钥、个人偏好、本机绝对路径
-      - 必须保留仍然正确的团队规则；只修正过期或缺失内容
-      - 无法写入时不要中断后续编码阶段，把缺口写入 required_outputs
+      3. **写入文件**：根据 profile_changes 中的决策，使用 Edit 工具更新画像文件。增量模式下只修改变更部分；full 模式下创建或完全重写 CLAUDE.md。
 
       **任务边界（重要）**：
-      - "总体任务"是给后续阶段执行的——你**不要**去理解、分析或尝试解决它
-      - **不要**阅读总体任务附带的 PDF/图片附件——你的唯一输入是 scan_project 阶段的 required_outputs
-      - 你的唯一职责是基于 scan_project 的结论建立或调整项目画像文件（CLAUDE.md 等）
-      - **不要**因为看到业务需求就去"顺便"做编码相关的准备工作
-      - 产出 required_outputs（profile_changes + profile_paths + retained_rules + validation + residual_profile_risks）即可
+      - 你的职责是**建立或调整画像**——基于 scan_project 的发现，更新 CLAUDE.md
+      - **不要**自己去读代码补充事实——那不是你的范围（scan_project 已经做了）
+      - **不要**理解或尝试解决用户的总体任务——你只关心项目上下文
+      - 产出 required_outputs 并实际写入文件
     allowed_tools:
       - read_file
       - edit_file
@@ -277,30 +263,29 @@ stages:
         items:
           type: object
           properties:
-            action: string
-            target: string
+            section: string
+            action: keep | update | delete | add
             reason: string
-        description: 建立/更新/跳过画像的动作清单
+        description: 对每个画像段的决策及原因
       profile_paths:
         type: array
         items: string
-        description: 已创建或更新的画像资产路径；无改动则 []
+        description: 已写入或已更新的画像文件路径
       retained_rules:
         type: array
         items: string
-        description: 明确保留的已有团队规则或画像内容
+        description: 保留的 .claude/rules/ 规则文件路径
       validation:
         type: object
         properties:
-          commands_executed: array<string>
-          results: string
-          skipped_validations: array<string>
-        description: 已执行验证和跳过原因
+          duplicate_check: string
+          accuracy_check: string
+        description: 画像内容验证结果
       residual_profile_risks:
         type: array
         items: string
-        description: 画像仍需人工确认的事项；没有则 ["无"]
-    auto_retry_limit: 1
+        description: 画像建立后的残余风险
+    auto_retry_limit: 2
     hooks:
       pre_tool_use:
         - when:
@@ -313,88 +298,65 @@ stages:
               - "truncate"
           require:
             ask_human_consent: true
-          on_fail: "这是不可逆操作，必须先通过 ask_human 取得用户明确确认。"
+          on_fail: "这是不可逆操作，必须先在本阶段通过 ask_human 取得用户明确确认。"
       post_output_assertions:
         - rollback_plan_when_irreversible
         - no_trailing_unparsed_payload
     agents:
       profile-content-evaluator:
-        description: 阅读已有画像内容，评估每项是否仍然正确、是否过期、是否应保留
-        tools: [Read, Glob]
+        description: 评估现有项目画像内容的正确性、时效性和完整性
+        tools: [Read]
         prompt: |
-          你的任务：阅读项目中已有的画像资产，逐项评估其内容是否仍然正确。
+          你的任务：评估现有项目画像内容的现状。
 
-          **前置步骤**：
-          - 先读取所有已有画像资产（CLAUDE.md、.claude/CLAUDE.md、.claude/rules/*.md、.claude/skills/*/SKILL.md 等）
-          - 如没有画像资产，直接报告"无已有画像"
-
-          **对每个画像资产的每项关键内容，评估**：
-          1. **仍然正确** — 保留，不要改动
-          2. **已过期** — 内容与当前项目实际不符，需要更新
-          3. **应删除** — 内容不再相关或本身就是错误的
-          4. **缺失** — 按 scan_project 的结论，缺少了某些重要信息
-
-          **特别注意**：
-          - 团队规则（rules）即使不够优雅也应保留——它们可能是血的教训
-          - 包含密钥、凭证、本机绝对路径的内容应标记为"应删除"
-          - 与项目实际代码矛盾的内容应标记为"已过期"
+          **评估维度**（对画像中的每个主要段落）：
+          1. **仍然正确**：这个段落的描述是否与 scan_project 发现一致？
+          2. **已过期**：是否有明显过时的内容（如已删除的模块、已废弃的命令）？
+          3. **存在风险**：是否包含本机绝对路径、密钥、凭证、敏感信息？
+          4. **缺失**：scan_project.project_facts 中哪些重要信息画像里没有？
 
           **输出格式**（JSON）：
           ```json
           {
-            "evaluated_assets": ["已评估的画像路径"],
-            "keep": [
-              {"content": "应保留的具体内容摘要", "reason": "为什么保留", "source": "来源文件"}
+            "evaluations": [
+              {
+                "section": "段落标题",
+                "verdict": "keep | update | delete | add",
+                "reason": "判断依据",
+                "current_content_summary": "现有内容概述"
+              }
             ],
-            "update": [
-              {"content": "需更新的内容", "reason": "为什么过期/不准确", "source": "来源文件"}
-            ],
-            "remove": [
-              {"content": "应删除的内容", "reason": "为什么删除", "source": "来源文件"}
-            ],
-            "missing": ["scan_project 结论中要求但画像中缺失的内容项"],
-            "overall_assessment": "整体评估：无需改动 / 轻微调整 / 需要大幅更新"
+            "overall_assessment": "整体评价",
+            "risk_items": ["风险项 1"]
           }
           ```
 
           **约束**：
           - 只读，不写任何文件
-          - 不确定是否过期的内容标记为 keep，加 note 说明不确定性
-          - 尊重已有团队约定的格式和风格
+          - 每个段落的判断必须基于 scan_project 的具体发现，不要纯推断
 
       profile-drafter:
-        description: 基于 scan_project 结论起草新的或更新的画像内容
+        description: 基于 scan_project 事实起草新的或增量更新的画像内容
         tools: [Read]
         prompt: |
-          你的任务：基于 scan_project 的结论，起草项目画像内容。
+          你的任务：基于 scan_project 的事实和 content-evaluator 的评估，起草画像内容。
 
-          **前置步骤**：
-          - 回顾 scan_project 的 project_facts（长期稳定事实）和 profile_update_needed（需要建立或调整的事项）
-
-          **起草内容**（根据 profile_mode 决定范围）：
-          - **full 模式**：起草完整的 CLAUDE.md 内容，覆盖：项目概览、技术栈、架构边界、常用命令、验证路径、开发规则、安全边界、陷阱、画像更新策略
-          - **incremental 模式**：只起草需要更新或新增的部分，明确标注"以下为增量更新"
-          - **none 模式**：输出空草案，说明为什么不需要更新
-
-          **起草原则**：
-          - 只写长期稳定的事实，不写临时的、一次性的信息
-          - 简洁、可维护——每句话都要有存在理由
-          - 不包含密钥、凭证、token、本机绝对路径、个人偏好
-          - 命令写相对路径或用项目级变量，不硬编码本机路径
-          - rules 只在有明确路径作用域时才建议创建
-          - skills 只在重复、多步骤、长期有价值的流程时才建议创建
+          **起草规则**：
+          1. 只写事实，不写愿望——"用 React Router v6"不是事实，"路由统一在 src/router/index.tsx"才是
+          2. 格式遵循 CLAUDE.md 惯例——如果已有画像用 ## 分层，沿用同样结构
+          3. 增量模式只输出要变更的段落；full 模式输出完整 CLAUDE.md
+          4. 不掺入本机绝对路径、密钥、凭证
 
           **输出格式**（JSON）：
           ```json
           {
-            "profile_mode": "full / incremental / none",
+            "profile_mode": "full | incremental | none",
             "sections": [
               {
-                "heading": "## 章节标题",
-                "content": "章节正文",
-                "action": "create / update / keep",
-                "target_file": "CLAUDE.md 或 .claude/rules/xxx.md",
-                "reason": "为什么需要这个章节/这项更新"
+                "heading": "## 段落标题",
+                "action": "keep | update | delete | add",
+                "content": "完整正文（markdown）",
+                "reason": "为什么这样写"
               }
             ],
             "full_draft": "full 模式下完整的 CLAUDE.md 正文；其他模式写 'N/A'",
@@ -406,10 +368,11 @@ stages:
           - 只起草，不写文件（文件写入由协调者负责）
           - 增量模式下只起草变更部分，不要输出全量内容
           - 格式风格应与已有画像保持一致
+
   - id: understand
     name: 理解
     instructions: |
-      你是理解阶段的**协调者**。你的任务不是自己一个人琢磨——而是把分析工作分派给 2 个专门的 sub-agent，收集它们的结果，综合后输出。
+      你是理解阶段的**协调者**。你的任务是把分析工作分派给 2 个专门的 sub-agent，收集结果后综合输出。
 
       **协调流程**：
 
@@ -418,36 +381,25 @@ stages:
          - `done-analyzer`：基于代码上下文推断"完成的样子"——哪些行为变化是可观测的、哪些验收标准是合理的
 
       2. **收集并综合**：收到两个 sub-agent 的结果后：
-         - 对比两者的分析，去重、合并
-         - goal-interpreter 提取的核心意图 → `user_goal_restated`
-         - done-analyzer 推断的验收标准 → `definition_of_done`
-         - 两者都提到的隐含假设 + 你从项目画像中推断的 → `assumptions`
+         - goal-interpreter 的核心意图 → `user_goal_restated`
+         - done-analyzer 的验收标准 → `definition_of_done`
+         - 两者都提到的隐含假设 + 从项目画像中推断的 → `assumptions`
 
-      **自主推断原则**：
-      - 能从用户任务描述、代码上下文、项目结构中自行推断的信息，不要问用户
-      - 只有任务描述明显缺失关键信息、且无法从代码/文档中推断时，才列入 assumptions
-      - assumptions 不是"问用户的问题"，而是"暂时这样假设，如有偏差再修正"
+      **推断原则（重要）**：
+      - 能用代码和项目画像确定的信息优先推断
+      - 但以下情况**必须**记录为 assumption 并标注"需用户确认"，不要自己推断：
+        - 功能等价性不确定：两个概念是同一功能还是不同功能？（如 CHTRPWD vs CHLPWD——"修改交易密码"和"修改登录密码"是一个页面还是两个独立页面？）
+        - 参数含义模糊：某个参数的取值和效果是什么？
+        - 业务逻辑推断：改动是否影响其他模块的约定？
+      - assumptions 不是"问用户的问题"，而是"暂时这样假设，如有偏差请修正"
 
       **输出**：给出完整的 required_outputs。不要散文报告。
 
       **任务边界（重要）**：
       - 你的职责是**理解**用户任务——提取核心意图、定义完成标准、记录假设
-      - **可以**阅读总体任务附带的 PDF/图片附件来理解需求（这是唯一需要读附件的阶段）
-      - **不要**开始执行任务——不要写代码、不要改文件、不要创建分支、不要运行构建
-      - 产出 required_outputs（user_goal_restated + definition_of_done + assumptions）即可
-      - 后续阶段（investigate/design/implement）会基于你的产出推进——你不用替它们做
-
-      **输出格式（非常重要）**：
-      1. 直接输出 JSON 对象，**不要**包裹在 ```json 或 ``` 代码块里
-      2. 键名必须用双引号包裹，如 `"status"` 不是 `status`
-      3. 字符串值必须用双引号包裹，如 `"completed"` 不是 `completed`
-      4. 数组元素用双引号包裹，如 `["假设 1"]` 不是 `[假设 1]`
-      5. 不要有尾随逗号
-
-      必须输出且只能输出以下 JSON 结构：
-      ```json
-      {"status":"completed","output_summary":"一句话总结","required_outputs":{"user_goal_restated":"用户想要什么","definition_of_done":["可观测完成标准 1"],"assumptions":[]}}
-      ```
+      - **可以**阅读总体任务附带的 PDF/图片附件来理解需求
+      - **不要**开始执行任务——不要写代码、不要改文件、不要创建分支
+      - 产出 required_outputs 即可——后续阶段会基于你的产出推进
     allowed_tools:
       - read_file
       - shell
@@ -466,7 +418,7 @@ stages:
       assumptions:
         type: array
         items: string
-        description: 自主推断的保守假设；没有则 []
+        description: 自主推断的假设；不确定的功能等价性必须标注"需用户确认"
     auto_retry_limit: 5
     hooks:
       post_output_assertions:
@@ -483,9 +435,14 @@ stages:
 
           **分析内容**：
           1. 用户说的"是什么"——字面任务描述
-          2. 用户真正"要什么"——任务背后的真实诉求（如"修崩溃"背后可能是"让用户能正常访问页面"）
+          2. 用户真正"要什么"——任务背后的真实诉求
           3. 隐含需求——用户没明说但合理的期望（如"修完后不应引入新 bug"、"改动应保持现有风格"）
-          4. 未明说的期望——从项目画像和代码惯例中推断（如"需要加测试"、"需要更新文档"）
+          4. 未明说的期望——从项目画像和代码惯例中推断
+
+          **关键纪律**：
+          - 区分"确定的"和"推测的"——推测的标 low confidence
+          - **功能等价性不确定时不要自己推断**：两个概念（如 CHTRPWD vs CHLPWD）是同一功能还是不同功能？
+            标记为"需确认"而不是自行决定合并。错误合并是功能回退的第一来源。
 
           **输出格式**（JSON）：
           ```json
@@ -494,13 +451,13 @@ stages:
             "real_goal": "用户真正的诉求（一句话）",
             "implicit_needs": ["隐含需求 1", "隐含需求 2"],
             "unstated_expectations": ["从代码惯例推断的期望 1"],
+            "uncertain_equivalences": ["不确定是否等价的 case 列表（如有）"],
             "confidence": "high|medium|low"
           }
           ```
 
           **约束**：
           - 只读，不写任何文件
-          - 区分"确定的"和"推测的"——推测的标 low confidence
 
       done-analyzer:
         description: 基于代码上下文推断"完成的样子"——可观测的验收标准
@@ -513,7 +470,7 @@ stages:
 
           **分析内容**：
           1. 从用户任务描述中识别关键行为变化（如"崩溃"→"不崩溃"、"未登录"→"跳转登录"）
-          2. 推断可观测的完成标准——必须是可以看到/测到的，不能是抽象的（"代码质量好"不算）
+          2. 推断可观测的完成标准——必须是可以看到/测到的，不能是抽象的
           3. 考虑：什么行为变化能证明任务完成了？什么测试能验证？
           4. 如能从代码中找到相关入口/路由/组件，标注文件路径
 
@@ -533,679 +490,170 @@ stages:
           - 只读，不写任何文件
           - 完成标准必须是可观测的——"用户能正常访问页面"而不是"代码写得好"
           - 不确定的推断标 low confidence
-  - id: investigate
-    name: 勘察
+
+  - id: decompose
+    name: 拆分
     instructions: |
-      你是勘察阶段的**协调者**。你的任务不是自己逐文件读代码——而是把勘察任务分派给 3 个专门的 sub-agent，收集它们的结构化结果，横向对比后形成调查结论。
+      你是拆分阶段的**协调者**。这是整个工作流中**最重要的阶段**——拆分质量决定了后续所有步骤的可靠性。
+
+      你的核心信念：**两个 case 只要有一个参数不同，就是两个独立 task。**
+      合并两个 case 减少行数但丢失参数 → 不是"高效"，是功能回退。
 
       **协调流程**：
 
-      1. **确定目标符号列表**：从用户任务描述和前序阶段结论中提取需要调查的符号（函数/组件/类/模块），列成清单。每个符号是一个独立的调查目标。
+      1. **委派 task-decomposer sub-agent**：通过 Task 工具调用，输入：
+         - understand 的 user_goal_restated + definition_of_done
+         - 项目画像的 project_facts
+         让 sub-agent 深入阅读受影响的代码，产出结构化的 task_items。
 
-      2. **逐目标委派 sub-agent**：对每个目标符号，分别调用 3 个 sub-agent（可通过 Task 工具并行调用）：
-         - `precondition-investigator`：调查"这个符号被调用前，调用方做了什么前置检查"
-         - `wrapper-investigator`：调查"是否存在封装了这个符号行为的中间层"
-         - `callsite-investigator`：调查"这个符号的所有调用方、参数模式、入口路径"
-         一次只调查一个目标符号。不要在一次调用中塞多个目标——那会稀释深度。
+      2. **审核 sub-agent 的拆分结果**：
+         - 逐条检查每个 task 的 pre_behavior 是否从代码中**实际读取**（不是推断）
+         - 检查拆分粒度：一个 task = 一个行为原子（一个 pageName case、一个函数签名变更）
+         - 功能等价性不确定的 case → 拆成两个独立 task，不要合并
+         - 每个 task 的 acceptance_criteria 是否包含 "参数完整性" + "业务函数保留" + "导航目标一致" + "不涉及无关文件"
 
-      3. **收集并横向对比**：每个目标 x 3 个维度的结果汇总后，横向对比：
-         - 哪些目标有前置检查？哪些没有？这些差异是否合理？
-         - 哪些目标有中间层封装？调用方是通过封装层还是直接调用？
-         - 所有调用方都传了哪些参数？哪些参数从没人传？
-         - 发现不一致的模式——这就是潜在的问题点。
+      3. **输出**：审核通过后给出 task_items。如果发现 pre_behavior 有从代码中读取不到的（推断的），标为 low confidence 并在 task description 中注明"需确认"。
 
-      4. **标记置信度**（每条结论必标）：
-         - **high**：代码直读确认 / git log 明确记录
-         - **medium**：推断但有间接证据
-         - **low**：纯推断 / 未读到关键代码
-         标 low 不是坏事，是诚实暴露——self_review 阶段会优先核对 low 项。
+      **拆分粒度标准**：
+      - 一个 task = 一个行为原子
+      - 两个 case 只要有一个参数不同 = 两个独立 task
+      - 不是"实现所有密码相关页面"=1 个 task——CHTRPWD（修改交易密码）和 CHLPWD（修改登录密码）是两个 task
+      - 不是"实现所有跳转逻辑"=1 个 giant task——LQBInvest、ESCTR、MIA、Setting 各自是一个 task
 
-      5. **输出**：required_outputs 中给出结构化调查结论。不要散文报告——给 implement 阶段可以直接消费的、逐目标的事实清单。
-
-      **搜索纪律**：grep 时尝试常见变体——驼峰/下划线互转、笔误、单复数。搜不到不要直接下"不存在"的结论——检查是否有命名接近的符号。
+      **人类暂停**：task_items 产出后，暂停等人类确认。人类会检查 pre_behavior 是否正确、拆分粒度是否合理。
 
       **任务边界（重要）**：
-      - 你的调查范围来自 `understand` 阶段的 user_goal_restated 和 definition_of_done——基于它们确定调查目标
-      - **不要**重新阅读原始业务需求的 PDF/图片附件——`understand` 阶段已经完成了需求理解
-      - **不要**自己推断"用户可能还需要……"然后扩大调查范围——聚焦于当前任务需要的符号和模块
-      - 聚焦于代码事实：调用方、前置检查、封装层、边界条件、未知项
-      - 产出 required_outputs 即可，**不要**动手改代码
-
-      required_outputs（JSON 字段）：
-        - similar_callsites: 覆盖"同类参考"+"调用方清单"两类，至少 3 条 path:line + 一句话作用
-        - evidence_findings: 已证实结论列表；每条包含结论、证据 path:line、置信度 high/medium/low、依据类型
-        - callsite_assumptions: 调用方语义假设清单；无目标符号写"本次无目标符号"
-        - boundary_cases: 已知需要处理或确认的边界、异常路径与安全/权限边界
-        - unknowns: 未查清的事项（写"无"也可以，但不能省略——沉默不算回答）
-
-      ⚠️ JSON 输出前请先 JSON.parse 验证。
+      - 你的职责是**拆分任务**——不是实施、不是审查实施结果
+      - **必须**实际读代码来确认 pre_behavior（通过 sub-agent），不能凭命名惯例推断
+      - **不要**试图实施——产出 task_items 后你的工作就完成了
+      - 不确定的功能等价性 → 拆成独立 task + 标注"需确认"，不要自己决定合并
     allowed_tools:
       - read_file
       - shell
     required_outputs:
-      - similar_callsites
-      - evidence_findings
-      - callsite_assumptions
-      - boundary_cases
-      - unknowns
+      - task_items
     output_schema:
-      similar_callsites:
+      task_items:
         type: array
+        critical: true
         items:
           type: object
           properties:
-            path_line: string
-            pattern: string
-        description: 同类参考与调用方清单，至少 3 条 path:line + 模式说明
-      evidence_findings:
-        type: array
-        items:
-          type: object
-          properties:
-            finding: string
-            evidence: string
-            confidence: high | medium | low
-            basis: 代码直读 | git log | 测试 | 推断
-        description: 已证实结论列表
-      callsite_assumptions:
-        type: array
-        items: string
-        description: 调用方语义假设清单；无目标符号写 ["本次无目标符号"]
-      boundary_cases:
-        type: array
-        items: string
-        description: 已知需要处理或确认的边界、异常路径与安全/权限边界
-      unknowns:
-        type: array
-        items: string
-        description: 未查清事项；没有则 ["无"]
-    auto_retry_limit: 3
-    hooks:
-      post_output_assertions:
-        - needs_rework_target_required
-        - unknowns_present
-        - no_trailing_unparsed_payload
-    agents:
-      precondition-investigator:
-        description: 调查目标符号被调用前的前置检查模式（守卫/校验/条件判断/权限检查）
-        tools: [Read, Grep, Bash]
-        prompt: |
-          你的任务：调查**一个**目标符号被调用前，所有调用点做了什么前置检查。
-
-          **前置步骤：读项目画像**
-          先读 CLAUDE.md、.claude/CLAUDE.md、.claude/rules/ 中与本次调查相关的部分。重点关注：项目惯例、架构决策、已知陷阱、命名约定。把画像信息作为调查的已知上下文——当代码行为和画像描述冲突时，以代码为准，但标注冲突。
-
-          **调查内容**：
-          1. 找到目标符号的所有调用点（grep 符号名）
-          2. 对每个调用点，看在调用前有什么前置逻辑：
-             - 条件守卫（if 检查、guard、assert、三元判断）
-             - 状态校验（非空检查、类型检查、状态检查）
-             - 权限/身份检查（仅记录代码里实际存在的，不要推断"应该有什么"）
-             - 其他前置逻辑（埋点、日志、参数转换）
-          3. 总结模式：多数调用方做了什么？哪些调用方没做？差异是否合理？
-
-          **输出格式**（JSON）：
-          ```json
-          {
-            "target": "目标符号名",
-            "profile_context": "项目画像中与此相关的信息（无则写'无'）",
-            "call_sites": [
-              {
-                "file_line": "路径:行号",
-                "preconditions": ["检查1", "检查2"],
-                "raw_code": "关键代码片段（≤3行）"
-              }
-            ],
-            "pattern_summary": "多数调用方的模式是什么？哪些不一致？",
-            "confidence": "high|medium|low"
-          }
-          ```
-
-          **约束**：
-          - 只调查一个目标符号。不要在一次调用中调查多个。
-          - 只记录"代码里实际存在的"——不要推断"应该有什么"。
-
-      wrapper-investigator:
-        description: 调查目标行为是否已被封装为中间层（工具函数/帮助函数/Hook/服务层）
-        tools: [Read, Grep, Bash]
-        prompt: |
-          你的任务：调查**一个**目标行为是否已被封装为中间层。
-
-          **前置步骤：读项目画像**
-          先读 CLAUDE.md、.claude/CLAUDE.md、.claude/rules/ 中与本次调查相关的部分。重点关注：项目惯例、架构决策、已知陷阱、命名约定。把画像信息作为调查的已知上下文。
-
-          **调查内容**：
-          1. 搜索封装层：grep 包含目标符号名或相关行为的函数定义/导出/方法
-          2. 读封装层代码：理解它做了什么（前置逻辑、默认参数、错误处理、后置逻辑）
-          3. 区分"封装者"和"使用者"：
-             - 封装者：自己定义了函数体，内部调用了目标
-             - 使用者：调用了封装者或目标
-          4. 如果存在封装层，调查有多少调用方通过封装层 vs 直接调用目标
-
-          **搜索纪律**：注意命名可能有笔误/变体——尝试驼峰/下划线互转、单复数、常见笔误。
-
-          **输出格式**（JSON）：
-          ```json
-          {
-            "target": "目标符号名",
-            "profile_context": "项目画像中与此相关的信息（无则写'无'）",
-            "wrappers": [
-              {
-                "name": "封装名称",
-                "file_line": "路径:行号",
-                "what_it_does": "封装做了什么额外的事",
-                "used_by_count": 3
-              }
-            ],
-            "direct_vs_wrapped": "多少调用方通过封装层 vs 直接调用",
-            "recommendation": "应该用封装层还是直接调用？理由？",
-            "confidence": "high|medium|low"
-          }
-          ```
-
-          **约束**：
-          - 只调查一个目标符号。
-          - 如果找不到封装，如实写"未找到"——不要编造。
-
-      callsite-investigator:
-        description: 调查目标符号的所有调用方、参数模式、入口路径
-        tools: [Read, Grep, Bash]
-        prompt: |
-          你的任务：调查**一个**目标符号的所有调用方和调用模式。
-
-          **前置步骤：读项目画像**
-          先读 CLAUDE.md、.claude/CLAUDE.md、.claude/rules/ 中与本次调查相关的部分。重点关注：项目惯例、架构决策、已知陷阱、命名约定。把画像信息作为调查的已知上下文。
-
-          **调查内容**：
-          1. Grep 目标符号名，找到所有调用点
-          2. 对每个调用点，记录：
-             - 文件:行号
-             - 参数：传了哪些值
-             - 入口：是通过封装层间接调用，还是直接调用目标本身
-             - 上下文：调用前做了什么（如有前置检查 agent 的结果，参考它）
-          3. 总结模式：
-             - "所有调用方都传了哪些参数"
-             - "哪些参数从没人传"
-             - "N/M 个调用方通过封装层调用"
-             - 至少看 2-3 处调用方（如果调用方超过 3 个，选最典型的 3 个深读，其余统计模式）
-
-          **输出格式**（JSON）：
-          ```json
-          {
-            "target": "目标符号名",
-            "profile_context": "项目画像中与此相关的信息（无则写'无'）",
-            "total_callsites": 5,
-            "sampled_callsites": [
-              {
-                "file_line": "路径:行号",
-                "params_passed": {"param1": "value1"},
-                "entry_type": "wrapper|direct",
-                "entry_name": "封装名或'直接'"
-              }
-            ],
-            "pattern_summary": {
-              "always_passed": ["所有调用都传的参数"],
-              "never_passed": ["从没人传的参数"],
-              "wrapper_usage": "3/5 通过封装层调用"
-            },
-            "confidence": "high|medium|low"
-          }
-          ```
-
-          **约束**：
-          - 只调查一个目标符号。
-          - 至少深读 2-3 处调用方，不要只看签名。
-
-  - id: align
-    name: 对齐
-    instructions: |
-      你是对齐阶段的**协调者**。你的任务不是自己逐文件扫描——而是把一致性调查分派给 3 个专门的 sub-agent，收集它们的结果，横向对比后形成约束清单。
-
-      **协调流程**：
-
-      1. **并行委派 sub-agent**：同时启动以下 3 个 sub-agent（通过 Task 工具并行调用）：
-         - `auth-consistency-checker`：扫描同类模块/页面的鉴权模式，识别一致性与差异
-         - `style-convention-checker`：扫描同类代码的写法模式（直接调用/封装层/middleware/错误处理/命名）
-         - `change-radius-baseliner`：统计同类改动的文件数、行数、抽象层，建立最小改动半径基准
-
-      2. **收集并综合**：收到三个 sub-agent 的结果后：
-         - 逐条对比，去重、合并同类约束
-         - 鉴权差异：逐条判断是"合理差异"（页面敏感度不同）还是"历史遗漏"（需要补）
-         - 风格惯例：提取不可违反的模式（50 个页面用 A，第 51 个必须用 A）
-         - 改动半径：建立本次改动不应超越的上限
-
-      3. **输出**：`lateral_constraints` 必须是合法 JSON 数组；每条是对象，包含 constraint、evidence、implication 三个字符串字段。不要输出裸 key/value 清单。
-         output_summary 里写明：横向约束清单 + 已自主确认的事项 +（如有）需要用户决策的问题。
-
-      **自主决策原则**：能查代码确认的就不要问用户。只有涉及不可逆操作、需求有歧义且代码无法确认、需要在多个合理方案中做选择时才 ask_human。
-
-      **任务边界（重要）**：
-      - 你的输入是前序阶段（understand/investigate）的 required_outputs——基于它们确定横向对比范围
-      - **不要**重新阅读原始业务需求的 PDF/图片附件——前序阶段已经提取了关键信息
-      - 聚焦于一致性扫描：鉴权模式、代码风格、改动半径基准
-      - 产出 lateral_constraints 即可，**不要**动手改代码
-    allowed_tools:
-      - read_file
-      - shell
-    required_outputs:
-      - lateral_constraints
-    output_schema:
-      lateral_constraints:
-        type: array
-        items:
-          type: object
-          properties:
-            constraint: string
-            evidence: string
-            implication: string
-        description: 横向一致性约束清单；每项包含约束、证据来源/同类位置、对本次改动的含义
+            task_id: string
+            description: string
+            file: string
+            pre_behavior:
+              type: object
+              properties:
+                location: string
+                guards: array<string>
+                navigation_target: string
+                params: object
+                business_function: string
+            acceptance_criteria: array<string>
+        description: 原子级子任务列表；每个 task 含改动前行为快照和验收标准
     auto_retry_limit: 1
     hooks:
       post_output_assertions:
-        - needs_rework_target_required
         - no_trailing_unparsed_payload
     agents:
-      auth-consistency-checker:
-        description: 扫描同类模块/页面的鉴权模式，识别一致性与差异，判断差异是否合理
+      task-decomposer:
+        description: 深入阅读代码，将用户任务拆分为原子级子任务——每个子任务含改动前行为快照
         tools: [Read, Grep, Bash]
         prompt: |
-          你的任务：扫描与本次改动相关的同类模块/页面的鉴权模式。
+          你的任务：阅读受影响的代码，将用户任务拆分为原子级子任务。
 
-          **前置步骤**：
-          - 读项目画像（CLAUDE.md、.claude/CLAUDE.md），了解鉴权架构和惯例
-          - 从用户任务和前序阶段结论中确定本次改动涉及的模块/页面范围
+          **拆分流程**：
 
-          **调查内容**：
-          1. 找到与本次改动目标同类的模块/页面（如同类页面、同类 API、同类组件）
-          2. 对每个同类模块，记录其鉴权方式：
-             - 入口处有什么鉴权检查（登录检查、权限检查、角色检查）
-             - 鉴权在哪里做的（middleware/路由守卫/组件内/函数开头）
-             - 鉴权失败时怎么处理的（跳转登录/弹提示/静默忽略）
-          3. 对比：哪些模块鉴权一致？哪些不一致？
-          4. 判断不一致是否合理：资金页面比客服页面鉴权更严 → 合理；两个同类列表页面一个检查登录一个不检查 → 可能遗漏
+          1. **确定目标区域**：从 user_goal_restated 和项目画像中找到受影响的代码文件（如 homepageRedirection.js 中的 switch-case 或 map 结构）
+
+          2. **逐个读取每个 case/入口的现有行为**：对每个要处理的 case（pageName / 分支 / 调用点），从代码中实际读取：
+             - 它当前调用了什么函数？（如 `goReservationsManagerFun(navigator)`、`CommonlyUsedFunctions.onlineService.onPress`）
+             - 它当前传了哪些参数？（如 `{changeType: '交易'}`、`{title: '忘记交易密码'}`、`dispatch`、`navigator`）
+             - 它当前有什么 guard？（如 `goLogin`、`isRealNameDecide`、无 guard）
+             - 它的导航目标是什么？（如 `navigator.push({component: LQBInvest})`）
+
+          3. **为每个 case 创建一个 task**：
+             ```
+             task_id: "ESCTR"
+             description: "为托管转入页面添加 AI Agent 跳转逻辑"
+             pre_behavior:
+               location: "homepageRedirection.js:710"
+               guards: ["isLoginAndCert"]
+               params: {dispatch: "来自 Redux connect 的 dispatch"}
+               business_function: null
+             acceptance_criteria:
+               - "params 中的 dispatch 保留"
+               - "isLoginAndCert guard 保留"
+               - "跳转目标正确"
+               - "不涉及其他 pageName 的改动"
+             ```
+
+          **关键纪律**：
+          - **每一个 case、每一个参数、每一个业务函数调用——都从代码中读出来，不是推断出来**
+          - 两个 case 只要有一个参数不同 → 两个独立 task
+          - 功能等价性不确定 → 拆成独立 task + 在 description 中标注"需确认"
+          - 参数差异 = 行为差异。不要合并差异化 case
 
           **输出格式**（JSON）：
           ```json
           {
-            "scope": "本次涉及的模块/页面范围",
-            "surveyed_modules": [
+            "task_items": [
               {
-                "module": "模块/页面路径",
-                "auth_pattern": "鉴权方式描述",
-                "auth_location": "middleware/路由守卫/组件内",
-                "failure_handling": "失败时的处理"
+                "task_id": "唯一标识",
+                "description": "这个 task 做什么",
+                "file": "要改的文件路径",
+                "pre_behavior": {
+                  "location": "代码位置 path:line",
+                  "guards": ["前置检查列表"],
+                  "navigation_target": "导航目标",
+                  "params": {"参数名": "参数值或说明"},
+                  "business_function": "调用的业务函数名（如 goReservationsManagerFun），无则 null"
+                },
+                "acceptance_criteria": [
+                  "验收标准 1：具体、可核对、不抽象"
+                ]
               }
             ],
-            "consistency_findings": [
-              {
-                "finding": "一致性发现",
-                "is_justified_difference": true,
-                "reason": "判断理由"
-              }
-            ],
-            "constraints_for_this_change": [
-              {"constraint": "约束", "evidence": "证据来源 path:line", "implication": "对本次改动的含义"}
-            ],
+            "decomposition_notes": "拆分说明：每个 case 的区别、不确定的等价性、人工需确认的项",
             "confidence": "high|medium|low"
           }
           ```
 
           **约束**：
           - 只读，不写任何文件
-          - 不要机械统一——逐条判断差异是否合理
-          - 找不到同类模块时如实报告，不要编造
+          - 必须实际读代码来填充 pre_behavior——不允许推断
+          - pre_behavior 中的每个字段都要有代码来源
 
-      style-convention-checker:
-        description: 扫描同类代码的写法模式（直接调用/封装层/middleware/错误处理/命名），提取必须沿用的惯例
-        tools: [Read, Grep, Bash]
-        prompt: |
-          你的任务：扫描同类代码的写法模式，提取本次必须沿用的惯例。
-
-          **前置步骤**：
-          - 读项目画像（CLAUDE.md、.claude/CLAUDE.md），了解项目代码风格和命名约定
-
-          **调查内容**：
-          1. 确定本次改动涉及的代码类型（如页面组件/API 路由/工具函数/状态管理）
-          2. 找同类代码（≥3 处），记录它们的模式：
-             - 调用方式：直接调用底层 / 通过公共封装 / 通过 middleware 包裹
-             - 错误处理：try-catch / .catch() / 错误边界组件 / 不处理
-             - 日志：有日志 / 无日志 / 什么级别
-             - 命名：驼峰/下划线/帕斯卡、文件命名、目录组织
-             - 参数风格：解构传参 / options 对象 / 位置参数
-             - 导入风格：具名导入 / 默认导入 /  barrel export
-          3. 提取"不可违反的惯例"：≥80% 同类代码都遵循的模式
-
-          **输出格式**（JSON）：
-          ```json
-          {
-            "code_category": "页面组件/API 路由/...",
-            "sampled_peers": ["路径 1", "路径 2", "路径 3"],
-            "conventions": [
-              {
-                "aspect": "调用方式/错误处理/日志/命名/参数/导入",
-                "dominant_pattern": "多数代码的模式",
-                "peer_count": "3/5",
-                "must_follow": true
-              }
-            ],
-            "constraints_for_this_change": [
-              {"constraint": "约束", "evidence": "证据来源 path:line", "implication": "对本次改动的含义"}
-            ],
-            "anti_patterns": ["同类代码普遍避免的做法"],
-            "confidence": "high|medium|low"
-          }
-          ```
-
-          **约束**：
-          - 只读，不写任何文件
-          - 一致性 > 架构优雅——即使模式不完美，也要沿用
-          - 至少看 3 处同类代码，不够就如实说
-
-      change-radius-baseliner:
-        description: 统计同类改动的文件数、行数、引入的抽象层，建立"最小改动半径"基准
-        tools: [Read, Bash]
-        prompt: |
-          你的任务：通过 git log 统计同类改动的规模，建立本次改动不应超越的上限。
-
-          **前置步骤**：
-          - 从用户任务和前序阶段结论中确定本次改动涉及的关键词（文件名/符号名/功能域）
-
-          **调查内容**：
-          1. 跑 `git log --oneline --all -30` 找到与本次同类/同模块的近期 commit
-          2. 对每个同类 commit，跑 `git diff --stat <commit>^..<commit>` 统计：
-             - 改了哪些文件
-             - 每个文件增删行数
-             - 总增删行数
-          3. 识别这些改动引入了什么：
-             - 只是改几行逻辑？
-             - 加了新文件/新组件/新测试？
-             - 引入了新的抽象层（工具函数/中间件/帮助函数）？
-          4. 统计中位数和上限：同类改动通常改几个文件、增减多少行
-
-          **输出格式**（JSON）：
-          ```json
-          {
-            "sampled_commits": [
-              {
-                "hash": "abc123",
-                "message": "commit 消息",
-                "files_changed": 3,
-                "lines_added": 15,
-                "lines_deleted": 5,
-                "introduced_abstractions": []
-              }
-            ],
-            "median_stats": {
-              "files": 3,
-              "lines_added": 15,
-              "lines_deleted": 5
-            },
-            "upper_bound": {
-              "files": 6,
-              "lines_added": 40,
-              "lines_deleted": 20
-            },
-            "constraints_for_this_change": [
-              {"constraint": "约束", "evidence": "证据来源", "implication": "对本次改动的含义"}
-            ],
-            "note": "本次改动不应显著超越 upper_bound。同类改动没引入的抽象层，本次也不引入。",
-            "confidence": "high|medium|low"
-          }
-          ```
-
-          **约束**：
-          - 只读，不写任何文件
-          - 跑 git 命令时加上 `--no-pager`
-          - 找不到同类 commit 时标注 low confidence，不要编造
-  - id: design
-    name: 方案
-    instructions: |
-      你是方案阶段的**协调者**。你的任务不是自己一个人设计方案——而是把方案生成和风险评估分派给 3 个专门的 sub-agent，收集它们的提案，横向对比后做出最终选择。
-
-      **协调流程**：
-
-      1. **并行委派 sub-agent**：同时启动以下 3 个 sub-agent（通过 Task 工具并行调用）：
-         - `minimal-change-planner`：从"最小改动"角度设计方案——只改必须改的，不引入新抽象
-         - `robust-planner`：从"最稳健"角度设计方案——充分处理边界、错误、回滚
-         - `risk-forecaster`：从已知事实推断风险面（不依赖具体方案，基于 investigate 的 unknowns/boundary_cases 预演风险）
-
-      2. **收集并选型**：收到三个 sub-agent 的结果后：
-         - 并排比较两个方案的复杂度、风险、可逆性
-         - risk-forecaster 识别的风险面→确认最终方案的 risk_register
-         - 综合选出最终方案（可以是某一方案、或两者融合），写清选定理由
-
-      3. **输出**：`selected_plan` 每步引用 investigate.evidence_findings 或 align.lateral_constraints；`success_criteria` 承接 understand.definition_of_done；`test_plan` 跳过必须写理由；`risk_register` 覆盖最易错处、最低置信处、回滚触发条件。
-
-      **保守原则**：evidence_findings 中标了 low 置信度的事项，选改动最小的路径。不确定加不加的东西，不加。同类改动没引入的抽象层，本次也不引入。
-
-      **任务边界（重要）**：
-      - 你的输入是前序阶段（understand/investigate/align）的 required_outputs——基于它们设计方案
-      - **不要**重新阅读原始业务需求的 PDF/图片附件——前序阶段已经完成了需求理解
-      - 聚焦于方案设计：候选方案对比、选定理由、事前风险预演
-      - 产出 required_outputs（selected_plan + success_criteria + test_plan + risk_register）即可
-      - **不要**动手写实现代码——那是 `implement` 阶段的职责
-    allowed_tools:
-      - read_file
-    required_outputs:
-      - selected_plan
-      - success_criteria
-      - test_plan
-      - risk_register
-    output_schema:
-      selected_plan:
-        type: array
-        items:
-          type: object
-          properties:
-            step: string
-            evidence_refs: array<string>
-        description: 选定方案步骤清单；每步引用 investigate.evidence_findings 或 align.lateral_constraints
-      success_criteria:
-        type: array
-        items: string
-        description: 可验证完成标准，承接 understand.definition_of_done
-      test_plan:
-        type: array
-        items:
-          type: object
-          properties:
-            check: string
-            covers: string
-            skip_reason: string
-        description: 要跑/要新增/可接受跳过的验证；跳过必须写 skip_reason
-      risk_register:
-        type: array
-        items:
-          type: object
-          properties:
-            risk: string
-            mitigation: string
-            trigger: string
-        description: 事前风险与预案，覆盖最易错处、最低置信处、回滚/返工触发条件
-    auto_retry_limit: 1
-    hooks:
-      post_output_assertions:
-        - needs_rework_target_required
-        - no_trailing_unparsed_payload
-    agents:
-      minimal-change-planner:
-        description: 从"最小改动"角度设计方案——只改必须改的，不引入新抽象
-        tools: [Read]
-        prompt: |
-          你的任务：从"最小改动"视角设计实施方案。
-
-          **前置步骤**：
-          - 阅读前序阶段的 required_outputs：understand（用户目标/DoD）、investigate（证据/边界/未知）、align（横向约束）
-
-          **设计原则**：
-          1. 只改必须改的——每行改动都要能说清"为什么必须变"
-          2. 不引入新抽象——不用新建工具函数/中间件/帮助函数，除非不改就无法完成任务
-          3. 沿用已有调用模式——同类代码怎么调用的，本次就怎么调用
-          4. 改动文件数、行数尽可能少——改动正确性与改动量成反比
-          5. 对照 align.lateral_constraints 中的 change-radius 上限，不超过同类改动规模
-
-          **输出格式**（JSON）：
-          ```json
-          {
-            "approach": "minimal-change",
-            "philosophy": "为什么最小改动是合适的（一句话）",
-            "steps": [
-              {
-                "step": "具体步骤",
-                "files_to_touch": ["文件路径"],
-                "evidence_refs": ["引用的证据"]
-              }
-            ],
-            "total_files_estimated": 2,
-            "total_lines_estimated": 15,
-            "new_abstractions": [],
-            "pros": ["优点 1"],
-            "cons": ["缺点 1"],
-            "confidence": "high|medium|low"
-          }
-          ```
-
-          **约束**：
-          - 只读，不写任何文件
-          - 不确定加不加的东西，不加
-
-      robust-planner:
-        description: 从"最稳健"角度设计方案——充分处理边界、错误、回滚
-        tools: [Read]
-        prompt: |
-          你的任务：从"最稳健"视角设计实施方案。
-
-          **前置步骤**：
-          - 阅读前序阶段的 required_outputs：understand（用户目标/DoD）、investigate（证据/边界/未知）、align（横向约束）
-
-          **设计原则**：
-          1. 充分处理 investigate.boundary_cases 中列出的所有边界
-          2. 对 investigate.unknowns 中的不确定事项，选择最保守的处理方式
-          3. 每个改动点都要考虑：如果这里失败了会怎样？如何回滚？
-          4. 鉴权、错误处理、日志必须与 align.lateral_constraints 中同类模块一致
-          5. 即使充分处理，仍然控制改动规模——"稳健"不等于"加码"
-
-          **输出格式**（JSON）：
-          ```json
-          {
-            "approach": "robust",
-            "philosophy": "为什么需要稳健处理（一句话）",
-            "steps": [
-              {
-                "step": "具体步骤",
-                "files_to_touch": ["文件路径"],
-                "boundary_handling": "如何处理边界",
-                "rollback": "如何回滚",
-                "evidence_refs": ["引用的证据"]
-              }
-            ],
-            "total_files_estimated": 2,
-            "total_lines_estimated": 25,
-            "new_abstractions": [],
-            "pros": ["优点 1"],
-            "cons": ["缺点 1"],
-            "confidence": "high|medium|low"
-          }
-          ```
-
-          **约束**：
-          - 只读，不写任何文件
-          - 充分处理边界 ≠ 过度工程——边界处理要可观测（有测试/有日志/有回滚），不是空口保证
-
-      risk-forecaster:
-        description: 对方案做风险预演，识别易错点、最没把握的反例
-        tools: [Read]
-        prompt: |
-          你的任务：对即将产生的方案做事前风险预演——在动手之前，而不是事后挑刺。
-
-          **前置步骤**：
-          - 阅读前序阶段的 required_outputs：investigate（evidence_findings/confidence、boundary_cases、unknowns、callsite_assumptions）、align（lateral_constraints）、understand（assumptions）
-
-          **分析内容**（不依赖具体方案，从已知事实推断风险面）：
-          1. **低置信风险**：investigate.evidence_findings 中标了 low/medium 置信度的结论——这些是"地基不牢"的地方。如果方案基于这些结论，风险是什么？
-          2. **边界遗漏风险**：investigate.boundary_cases 中哪些边界最容易在处理时被遗漏？
-          3. **未知雷区**：investigate.unknowns 中哪些"未知"如果实际与假设相反，会导致方案失败？
-          4. **调用方断裂风险**：investigate.callsite_assumptions 中哪些假设如果被打破，会影响多少调用方？
-          5. **横向一致性风险**：align.lateral_constraints 中哪些约束最容易在实施时被忽略？
-          6. **最易出错的两三处**：综合以上，预测实施中最容易出错的点
-
-          **输出格式**（JSON）：
-          ```json
-          {
-            "top_risks": [
-              {
-                "risk": "风险描述",
-                "likelihood": "high|medium|low",
-                "impact": "high|medium|low",
-                "trigger": "什么情况下会发生",
-                "mitigation": "预防/缓解措施"
-              }
-            ],
-            "low_confidence_dependencies": ["依赖了哪些 low 置信度结论"],
-            "most_error_prone_areas": ["最易出错的 2-3 处"],
-            "recommended_safeguards": ["建议的防护措施"],
-            "confidence": "high|medium|low"
-          }
-          ```
-
-          **约束**：
-          - 只读，不写任何文件
-          - 这是事前预演，不是事后挑刺——挑的是"动手前心里没底的地方"
-          - 不要因为"可能有风险"就建议不做——每个风险都给缓解措施
   - id: implement
     name: 实施
     instructions: |
-      严格按 design 实施最小改动；偏离 design 必须 needs_rework 回到 design。
+      你是实施阶段的**协调者**。你的任务是对 decompose.task_items 中的**每一个 task**，用**全新的 sub-agent**（fresh context）实施，然后立即用另一个 fresh sub-agent 做机械验证。通过 → 下一个 task。失败 → 重试（最多 2 次），仍失败 → 标记 BLOCKED 继续下一个。
 
-      **任务点驱动（基于真实需要，不刷次数）**：
-      动手前先想清楚——总体目标（understand.user_goal_restated）和本阶段目标（design 成功标准）是什么？
-      基于真实需要列出本次要做的 Points（要读哪些文件、改哪些、跑什么验证），逐步执行，每步对照目标自检：
-        - 这个 Point 做完了吗？还偏离总体目标吗？需要回 design 吗？
-        - "看几次"由真实需要决定——理解了就不必再读，没理解就读到理解为止。不为凑次数而刷 Read。
-        - 涉及不可逆 shell 操作（rm/git reset/drop table/truncate）时，先 ask_human 取得用户同意（宿主强制）。
-      "先看后改"是纪律，但次数不硬性门控（那会让模型为凑次数而形式读取）。改由你自检是否真的理解了目标文件。
+      **核心原则**：
+      - **每个 task 一个 fresh implementer sub-agent**：sub-agent 的上下文只有这一个 task 的信息——一组参数、一个业务函数、一个跳转目标。不需要在 11 套数据间切换注意力
+      - **每个 task 一个 fresh verifier sub-agent**：不做判断，只做核对——参数还在吗？函数还调吗？文件改对了吗？
+      - **PASS/FAIL 判定机械化**：verifier 的核对清单每一项只需回答 YES/NO
 
-      **每个 Point 动手前的前置三步**（不做完不动手改代码）：
-      1. **读被调用者定义**：你要修改/调用的每个函数/组件/类，先 Read 它的源码定义（函数签名、参数类型、返回值、内部做了什么校验/副作用）。不要凭命名惯例假设它做什么。
-      2. **查已有调用方**：grep 这个符号的所有已有调用方，至少看 2-3 处——它们传了什么参数、用了什么入口（直接调用/包装器/middleware）、入口处做了什么鉴权。已有调用方的写法就是你应遵循的模版。
-      3. **找公共封装**：检查项目里是否有包装器/帮助函数/公共入口封装了你要做的事情（注意：命名可能有笔误、变体——搜不到时试试常见拼写变形）。有公共封装就必须用公共封装，不要直接调用底层。
+      **Task 循环流程**：
 
-      每改完一个 Point，在 "## 改动核对" 里写一段，写清楚：
-      - 读了哪些被调用者定义（path:line）
-      - 参考了哪些已有调用方（path:line）
-      - 用的入口是什么（公共封装 or 直接调用）
-      - 推进了哪条 success_criteria + 引入了什么新风险。写法例：
-        ```markdown
-        ### src/auth/login.ts
-        - 被调用者：ConmmonlyUsedFunctions.onlineService（utils/common.ts:142）
-        - 调用方参考：Setting 页面（pages/Setting/index.tsx:23）
-        - 入口：公共封装（ConmmonlyUsedFunctions）
-        - 推进：success_criteria 第 2 条（未登录跳转 /settings）
-        - 新风险：引入了 redirect 时序依赖，需 self_review 跑一遍 e2e
-        ```
-      然后才进入下一个 Point。改完所有 Point 后，跑 git diff 确认本次改动只包含目标相关的变更——**没有任何顺手重构、格式统一、无关优化**。
+      ```
+      对 task_items 中的每个 task:
+        1. 准备 implementer 上下文：task 全文 + pre_behavior + acceptance_criteria + 要改的文件完整内容
+        2. 启动 implementer sub-agent → DONE | DONE_WITH_CONCERNS | BLOCKED
+        3. 如果 BLOCKED → 标记该 task BLOCKED，继续下一个 task
+        4. 启动 verifier sub-agent → PASS | FAIL（附证据）
+        5. 如果 FAIL → 重新 implement（最多 2 次，fresh implementer 每次）→ 重试也 FAIL → 标记 BLOCKED
+        6. 如果 PASS → 下一个 task
+      ```
 
-      **每个 Point 改完后的改后核对**（做完才写"改动核对"段落）：
-      1. **跑 git diff 看本 Point 的改动**：逐行过一遍——这一行为什么必须变？能在 5 秒内说清理由吗？说不清就撤销。
-      2. **跑相关测试/构建**：这个 Point 涉及的模块，有没有测试可以跑？能跑的就跑，不要口头说"应该通过"。
-      3. **对照 design 自检**：本 Point 的改动是否严格对应 design.selected_plan 中的某一步？偏离了 → 要么改回去，要么 needs_rework 回 design。
+      **所有 task 完成后**：汇总结果——total / passed / blocked / failed，每个 blocked task 的失败原因。
 
-      required_outputs 必须提供：
-        - changed_files: JSON 数组；本阶段实际改动/未改动的文件清单与原因；每项是对象，至少包含 file、changes
-        - delta_checks: JSON 数组；每个改动文件推进了哪条 success_criteria、引入什么风险、如何验证；每项是对象，至少包含 file、success_criteria_addressed、new_risks、verification
-        - validation_run: JSON 对象；已执行的验证命令/结果；未执行要写原因与残余风险；至少包含 commands_executed、results、skipped_validations、residual_risks
-      required_outputs 后面只能有一个对象：写成 "required_outputs": { ... }，不要写成 "required_outputs": {{ ... }}。
-
-      **回滚预案**：涉及不可逆操作（rm/git reset/drop table/truncate 等）时，在对应文件的
-      改动核对子段内写明回滚步骤（如何撤销本次不可逆操作）。
-
-      改动尽量小、贴近原代码风格。坚决不顺手"清理无关代码"。如果发现现有代码有明显问题但不是本次目标，记录到 output_summary 的"改动核对"段落（标注为"已知问题，非本次目标"），不要顺手修——"顺手"是 bug 的第一来源。改动的每一行都要有明确理由——能对自己说清楚"这一行为什么必须变"。
+      警告：你的 shell 命令受到引擎层安全限制——`sed -i` 全局被禁，`>` 输出重定向在只读子阶段被禁。请使用 Edit 工具逐段编辑代码。
 
       **任务边界（重要）**：
-      - 严格按 `design` 阶段的 selected_plan 实施——不要偏离方案，不要加"顺便"的改动
-      - **不要**重新阅读原始业务需求的 PDF/图片附件——理解 → 勘察 → 对齐 → 方案 四个阶段已经完成了充分的上下文准备
-      - 如果发现方案有问题或不可行，用 needs_rework 回到 design，不要自己"灵活调整"
-      - 产出 required_outputs（changed_files + delta_checks + validation_run）
+      - **每一个 task 的 implementer sub-agent 获得 fresh context**——不要在 sub-agent prompt 里塞入其他 task 的信息或前面 task 的结果
+      - 如果你发现 decompose 的拆分有问题（如两个应该拆开的 case 被合并了），标记 needs_rework → decompose
     allowed_tools:
       - read_file
       - edit_file
@@ -1213,43 +661,31 @@ stages:
     gates:
       - authorized_files_only
     required_outputs:
-      - changed_files
-      - delta_checks
-      - validation_run
+      - task_results
+      - summary
     output_schema:
-      changed_files:
+      task_results:
         type: array
         items:
           type: object
           properties:
-            file: string
-            changes: array<string>
-            reason: string
-        description: 本阶段实际改动/未改动的文件清单与原因
-      delta_checks:
-        type: array
-        items:
-          type: object
-          properties:
-            file: string
-            success_criteria_addressed: array<string>
-            new_risks: array<string>
-            verification: string
-        description: 每个改动文件推进的成功标准、引入风险、验证方式
-      validation_run:
+            task_id: string
+            status: passed | blocked | failed
+            attempts: number
+            failure_reason: string
+        description: 每个 task 的实施结果
+      summary:
         type: object
         properties:
-          commands_executed: array<string>
-          results: string
-          skipped_validations: array<string>
-          residual_risks: string
-        description: 已执行验证命令/结果；未执行写原因与残余风险
+          total: number
+          passed: number
+          blocked: number
+          failed: number
+        description: 汇总统计
     auto_retry_limit: 1
     hooks:
       pre_tool_use:
-        # v2.1：去掉 same_file_reads_min + shell_must_have_run 的"读≥3次+跑过git log"硬门控——
-        # 它是 Goodhart 源：模型为凑次数而形式刷 Read，而非基于真实需要理解文件。改为 prompt
-        # 引导任务点驱动 + 自检（见 instructions）。只保留不可逆操作的 ask_human consent（安全门）。
+        # 不可逆操作需用户确认（安全门）
         - when:
             tool: Bash
             command_contains:
@@ -1263,215 +699,68 @@ stages:
           on_fail: "这是不可逆操作，必须先在本阶段通过 ask_human 取得用户明确确认。"
       post_output_assertions:
         - rollback_plan_when_irreversible
-        - needs_rework_target_required
-        - no_trailing_unparsed_payload
-  - id: self_review
-    name: 自审
-    instructions: |
-      你是自审阶段的**协调者**。你的任务不是自己一个人审——而是把审查工作分派给 3 个专门的 sub-agent，每个从不同维度独立审查，收集它们的发现，综合后做出最终判断。
-
-      **协调流程**：
-
-      1. **准备上下文**：在委派 sub-agent 之前，先从 session 中提取前序阶段的 required_outputs 关键数据：
-         - understand.definition_of_done / assumptions
-         - investigate.evidence_findings（含置信度标记）/ boundary_cases / unknowns / callsite_assumptions
-         - align.lateral_constraints
-         - design.selected_plan / success_criteria / test_plan / risk_register
-         - implement.changed_files / delta_checks / validation_run
-         这些数据是 sub-agent 的审查依据，必须在 Task 调用 prompt 中传入。
-
-      2. **并行委派 sub-agent**：先跑 `git diff` 获取本次改动，然后同时启动以下 3 个 sub-agent（通过 Task 工具并行调用），在 prompt 中给出 diff 内容 + 对应的前序阶段数据：
-         - `security-consistency-reviewer`：专审安全/鉴权一致性
-         - `correctness-boundary-reviewer`：专审逻辑正确性与边界覆盖
-         - `simplicity-reviewer`：专审简洁性——是否有超出计划的改动
-
-      3. **收集并综合**：收到三个 reviewer 的发现后：
-         - 合并所有 finding，去重
-         - 逐条评估 severity（info/low/medium/high/critical）
-         - 有三个 reviewer 都指出的问题 → 大概率是真问题
-         - 只有一个 reviewer 指出且 severity 不高 → 可能是过度审查
-         - 出现 blocker/critical/严重不一致/安全问题 → rework_decision 不能是 pass
-
-      4. **最终判断**：
-         - 通过：status="completed"，rework_decision="pass"，review_findings 给逐项核对清单
-         - 返工：status="needs_rework"，rework_target_stage_id 指向 implement/design/investigate，rework_reason 用中文说明
-
-      5. **你自己也要做的事**（sub-agent 不覆盖的）：
-         - 真跑测试/构建/lint（如果 sub-agent 没跑）
-         - 真跑 `git diff` 并逐行自审
-         - 最终裁决——三个 reviewer 可能有分歧，你做最终判断
-
-      **仅允许只读工具：Read 看 diff、shell 跑 git diff/test/build/lint，禁止 edit。**
-
-      **任务边界（重要）**：
-      - 你的审查依据是前序阶段的 required_outputs（understand.DoD、investigate 证据/边界、align 约束、design 方案/风险、implement 改动核对）——对照它们审 diff
-      - **不要**重新阅读原始业务需求的 PDF/图片附件——审查的是"改动是否符合既定方案和约束"，不是"改动是否符合你对需求的重新理解"
-      - 聚焦于三个维度：安全性（鉴权一致性）、正确性（边界覆盖 + 证据对齐）、简洁性（无超出方案的改动）
-      - 产出 review_findings + rework_decision + residual_risks
-    allowed_tools:
-      - read_file
-      - shell
-    required_outputs:
-      - review_findings
-      - rework_decision
-      - residual_risks
-    output_schema:
-      review_findings:
-        type: array
-        items:
-          type: object
-          properties:
-            item: string
-            finding: string
-            evidence: string
-            severity: info | low | medium | high | critical
-        description: 逐项核对清单；每条约束/边界/测试项对应 diff 或验证证据
-      rework_decision:
-        type: string
-        enum:
-          - pass
-          - needs_rework
-        description: 通过写 pass；需要返工时最外层 status 也必须是 needs_rework
-      residual_risks:
-        type: array
-        items: string
-        description: 剩余风险；没有则 ["无"]
-    auto_retry_limit: 1
-    hooks:
-      post_output_assertions:
-        - review_self_consistency
-        - needs_rework_target_required
-        - hedged_findings_demoted
         - no_trailing_unparsed_payload
     agents:
-      security-consistency-reviewer:
-        description: 专审安全/鉴权一致性——diff 中每个入口的鉴权是否与同类入口一致
-        tools: [Read, Grep, Bash]
+      task-implementer:
+        description: 实施一个原子级 task——fresh context，只有该 task 的一组参数
+        tools: [Read, Edit, Bash]
         prompt: |
-          你的任务：从安全与鉴权一致性角度审查本次改动。
+          你是实施者。你的任务是用最小改动实现以下**一个** task。
 
-          **审查维度**：
-          1. **鉴权一致性**：改动中涉及的每个入口（页面/API/组件），其鉴权方式是否与 align.lateral_constraints 中记录的同类入口一致？
-             - 同类入口都有登录检查，本次改动的新入口有没有？
-             - 同类入口都没有某权限检查，本次改动有没有"多加"？（多加也是不一致）
-             - 不一致本身就是安全风险——攻击者会找最薄弱的那扇门。
-          2. **数据安全**：改动的代码是否引入了新的数据泄露风险？是否在日志/错误信息中暴露了敏感信息？
-          3. **输入校验**：新增的参数/输入是否有校验？是否信任了用户输入？
-          4. **回滚安全**：如果涉及不可逆操作，是否有回滚预案？
+          **禁止碰无关文件**。你的改动必须严格限制在本 task 声明的 file 范围内。
 
-          **审查方法**：
-          - 跑 `git diff` 获取改动内容
-          - 对每个改动的入口，grep 同类入口的鉴权模式进行对比
-          - 不要推断"应该有什么"——只对比"同类实际有什么"
+          **你的 Task**：
+          [控制器会在此处提供 task 描述全文]
 
-          **输出格式**（JSON）：
-          ```json
-          {
-            "findings": [
-              {
-                "item": "审查项（入口/代码位置）",
-                "finding": "发现",
-                "evidence": "diff 中的位置或同类入口 path:line",
-                "severity": "info|low|medium|high|critical"
-              }
-            ],
-            "overall_assessment": "整体安全评估（一句话）",
-            "confidence": "high|medium|low"
-          }
-          ```
+          **改动前行为（不可破坏的约束）**：
+          [控制器会在此处提供 pre_behavior 全文]
+          上面列出的每一个参数、每一个函数调用、每一个 guard——都必须在你改动后的代码中保留。
+          参数差异 = 行为差异。两个 case 只要有一个参数不同就不是同一个 case。
+          不要合并差异化 case、不要简化"看起来相似"的逻辑。
 
-          **约束**：
-          - 只读，不写任何文件
-          - 不要因为"可能不安全"就建议不做——给具体证据
-          - 鉴权差异可能是合理的——逐条判断，不套模板
+          **验收标准**：
+          [控制器会在此处提供 acceptance_criteria 全文]
 
-      correctness-boundary-reviewer:
-        description: 专审逻辑正确性与边界覆盖——对照 investigate 结果逐条核对 diff
+          **禁令**：
+          - 禁止修改 task 声明的 file 之外的任何文件
+          - 禁止合并或简化 pre_behavior 中列出的差异化 case
+          - 禁止顺手改动格式、注释、命名（"顺手"是 bug 的第一来源）
+          - 禁止"优化"、"重构"、"顺便修一下"
+          - 禁止使用 sed -i（引擎硬拒绝）——用 Edit 工具逐段编辑
+
+          **完成后**：
+          1. 跑 git diff 逐行确认：改动的每一行都有明确理由吗？
+          2. 跑至少一条验证命令并展示实际输出（lint/构建/测试/语法检查）
+          3. 报告状态：DONE | DONE_WITH_CONCERNS | BLOCKED
+
+      task-verifier:
+        description: 机械核对——逐项检查 task 的实施结果，不做判断，只核对 YES/NO
         tools: [Read, Bash]
         prompt: |
-          你的任务：从逻辑正确性与边界覆盖角度审查本次改动。
+          你是验证者。你的任务不是判断这个改动"好不好"，而是核对以下事实。
 
-          **审查维度**：
-          1. **证据对齐**：改动是否覆盖了 investigate.evidence_findings 中所有的"已证实结论"？有没有与证据矛盾的改动？
-          2. **边界覆盖**：investigate.boundary_cases 列出的边界（空/零/负/并发/超时/失败/超大输入），diff 中是否有对应处理？
-          3. **低置信项核对**（优先级最高）：investigate.evidence_findings 中标了 low/medium 置信度的结论——本次改动如果依赖了这些结论，是否有验证？还是盲信？
-          4. **调用方假设**：investigate.callsite_assumptions 中每条假设，本次改动是否打破了？打破了几处？
-          5. **成功标准覆盖**：design.success_criteria 中每条标准，diff 中是否有对应的改动？漏了哪条？
-          6. **测试对齐**：design.test_plan 中列出的测试，implement.validation_run 是否执行了？结果如何？
+          **核对清单（每一项只需回答 YES/NO，如果 NO 提供 path:line 证据）**：
+          1. pre_behavior 中的每一个 params key 在改动后代码中是否仍然存在？
+          2. pre_behavior 中的 business_function 调用在改动后代码中是否仍然存在？
+          3. pre_behavior 中的每一个 guard 在改动后代码中是否仍然存在？
+          4. diff 是否**只**涉及 task 声明的 file？有没有改动其他文件？
+          5. diff 中是否有与 task 无关的改动（格式、注释、命名）？
+          6. implementer 是否执行了至少一条验证命令并展示了实际输出？
 
-          **审查方法**：
-          - 跑 `git diff` 获取改动内容
-          - 逐条对照前序阶段的 required_outputs（不看 output_summary——那可能是糊弄的）
-          - 每发现一处缺口，标注对应的前序阶段字段
+          **铁律**：
+          - 不信任 implementer 的自我报告——读代码，自己核实
+          - 核对，不是判断。"不确定"就是 FAIL
+          - 参数丢失、业务函数被替换、错误合并 → FAIL
 
           **输出格式**（JSON）：
           ```json
           {
-            "findings": [
-              {
-                "item": "核对项（来自哪个前序阶段的哪个字段）",
-                "finding": "发现",
-                "evidence": "diff 中的位置或缺失证据",
-                "severity": "info|low|medium|high|critical"
-              }
-            ],
-            "low_confidence_items_checked": ["核对了哪些 low/medium 置信项"],
-            "uncovered_boundaries": ["未覆盖的边界"],
-            "broken_assumptions": ["被打破的调用方假设"],
-            "overall_assessment": "整体正确性评估（一句话）",
-            "confidence": "high|medium|low"
+            "checks": [{"item": "检查项", "result": "YES|NO", "evidence": "path:line"}],
+            "verdict": "PASS|FAIL",
+            "failure_details": "如果 FAIL：具体说明哪些检查项未通过"
           }
           ```
 
           **约束**：
           - 只读，不写任何文件
-          - 优先核对 low 置信项——那是地基最不牢的地方
-          - 找不到证据 ≠ 没问题——标注为缺口
-
-      simplicity-reviewer:
-        description: 专审简洁性——diff 中是否有超出 design 计划的改动、顺手重构、无关优化
-        tools: [Read, Bash]
-        prompt: |
-          你的任务：从简洁性角度审查本次改动——确保每一行改动都有明确理由。
-
-          **审查维度**：
-          1. **计划对齐**：diff 中的每一行是否都对应 design.selected_plan 中的某一步？
-          2. **无关改动检测**：有没有以下"顺手"行为？
-             - 顺手重构（改了与目标无关的函数/变量）
-             - 顺手优化（"既然看到了就顺便改一下"）
-             - 统一格式（改了与目标无关的缩进/空行/引号）
-             - 抽出公共函数（"这个逻辑可以复用"）
-             - 加了新依赖/新 import（"以后会用到"）
-             - 改了注释/文档（与目标无关的）
-          3. **改动规模**：实际改动文件数、行数是否在 align.lateral_constraints 的 change-radius 上限内？
-          4. **新增抽象**：是否引入了 design 方案中没有的新工具函数/中间件/帮助函数？
-          5. **最小改动原则**：每一行删掉的代码——是必须删的吗？每一行新增的代码——能用更少的行数达到同样效果吗？
-
-          **审查方法**：
-          - 跑 `git diff` 获取改动内容
-          - 逐行对照 design.selected_plan
-          - 任何无法在 5 秒内说清"为什么必须变"的行 → 标记为可疑
-
-          **输出格式**（JSON）：
-          ```json
-          {
-            "findings": [
-              {
-                "item": "审查项（diff 位置）",
-                "finding": "发现",
-                "evidence": "diff 行内容",
-                "severity": "info|low|medium|high|critical"
-              }
-            ],
-            "unplanned_changes": ["不在 design 计划中的改动"],
-            "unnecessary_abstractions": ["新增的不必要抽象"],
-            "size_vs_baseline": "实际规模 vs align 基准",
-            "overall_assessment": "整体简洁性评估（一句话）",
-            "confidence": "high|medium|low"
-          }
-          ```
-
-          **约束**：
-          - 只读，不写任何文件
-          - "顺手"是 bug 的第一来源——对每行改动保持敌意
-          - 不确定该不该删的 → 标记为 finding，让协调者裁决
+          - 你的 Bash 命令仅限于 git diff、grep、cat、node --check

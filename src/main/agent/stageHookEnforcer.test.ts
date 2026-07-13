@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { evaluateHook } from "./stageHookEnforcer.js";
+import { evaluateHook, checkCommandSafety } from "./stageHookEnforcer.js";
 import type { AgentSession, ToolCallRecord, WorkflowStage, HumanQuestion } from "../../shared/types.js";
 
 function makeStage(hooks?: WorkflowStage["hooks"]): WorkflowStage {
@@ -292,5 +292,134 @@ describe("stageHookEnforcer.evaluateHook", () => {
       new_string: "echo"
     });
     expect(decision.allow).toBe(true);
+  });
+});
+
+describe("stageHookEnforcer.checkCommandSafety", () => {
+  it("非 Bash 工具直接放行", () => {
+    const result = checkCommandSafety("self_review", "Read", { file_path: "/tmp/a.ts" });
+    expect(result.allow).toBe(true);
+  });
+
+  it("空命令放行", () => {
+    const result = checkCommandSafety("self_review", "Bash", { command: "" });
+    expect(result.allow).toBe(true);
+  });
+
+  it("sed -i 全局硬拒绝", () => {
+    const result = checkCommandSafety("implement", "Bash", {
+      command: "sed -i 's/old/new/' /path/to/file.js"
+    });
+    expect(result.allow).toBe(false);
+    expect(result.message).toContain("sed -i");
+  });
+
+  it("sed --in-place 长格式也被拒绝", () => {
+    const result = checkCommandSafety("implement", "Bash", {
+      command: "sed --in-place 's/old/new/' file.js"
+    });
+    expect(result.allow).toBe(false);
+    expect(result.message).toContain("sed");
+  });
+
+  it("sed -i 即使在 implement 阶段也拒绝", () => {
+    const result = checkCommandSafety("implement", "Bash", {
+      command: "sed -i '776s/.*/foo/' file.js"
+    });
+    expect(result.allow).toBe(false);
+  });
+
+  it("sed 不带 -i 放行（只预览）", () => {
+    const result = checkCommandSafety("implement", "Bash", {
+      command: "sed -n '775,780p' file.js"
+    });
+    expect(result.allow).toBe(true);
+  });
+
+  it("> 输出重定向在只读阶段 self_review 被拒绝", () => {
+    const result = checkCommandSafety("self_review", "Bash", {
+      command: "grep 'foo' file.js > /tmp/output.txt"
+    });
+    expect(result.allow).toBe(false);
+    expect(result.message).toContain("输出重定向");
+  });
+
+  it("> 输出重定向在只读阶段 investigate 被拒绝", () => {
+    const result = checkCommandSafety("investigate", "Bash", {
+      command: "cat file.js > other.js"
+    });
+    expect(result.allow).toBe(false);
+  });
+
+  it(">> 追加重定向在只读阶段被拒绝", () => {
+    const result = checkCommandSafety("self_review", "Bash", {
+      command: "echo 'log' >> app.log"
+    });
+    expect(result.allow).toBe(false);
+  });
+
+  it("2>&1 在只读阶段放行（无害重定向）", () => {
+    const result = checkCommandSafety("self_review", "Bash", {
+      command: "npm test 2>&1 | head -50"
+    });
+    expect(result.allow).toBe(true);
+  });
+
+  it(">/dev/null 在只读阶段放行（无害重定向）", () => {
+    const result = checkCommandSafety("self_review", "Bash", {
+      command: "which node >/dev/null 2>&1"
+    });
+    expect(result.allow).toBe(true);
+  });
+
+  it(">> /dev/null 在只读阶段放行", () => {
+    const result = checkCommandSafety("self_review", "Bash", {
+      command: "npm ls >> /dev/null"
+    });
+    expect(result.allow).toBe(true);
+  });
+
+  it("引号内的 > 不误判", () => {
+    const result = checkCommandSafety("self_review", "Bash", {
+      command: "grep '>' file.js"
+    });
+    expect(result.allow).toBe(true);
+  });
+
+  it("引号内的 >> 不误判", () => {
+    const result = checkCommandSafety("self_review", "Bash", {
+      command: 'echo "a >> b"'
+    });
+    expect(result.allow).toBe(true);
+  });
+
+  it("非只读阶段 implement 允许 > 重定向", () => {
+    const result = checkCommandSafety("implement", "Bash", {
+      command: "npm ls > deps.txt"
+    });
+    expect(result.allow).toBe(true);
+  });
+
+  it("聊天记录中 chatProvider.js 毁灭的真实命令应被拦截", () => {
+    // 真实案例：self_review 阶段，grep 路径被截断，> 变成了输出重定向
+    const result = checkCommandSafety("self_review", "Bash", {
+      command: 'grep -n "SHOW_WAKE_UP_SCREEN_PAGE" /home/p> /home/user/projects/huaxiafortune/lib/views/AIAgentComponent/chatProvider.js | head -40'
+    });
+    expect(result.allow).toBe(false);
+    expect(result.message).toContain("输出重定向");
+  });
+
+  it("decompose 阶段是只读阶段，> 重定向被拒绝", () => {
+    const result = checkCommandSafety("decompose", "Bash", {
+      command: "cat plan.md > backup.md"
+    });
+    expect(result.allow).toBe(false);
+  });
+
+  it("verify 阶段是只读阶段，> 重定向被拒绝", () => {
+    const result = checkCommandSafety("verify", "Bash", {
+      command: "git diff > changes.patch"
+    });
+    expect(result.allow).toBe(false);
   });
 });

@@ -20,6 +20,81 @@ import type {
  */
 export type HookDecision = { allow: true } | { allow: false; message: string };
 
+/**
+ * 只读阶段的 stage_id 集合——这些阶段的 job 是审查/调查/设计，不是实施。
+ * Bash 命令中的输出重定向（>、>>）在这些阶段被硬拒绝。
+ */
+const READ_ONLY_STAGES = new Set([
+  "scan_project",
+  "understand",
+  "investigate",
+  "align",
+  "design",
+  "decompose",
+  "self_review",
+  "verify",
+]);
+
+/**
+ * 引擎层 Bash 命令安全拦截——不依赖 YAML 配置，硬编码执行。
+ *
+ * 这是因果致效层的约束，不是 prompt 建议：
+ * - "你是只读的" 是 prompt → 模型可以不遵守
+ * - "你的 Bash 命令不能含 >" 是引擎 → 模型物理上做不到
+ *
+ * 拦截内容：
+ * - sed -i：全局硬拒绝（用 sed 原地编辑源代码极危险，用 Edit 工具替代）
+ * - > / >> 输出重定向：只读阶段硬拒绝（防止 self_review/verify 等审查阶段意外写文件）
+ * - 例外：>/dev/null、>> /dev/null、2>&1、1>&2 等无害重定向放行
+ */
+export function checkCommandSafety(
+  stageId: string,
+  toolName: string,
+  toolInput: Record<string, unknown>
+): HookDecision {
+  // 只对 Bash 命令做安全检查
+  if (toolName !== "Bash") return { allow: true };
+
+  const rawCmd = String((toolInput as { command?: unknown }).command ?? "");
+  if (!rawCmd) return { allow: true };
+
+  // 移除引号内的内容（单引号和双引号），避免引号内的 > 被误判
+  const unquoted = rawCmd
+    .replace(/'[^']*'/g, "''")
+    .replace(/"[^"]*"/g, '""');
+
+  // ── 全局禁止：sed -i（原地编辑）——短格式和长格式 ──
+  if (/\bsed\s+-i\b/.test(unquoted) || /\bsed\s+--in-place\b/.test(unquoted)) {
+    return {
+      allow: false,
+      message: "引擎安全拦截：sed -i 原地编辑源代码极危险（一个错误的正则就能删除大段代码）。请使用 Edit 工具逐段替换，或先用 sed 预览（去掉 -i）确认无误后再用 Edit 工具操作。",
+    };
+  }
+
+  // ── 只读阶段：禁止输出重定向 ──
+  if (READ_ONLY_STAGES.has(stageId)) {
+    // 检测输出重定向：> 或 >> 后面跟的不是 /dev/null
+    // 先移除无害的重定向模式：2>&1, 1>&2, >/dev/null, >>/dev/null, &>
+    const cleaned = unquoted
+      .replace(/2>\s*&1/g, "")
+      .replace(/1>\s*&2/g, "")
+      .replace(/>>\s*\/dev\/null/g, "")
+      .replace(/>\s*\/dev\/null/g, "")
+      .replace(/&>\s*\/dev\/null/g, "");
+
+    // 检测剩余的输出重定向：> 或 >> 且后面不是 &
+    // 匹配: "cmd > file" 或 "cmd >> file" 或 "cmd> file" 或 "cmd>>file"
+    if (/>\s*\S/.test(cleaned) || />{1,2}\s+\S/.test(cleaned)) {
+      return {
+        allow: false,
+        message: `引擎安全拦截：${stageId} 是只读阶段，Bash 命令不能使用输出重定向（> 或 >>）。这可以防止审查/调查阶段意外覆盖项目文件。如需保存命令输出，结果已在终端显示——不需要重定向到文件。`,
+      };
+    }
+  }
+
+  return { allow: true };
+}
+
 export function evaluateHook(
   stage: WorkflowStage,
   session: AgentSession,

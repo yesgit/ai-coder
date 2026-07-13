@@ -3,23 +3,26 @@ import path from "node:path";
 import { WorkflowRegistry } from "./workflowRegistry.js";
 
 /**
- * 谨慎程序员 yaml 快照——项目画像前置 + 结构化状态传递方向：
- * L3 扫标题断言全退场、L1 behavior 门控（git log/git diff 的 retry/block）降为 prompt 提示，
- * 只留结构性 + L2 自洽性 + 安全门（不可逆操作 ask_human / rollback）。
- * v2.1 通过 required_outputs 传递承重认知状态，避免阶段边界只剩 output_summary。
- * 与 v1.3 并存作对比基线，routing.auto_start=false（手动选）。
+ * 谨慎程序员 yaml v4.0 快照验证。
+ *
+ * v4.0 根本架构变更（v3.0 执行日志驱动）：
+ * - 砍掉 investigate/align/design/self_review 四个阶段
+ * - 新增 decompose（原子级任务拆分，每个 task 含 pre_behavior 行为快照）
+ * - implement 改为 task-loop 协调者（每 task fresh sub-agent + 机械核对）
+ * - 不再靠"让 LLM 更谨慎"，靠"让任务小到不可能错"
+ * - 引擎层 Bash 安全拦截（> 重定向在只读阶段硬拒绝、sed -i 全局硬拒绝）
  */
 describe("careful-coder.yaml latest", () => {
   const workflowsDir = path.resolve(__dirname, "../../../workflows");
 
-  async function loadV2() {
+  async function loadV4() {
     const r = new WorkflowRegistry(workflowsDir);
     const result = await r.listWithIssues();
     const issues = result.issues.filter((i) => i.path.includes("careful-coder"));
     expect(issues, JSON.stringify(issues)).toEqual([]);
-    const v2 = result.workflows.find((w) => w.id === "careful-coder");
-    expect(v2).toBeDefined();
-    return v2!;
+    const v4 = result.workflows.find((w) => w.id === "careful-coder");
+    expect(v4).toBeDefined();
+    return v4!;
   }
 
   it("parses cleanly and auto-starts as the only cautious workflow", async () => {
@@ -27,86 +30,73 @@ describe("careful-coder.yaml latest", () => {
     const listed = await registry.list();
     expect(listed.map((workflow) => workflow.id)).toEqual(["careful-coder"]);
 
-    const v2 = await loadV2();
-    expect(v2.version).toBe("3.0.0");
-    expect(v2.name).toBe("谨慎程序员");
-    expect(v2.routing?.auto_start).toBe(true);
+    const v4 = await loadV4();
+    expect(v4.version).toBe("4.0.0");
+    expect(v4.name).toBe("谨慎程序员");
+    expect(v4.routing?.auto_start).toBe(true);
   });
 
-  it("rework 覆盖所有前置阶段（任意层回溯）", async () => {
-    const v2 = await loadV2();
-    expect(v2.rework?.enabled).toBe(true);
-    expect(v2.rework?.allowed_targets).toEqual([
+  it("pipeline: scan → profile → understand → decompose → implement（5 阶段）", async () => {
+    const v4 = await loadV4();
+    expect(v4.stages.map((s) => s.id)).toEqual([
       "scan_project",
       "update_project_profile",
       "understand",
-      "investigate",
-      "align",
-      "design",
+      "decompose",
       "implement"
     ]);
   });
 
-  it("项目画像阶段位于编码阶段之前", async () => {
-    const v2 = await loadV2();
-    expect(v2.stages.slice(0, 2).map((s) => s.id)).toEqual(["scan_project", "update_project_profile"]);
-    expect(v2.stages[2].id).toBe("understand");
-  });
-
-  it("design 阶段只留结构性断言（L3 扫标题全退场）", async () => {
-    const v2 = await loadV2();
-    const design = v2.stages.find((s) => s.id === "design")!;
-    expect(design.hooks?.post_output_assertions).toEqual([
-      "needs_rework_target_required",
-      "no_trailing_unparsed_payload"
-    ]);
-    for (const name of ["design_alternatives_present", "design_quadrant_eval_present", "preflight_risks_present"]) {
-      expect(design.hooks?.post_output_assertions, `design 不应再挂 ${name}`).not.toContain(name);
-    }
-  });
-
-  it("investigate 去 behavior git log 门控，保留 unknowns 诚实暴露", async () => {
-    const v2 = await loadV2();
-    const inv = v2.stages.find((s) => s.id === "investigate")!;
-    // L1 门控降为 prompt——不再 post_output_checks
-    expect(inv.hooks?.post_output_checks ?? []).toEqual([]);
-    expect(inv.hooks?.post_output_assertions).toEqual([
-      "needs_rework_target_required",
-      "unknowns_present",
-      "no_trailing_unparsed_payload"
-    ]);
-    // required_outputs 承载证据状态：去 git_history_summary（改为 prompt 提示跑 git log），
-    // 但保留下游需要消费的 finding / 调用方假设 / 边界。
-    expect(inv.required_outputs).toEqual([
-      "similar_callsites",
-      "evidence_findings",
-      "callsite_assumptions",
-      "boundary_cases",
-      "unknowns"
+  it("rework covers all stages", async () => {
+    const v4 = await loadV4();
+    expect(v4.rework?.enabled).toBe(true);
+    expect(v4.rework?.allowed_targets).toEqual([
+      "scan_project",
+      "update_project_profile",
+      "understand",
+      "decompose",
+      "implement"
     ]);
   });
 
-  it("design / implement 产出可被下游消费的结构化状态", async () => {
-    const v2 = await loadV2();
-    const design = v2.stages.find((s) => s.id === "design")!;
-    expect(design.required_outputs).toEqual([
-      "selected_plan",
-      "success_criteria",
-      "test_plan",
-      "risk_register"
-    ]);
-
-    const impl = v2.stages.find((s) => s.id === "implement")!;
-    expect(impl.required_outputs).toEqual([
-      "changed_files",
-      "delta_checks",
-      "validation_run"
-    ]);
+  it("decompose 产出 task_items——含 pre_behavior 行为快照", async () => {
+    const v4 = await loadV4();
+    const decompose = v4.stages.find((s) => s.id === "decompose")!;
+    expect(decompose.required_outputs).toEqual(["task_items"]);
+    const schema = decompose.output_schema ?? {};
+    expect(schema).toHaveProperty("task_items");
+    // pre_behavior 子字段存在（验证行为快照结构）
+    const props = (schema.task_items as any)?.items?.properties;
+    expect(props).toHaveProperty("pre_behavior");
+    expect(props).toHaveProperty("acceptance_criteria");
   });
 
-  it("每个 required_outputs 都有同名 output_schema，作为跨阶段唯一口径", async () => {
-    const v2 = await loadV2();
-    for (const stage of v2.stages) {
+  it("implement 是 task-loop 协调者，含 task-implementer 和 task-verifier sub-agents", async () => {
+    const v4 = await loadV4();
+    const impl = v4.stages.find((s) => s.id === "implement")!;
+    expect(impl.required_outputs).toContain("task_results");
+    expect(impl.required_outputs).toContain("summary");
+    expect(impl.agents).toBeDefined();
+    expect(impl.agents).toHaveProperty("task-implementer");
+    expect(impl.agents).toHaveProperty("task-verifier");
+    // task-verifier 是只读的
+    expect(impl.agents!["task-verifier"].tools).not.toContain("edit_file");
+  });
+
+  it("implement 不可逆操作安全门保留", async () => {
+    const v4 = await loadV4();
+    const impl = v4.stages.find((s) => s.id === "implement")!;
+    const preToolUse = impl.hooks?.pre_tool_use ?? [];
+    expect(preToolUse).toHaveLength(1);
+    expect(preToolUse[0].require.ask_human_consent).toBe(true);
+    const assertions = impl.hooks?.post_output_assertions ?? [];
+    expect(assertions).toContain("rollback_plan_when_irreversible");
+    expect(assertions).toContain("no_trailing_unparsed_payload");
+  });
+
+  it("每个 required_outputs 都有同名 output_schema", async () => {
+    const v4 = await loadV4();
+    for (const stage of v4.stages) {
       const schema = stage.output_schema ?? {};
       for (const field of stage.required_outputs ?? []) {
         expect(schema, `${stage.id}.${field} 缺少 output_schema`).toHaveProperty(field);
@@ -114,45 +104,27 @@ describe("careful-coder.yaml latest", () => {
     }
   });
 
-  it("implement 只留不可逆操作安全门(去掉读≥3次硬门控,避免刷次数)", async () => {
-    const v2 = await loadV2();
-    const impl = v2.stages.find((s) => s.id === "implement")!;
-    // v2.1：去掉 same_file_reads_min + shell_must_have_run（Goodhart 源：模型为凑次数刷 Read），
-    // 只留不可逆操作 ask_human consent（安全门，非谨慎门）。读几次改由 prompt 自检引导。
-    const preToolUse = impl.hooks?.pre_tool_use ?? [];
-    expect(preToolUse).toHaveLength(1);
-    expect(preToolUse[0].require.ask_human_consent).toBe(true);
-    expect(preToolUse[0].require.same_file_reads_min).toBeUndefined();
-    expect(preToolUse[0].require.shell_must_have_run).toBeUndefined();
-    const assertions = impl.hooks?.post_output_assertions ?? [];
-    expect(assertions).toContain("rollback_plan_when_irreversible");
-    expect(assertions).toContain("needs_rework_target_required");
-    expect(assertions).toContain("no_trailing_unparsed_payload");
-    expect(assertions).not.toContain("implement_delta_check_present");
+  it("已删除的旧阶段不存在（v3.0→v4.0 重构证明）", async () => {
+    const v4 = await loadV4();
+    const removedIds = ["investigate", "align", "design", "self_review"];
+    for (const id of removedIds) {
+      expect(
+        v4.stages.find((s) => s.id === id),
+        `${id} 应在 v4.0 中已删除`
+      ).toBeUndefined();
+    }
   });
 
-  it("self_review 保留自洽性断言，去 behavior git diff 门控", async () => {
-    const v2 = await loadV2();
-    const sr = v2.stages.find((s) => s.id === "self_review")!;
-    expect(sr.allowed_tools).not.toContain("edit_file");
-    // L1 门控降为 prompt
-    expect(sr.hooks?.post_output_checks ?? []).toEqual([]);
-    expect(sr.hooks?.post_output_assertions).toEqual([
-      "review_self_consistency",
-      "needs_rework_target_required",
-      "hedged_findings_demoted",
+  it("understand 只留结构性断言（no_trailing_unparsed_payload）", async () => {
+    const v4 = await loadV4();
+    expect(v4.stages.find((s) => s.id === "understand")!.hooks?.post_output_assertions).toEqual([
       "no_trailing_unparsed_payload"
     ]);
   });
 
-  it("understand / align 只留结构性断言", async () => {
-    const v2 = await loadV2();
-    expect(v2.stages.find((s) => s.id === "understand")!.hooks?.post_output_assertions).toEqual([
-      "no_trailing_unparsed_payload"
-    ]);
-    expect(v2.stages.find((s) => s.id === "align")!.hooks?.post_output_assertions).toEqual([
-      "needs_rework_target_required",
-      "no_trailing_unparsed_payload"
-    ]);
+  it("project profile stages preserved", async () => {
+    const v4 = await loadV4();
+    expect(v4.stages.slice(0, 2).map((s) => s.id)).toEqual(["scan_project", "update_project_profile"]);
+    expect(v4.stages[2].id).toBe("understand");
   });
 });
