@@ -2,7 +2,7 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { ClaudeAgentRunner, describeSdkMessageSnippet } from "./claudeAgentRunner.js";
+import { ClaudeAgentRunner, describeSdkMessageSnippet, parseBestStageAgentResult } from "./claudeAgentRunner.js";
 import type { AgentSession, WorkflowTemplate } from "../../shared/types.js";
 
 const workflow: WorkflowTemplate = {
@@ -20,6 +20,32 @@ const workflow: WorkflowTemplate = {
 };
 
 describe("ClaudeAgentRunner", () => {
+  it("prefers parseable assistant JSON over SDK no-content result text", () => {
+    const parsed = parseBestStageAgentResult(
+      "(no content)",
+      '{"status":"completed","output_summary":"ok","required_outputs":{"profile_mode":"incremental"}}'
+    );
+
+    expect(parsed.parse_diagnostics?.parse_strategy).toBe("single_json_object");
+    expect(parsed.required_outputs).toEqual({ profile_mode: "incremental" });
+  });
+
+  it("prefers SDK structured output over malformed display text", () => {
+    const structuredOutput = {
+      status: "completed",
+      output_summary: "扫描完成",
+      required_outputs: { profile_mode: "incremental" }
+    };
+    const parsed = parseBestStageAgentResult(
+      "(no content)",
+      "我已经完成扫描，下面是结果：profile_mode: full",
+      structuredOutput
+    );
+
+    expect(parsed.parse_diagnostics?.parse_strategy).toBe("single_json_object");
+    expect(parsed.required_outputs).toEqual({ profile_mode: "incremental" });
+  });
+
   it("continues into the next running stage until an approval gate is reached", async () => {
     const multiStageWorkflow: WorkflowTemplate = {
       ...workflow,
@@ -78,6 +104,77 @@ describe("ClaudeAgentRunner", () => {
     expect(updated.stage_runs?.[0]).toMatchObject({ stage_id: "requirements", status: "completed" });
     expect(updated.stage_runs?.at(-1)).toMatchObject({ stage_id: "plan", status: "waiting_approval" });
     expect(updated.messages.some((message) => message.content.includes("阶段重试"))).toBe(false);
+  });
+
+  it("does not fail a required-output stage when SDK result is no-content but assistant text contains stage JSON", async () => {
+    async function* query() {
+      yield {
+        type: "assistant",
+        message: {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                status: "completed",
+                output_summary: "扫描完成",
+                required_outputs: { profile_mode: "incremental" }
+              })
+            }
+          ]
+        }
+      };
+      yield {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: "(no content)"
+      };
+    }
+
+    const wf: WorkflowTemplate = {
+      ...workflow,
+      stages: [
+        { id: "scan_project", name: "扫描项目画像", required_outputs: ["profile_mode"], auto_retry_limit: 1 },
+        { id: "plan", name: "Plan" }
+      ]
+    };
+    const session: AgentSession = {
+      id: "00000000-0000-4000-8000-000000000030",
+      project_path: "/tmp/project",
+      workflow_id: wf.id,
+      task_prompt: "检查项目",
+      status: "running",
+      current_stage: "scan_project",
+      messages: [],
+      tool_calls: [],
+      file_changes: [],
+      approvals: [],
+      stage_runs: [
+        {
+          id: "00000000-0000-4000-8000-000000000031",
+          stage_id: "scan_project",
+          attempt: 1,
+          status: "running",
+          input_summary: "Initial task",
+          started_at: new Date().toISOString()
+        }
+      ],
+      rework_requests: [],
+      progress_events: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+
+    const updated = await new ClaudeAgentRunner(query).run({ session, workflow: wf });
+
+    expect(updated.status).not.toBe("blocked");
+    expect(updated.status).not.toBe("failed");
+    expect(updated.error).toBeUndefined();
+    expect(updated.stage_runs?.[0]).toMatchObject({
+      stage_id: "scan_project",
+      status: "completed",
+      required_outputs: { profile_mode: "incremental" }
+    });
   });
 
   it("waits for stage approval before live or mock execution", async () => {

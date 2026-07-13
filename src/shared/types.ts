@@ -336,6 +336,13 @@ export interface StageAgentResult {
 }
 
 export interface ParseDiagnostics {
+  /**
+   * 解析策略。只有 `single_json_object` 表示 agent 最后一条回复本身就是合法的单一阶段 JSON。
+   * 其他策略用于兼容提取/修复，但工作流引擎可据此要求模型重试协议输出。
+   */
+  parse_strategy?: "single_json_object" | "repaired_single_json_object" | "embedded_json" | "relaxed_fields" | "none";
+  /** true = raw 回复不是单一合法 JSON 对象，虽然解析器可能从中提取/修复出了阶段结果 */
+  protocol_violation?: boolean;
   /** true = raw 末尾还有未闭合 JSON 或大段 JSON 残骸（多余引号/未闭合括号等） */
   had_unparsed_tail: boolean;
   /** 末尾未解析文本字符数（去除合法 JSON 已覆盖的范围） */

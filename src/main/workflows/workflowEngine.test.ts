@@ -117,7 +117,7 @@ describe("WorkflowEngine", () => {
     expect(session.stage_runs?.[0]).toMatchObject({ stage_id: "understand", status: "completed" });
   });
 
-  it("soft-completes a stage agent result missing required outputs when retry is exhausted", () => {
+  it("keeps repairing a stage agent result missing required outputs instead of blocking immediately", () => {
     const engine = new WorkflowEngine();
     const session = createSession();
     const workflowWithRequiredOutput: WorkflowTemplate = {
@@ -135,11 +135,10 @@ describe("WorkflowEngine", () => {
     });
 
     expect(session.status).toBe("running");
-    expect(session.current_stage).toBe("plan");
-    expect(session.error).toBeUndefined();
-    expect(session.stage_runs?.[0]).toMatchObject({ stage_id: "understand", status: "completed" });
-    expect(session.stage_runs?.[0].output_summary).toContain("结构化字段缺失");
-    expect(session.stage_runs?.[0].output_summary).toContain("task_summary");
+    expect(session.current_stage).toBe("understand");
+    expect(session.error).toContain("Missing required outputs");
+    expect(session.error).toContain("task_summary");
+    expect(session.stage_runs?.[0]).toMatchObject({ stage_id: "understand", status: "running", attempt: 2 });
   });
 
   it("applies a needs_rework stage agent result", () => {
@@ -263,11 +262,14 @@ describe("WorkflowEngine", () => {
     expect(session.status).toBe("running");
     expect(session.stage_runs?.[0]).toMatchObject({ stage_id: "understand", attempt: 2, status: "running", retry_reason: expect.stringContaining("Missing required outputs") });
     expect(session.stage_runs?.[0].retry_reason).toContain("不要只输出 required_outputs 内部字段");
-    expect(session.stage_runs?.[0].retry_reason).toContain("不要把 JSON 嵌入 Markdown");
+    expect(session.stage_runs?.[0].retry_reason).toContain("不要主动嵌入 Markdown");
+    expect(session.stage_runs?.[0].retry_reason).toContain("required_outputs: full 是错误的");
+    expect(session.stage_runs?.[0].retry_reason).toContain("\"required_outputs\"");
+    expect(session.stage_runs?.[0].retry_reason).toContain("\"task_summary\"");
     expect(session.error).toContain("Missing required outputs");
   });
 
-  it("soft-completes after exceeding auto-retry limit for missing outputs", () => {
+  it("continues output-contract repair after exceeding workflow auto_retry_limit", () => {
     const engine = new WorkflowEngine();
     const session = createSession();
     const workflowWithRetry: WorkflowTemplate = {
@@ -284,17 +286,50 @@ describe("WorkflowEngine", () => {
       status: "completed",
       output_summary: "Done"
     });
-    // 第二次尝试：仍然 missing output，应该软通过，把缺口交给下游入境验收
+    // 第二次尝试：仍然 missing output，也应继续把原因发回模型修复，而不是阻断会话
     engine.applyStageResult(session, workflowWithRetry, {
       status: "completed",
       output_summary: "Done"
     });
 
     expect(session.status).toBe("running");
-    expect(session.current_stage).toBe("plan");
-    expect(session.error).toBeUndefined();
-    expect(session.stage_runs?.[0].output_summary).toContain("结构化字段缺失");
-    expect(session.stage_runs?.[0].output_summary).toContain("task_summary");
+    expect(session.current_stage).toBe("understand");
+    expect(session.error).toContain("Missing required outputs");
+    expect(session.error).toContain("task_summary");
+    expect(session.stage_runs?.[0]).toMatchObject({ attempt: 3, status: "running" });
+  });
+
+  it("missing output retry includes schema-aware required_outputs template", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+    const workflowWithProfileMode: WorkflowTemplate = {
+      ...workflow,
+      stages: [
+        {
+          id: "scan_project",
+          name: "Scan Project",
+          required_outputs: ["profile_mode", "existing_profile_assets"],
+          output_schema: {
+            profile_mode: { type: "string", enum: ["full", "incremental", "none"] },
+            existing_profile_assets: { type: "array", items: "string" }
+          },
+          auto_retry_limit: 1
+        }
+      ]
+    };
+
+    engine.ensureState(session, workflowWithProfileMode);
+    engine.applyStageResult(session, workflowWithProfileMode, {
+      status: "completed",
+      output_summary: "Done",
+      required_outputs: { existing_profile_assets: ["/tmp/CLAUDE.md"] }
+    });
+
+    expect(session.status).toBe("running");
+    expect(session.error).toContain("profile_mode");
+    expect(session.error).toContain("已解析到 required_outputs keys: existing_profile_assets");
+    expect(session.error).toContain("\"profile_mode\": \"full | incremental | none\"");
+    expect(session.error).toContain("\"existing_profile_assets\": []");
   });
 
   it("can restart from a specified stage", () => {
@@ -318,7 +353,7 @@ describe("WorkflowEngine", () => {
     expect(session.stage_runs?.[0]).toMatchObject({ stage_id: "understand", stage_name: "Understand" });
   });
 
-  it("blocks instead of soft-completing when a critical required output is still missing", () => {
+  it("keeps repairing critical required output misses before hard blocking", () => {
     const engine = new WorkflowEngine();
     const session = createSession();
     const workflowWithCriticalOutput: WorkflowTemplate = {
@@ -347,13 +382,14 @@ describe("WorkflowEngine", () => {
       output_summary: "Still missing task_items"
     });
 
-    expect(session.status).toBe("blocked");
+    expect(session.status).toBe("running");
     expect(session.current_stage).toBe("decompose");
-    expect(session.error).toContain("Critical required outputs missing");
+    expect(session.error).toContain("Missing required outputs");
     expect(session.error).toContain("task_items");
+    expect(session.stage_runs?.[0]).toMatchObject({ attempt: 3, status: "running" });
   });
 
-  it("soft-completes immediately when stage has no auto_retry_limit", () => {
+  it("uses output-contract repair retries even when stage has no auto_retry_limit", () => {
     const engine = new WorkflowEngine();
     const session = createSession();
     const workflowWithoutRetry: WorkflowTemplate = {
@@ -371,9 +407,103 @@ describe("WorkflowEngine", () => {
     });
 
     expect(session.status).toBe("running");
+    expect(session.current_stage).toBe("understand");
+    expect(session.error).toContain("Missing required outputs");
+    expect(session.stage_runs?.[0]).toMatchObject({ attempt: 2, status: "running" });
+  });
+
+  it("hard-blocks output-contract repair only after the internal repair limit", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+    const workflowWithoutRetry: WorkflowTemplate = {
+      ...workflow,
+      stages: [
+        { id: "understand", name: "Understand", required_outputs: ["task_summary"] },
+        { id: "plan", name: "Plan" }
+      ]
+    };
+
+    engine.ensureState(session, workflowWithoutRetry);
+    for (let index = 0; index < 6; index += 1) {
+      engine.applyStageResult(session, workflowWithoutRetry, {
+        status: "completed",
+        output_summary: `Still wrong ${index}`
+      });
+    }
+
+    expect(session.status).toBe("blocked");
+    expect(session.current_stage).toBe("understand");
+    expect(session.error).toContain("Missing required outputs after 6 attempts");
+    expect(session.error).toContain("task_summary");
+  });
+
+  it("accepts non-single JSON protocol output when required_outputs are complete", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+    const workflowWithRetry: WorkflowTemplate = {
+      ...workflow,
+      stages: [
+        { id: "understand", name: "Understand", required_outputs: ["task_summary"], auto_retry_limit: 1 },
+        { id: "plan", name: "Plan" }
+      ]
+    };
+
+    engine.ensureState(session, workflowWithRetry);
+    engine.applyStageResult(session, workflowWithRetry, {
+      status: "completed",
+      output_summary: "Done",
+      required_outputs: { task_summary: "x" },
+      parse_diagnostics: {
+        parse_strategy: "embedded_json",
+        protocol_violation: true,
+        had_unparsed_tail: false,
+        tail_length: 20,
+        last_open_brace_index: 10,
+        bracket_balance: 0,
+        candidate_count: 1
+      }
+    });
+
+    expect(session.status).toBe("running");
     expect(session.current_stage).toBe("plan");
     expect(session.error).toBeUndefined();
-    expect(session.stage_runs?.[0].output_summary).toContain("结构化字段缺失");
+    expect(session.stage_runs?.[0]).toMatchObject({
+      attempt: 1,
+      status: "completed",
+      required_outputs: { task_summary: "x" }
+    });
+  });
+
+  it("retries when no stage result can be parsed at all", () => {
+    const engine = new WorkflowEngine();
+    const session = createSession();
+    const workflowWithRetry: WorkflowTemplate = {
+      ...workflow,
+      stages: [
+        { id: "understand", name: "Understand", required_outputs: ["task_summary"], auto_retry_limit: 1 },
+        { id: "plan", name: "Plan" }
+      ]
+    };
+
+    engine.ensureState(session, workflowWithRetry);
+    engine.applyStageResult(session, workflowWithRetry, {
+      status: "completed",
+      output_summary: "plain text only",
+      parse_diagnostics: {
+        parse_strategy: "none",
+        protocol_violation: true,
+        had_unparsed_tail: false,
+        tail_length: 0,
+        last_open_brace_index: -1,
+        bracket_balance: 0,
+        candidate_count: 0
+      }
+    });
+
+    expect(session.status).toBe("running");
+    expect(session.current_stage).toBe("understand");
+    expect(session.error).toContain("没有解析到结构化阶段结果");
+    expect(session.stage_runs?.[0]).toMatchObject({ attempt: 2, status: "running" });
   });
 
   it("post_output_assertions: review_self_consistency 命中 → 走 retry → 超限 block", () => {

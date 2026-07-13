@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { AgentSession, HumanQuestion, HumanQuestionOption, SessionProgressEvent, WorkflowStage, WorkflowTemplate } from "../../shared/types.js";
+import type { AgentSession, HumanQuestion, HumanQuestionOption, SessionProgressEvent, StageAgentResult, WorkflowStage, WorkflowTemplate } from "../../shared/types.js";
 import { isMeaningfulAgentText } from "../../shared/agentMessages.js";
 import {
   approveOrDenyToolUse,
@@ -8,6 +8,7 @@ import {
 } from "../security/projectPolicy.js";
 import { WorkflowEngine } from "../workflows/workflowEngine.js";
 import { buildStageInstructions } from "./workflowPrompt.js";
+import { buildStageOutputFormat } from "./stageOutputFormat.js";
 import { evaluateHook, checkCommandSafety } from "./stageHookEnforcer.js";
 import { buildStageAgentInput, createMockStageAgentResult, parseStageAgentResult } from "./stageAgentProtocol.js";
 import { extractClaudeStageOutput, formatClaudeTranscript } from "./claudeMessageAdapter.js";
@@ -152,6 +153,7 @@ export class ClaudeAgentRunner {
           disallowedTools: buildDisallowedClaudeTools(input.workflow),
           // permissionMode 不设置，使用 SDK 默认行为。工具调用的审批逻辑在 canUseTool 回调中实现
           settingSources: ["user", "project", "local"],
+          outputFormat: buildStageOutputFormat(currentStage),
           ...(Object.keys(sdkAgents).length > 0 ? { agents: sdkAgents } : {}),
           canUseTool: async (toolName: string, toolInput: Record<string, unknown>, options: { toolUseID: string }) => {
             // SDK 原生 Task 工具：sub-agent 调用由 SDK 内部管理，直接放行
@@ -275,7 +277,7 @@ export class ClaudeAgentRunner {
       }
 
       const stageOutput = extractClaudeStageOutput(sdkMessages);
-      const transcript = formatClaudeTranscript(sdkMessages);
+      const transcript = formatClaudeTranscript(sdkMessages) || formatStructuredOutput(stageOutput.structuredOutput);
 
       if (this.hasPendingToolCall(input.session) || this.hasPendingHumanQuestion(input.session)) {
         // 有待审批工具/问题：push transcript 后中断
@@ -293,7 +295,11 @@ export class ClaudeAgentRunner {
 
       // 先 applyStageResult（可能触发 retry 或推进到下一阶段），再根据实际状态变化决定 push 什么消息
       const activeRunBeforeApply = this.workflowEngine.getActiveStageRun(input.session);
-      this.workflowEngine.applyStageResult(input.session, input.workflow, parseStageAgentResult(stageOutput.resultText || transcript));
+      this.workflowEngine.applyStageResult(
+        input.session,
+        input.workflow,
+        parseBestStageAgentResult(stageOutput.resultText, transcript, stageOutput.structuredOutput)
+      );
       const statusAfterApply = input.session.status;
       const activeRunAfterApply = this.workflowEngine.getActiveStageRun(input.session);
       const isRetryOfSameStage =
@@ -649,6 +655,50 @@ function isPdfPageImageRead(toolName: string, toolInput: Record<string, unknown>
 
 function normalizeAssistantMessageContent(content: string): string {
   return content.trim().replace(/\s+/g, " ");
+}
+
+export function parseBestStageAgentResult(resultText: string, transcript: string, structuredOutput?: unknown): StageAgentResult {
+  const candidates = [
+    {
+      text: formatStructuredOutput(structuredOutput),
+      result: structuredOutput !== undefined ? parseStageAgentResult(formatStructuredOutput(structuredOutput)) : null
+    },
+    { text: resultText, result: resultText.trim() ? parseStageAgentResult(resultText) : null },
+    { text: transcript, result: transcript.trim() ? parseStageAgentResult(transcript) : null }
+  ].filter((candidate): candidate is { text: string; result: StageAgentResult } => candidate.result !== null);
+
+  if (candidates.length === 0) {
+    return parseStageAgentResult("");
+  }
+
+  return candidates.reduce((best, candidate) => (
+    scoreStageResult(candidate.result) > scoreStageResult(best.result) ? candidate : best
+  )).result;
+}
+
+function formatStructuredOutput(value: unknown): string {
+  if (value === undefined) return "";
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return "";
+  }
+}
+
+function scoreStageResult(result: StageAgentResult): number {
+  switch (result.parse_diagnostics?.parse_strategy) {
+    case "single_json_object":
+      return 5;
+    case "repaired_single_json_object":
+      return 4;
+    case "embedded_json":
+      return 3;
+    case "relaxed_fields":
+      return 2;
+    case "none":
+    default:
+      return 0;
+  }
 }
 
 /**

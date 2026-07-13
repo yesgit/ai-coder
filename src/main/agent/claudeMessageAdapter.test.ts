@@ -39,6 +39,45 @@ describe("claude message adapter", () => {
     expect(extractClaudeStageOutput(messages).error).toBe("SDK failed");
   });
 
+  it("ignores no-content SDK result placeholders", () => {
+    const messages = [
+      {
+        type: "assistant",
+        message: { content: [{ type: "text", text: '{"status":"completed","output_summary":"ok"}' }] }
+      },
+      {
+        type: "result",
+        subtype: "success",
+        result: "(no content)"
+      }
+    ];
+
+    expect(extractClaudeStageOutput(messages)).toMatchObject({
+      assistantText: '{"status":"completed","output_summary":"ok"}',
+      resultText: ""
+    });
+    expect(formatClaudeTranscript(messages)).toBe('{"status":"completed","output_summary":"ok"}');
+  });
+
+  it("extracts SDK structured output independently from display text", () => {
+    const structuredOutput = {
+      status: "completed",
+      output_summary: "画像扫描完成",
+      required_outputs: { profile_mode: "incremental" }
+    };
+    const output = extractClaudeStageOutput([
+      {
+        type: "result",
+        subtype: "success",
+        result: "(no content)",
+        structured_output: structuredOutput
+      }
+    ]);
+
+    expect(output.structuredOutput).toEqual(structuredOutput);
+    expect(output.resultText).toBe("");
+  });
+
   it("extracts error result text from failed SDK runs", () => {
     const messages = [
       {

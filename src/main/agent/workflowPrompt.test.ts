@@ -92,7 +92,9 @@ describe("buildStageInstructions", () => {
     expect(prompt.slice(finalProtocolIndex)).toContain("\"required_outputs\": {");
     expect(prompt.slice(finalProtocolIndex)).toContain("\"profile_mode\": \"<profile_mode>\"");
     expect(prompt.slice(finalProtocolIndex)).toContain("不要输出 Markdown、代码块、标题、列表或解释文字");
-    expect(prompt.slice(finalProtocolIndex)).toContain("不要把 JSON 放进 ```json 代码块");
+    expect(prompt.slice(finalProtocolIndex)).toContain("不要主动把 JSON 放进 ```json 代码块");
+    expect(prompt.slice(finalProtocolIndex)).toContain("宿主能完整恢复对象时仍会接受");
+    expect(prompt.slice(finalProtocolIndex)).toContain("首选让第一个非空字符为 `{`");
     expect(prompt.slice(finalProtocolIndex)).toContain("不要只输出 required_outputs 内部字段");
     expect(prompt.slice(finalProtocolIndex)).toContain("sub-agent prompt 中的 JSON 示例只用于说明子任务返回格式");
     expect(prompt.trim().endsWith("如果你需要在 output_summary 或 required_outputs 字符串中包含 Markdown，请把它作为 JSON 字符串值转义后放入对象内部。")).toBe(true);
@@ -298,8 +300,60 @@ describe("buildStageInstructions", () => {
     expect(prompt).toContain("当前阶段 required_outputs JSON Schema");
     expect(prompt).toContain("\"changed_files\"");
     expect(prompt).toContain("\"array\"");
+    expect(prompt).toContain("## 阶段启动契约（先读这里，再开始行动）");
+    expect(prompt).toContain("- 当前阶段任务：实施改动");
+    expect(prompt).toContain("- 阶段结束时只能输出一个 JSON object");
+    expect(prompt).toContain("不要主动添加 ```json 代码块");
+    expect(prompt).toContain("- 最外层 JSON object 必须包含：status、output_summary、required_outputs");
+    expect(prompt).toContain("\"changed_files\": []");
+    expect(prompt).toContain("- required_outputs 字段说明 / JSON Schema：");
     // schema 不再内联在阶段概览行中，而是在 outputShapeHints 区域以 JSON Schema 形式呈现
     expect(prompt).toContain("required_outputs 字段形状提示");
+  });
+
+  it("renders enum output_schema values in the stage start contract", () => {
+    const input: StageAgentInput = {
+      workflow: {
+        id: "careful-coder",
+        name: "谨慎程序员 v2",
+        description: "",
+        stages: [
+          {
+            id: "scan_project",
+            name: "扫描项目画像",
+            approval_required: false,
+            required_outputs: ["profile_mode"],
+            output_schema: {
+              profile_mode: { type: "string", enum: ["full", "incremental", "none"] }
+            },
+            required_checks: [],
+            gates: []
+          }
+        ]
+      },
+      previous_stage_summaries: [],
+      current_stage: {
+        id: "scan_project",
+        name: "扫描项目画像",
+        instructions: "扫描项目画像",
+        approval_required: false,
+        required_outputs: ["profile_mode"],
+        output_schema: {
+          profile_mode: { type: "string", enum: ["full", "incremental", "none"] }
+        }
+      },
+      task_prompt: "修一个问题",
+      project_path: "/tmp/project",
+      allowed_tools: [],
+      required_outputs: ["profile_mode"],
+      gates: [],
+      recent_messages: [],
+      human_qa_history: []
+    };
+
+    const prompt = buildStageInstructions(input);
+
+    expect(prompt).toContain("\"profile_mode\": \"full | incremental | none\"");
   });
 
   it("hook sections: pre_tool_use 与 post_output_assertions 分别使用各自的 header（不混淆 deny/retry 语义）", () => {
@@ -343,7 +397,7 @@ describe("buildStageInstructions", () => {
     expect(prompt).toContain("请先 Read");
 
     // post_output_assertions header 必须强调"输出后 / retry / blocked"
-    expect(prompt).toContain("本阶段产物校验（输出落地后由宿主评估：自洽性断言扫产出文本、行为校验按 tool_calls 核对真动作；未通过按 auto_retry_limit 重试，超限走 blocked）");
+    expect(prompt).toContain("本阶段产物校验（输出落地后由宿主评估：自洽性断言扫产出文本、行为校验按 tool_calls 核对真动作；未通过会带原因打回重试");
     expect(prompt).toContain("review_self_consistency");
 
     // 两段 header 在 prompt 中按出现顺序排列，pre 在前

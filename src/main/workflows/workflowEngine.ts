@@ -10,6 +10,8 @@ import type {
   WorkflowTemplate
 } from "../../shared/types.js";
 
+const OUTPUT_CONTRACT_REPAIR_RETRY_LIMIT = 5;
+
 export class WorkflowEngine {
   ensureState(session: AgentSession, workflow: WorkflowTemplate): AgentSession {
     session.stage_runs ??= [];
@@ -79,32 +81,24 @@ export class WorkflowEngine {
 
     const missingOutputs = (stage?.required_outputs ?? []).filter((name) => !hasRequiredOutput(result, name));
     if (missingOutputs.length > 0) {
-      const maxRetry = stage?.auto_retry_limit ?? 0;
+      const maxRetry = getOutputContractRetryLimit(stage);
       const currentAttempt = this.getStageAttempt(session, stageRun.stage_id);
       // 若 parse_diagnostics 已经发现 JSON 烂尾，极大概率"missing"的真因是 JSON 没解析出来，
       // 而不是模型真的少写了字段。把诊断信息一并回传——避免模型反复输出同一份烂 JSON 还以为自己写对了。
       const diag = result.parse_diagnostics;
+      const parseHint = diag?.parse_strategy === "none"
+        ? "（没有解析到结构化阶段结果；可能只输出了说明文字，或 JSON 已损坏。）"
+        : "";
       const diagHint = diag?.had_unparsed_tail
         ? ` (JSON parse 失败诊断：bracket_balance=${diag.bracket_balance}, tail_length=${diag.tail_length}, candidate_count=${diag.candidate_count}——最外层 JSON 大概率有未闭合字符串/花括号/多余引号。请本地 JSON.parse 验证一遍再回传，整段写成单一合法对象。)`
         : "";
-      const shapeHint =
-        " 请把整段回复写成单一合法 JSON 对象，最外层必须包含 status、output_summary、required_outputs；不要只输出 required_outputs 内部字段，不要把 JSON 嵌入 Markdown 或 ```json 代码块。";
-      const criticalMissing = missingOutputs.filter((name) => isCriticalRequiredOutput(stage, name));
+      const shapeHint = buildMissingOutputsShapeHint(stage, result);
       if (currentAttempt <= maxRetry) {
-        return this.retryCurrentStage(session, workflow, `Missing required outputs: ${missingOutputs.join(", ")}${diagHint}${shapeHint}`);
+        return this.retryCurrentStage(session, workflow, `Missing required outputs: ${missingOutputs.join(", ")}${parseHint}${diagHint}${shapeHint}`);
       }
-      if (criticalMissing.length > 0) {
-        return this.blockCurrentStage(
-          session,
-          `Critical required outputs missing after ${currentAttempt} attempts: ${criticalMissing.join(", ")}${diagHint}${shapeHint}`
-        );
-      }
-      return this.completeCurrentStageWithMissingOutputs(
+      return this.blockCurrentStage(
         session,
-        workflow,
-        result,
-        missingOutputs,
-        `Missing required outputs after ${currentAttempt} attempts: ${missingOutputs.join(", ")}${diagHint}${shapeHint}`
+        `Missing required outputs after ${currentAttempt} attempts: ${missingOutputs.join(", ")}${parseHint}${diagHint}${shapeHint}`
       );
     }
 
@@ -417,34 +411,6 @@ export class WorkflowEngine {
     return session;
   }
 
-  private completeCurrentStageWithMissingOutputs(
-    session: AgentSession,
-    workflow: WorkflowTemplate,
-    result: StageAgentResult,
-    missingOutputs: string[],
-    reason: string
-  ): AgentSession {
-    const stageRun = this.getActiveStageRun(session);
-    if (!stageRun) {
-      return session;
-    }
-
-    if (result.required_outputs) {
-      stageRun.required_outputs = result.required_outputs;
-    }
-
-    const summary = [
-      result.output_summary,
-      "",
-      `结构化字段缺失（已软通过，交由后续阶段按文义验收；无法继续时应 needs_rework 打回本阶段）：${missingOutputs.join(", ")}。`,
-      `原始校验信息：${reason}`
-    ].filter(Boolean).join("\n");
-
-    const nextSession = this.completeCurrentStage(session, workflow, summary);
-    nextSession.error = undefined;
-    return nextSession;
-  }
-
   private getStageAttempt(session: AgentSession, stageId: string): number {
     const runs = (session.stage_runs ?? []).filter((run) => run.stage_id === stageId);
     if (runs.length === 0) return 0;
@@ -561,7 +527,45 @@ function hasRequiredOutput(result: StageAgentResult, name: string): boolean {
   return Object.hasOwn(result.required_outputs ?? {}, name);
 }
 
-function isCriticalRequiredOutput(stage: WorkflowStage | undefined, name: string): boolean {
-  const schema = stage?.output_schema?.[name];
-  return typeof schema === "object" && schema !== null && !Array.isArray(schema) && (schema as { critical?: unknown }).critical === true;
+function buildStrictJsonShapeHint(): string {
+  return " 请把整段回复写成单一合法 JSON 对象，最外层必须包含 status、output_summary、required_outputs；不要只输出 required_outputs 内部字段。直接输出对象最稳定，不要主动嵌入 Markdown 或 ```json 代码块。";
+}
+
+function getOutputContractRetryLimit(stage: WorkflowStage | undefined): number {
+  return Math.max(stage?.auto_retry_limit ?? 0, OUTPUT_CONTRACT_REPAIR_RETRY_LIMIT);
+}
+
+function buildMissingOutputsShapeHint(stage: WorkflowStage | undefined, result: StageAgentResult): string {
+  const parsedKeys = Object.keys(result.required_outputs ?? {});
+  const requiredTemplate = Object.fromEntries(
+    (stage?.required_outputs ?? []).map((name) => [name, exampleValueForRequiredOutput(name, stage?.output_schema?.[name])])
+  );
+  const stageResultTemplate = {
+    status: "completed",
+    output_summary: "用一句话总结本阶段结果",
+    required_outputs: requiredTemplate
+  };
+  const parsedKeysText = parsedKeys.length > 0 ? parsedKeys.join(", ") : "无";
+  return [
+    buildStrictJsonShapeHint(),
+    ` 已解析到 required_outputs keys: ${parsedKeysText}。`,
+    "不要把某个字段值直接写成 required_outputs（例如 required_outputs: full 是错误的）；required_outputs 必须是对象，且缺失字段必须作为对象 key 放进去。",
+    "请按这个完整外层 JSON 模板重写整段回复：",
+    JSON.stringify(stageResultTemplate, null, 2)
+  ].join(" ");
+}
+
+function exampleValueForRequiredOutput(name: string, schema: unknown): unknown {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    return `<${name}>`;
+  }
+  const record = schema as Record<string, unknown>;
+  if (Array.isArray(record.enum) && record.enum.length > 0) {
+    return record.enum.map(String).join(" | ");
+  }
+  if (record.type === "array") return [];
+  if (record.type === "object") return {};
+  if (record.type === "boolean") return false;
+  if (record.type === "number" || record.type === "integer") return 0;
+  return `<${name}>`;
 }

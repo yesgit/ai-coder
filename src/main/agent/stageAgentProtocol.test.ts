@@ -422,6 +422,8 @@ describe("stage agent protocol", () => {
     expect(result).toMatchObject({ status: "completed", output_summary: "Plain assistant response" });
     expect(result.parse_diagnostics?.had_unparsed_tail).toBe(false);
     expect(result.parse_diagnostics?.candidate_count).toBe(0);
+    expect(result.parse_diagnostics?.parse_strategy).toBe("none");
+    expect(result.parse_diagnostics?.protocol_violation).toBe(true);
   });
 
   it("flags trailing unparsed JSON as a diagnostic (so the assertion can retry)", () => {
@@ -438,6 +440,8 @@ describe("stage agent protocol", () => {
     expect(result.required_outputs).toEqual({ a: 1 });
     expect(result.parse_diagnostics).toBeDefined();
     expect(result.parse_diagnostics!.had_unparsed_tail).toBe(true);
+    expect(result.parse_diagnostics!.parse_strategy).toBe("embedded_json");
+    expect(result.parse_diagnostics!.protocol_violation).toBe(true);
     // 起码包括 raw 末尾的未闭合 `{`
     expect(result.parse_diagnostics!.bracket_balance).toBeGreaterThan(0);
   });
@@ -472,6 +476,8 @@ describe("stage agent protocol", () => {
       }
     });
     expect(result.parse_diagnostics?.had_unparsed_tail).toBe(false);
+    expect(result.parse_diagnostics?.parse_strategy).toBe("repaired_single_json_object");
+    expect(result.parse_diagnostics?.protocol_violation).toBe(true);
   });
 
   it("parses relaxed pseudo-structured stage output when JSON was omitted", () => {
@@ -502,12 +508,16 @@ assumptions
       definition_of_done: expect.stringContaining("创建分支"),
       assumptions: expect.stringContaining("登录校验")
     });
+    expect(result.parse_diagnostics?.parse_strategy).toBe("relaxed_fields");
+    expect(result.parse_diagnostics?.protocol_violation).toBe(true);
   });
 
   it("clean single-object JSON: had_unparsed_tail=false", () => {
     const result = parseStageAgentResult('{"status":"completed","output_summary":"ok"}');
     expect(result.parse_diagnostics?.had_unparsed_tail).toBe(false);
     expect(result.parse_diagnostics?.bracket_balance).toBe(0);
+    expect(result.parse_diagnostics?.parse_strategy).toBe("single_json_object");
+    expect(result.parse_diagnostics?.protocol_violation).toBe(false);
   });
 
   it("parses stage JSON from assistant prose with embedded markdown fences", () => {
@@ -547,6 +557,8 @@ assumptions
         preservation_plan: "最终保留计划"
       }
     });
+    expect(result.parse_diagnostics?.parse_strategy).toBe("embedded_json");
+    expect(result.parse_diagnostics?.protocol_violation).toBe(true);
   });
 
   it("creates mock required outputs for required fields", () => {

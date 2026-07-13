@@ -161,17 +161,22 @@ export function parseStageAgentResult(rawContent: string): StageAgentResult {
   const repairedRawContent = direct ? null : repairCommonStageJsonTypos(rawContent);
   const repairedDirect = repairedRawContent ? parseCandidate(repairedRawContent) : null;
   const relaxed = !direct && !repairedDirect && candidates.length === 0 ? parseRelaxedStageResult(rawContent) : null;
-  const parsed =
-    findLastStageResultCandidate(candidates) ?? candidates.at(-1) ?? direct ?? repairedDirect ?? relaxed ?? null;
+  const embedded = findLastStageResultCandidate(candidates) ?? candidates.at(-1) ?? null;
+  const parsed = embedded ?? direct ?? repairedDirect ?? relaxed ?? null;
+  const parseStrategy = determineParseStrategy(rawContent, parsed, direct, repairedDirect, embedded, relaxed);
 
   const diagnosticsSource = parsed === repairedDirect && repairedRawContent ? repairedRawContent : rawContent;
   const diagnosticsRanges = diagnosticsSource === rawContent ? ranges : extractJsonObjectRanges(diagnosticsSource);
-  const diagnostics = analyzeRawForJsonBreakage(
-    diagnosticsSource,
-    diagnosticsRanges,
-    diagnosticsSource === rawContent ? candidates.length : 1,
-    parsed
-  );
+  const diagnostics: ParseDiagnostics = {
+    ...analyzeRawForJsonBreakage(
+      diagnosticsSource,
+      diagnosticsRanges,
+      diagnosticsSource === rawContent ? candidates.length : 1,
+      parsed
+    ),
+    parse_strategy: parseStrategy,
+    protocol_violation: parseStrategy !== "single_json_object"
+  };
 
   if (!parsed) {
     return {
@@ -197,6 +202,22 @@ export function parseStageAgentResult(rawContent: string): StageAgentResult {
     error,
     parse_diagnostics: diagnostics
   };
+}
+
+function determineParseStrategy(
+  rawContent: string,
+  parsed: Record<string, unknown> | null,
+  direct: Record<string, unknown> | null,
+  repairedDirect: Record<string, unknown> | null,
+  embedded: Record<string, unknown> | null,
+  relaxed: Record<string, unknown> | null
+): ParseDiagnostics["parse_strategy"] {
+  if (!parsed) return "none";
+  if (direct && parsed === direct && isWholeSingleJsonObject(rawContent)) return "single_json_object";
+  if (repairedDirect && parsed === repairedDirect) return "repaired_single_json_object";
+  if (embedded && parsed === embedded) return isWholeSingleJsonObject(rawContent) ? "single_json_object" : "embedded_json";
+  if (relaxed && parsed === relaxed) return "relaxed_fields";
+  return "embedded_json";
 }
 
 export function createMockStageAgentResult(input: StageAgentInput): StageAgentResult {
@@ -335,6 +356,19 @@ function extractJsonObjectRanges(content: string): JsonRange[] {
     }
   }
   return ranges;
+}
+
+function isWholeSingleJsonObject(content: string): boolean {
+  const trimmedStart = content.search(/\S/);
+  if (trimmedStart === -1) return false;
+  const trimmedEnd = (() => {
+    for (let index = content.length - 1; index >= 0; index -= 1) {
+      if (/\S/.test(content[index] ?? "")) return index;
+    }
+    return -1;
+  })();
+  if (content[trimmedStart] !== "{" || content[trimmedEnd] !== "}") return false;
+  return findJsonObjectEnd(content, trimmedStart) === trimmedEnd;
 }
 
 /**

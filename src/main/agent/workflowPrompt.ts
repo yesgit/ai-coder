@@ -25,6 +25,7 @@ export function buildStageInstructions(input: StageAgentInput): string {
   const gates = input.gates.length ? input.gates.join(", ") : "none";
   const hookSections = describeStageHooks(input.current_stage.hooks);
   const outputShapeHints = describeRequiredOutputShapes(input.required_outputs, input.current_stage.output_schema);
+  const stageStartContract = describeStageStartContract(input, outputShapeHints);
 
   // ── 静态前缀（跨阶段不变，可利用 prompt cache）──
 
@@ -73,6 +74,7 @@ export function buildStageInstructions(input: StageAgentInput): string {
     "使用任何工具后，或在不需要工具时完成阶段工作后，请通过且仅通过一个符合下方协议的 JSON 对象结束当前阶段。",
     "最终 JSON 对象前后不要添加额外说明文字。",
     "禁止输出“先解释一下”“下面是 JSON”“根据分析如下”等前导语；也禁止在 JSON 后补充说明、再贴第二个对象，或把 JSON 放进 ```json 代码块。",
+    "首选格式：最后一条回复的第一个非空字符是 `{`，最后一个非空字符是 `}`。宿主会优先读取 SDK 结构化输出，并兼容提取文本中的完整对象；无法恢复完整对象或缺少必填字段时才会打回重试。",
     "输出前自行做一次严格自检：最外层必须是单个对象；所有 key/字符串都用双引号；没有未闭合的引号/花括号/方括号；没有尾随逗号；required_outputs 必须是对象而不是数组或字符串。",
     "",
   ].join("\n");
@@ -88,11 +90,14 @@ export function buildStageInstructions(input: StageAgentInput): string {
     `allowed_tools: ${allowedTools}`,
     `required_outputs: ${requiredOutputs}`,
     `gates: ${gates}`,
+    "",
+    "## 阶段启动契约（先读这里，再开始行动）",
+    stageStartContract,
     ...(hookSections.preToolUse
       ? ["", "本阶段工序闸门（在工具调用前由宿主校验，未满足会被 deny 并要求补齐）：", hookSections.preToolUse]
       : []),
     ...(hookSections.postOutput
-      ? ["", "本阶段产物校验（输出落地后由宿主评估：自洽性断言扫产出文本、行为校验按 tool_calls 核对真动作；未通过按 auto_retry_limit 重试，超限走 blocked）：", hookSections.postOutput]
+      ? ["", "本阶段产物校验（输出落地后由宿主评估：自洽性断言扫产出文本、行为校验按 tool_calls 核对真动作；未通过会带原因打回重试；JSON 协议/required_outputs 缺字段会进入输出合同修复重试）：", hookSections.postOutput]
       : []),
     ...(outputShapeHints
       ? [
@@ -200,7 +205,8 @@ export function buildStageInstructions(input: StageAgentInput): string {
     "",
     "硬性输出规则：",
     "- 最后一条回复只能是上面的单一 JSON 对象，不要输出 Markdown、代码块、标题、列表或解释文字。",
-    "- 不要把 JSON 放进 ```json 代码块。",
+    "- 不要主动把 JSON 放进 ```json 代码块；直接输出对象最稳定。宿主能完整恢复对象时仍会接受。",
+    "- 首选让第一个非空字符为 `{`、最后一个非空字符为 `}`。",
     "- 不要只输出 required_outputs 内部字段；必须保留最外层 status、output_summary、required_outputs。",
     "- 阶段指令或 sub-agent prompt 中的 JSON 示例只用于说明子任务返回格式，不是当前阶段最终输出格式。",
     "- 如果你需要在 output_summary 或 required_outputs 字符串中包含 Markdown，请把它作为 JSON 字符串值转义后放入对象内部。"
@@ -299,6 +305,44 @@ function describeRequiredOutputShapes(requiredOutputs: string[], outputSchema?: 
     );
   }
   return lines.length ? lines.join("\n") : null;
+}
+
+function describeStageStartContract(input: StageAgentInput, outputShapeHints: string | null): string {
+  const requiredOutputsObject = Object.fromEntries(
+    input.required_outputs.map((name) => [name, exampleValueForRequiredOutput(name, input.current_stage.output_schema?.[name])])
+  );
+  const stageTask = input.current_stage.instructions?.trim() || "完成当前阶段定义的工作，并只产出当前阶段要求的内容。";
+  return [
+    `- 当前阶段任务：${stageTask}`,
+    "- 阶段结束时只能输出一个 JSON object；不要输出 Markdown、代码块、前导解释或尾随说明。",
+    "- 首选让第一个非空字符为 `{`、最后一个非空字符为 `}`；不要主动添加 ```json 代码块。",
+    "- 最外层 JSON object 必须包含：status、output_summary、required_outputs。",
+    "- required_outputs 必须是 JSON object，字段必须完整覆盖当前阶段 required_outputs：",
+    JSON.stringify(requiredOutputsObject, null, 2),
+    ...(outputShapeHints
+      ? [
+          "- required_outputs 字段说明 / JSON Schema：",
+          outputShapeHints
+        ]
+      : [
+          "- 没有额外 JSON Schema 时，也必须让每个字段内容具体、可复用，并包含事实、路径、命令结果或明确假设。"
+        ])
+  ].join("\n");
+}
+
+function exampleValueForRequiredOutput(name: string, schema: unknown): unknown {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    return `<${name}>`;
+  }
+  const record = schema as Record<string, unknown>;
+  if (Array.isArray(record.enum) && record.enum.length > 0) {
+    return record.enum.map(String).join(" | ");
+  }
+  if (record.type === "array") return [];
+  if (record.type === "object") return {};
+  if (record.type === "boolean") return false;
+  if (record.type === "number" || record.type === "integer") return 0;
+  return `<${name}>`;
 }
 
 function describeStageHooks(hooks: StageHooksConfig | undefined): { preToolUse: string | null; postOutput: string | null } {
