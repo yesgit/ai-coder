@@ -440,9 +440,6 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     if (!workflow) {
       throw new Error(`Workflow not found: ${session.workflow_id}`);
     }
-    if (session.status === "waiting_approval") {
-      throw new Error("Session is waiting for approval or a required answer.");
-    }
     // 处理附件：校验 + 图片保存到磁盘，转为文件引用
     let processedAttachments = attachments;
     if (attachments?.length) {
@@ -478,10 +475,26 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
       await sessions.save(session);
       return session;
     }
-    // 将会话状态改为 running，触发新一轮执行
-    if (!workflowEngine.getActiveStageRun(session)) {
+
+    if (session.status === "waiting_approval") {
+      session.progress_events ??= [];
+      session.progress_events.push({
+        id: randomUUID(),
+        type: "status",
+        message: "补充消息已加入当前会话；仍需完成当前审批或回答后才能继续。",
+        visibility: "milestone",
+        created_at: new Date().toISOString()
+      });
+      await sessions.save(session);
+      return session;
+    }
+
+    if (session.status === "failed" || session.status === "blocked" || session.status === "interrupted") {
+      workflowEngine.resumeFromFailedStage(session, workflow);
+    } else if (session.status === "completed") {
       workflowEngine.startFollowUp(session, workflow, message.trim() || "Follow-up user message");
     } else {
+      workflowEngine.ensureState(session, workflow);
       session.status = "running";
     }
     await sessions.save(session);

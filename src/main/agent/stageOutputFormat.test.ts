@@ -73,4 +73,35 @@ describe("stage output format", () => {
       enum: ["keep", "update", "delete", "add"]
     });
   });
+
+  it("converts generic array shorthand recursively", () => {
+    const stage = {
+      id: "decompose",
+      name: "Decompose",
+      required_outputs: ["task"],
+      output_schema: {
+        task: {
+          type: "object",
+          properties: {
+            guards: "array<string>",
+            verdicts: "array<PASS | FAIL>"
+          }
+        }
+      }
+    } as WorkflowStage;
+
+    const schema = buildStageOutputFormat(stage).schema as {
+      properties: {
+        required_outputs: {
+          properties: {
+            task: { properties: Record<string, unknown> };
+          };
+        };
+      };
+    };
+    expect(schema.properties.required_outputs.properties.task.properties).toMatchObject({
+      guards: { type: "array", items: { type: "string" } },
+      verdicts: { type: "array", items: { type: "string", enum: ["PASS", "FAIL"] } }
+    });
+  });
 });

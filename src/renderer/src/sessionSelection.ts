@@ -50,6 +50,10 @@ export function getVisibleSessions(sessions: AgentSession[], projectPath?: strin
   return sessions.filter((session) => session.project_path === projectPath);
 }
 
+export function resolveComposerSession(activeSession: AgentSession | null, projectPath?: string): AgentSession | null {
+  return activeSession?.project_path === projectPath ? activeSession : null;
+}
+
 export function resolveActiveSessionId(sessions: AgentSession[], options: SessionSelectionOptions): string | null {
   const visibleSessions = getVisibleSessions(sessions, options.projectPath);
   const preferredSession = findSession(visibleSessions, options.preferredSessionId);

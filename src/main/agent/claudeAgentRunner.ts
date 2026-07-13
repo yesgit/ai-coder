@@ -126,7 +126,7 @@ export class ClaudeAgentRunner {
       const instructions = buildStageInstructions(stageAgentInput);
       await this.recordProgress(input, "runner", `开始执行阶段：${currentStage.name || currentStage.id}`, "milestone");
       const nodeInfo = await resolveNodeExecutable();
-      const sdkEnv = nodeInfo?.env ? { ...process.env, ...nodeInfo.env } : undefined;
+      const sdkEnv = buildClaudeSdkEnv(nodeInfo?.env);
 
       // 构建 SDK agents 配置：将 YAML 中定义的 sub-agent 映射为 SDK AgentDefinition
       const sdkAgents: Record<string, { description: string; tools?: string[]; prompt: string; model?: string }> = {};
@@ -674,6 +674,16 @@ export function parseBestStageAgentResult(resultText: string, transcript: string
   return candidates.reduce((best, candidate) => (
     scoreStageResult(candidate.result) > scoreStageResult(best.result) ? candidate : best
   )).result;
+}
+
+export function buildClaudeSdkEnv(nodeEnv?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    ...nodeEnv,
+    // SDK 0.1.77 stops before consuming the result of the attempt that reaches
+    // its limit. Leave enough headroom for a corrected final submission.
+    MAX_STRUCTURED_OUTPUT_RETRIES: process.env.MAX_STRUCTURED_OUTPUT_RETRIES?.trim() || "10"
+  };
 }
 
 function formatStructuredOutput(value: unknown): string {

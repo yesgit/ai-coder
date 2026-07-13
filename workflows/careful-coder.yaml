@@ -664,7 +664,7 @@ stages:
                location: "homepageRedirection.js:710"
                guards: ["isLoginAndCert"]
                params: {dispatch: "来自 Redux connect 的 dispatch"}
-               business_function: null
+               business_function: "N/A"
              acceptance_criteria:
                - "params 中的 dispatch 保留"
                - "isLoginAndCert guard 保留"
@@ -691,7 +691,7 @@ stages:
                   "guards": ["前置检查列表"],
                   "navigation_target": "导航目标",
                   "params": {"参数名": "参数值或说明"},
-                  "business_function": "调用的业务函数名（如 goReservationsManagerFun），无则 null"
+                  "business_function": "调用的业务函数名（如 goReservationsManagerFun），无则 N/A"
                 },
                 "acceptance_criteria": [
                   "验收标准 1：具体、可核对、不抽象"

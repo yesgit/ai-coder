@@ -337,7 +337,7 @@ export class WorkflowEngine {
     if (this.getActiveStageRun(session)) {
       return session;
     }
-    const firstStage = workflow.stages[0];
+    const firstStage = workflow.stages.find((stage) => !isProjectProfileStage(stage.id)) ?? workflow.stages[0];
     if (!firstStage) {
       throw new Error("Workflow has no stages");
     }
@@ -521,6 +521,10 @@ export class WorkflowEngine {
     }
     return index;
   }
+}
+
+function isProjectProfileStage(stageId: string): boolean {
+  return stageId === "scan_project" || stageId === "update_project_profile";
 }
 
 function hasRequiredOutput(result: StageAgentResult, name: string): boolean {

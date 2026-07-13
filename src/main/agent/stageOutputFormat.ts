@@ -36,6 +36,14 @@ export function buildStageOutputFormat(stage: WorkflowStage): {
 
 function normalizeOutputSchema(schema: unknown): Record<string, unknown> {
   if (typeof schema === "string") {
+    const arrayShorthand = schema.trim().match(/^array\s*<\s*(.+)\s*>$/);
+    if (arrayShorthand) {
+      return {
+        type: "array",
+        items: normalizeOutputSchema(arrayShorthand[1])
+      };
+    }
+
     const alternatives = schema.split("|").map((value) => value.trim()).filter(Boolean);
     if (alternatives.length > 1) {
       return { type: "string", enum: alternatives };

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AgentSession } from "../../shared/types.js";
-import { getVisibleSessions, groupSessionsByProject, resolveActiveSessionId } from "./sessionSelection.js";
+import { getVisibleSessions, groupSessionsByProject, resolveActiveSessionId, resolveComposerSession } from "./sessionSelection.js";
 
 const baseSession: AgentSession = {
   id: "session-a",
@@ -61,6 +61,18 @@ describe("session selection", () => {
       "session-newer-review",
       "session-plan"
     ]);
+  });
+
+  it.each(["created", "running", "waiting_approval", "blocked", "completed", "failed", "interrupted"] as const)(
+    "keeps a selected %s session attached to the composer",
+    (status) => {
+      const session = { ...baseSession, status };
+      expect(resolveComposerSession(session, session.project_path)).toBe(session);
+    }
+  );
+
+  it("does not attach a session from another project to the composer", () => {
+    expect(resolveComposerSession(baseSession, "/tmp/project-b")).toBeNull();
   });
 
   it("keeps the current visible session during normal refreshes", () => {

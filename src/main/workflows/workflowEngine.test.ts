@@ -244,6 +244,43 @@ describe("WorkflowEngine", () => {
     expect(session.stage_runs?.[1].input_summary).toBe("Resume retry");
   });
 
+  it("starts a completed-session follow-up at the first non-profile stage", () => {
+    const engine = new WorkflowEngine();
+    const profileWorkflow: WorkflowTemplate = {
+      ...workflow,
+      stages: [
+        { id: "scan_project", name: "Scan project" },
+        { id: "update_project_profile", name: "Update project profile" },
+        { id: "understand", name: "Understand" },
+        { id: "implement", name: "Implement" }
+      ]
+    };
+    const session = createSession();
+    session.status = "completed";
+    session.current_stage = "implement";
+    session.stage_runs = profileWorkflow.stages.map((stage) => ({
+      id: `${stage.id}-run`,
+      stage_id: stage.id,
+      attempt: 1,
+      status: "completed",
+      input_summary: "initial",
+      output_summary: `${stage.id} complete`,
+      started_at: new Date().toISOString(),
+      completed_at: new Date().toISOString()
+    }));
+
+    engine.startFollowUp(session, profileWorkflow, "Explain the result");
+
+    expect(session.status).toBe("running");
+    expect(session.current_stage).toBe("understand");
+    expect(session.stage_runs.at(-1)).toMatchObject({
+      stage_id: "understand",
+      attempt: 2,
+      status: "running",
+      input_summary: "Explain the result"
+    });
+  });
+
   it("auto-retries when missing required outputs and attempt count is below limit", () => {
     const engine = new WorkflowEngine();
     const session = createSession();

@@ -2,7 +2,7 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { ClaudeAgentRunner, describeSdkMessageSnippet, parseBestStageAgentResult } from "./claudeAgentRunner.js";
+import { buildClaudeSdkEnv, ClaudeAgentRunner, describeSdkMessageSnippet, parseBestStageAgentResult } from "./claudeAgentRunner.js";
 import type { AgentSession, WorkflowTemplate } from "../../shared/types.js";
 
 const workflow: WorkflowTemplate = {
@@ -20,6 +20,23 @@ const workflow: WorkflowTemplate = {
 };
 
 describe("ClaudeAgentRunner", () => {
+  it("gives structured output retries headroom while preserving an explicit override", () => {
+    const previous = process.env.MAX_STRUCTURED_OUTPUT_RETRIES;
+    try {
+      delete process.env.MAX_STRUCTURED_OUTPUT_RETRIES;
+      expect(buildClaudeSdkEnv({ TEST_NODE_PATH: "/tmp/node" })).toMatchObject({
+        TEST_NODE_PATH: "/tmp/node",
+        MAX_STRUCTURED_OUTPUT_RETRIES: "10"
+      });
+
+      process.env.MAX_STRUCTURED_OUTPUT_RETRIES = "12";
+      expect(buildClaudeSdkEnv().MAX_STRUCTURED_OUTPUT_RETRIES).toBe("12");
+    } finally {
+      if (previous === undefined) delete process.env.MAX_STRUCTURED_OUTPUT_RETRIES;
+      else process.env.MAX_STRUCTURED_OUTPUT_RETRIES = previous;
+    }
+  });
+
   it("prefers parseable assistant JSON over SDK no-content result text", () => {
     const parsed = parseBestStageAgentResult(
       "(no content)",

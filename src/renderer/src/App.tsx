@@ -17,7 +17,7 @@ import type {
 import { buildSessionTimeline } from "./sessionTimeline.js";
 import type { TimelineEvent } from "./sessionTimeline.js";
 import { summarizeSessionTitle } from "../../shared/sessionTitle.js";
-import { getVisibleSessions, groupSessionsByProject, resolveActiveSessionId } from "./sessionSelection.js";
+import { getVisibleSessions, groupSessionsByProject, resolveActiveSessionId, resolveComposerSession } from "./sessionSelection.js";
 import { buildWorkflowStageDisplays } from "./workflowStageStatus.js";
 import {
   formatStageName,
@@ -723,11 +723,7 @@ export default function App() {
     setTaskAttachments((prev) => prev.filter((_, i) => i !== index));
   }
 
-  const composerSession =
-    activeSession?.project_path === projectPath &&
-    (activeSession.status === "running" || activeSession.status === "completed")
-      ? activeSession
-      : null;
+  const composerSession = resolveComposerSession(activeSession, projectPath);
   const canStart = Boolean(projectPath && taskPrompt.trim() && workflows.length > 0 && !busy);
   const canSubmitComposer = composerSession
     ? Boolean(projectPath && (taskPrompt.trim() || taskAttachments.length > 0) && !busy)
