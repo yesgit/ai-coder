@@ -71,6 +71,51 @@ describe("evaluateBehaviorChecks", () => {
     });
   });
 
+  describe("successful_commands_run", () => {
+    const s = stageWithChecks({
+      post_output_checks: [
+        { require: { successful_commands_run: ["npm test"] }, on_fail: "必须有真实成功的测试结果" }
+      ]
+    });
+
+    it("只接受回传 exit_code=0 的命令结果", () => {
+      const ok = { ...bash("investigate", "npm test"), exit_code: 0 };
+      expect(evaluateBehaviorChecks(s, [ok], PROJECT)).toEqual([]);
+    });
+
+    it("未知或非零退出码不能冒充验证成功", () => {
+      const unknown = bash("investigate", "npm test");
+      const failed = { ...bash("investigate", "npm test"), exit_code: 1 };
+      expect(evaluateBehaviorChecks(s, [unknown], PROJECT)).toHaveLength(1);
+      expect(evaluateBehaviorChecks(s, [failed], PROJECT)).toHaveLength(1);
+    });
+  });
+
+  describe("generic evidence counts", () => {
+    it("requires real evidence calls and successful command results", () => {
+      const s = stageWithChecks({
+        post_output_checks: [{
+          require: { evidence_calls_min: 2, successful_commands_min: 1 },
+          on_fail: "需要真实证据"
+        }]
+      });
+      const read = readCall("investigate", "src/a.ts");
+      const failed = { ...bash("investigate", "npm test"), exit_code: 1 };
+      expect(evaluateBehaviorChecks(s, [read, failed], PROJECT)).toHaveLength(1);
+      const passed = { ...bash("investigate", "npm test"), exit_code: 0 };
+      expect(evaluateBehaviorChecks(s, [read, passed], PROJECT)).toEqual([]);
+    });
+
+    it("does not count approved-only reads or Bash without exit_code=0 as evidence", () => {
+      const s = stageWithChecks({
+        post_output_checks: [{ require: { evidence_calls_min: 1 }, on_fail: "需要已完成证据" }]
+      });
+      expect(evaluateBehaviorChecks(s, [readCall("investigate", "src/a.ts", "approved")], PROJECT)).toHaveLength(1);
+      expect(evaluateBehaviorChecks(s, [bash("investigate", "git status")], PROJECT)).toHaveLength(1);
+      expect(evaluateBehaviorChecks(s, [{ ...bash("investigate", "git status"), exit_code: 0 }], PROJECT)).toEqual([]);
+    });
+  });
+
   describe("files_read", () => {
     const s = stageWithChecks({
       post_output_checks: [

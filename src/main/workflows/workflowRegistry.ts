@@ -100,7 +100,11 @@ const postOutputAssertionSchema = z.enum([
   "implement_delta_check_present",
   "rollback_plan_when_irreversible",
   "hedged_findings_demoted",
-  "no_trailing_unparsed_payload"
+  "no_trailing_unparsed_payload",
+  "requirements_evidence_grounded",
+  "profile_scan_respects_assessment",
+  "profile_maintenance_scope_only",
+  "readonly_stage_no_implementation_claim"
 ]);
 const stageHooksSchema = z
   .object({
@@ -136,6 +140,9 @@ const stageHooksSchema = z
           require: z
             .object({
               commands_run: z.array(z.string().min(1)).optional(),
+              successful_commands_run: z.array(z.string().min(1)).optional(),
+              evidence_calls_min: z.number().int().min(1).optional(),
+              successful_commands_min: z.number().int().min(1).optional(),
               files_read: z
                 .array(z.object({ target: z.string().min(1), min: z.number().int().min(1) }))
                 .optional()
@@ -143,8 +150,11 @@ const stageHooksSchema = z
             .refine(
               (req) =>
                 (req.commands_run && req.commands_run.length > 0) ||
+                (req.successful_commands_run && req.successful_commands_run.length > 0) ||
+                req.evidence_calls_min !== undefined ||
+                req.successful_commands_min !== undefined ||
                 (req.files_read && req.files_read.length > 0),
-              "post_output_check require must declare at least one constraint (commands_run or files_read)"
+              "post_output_check require must declare at least one constraint (commands_run, successful_commands_run or files_read)"
             ),
           on_fail: z.string().min(1)
         })
@@ -213,6 +223,7 @@ const workflowSchema = z.object({
         instructions: z.string().optional(),
         approval_required: z.boolean().default(false),
         allowed_tools: stringArraySchema,
+        required_skills: stringArraySchema,
         required_outputs: stringArraySchema,
         output_schema: outputSchema,
         required_checks: stringArraySchema,
@@ -287,6 +298,7 @@ function normalizeWorkflow(input: unknown, sourceType: WorkflowSourceType, fileP
       instructions: stage.instructions,
       approval_required: stage.approval_required,
       allowed_tools: stage.allowed_tools,
+      required_skills: stage.required_skills,
       required_outputs: stage.required_outputs,
       output_schema: stage.output_schema,
       required_checks: stage.required_checks,

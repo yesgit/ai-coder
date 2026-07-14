@@ -84,6 +84,29 @@ describe("buildSessionTimeline", () => {
     expect(events.find((event) => event.id === `${session.id}:status`)).toMatchObject({ type: "status", title: "会话失败" });
   });
 
+  it("does not show a retry reason as a failed session while still running", () => {
+    const events = buildSessionTimeline({
+      ...session,
+      status: "running",
+      error: "Output checks failed: missing evidence"
+    });
+    expect(events.find((event) => event.type === "error")).toBeUndefined();
+    expect(events.find((event) => event.id === `${session.id}:status`)?.title).toBe("会话运行中");
+  });
+
+  it("keeps Skill usage messages alongside the final assistant answer", () => {
+    const events = buildSessionTimeline({
+      ...session,
+      messages: [
+        { role: "assistant", kind: "skill_usage", content: "正在加载 Skill：`careful-coder:verification-before-completion`", created_at: "2026-06-03T01:02:00.000Z" },
+        { role: "assistant", content: "验证完成。", created_at: "2026-06-03T01:03:00.000Z" }
+      ]
+    });
+    expect(events.filter((event) => event.type === "message").map((event) => event.title)).toEqual([
+      "助手消息", "助手使用 Skill"
+    ]);
+  });
+
   it("labels blocked sessions as blocked instead of failed in the error event", () => {
     const blockedSession: AgentSession = {
       ...session,
@@ -142,6 +165,24 @@ describe("buildSessionTimeline", () => {
     expect(events.map((event) => event.title)).toContain("阶段需要返工：执行 第 1 次尝试");
     expect(events.map((event) => event.title)).toContain("返工请求：执行 -> 计划");
     expect(events.map((event) => event.title)).toContain("阶段开始：计划 第 2 次尝试");
+  });
+
+  it("does not label an upstream summary as the running stage's activity", () => {
+    const events = buildSessionTimeline({
+      ...session,
+      stage_runs: [{
+        id: "understand-run",
+        stage_id: "understand",
+        attempt: 1,
+        status: "running",
+        input_summary: "项目画像扫描完成。已有 CLAUDE.md。",
+        started_at: "2026-06-03T01:05:30.000Z"
+      }]
+    });
+
+    const started = events.find((event) => event.id.includes("understand-run") && event.title.startsWith("阶段开始"));
+    expect(started?.detail).toBe("正在执行本阶段，尚未产生阶段结果。");
+    expect(started?.detail).not.toContain("项目画像");
   });
 
   it("keeps transient progress out of the timeline (transient goes to activity stream)", () => {

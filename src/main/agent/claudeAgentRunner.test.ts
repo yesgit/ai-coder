@@ -2,7 +2,7 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildClaudeSdkEnv, ClaudeAgentRunner, describeSdkMessageSnippet, parseBestStageAgentResult } from "./claudeAgentRunner.js";
+import { buildClaudeSdkEnv, ClaudeAgentRunner, describeSdkMessageSnippet, describeToolAttempt, evaluateHumanQuestionRequest, extractSdkToolUses, extractToolExecutionResult, parseBestStageAgentResult } from "./claudeAgentRunner.js";
 import type { AgentSession, WorkflowTemplate } from "../../shared/types.js";
 
 const workflow: WorkflowTemplate = {
@@ -20,6 +20,222 @@ const workflow: WorkflowTemplate = {
 };
 
 describe("ClaudeAgentRunner", () => {
+  it("never persists an unanswerable choice question when options are missing", () => {
+    const runner = new ClaudeAgentRunner() as unknown as {
+      buildHumanQuestion: (session: Pick<AgentSession, "current_stage">, input: Record<string, unknown>, id: string) => unknown;
+    };
+    expect(runner.buildHumanQuestion(
+      { current_stage: "understand" },
+      { question: "请选择实现方式", type: "single" },
+      "question-1"
+    )).toMatchObject({ question_type: "text", options: undefined });
+
+    expect(runner.buildHumanQuestion(
+      { current_stage: "understand" },
+      { question: "请选择", type: "single", options: ["方案 A", "方案 B"] },
+      "question-2"
+    )).toMatchObject({
+      question_type: "single",
+      options: [{ value: "方案 A", label: "方案 A" }, { value: "方案 B", label: "方案 B" }]
+    });
+  });
+
+  it("rejects questionnaire-style or evidence-free human questions", () => {
+    expect(evaluateHumanQuestionRequest({
+      question: "1. 开发者标识是什么？\n2. 哪些页面需要支持？\n3. 触发方式是什么？",
+      type: "text",
+      already_checked: ["用户原始需求"],
+      why_needed: "不同回答会改变分支名、范围和运行时实现"
+    })).toContain("一次只能询问一个决策");
+
+    expect(evaluateHumanQuestionRequest({
+      question: "采用哪种兼容策略？",
+      type: "single",
+      already_checked: [],
+      why_needed: "不同策略会改变旧调用方行为和验收结果"
+    })).toContain("already_checked 为空");
+
+    expect(evaluateHumanQuestionRequest({
+      question: "采用哪种兼容策略？",
+      type: "single",
+      already_checked: ["用户未指定；已检查 src/api.ts:42 的旧调用方"],
+      why_needed: "保留旧签名与直接迁移会产生不同兼容行为",
+      options: [{ value: "compatible", label: "保持兼容" }, { value: "breaking", label: "直接迁移" }]
+    })).toBeNull();
+  });
+
+  it("associates SDK tool results with their real exit code", () => {
+    expect(extractToolExecutionResult({
+      type: "user",
+      tool_use_result: { exit_code: 0, stdout: "tests passed" },
+      message: { content: [{ type: "tool_result", tool_use_id: "bash-1", content: "tests passed" }] }
+    })).toMatchObject({ toolUseId: "bash-1", exitCode: 0, outputSummary: expect.stringContaining("tests passed") });
+
+    expect(extractToolExecutionResult({
+      type: "user",
+      message: { content: [{ type: "tool_result", tool_use_id: "bash-2", content: "failed", exit_code: 1 }] }
+    })).toMatchObject({ toolUseId: "bash-2", exitCode: 1 });
+
+    expect(extractToolExecutionResult({
+      type: "user",
+      tool_use_result: { stdout: "42", stderr: "", interrupted: false },
+      message: { content: [{ type: "tool_result", tool_use_id: "bash-3", content: "42" }] }
+    })).toMatchObject({ toolUseId: "bash-3", executionSucceeded: true });
+
+    expect(extractToolExecutionResult({
+      type: "user",
+      tool_use_result: { stdout: "", stderr: "boom", interrupted: true },
+      message: { content: [{ type: "tool_result", tool_use_id: "bash-4", content: "boom", is_error: true }] }
+    })).toMatchObject({ toolUseId: "bash-4", executionSucceeded: false });
+  });
+
+  it("shows the rejected command in safety progress", () => {
+    expect(describeToolAttempt("Bash", { command: "python3 -c \"print(1)\"" })).toBe("Bash: python3 -c \"print(1)\"");
+  });
+
+  it("normalizes a successful SDK Bash result without exit_code to exit_code=0", () => {
+    const runner = new ClaudeAgentRunner(async function* () {});
+    const toolSession: AgentSession = {
+      id: "tool-result-session",
+      project_path: "/tmp/project",
+      workflow_id: workflow.id,
+      task_prompt: "inspect",
+      status: "running",
+      current_stage: "execute",
+      messages: [],
+      tool_calls: [{
+        id: "bash-success",
+        stage_id: "execute",
+        tool: "Bash",
+        input: { command: "git status" },
+        status: "approved",
+        created_at: new Date().toISOString()
+      }],
+      file_changes: [],
+      approvals: [],
+      stage_runs: [],
+      rework_requests: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+    (runner as unknown as { recordToolExecutionResult(session: AgentSession, message: unknown): void })
+      .recordToolExecutionResult(toolSession, {
+        type: "user",
+        tool_use_result: { stdout: "clean", stderr: "", interrupted: false },
+        message: { content: [{ type: "tool_result", tool_use_id: "bash-success", content: "clean" }] }
+      });
+
+    expect(toolSession.tool_calls[0]).toMatchObject({ status: "completed", exit_code: 0 });
+  });
+
+  it("reconstructs an audited tool call from SDK tool_use and tool_result messages", () => {
+    const runner = new ClaudeAgentRunner(async function* () {});
+    const session = {
+      id: "sdk-audit", project_path: "/tmp/project", workflow_id: workflow.id, task_prompt: "inspect",
+      status: "running", current_stage: "understand", messages: [], tool_calls: [], file_changes: [], approvals: [],
+      stage_runs: [], rework_requests: [], created_at: new Date().toISOString(), updated_at: new Date().toISOString()
+    } as AgentSession;
+    const toolUseMessage = {
+      type: "assistant",
+      message: { content: [{ type: "tool_use", id: "read-1", name: "Read", input: { file_path: "/tmp/spec.md" } }] }
+    };
+    expect(extractSdkToolUses(toolUseMessage)).toEqual([
+      { id: "read-1", tool: "Read", input: { file_path: "/tmp/spec.md" } }
+    ]);
+
+    const privateRunner = runner as unknown as {
+      recordSdkToolUses(session: AgentSession, stageId: string, message: unknown): void;
+      recordToolExecutionResult(session: AgentSession, message: unknown): void;
+    };
+    privateRunner.recordSdkToolUses(session, "understand", toolUseMessage);
+    privateRunner.recordToolExecutionResult(session, {
+      type: "user",
+      message: { content: [{ type: "tool_result", tool_use_id: "read-1", content: "spec", is_error: false }] }
+    });
+
+    expect(session.tool_calls).toHaveLength(1);
+    expect(session.tool_calls[0]).toMatchObject({ id: "read-1", stage_id: "understand", tool: "Read", status: "completed" });
+  });
+
+  it("loads configured local Plugins into the SDK session", async () => {
+    let receivedOptions: Record<string, unknown> | undefined;
+    async function* query(params: unknown) {
+      receivedOptions = (params as { options?: Record<string, unknown> }).options;
+      yield {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: JSON.stringify({ status: "completed", output_summary: "ok" })
+      };
+    }
+
+    const session: AgentSession = {
+      id: "00000000-0000-4000-8000-000000000080",
+      project_path: "/tmp/project",
+      workflow_id: workflow.id,
+      task_prompt: "Check plugin loading",
+      status: "running",
+      current_stage: "execute",
+      messages: [],
+      tool_calls: [],
+      file_changes: [],
+      approvals: [],
+      stage_runs: [{
+        id: "00000000-0000-4000-8000-000000000081",
+        stage_id: "execute",
+        attempt: 1,
+        status: "running",
+        input_summary: "Initial task",
+        started_at: new Date().toISOString()
+      }],
+      rework_requests: [],
+      progress_events: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+
+    await new ClaudeAgentRunner({
+      queryOverride: query,
+      pluginPaths: ["/tmp/careful-coder-plugin"]
+    }).run({ session, workflow });
+
+    expect(receivedOptions?.plugins).toEqual([
+      { type: "local", path: "/tmp/careful-coder-plugin" }
+    ]);
+    const preToolUseHook = ((receivedOptions?.hooks as {
+      PreToolUse: Array<{ hooks: Array<(input: unknown) => Promise<unknown>> }>;
+    }).PreToolUse[0].hooks[0]);
+    await expect(preToolUseHook({})).resolves.toMatchObject({
+      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "ask" }
+    });
+  });
+
+  it("injects required core Skill content before a stage can run", async () => {
+    const pluginPath = await mkdtemp(path.join(tmpdir(), "careful-skill-"));
+    const skillPath = path.join(pluginPath, "skills", "test-skill");
+    await mkdir(skillPath, { recursive: true });
+    await writeFile(skillPath + "/SKILL.md", "---\nname: test-skill\ndescription: Test.\n---\n\n# Required discipline\nFollow evidence.\n");
+    let receivedPrompt = "";
+    async function* query(params: unknown) {
+      receivedPrompt = String((params as { prompt?: unknown }).prompt ?? "");
+      yield { type: "result", subtype: "success", is_error: false, result: JSON.stringify({ status: "completed", output_summary: "ok" }) };
+    }
+    const requiredWorkflow: WorkflowTemplate = {
+      ...workflow,
+      stages: workflow.stages.map((stage) => stage.id === "execute" ? { ...stage, required_skills: ["test-skill"] } : stage)
+    };
+    const session: AgentSession = {
+      id: "00000000-0000-4000-8000-000000000090", project_path: "/tmp/project", workflow_id: workflow.id,
+      task_prompt: "test", status: "running", current_stage: "execute", messages: [], tool_calls: [], file_changes: [], approvals: [],
+      stage_runs: [{ id: "00000000-0000-4000-8000-000000000091", stage_id: "execute", attempt: 1, status: "running", input_summary: "test", started_at: new Date().toISOString() }],
+      rework_requests: [], progress_events: [], created_at: new Date().toISOString(), updated_at: new Date().toISOString()
+    };
+    await new ClaudeAgentRunner({ queryOverride: query, pluginPaths: [pluginPath] }).run({ session, workflow: requiredWorkflow });
+    expect(receivedPrompt).toContain("宿主强制加载的核心心智");
+    expect(receivedPrompt).toContain("Follow evidence.");
+    expect(session.messages.some((message) => message.kind === "skill_usage" && message.content.includes("test-skill"))).toBe(true);
+  });
+
   it("gives structured output retries headroom while preserving an explicit override", () => {
     const previous = process.env.MAX_STRUCTURED_OUTPUT_RETRIES;
     try {

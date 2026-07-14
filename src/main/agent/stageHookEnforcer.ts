@@ -5,6 +5,7 @@ import type {
   ToolCallRecord,
   WorkflowStage
 } from "../../shared/types.js";
+import { isReadOnlyShellCommand } from "../security/projectPolicy.js";
 
 /**
  * 阶段级工序闸门评估器。
@@ -25,6 +26,8 @@ export type HookDecision = { allow: true } | { allow: false; message: string };
  * Bash 命令中的输出重定向（>、>>）在这些阶段被硬拒绝。
  */
 const READ_ONLY_STAGES = new Set([
+  "maintain_project_profile",
+  "assess_project_profile",
   "scan_project",
   "understand",
   "investigate",
@@ -33,6 +36,19 @@ const READ_ONLY_STAGES = new Set([
   "decompose",
   "self_review",
   "verify",
+]);
+
+// 只建立事实或契约的阶段使用最窄 Shell 能力。verify/self_review 可运行测试，
+// 但仍受 READ_ONLY_STAGES 的重定向保护。
+const STRICT_EVIDENCE_STAGES = new Set([
+  "maintain_project_profile",
+  "assess_project_profile",
+  "scan_project",
+  "understand",
+  "investigate",
+  "align",
+  "design",
+  "decompose"
 ]);
 
 /**
@@ -44,7 +60,7 @@ const READ_ONLY_STAGES = new Set([
  *
  * 拦截内容：
  * - sed -i：全局硬拒绝（用 sed 原地编辑源代码极危险，用 Edit 工具替代）
- * - > / >> 输出重定向：只读阶段硬拒绝（防止 self_review/verify 等审查阶段意外写文件）
+ * - 只读阶段只允许 projectPolicy 的严格只读命令白名单；解释器、here-doc、写文件脚本等一律拒绝
  * - 例外：>/dev/null、>> /dev/null、2>&1、1>&2 等无害重定向放行
  */
 export function checkCommandSafety(
@@ -52,6 +68,16 @@ export function checkCommandSafety(
   toolName: string,
   toolInput: Record<string, unknown>
 ): HookDecision {
+  if (stageId === "maintain_project_profile") {
+    const serialized = JSON.stringify(toolInput).toLowerCase();
+    if (/\.ai-coder\/uploads|\.(?:pdf|png|jpe?g|webp|gif)(?:[\"'\\/]|$)/.test(serialized)) {
+      return {
+        allow: false,
+        message: "引擎安全拦截：画像维护阶段与业务附件隔离，不能读取上传目录、PDF 或图片；请只检查长期项目画像资产和必要的项目事实证据。"
+      };
+    }
+  }
+
   // 只对 Bash 命令做安全检查
   if (toolName !== "Bash") return { allow: true };
 
@@ -88,6 +114,13 @@ export function checkCommandSafety(
       return {
         allow: false,
         message: `引擎安全拦截：${stageId} 是只读阶段，Bash 命令不能使用输出重定向（> 或 >>）。这可以防止审查/调查阶段意外覆盖项目文件。如需保存命令输出，结果已在终端显示——不需要重定向到文件。`,
+      };
+    }
+
+    if (STRICT_EVIDENCE_STAGES.has(stageId) && !isReadOnlyShellCommand(rawCmd)) {
+      return {
+        allow: false,
+        message: `引擎安全拦截：${stageId} 是严格取证阶段，Bash 只允许 git status/diff/show、rg/grep、ls/find/head 等严格只读命令。禁止 Python/Node/Perl/Ruby、here-doc、写文件脚本、状态变更命令和无法证明只读的复合命令。`
       };
     }
   }
@@ -228,6 +261,16 @@ export function hasShellRun(toolCalls: ToolCallRecord[], needle: string): boolea
     if (call.tool !== "Bash") return false;
     if (call.status !== "approved" && call.status !== "completed") return false;
     if (!isRecord(call.input)) return false;
+    const cmd = String((call.input as Record<string, unknown>).command ?? "").toLowerCase();
+    return cmd.includes(lower);
+  });
+}
+
+/** 只接受 SDK 已回传 exit_code=0 的真实 Bash 结果。 */
+export function hasSuccessfulShellRun(toolCalls: ToolCallRecord[], needle: string): boolean {
+  const lower = needle.toLowerCase();
+  return toolCalls.some((call) => {
+    if (call.tool !== "Bash" || call.exit_code !== 0 || !isRecord(call.input)) return false;
     const cmd = String((call.input as Record<string, unknown>).command ?? "").toLowerCase();
     return cmd.includes(lower);
   });

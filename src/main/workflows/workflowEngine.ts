@@ -94,7 +94,12 @@ export class WorkflowEngine {
         : "";
       const shapeHint = buildMissingOutputsShapeHint(stage, result);
       if (currentAttempt <= maxRetry) {
-        return this.retryCurrentStage(session, workflow, `Missing required outputs: ${missingOutputs.join(", ")}${parseHint}${diagHint}${shapeHint}`);
+        return this.retryCurrentStage(
+          session,
+          workflow,
+          `Missing required outputs: ${missingOutputs.join(", ")}${parseHint}${diagHint}${shapeHint}`,
+          { attemptedSummary: result.output_summary, attemptedOutputs: result.required_outputs, reuseEvidence: true }
+        );
       }
       return this.blockCurrentStage(
         session,
@@ -138,13 +143,13 @@ export class WorkflowEngine {
     // 不应被行为门控（否则 needs_rework 早期分支会误触，且模型可用合法 needs_rework 逃逸行为要求）。
     // 切片范围：stage_id 匹配 + created_at ≥ 本次 stageRun.started_at——既排除他阶段调用，
     // 也排除同阶段前序 rework run 的旧调用（rework 起 new stageRun 有新 started_at，旧 run 调用被排除，
-    // 第二轮须重新验证）；retry 复用同一 stageRun 不改 started_at，故同 run 多 attempt 调用都算，
-    // 符合"本次 stageRun 真发生过"语义。与文本断言（L3）合并走同一条 retry → block。
+    // 第二轮须重新验证）。纯输出格式修复通过 evidence_started_at 复用上一轮真实证据；
+    // 实质性断言失败创建新 run 并要求重新取证。与文本断言（L3）合并走同一条 retry → block。
     const behaviorFailures = result.status === "completed"
       ? evaluateBehaviorChecks(
           stage,
           (session.tool_calls ?? []).filter(
-            (tc) => tc.stage_id === stageRun.stage_id && tc.created_at >= stageRun.started_at
+            (tc) => tc.stage_id === stageRun.stage_id && tc.created_at >= (stageRun.evidence_started_at ?? stageRun.started_at)
           ),
           session.project_path
         )
@@ -158,7 +163,11 @@ export class WorkflowEngine {
     const maxRetry = stage.auto_retry_limit ?? 0;
     const currentAttempt = this.getStageAttempt(session, stageRun.stage_id);
     if (currentAttempt <= maxRetry) {
-      this.retryCurrentStage(session, workflow, reason);
+      this.retryCurrentStage(session, workflow, reason, {
+        attemptedSummary: result.output_summary,
+        attemptedOutputs: result.required_outputs,
+        reuseEvidence: false
+      });
     } else {
       this.blockCurrentStage(session, `${reason} (after ${currentAttempt} attempts)`);
     }
@@ -397,16 +406,40 @@ export class WorkflowEngine {
     return session;
   }
 
-  private retryCurrentStage(session: AgentSession, workflow: WorkflowTemplate, reason: string): AgentSession {
+  private retryCurrentStage(
+    session: AgentSession,
+    workflow: WorkflowTemplate,
+    reason: string,
+    options: {
+      attemptedSummary?: string;
+      attemptedOutputs?: Record<string, unknown>;
+      reuseEvidence?: boolean;
+    } = {}
+  ): AgentSession {
     const stageRun = this.getActiveStageRun(session);
     if (!stageRun) {
       return session;
     }
 
-    stageRun.status = "running";
-    stageRun.retry_reason = reason;
-    stageRun.attempt = (stageRun.attempt ?? 1) + 1;
-    session.status = "running";
+    const stage = this.getStage(workflow, stageRun.stage_id);
+    if (!stage) return this.blockCurrentStage(session, `Workflow stage not found: ${stageRun.stage_id}`);
+
+    stageRun.status = "superseded";
+    stageRun.completed_at = new Date().toISOString();
+    stageRun.output_summary = options.attemptedSummary ?? stageRun.output_summary ?? reason;
+    if (options.attemptedOutputs) stageRun.required_outputs = options.attemptedOutputs;
+
+    const retryRun = this.startStage(
+      session,
+      workflow,
+      stage,
+      `Retry after ${stageRun.stage_id} attempt ${stageRun.attempt}`
+    );
+    retryRun.retry_reason = reason;
+    retryRun.evidence_started_at = options.reuseEvidence
+      ? (stageRun.evidence_started_at ?? stageRun.started_at)
+      : retryRun.started_at;
+    // 兼容持久化结构：把最近一次重试原因留给 runner 注入上下文；UI 仅在终态展示为错误。
     session.error = reason;
     return session;
   }
@@ -524,7 +557,7 @@ export class WorkflowEngine {
 }
 
 function isProjectProfileStage(stageId: string): boolean {
-  return stageId === "scan_project" || stageId === "update_project_profile";
+  return stageId === "maintain_project_profile" || stageId === "assess_project_profile" || stageId === "scan_project" || stageId === "update_project_profile";
 }
 
 function hasRequiredOutput(result: StageAgentResult, name: string): boolean {

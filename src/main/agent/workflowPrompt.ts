@@ -8,6 +8,7 @@ const RECENT_STAGE_COUNT = 2; // 最近 N 个阶段保留截断后的 required_o
 
 export function buildStageInstructions(input: StageAgentInput): string {
   const isTaskUnderstandingStage = input.current_stage.id === "understand";
+  const isProfileMaintenanceStage = input.current_stage.id === "maintain_project_profile";
   const completedStageIds = new Set(input.previous_stage_summaries.map((s) => s.stage_id));
   const stageProgressLines = input.workflow.stages
     .map((stage, index) => {
@@ -36,15 +37,26 @@ export function buildStageInstructions(input: StageAgentInput): string {
       : []),
     "请始终使用简体中文回答，包括阶段总结、问题说明、审批请求和最终 JSON 中的自然语言内容。",
     "像一名谨慎的人类开发者一样推进：先理解意图，再查看证据，形成假设，比较方案，实施最小改动，并用验证结果校准判断。",
+    "谨慎程序员 Plugin 提供按需加载的 Skills。遇到匹配情境时，先调用原生 Skill 工具并遵循完整 Skill；不要只凭 Skill 名称猜测其流程。",
+    "准备宣称任务完成时，必须先使用 `careful-coder:verification-before-completion`，并以原始用户请求、最终 diff 与真实验证结果为依据。",
     "优先解决真实用户问题，而不是机械完成字段；如果流程字段与问题本质有张力，请在阶段输出中解释取舍。",
     "每个阶段都要把判断建立在可观察事实上：代码、配置、测试、错误信息、用户明确要求或前序阶段摘要。",
     "",
-    "## 总体任务（仅供参考——你只需完成当前阶段，不要越位执行）",
+    isProfileMaintenanceStage
+      ? "## 画像维护目标（业务需求正文与附件已由宿主隔离）"
+      : "## 总体任务（最高优先级验收来源——当前阶段不得越位执行）",
     input.task_prompt,
     "",
-    "⚠️ 上方的「总体任务」是整个工作流的最终目标，不是你一个人的任务。",
-    "你的职责仅限于当前阶段的 required_outputs。总体任务会在后续阶段被逐步推进。",
-    "除非你在 `understand` 阶段（第 3 阶段），否则不要阅读总体任务附带的 PDF/图片——那是给 understand 阶段理解需求用的。",
+    ...(isProfileMaintenanceStage
+      ? [
+          "⚠️ 画像阶段与本次业务任务语义隔离。不得猜测任务、附件内容、功能范围或后续实现；只维护跨任务复用的长期项目事实。",
+          "你的职责仅限于当前阶段的 required_outputs。"
+        ]
+      : [
+          "⚠️ 上方的「总体任务」和后续人类问答定义最终验收；你只执行当前阶段，但不得让阶段字段或前序摘要缩窄这个目标。",
+          "你的职责仅限于当前阶段的 required_outputs。它们服务于总体任务，而不是替代总体任务。",
+          "除非你在 `understand` 阶段，否则不要阅读总体任务附带的 PDF/图片——那是给 understand 阶段理解需求用的。"
+        ]),
     "",
     "工作流引擎负责控制阶段流转。你只需要完成当前阶段。",
     "你可以参考工作流概览和此前阶段摘要，但不要执行后续阶段。",
@@ -60,7 +72,7 @@ export function buildStageInstructions(input: StageAgentInput): string {
     ...(isTaskUnderstandingStage
       ? [
           "当前是 understand 阶段：你的任务语义输入是用户本次提交的原始任务、附件和后续明确回答。",
-          "scan_project / update_project_profile 是独立的项目背景预处理，不是本次用户任务的语义上游；不要把画像阶段总结、画像更新事项或画像 required_outputs 当作用户需求、验收标准或待办。"
+          "maintain_project_profile 是独立的项目背景预处理，不是本次用户任务的语义上游；不要把画像阶段总结、画像更新事项或画像 required_outputs 当作用户需求、验收标准或待办。"
         ]
       : [
           "入境验收（重要）：如果存在前序阶段摘要（即非首阶段），动手当前阶段工作之前必须先核对前序阶段产出是否满足本阶段的输入要求——",
@@ -218,20 +230,25 @@ export function buildStageInstructions(input: StageAgentInput): string {
   const buildTail = (opts: { lines: string; includeReviewSummary: boolean }) =>
     [
       "---",
-      "## ⚠️ 阶段隔离纪律（重要——违反会导致阶段失败）",
+      "## ⚠️ 阶段边界与需求保真（重要——违反会导致阶段失败）",
       "",
-      "1. **你只需要完成「当前阶段」的工作**。总体任务会在后续阶段中逐步推进，不要在當前階段执行。",
-      "2. **不要阅读总体任务附带的 PDF/图片附件**——除非当前阶段指令明确允许（只有 `understand` 阶段需要读附件理解需求；其他阶段的输入是前序阶段的 required_outputs，不是原始附件）。",
-      "3. **每个阶段都有明确的 required_outputs**——聚焦于产出这些字段，不要做阶段职责之外的事。不是你的产出就不要做。",
-      isTaskUnderstandingStage
+      "1. **你只需要完成「当前阶段」的工作**。总体任务会在后续阶段中逐步推进，不要提前执行后续阶段的工作。",
+      isProfileMaintenanceStage
+        ? "2. **宿主没有向本阶段提供业务任务正文、问答或附件；不得从文件名或 Git 变更猜测它们。**"
+        : "2. **不要阅读总体任务附带的 PDF/图片附件**——除非当前阶段指令明确允许（只有 `understand` 阶段需要读附件理解需求；其他阶段的输入是前序阶段的 required_outputs，不是原始附件）。",
+      "3. **每个阶段都有明确的 required_outputs**——聚焦于产出这些字段，但它们只是工作产物，不得缩窄、改写或覆盖用户要达成的结果。",
+      isProfileMaintenanceStage
+        ? "4. **只维护长期项目事实；不得输出本次需求结论、实现建议、业务文件清单或后续阶段安排。**"
+        : isTaskUnderstandingStage
         ? "4. **当前 understand 阶段必须从初始用户任务和附件理解需求**。项目画像文件只能作为背景证据按需读取；画像阶段摘要不是本阶段输入。"
-        : "4. **前序阶段的 required_outputs 是你最重要的输入**——优先消费它们，而不是回到原始任务描述重新理解。原始任务描述只是背景，不是你的行动指令。",
-      "5. **如果你发现自己在读 PDF 或思考「用户想要什么」而不是「我该产出什么」**——停下来，回到当前阶段的 required_outputs 清单。",
+        : "4. **初始用户任务与后续人类问答始终是最高优先级的验收来源**。前序阶段的 required_outputs 只是证据和可质疑的工作假设；发现它们遗漏、误解或缩窄需求时，必须纠正并明确记录，而不是机械继承。",
+      "5. **提问是昂贵的阻塞动作，不是需求访谈。调用 ask_human 前必须回看用户原话/附件/既有回答，并用只读工具检查项目规则、相邻实现、消费者和 git 证据。只有答案会导致不同实现、安全边界或验收结果，且证据无法回答时才提问。**",
+      "6. **一次只问一个决策。用户已经明确的范围（如“全部”“从 N 开始”）、仓库可查的事实、可按惯例采取的可逆默认值，一律不要再问。**",
       "---",
       "",
       "可用扩展工具：",
-      "- mcp__ai_coder__ask_human(question: string, type: \"single\"|\"multi\"|\"text\", options?: [{value,label}])",
-      "  向用户提问并暂停执行。single/multi 时 options 必填。仅在你确实需要用户的偏好、选择或缺失信息时使用，不要因为可以求助就回避自己应该做的判断。",
+      "- mcp__ai_coder__ask_human(question, type, already_checked, why_needed, options?)",
+      "  向用户提问并暂停执行。already_checked 必须列出已核对的用户原话/附件/代码/规则证据；why_needed 必须说明不同回答会如何改变实现、安全或验收。一次只能问一个决策。single/multi 时 options 必填。",
       "  调用该工具后工作流会暂停；用户回答后下一轮指令的\"人类问答历史\"部分会包含答案。",
       "",
       "人类问答历史（你之前向用户提的问题及回答）：",
@@ -396,6 +413,17 @@ function describeBehaviorCheck(check: PostOutputBehaviorCheck): string {
       `本阶段必须真跑过包含 ${check.require.commands_run.map((s) => `\`${s.trim()}\``).join(" / ")} 的 Bash 命令（宿主按 tool_calls 核对，写文字不算数）`
     );
   }
+  if (check.require.successful_commands_run?.length) {
+    reqs.push(
+      `本阶段必须成功执行（SDK 回传 exit_code=0）包含 ${check.require.successful_commands_run.map((s) => `\`${s.trim()}\``).join(" / ")} 的 Bash 命令；仅发起调用或吞掉失败均不算验证证据`
+    );
+  }
+  if (check.require.evidence_calls_min !== undefined) {
+    reqs.push(`本阶段至少产生 ${check.require.evidence_calls_min} 次 Read/Grep/Glob/Bash 证据调用`);
+  }
+  if (check.require.successful_commands_min !== undefined) {
+    reqs.push(`本阶段至少有 ${check.require.successful_commands_min} 条 Bash 命令获得 exit_code=0 的真实结果`);
+  }
   if (check.require.files_read?.length) {
     reqs.push(
       `本阶段必须 Read/Grep 命中 ${check.require.files_read.map((f) => `\`${f.target}\` ≥ ${f.min} 次`).join(" / ")}`
@@ -408,6 +436,8 @@ function describeAssertion(name: string): string {
   switch (name) {
     case "review_self_consistency":
       return "review_self_consistency：output 中出现阻塞类问题信号（blocker/critical/严重不一致/安全问题/高优先级问题…）时，rework_decision 不允许是 pass——要么改 needs_rework，要么改写描述消除阻塞词。";
+    case "requirements_evidence_grounded":
+      return "requirements_evidence_grounded：用户结果、可观察验收、保留行为、证据、行为因果路径和关键未知必须完整；存在阻塞规划的未知项不得 completed。";
     case "needs_rework_target_required":
       return "needs_rework_target_required：status=needs_rework 时必须带 rework_target_stage_id。";
     case "unknowns_present":

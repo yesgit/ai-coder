@@ -5,7 +5,7 @@ import type {
   ToolCallRecord,
   WorkflowStage
 } from "../../shared/types.js";
-import { countReadHits, hasShellRun } from "./stageHookEnforcer.js";
+import { countReadHits, hasShellRun, hasSuccessfulShellRun } from "./stageHookEnforcer.js";
 
 /**
  * 阶段产物落地侧的断言评估器。
@@ -96,6 +96,11 @@ function behaviorCheckLabel(check: PostOutputBehaviorCheck): string {
   if (check.require.commands_run?.length) {
     parts.push(`commands_run[${check.require.commands_run.join(",")}]`);
   }
+  if (check.require.successful_commands_run?.length) {
+    parts.push(`successful_commands_run[${check.require.successful_commands_run.join(",")}]`);
+  }
+  if (check.require.evidence_calls_min !== undefined) parts.push(`evidence_calls_min[${check.require.evidence_calls_min}]`);
+  if (check.require.successful_commands_min !== undefined) parts.push(`successful_commands_min[${check.require.successful_commands_min}]`);
   if (check.require.files_read?.length) {
     parts.push(`files_read[${check.require.files_read.map((f) => f.target).join(",")}]`);
   }
@@ -107,10 +112,25 @@ function checkBehaviorRequire(
   toolCalls: ToolCallRecord[],
   projectPath: string
 ): string | null {
-  const { commands_run, files_read } = check.require;
+  const { commands_run, successful_commands_run, evidence_calls_min, successful_commands_min, files_read } = check.require;
   if (commands_run && commands_run.length > 0) {
     const missing = commands_run.filter((needle) => !hasShellRun(toolCalls, needle));
     if (missing.length > 0) return `本阶段未执行：${missing.join(" / ")}`;
+  }
+  if (successful_commands_run && successful_commands_run.length > 0) {
+    const missing = successful_commands_run.filter((needle) => !hasSuccessfulShellRun(toolCalls, needle));
+    if (missing.length > 0) return `本阶段未成功执行：${missing.join(" / ")}`;
+  }
+  if (evidence_calls_min !== undefined) {
+    const count = toolCalls.filter((call) => {
+      if (call.tool === "Bash") return call.status === "completed" && call.exit_code === 0;
+      return ["Read", "Grep", "Glob", "LS"].includes(call.tool) && call.status === "completed";
+    }).length;
+    if (count < evidence_calls_min) return `证据工具调用仅 ${count} 次，至少需要 ${evidence_calls_min} 次`;
+  }
+  if (successful_commands_min !== undefined) {
+    const count = toolCalls.filter((call) => call.tool === "Bash" && call.exit_code === 0).length;
+    if (count < successful_commands_min) return `成功 Bash 结果仅 ${count} 条，至少需要 ${successful_commands_min} 条`;
   }
   if (files_read && files_read.length > 0) {
     const under = files_read.filter((f) => countReadHits(toolCalls, f.target, projectPath) < f.min);
@@ -550,6 +570,115 @@ const rollbackPlanWhenIrreversible: AssertionImpl = (result) => {
   ].join("");
 };
 
+const requirementsEvidenceGrounded: AssertionImpl = (result) => {
+  const outputs = result.required_outputs ?? {};
+  const requestedOutcome = outputs.requested_outcome;
+  const acceptance = outputs.observable_acceptance;
+  const preserved = outputs.preserved_behaviors;
+  const evidence = outputs.evidence;
+  const paths = outputs.behavior_paths;
+  const unknowns = outputs.critical_unknowns;
+  const baseline = outputs.baseline_context;
+  const matrixStatus = outputs.scope_matrix_status;
+  const matrix = outputs.scope_matrix;
+
+  if (typeof requestedOutcome !== "string" || requestedOutcome.trim().length < 8) {
+    return "理解阶段缺少具体 requested_outcome；必须描述用户可观察到的结果，而非文件或配置动作。";
+  }
+  if (!Array.isArray(acceptance) || acceptance.length === 0 || acceptance.some((item) =>
+    !isStructuredItem(item, ["criterion", "source", "how_to_verify"])
+  )) {
+    return "observable_acceptance 必须非空，且每项包含 criterion/source/how_to_verify。";
+  }
+  if (!Array.isArray(preserved) || preserved.length === 0) {
+    return "preserved_behaviors 必须明确至少一项需保持的既有行为或边界。";
+  }
+  if (!Array.isArray(evidence) || evidence.length === 0 || evidence.some((item) =>
+    !isStructuredItem(item, ["claim", "source"])
+  )) {
+    return "evidence 必须非空，且每项包含 claim/source；无来源的推断不能进入需求契约。";
+  }
+  if (!Array.isArray(paths) || paths.length === 0 || paths.some((item) =>
+    !isStructuredItem(item, ["trigger", "consumer", "observable_result", "evidence"])
+  )) {
+    return "behavior_paths 必须至少给出一条从触发入口到可观察结果的因果路径及证据。";
+  }
+  if (!Array.isArray(unknowns)) return "critical_unknowns 必须显式给出数组，允许为空。";
+  const blocking = unknowns.find((item) => item && typeof item === "object" && (item as Record<string, unknown>).blocks_planning === true);
+  if (blocking) {
+    return "存在 blocks_planning=true 的关键未知项；必须继续取证、ask_human 或 needs_rework，不能 completed。";
+  }
+  if (!baseline || typeof baseline !== "object" || Array.isArray(baseline)) {
+    return "baseline_context 必须明确 requested/effective/evidence/code_reads_from_effective_baseline。";
+  }
+  const baselineRecord = baseline as Record<string, unknown>;
+  if (!["requested", "effective", "evidence"].every((key) => typeof baselineRecord[key] === "string" && String(baselineRecord[key]).trim())) {
+    return "baseline_context 的 requested/effective/evidence 必须是非空字符串。";
+  }
+  if (baselineRecord.code_reads_from_effective_baseline !== true) {
+    return "代码证据尚未确认来自 effective baseline；不能用用户明确排除的工作区作为需求证据。";
+  }
+  if (!["not_applicable", "complete", "incomplete"].includes(String(matrixStatus))) {
+    return "scope_matrix_status 必须是 not_applicable/complete/incomplete。";
+  }
+  if (!Array.isArray(matrix)) return "scope_matrix 必须显式给出数组。";
+  if (matrixStatus === "complete" && (matrix.length === 0 || matrix.some((item) => !isStructuredItem(item, ["item", "exact_value", "source_location", "confidence"])))) {
+    return "scope_matrix_status=complete 时矩阵必须非空，且每项包含 item/exact_value/source_location/confidence。";
+  }
+  return null;
+};
+
+const readonlyStageNoImplementationClaim: AssertionImpl = (result) => {
+  const summary = result.output_summary ?? "";
+  // 不跨中文句号/问号/感叹号扫描，避免“已完成需求理解。用户要求实现页面…”被拼成实施声明。
+  const implementationClaim = /(?:(?:已|已经)(?:实现|添加|修改|写入|创建|删除|修复)|(?:已|已经)?完成(?:了)?)[^。！？\n]{0,20}(?:功能|代码|文件|页面|接口|路由|配置)|(?:功能|代码|文件|页面|接口|路由|配置)[^。！？\n]{0,20}(?:已完成|已实现|已添加|已修改|已写入|已创建|已删除|已修复)/i;
+  return implementationClaim.test(summary)
+    ? "当前是只读取证阶段，output_summary 却声称已经完成代码/功能实施；请只报告理解、证据、未知项或施工计划。"
+    : null;
+};
+
+const profileScanRespectsAssessment: AssertionImpl = (result, prior) => {
+  const decidedMode = prior.assess_project_profile?.profile_mode;
+  const actualMode = result.required_outputs?.profile_mode;
+  if (!(["full", "incremental", "none"] as unknown[]).includes(decidedMode)) {
+    return "缺少 assess_project_profile 的有效 profile_mode；必须先完成画像模式判断。";
+  }
+  if (actualMode !== decidedMode) {
+    return `画像取证阶段不得改变前置决策：assess_project_profile=${String(decidedMode)}，scan_project=${String(actualMode)}。证据冲突时应 needs_rework，而不是静默扩大扫描范围。`;
+  }
+  if (decidedMode === "none") {
+    const updates = result.required_outputs?.profile_update_needed;
+    if (!Array.isArray(updates) || updates.length !== 1 || updates[0] !== "无") {
+      return "profile_mode=none 时 profile_update_needed 必须严格为 [\"无\"]，不得继续制造画像更新工作。";
+    }
+  }
+  return null;
+};
+
+const profileMaintenanceScopeOnly: AssertionImpl = (result) => {
+  const text = collectText(result);
+  const taskSemanticLeak = /(?:本次|当前|用户|总体)(?:需求|任务)|附件|\bpdf\b|下一阶段|后续(?:开发|实现)|需要实现|建议(?:修改|新增|实现|开发)|页面跳转|序号\s*\d+/i;
+  if (taskSemanticLeak.test(text)) {
+    return "画像维护产出越界讨论了本次业务需求、附件、实现建议或后续阶段；画像只能记录跨任务复用的长期项目事实。";
+  }
+  const validation = result.required_outputs?.validation;
+  if (!validation || typeof validation !== "object" || Array.isArray(validation) || (validation as Record<string, unknown>).task_semantics_excluded !== true) {
+    return "画像维护必须在 validation.task_semantics_excluded=true，确认业务任务正文、问答与附件未参与画像判断。";
+  }
+  const mode = result.required_outputs?.profile_mode;
+  const paths = result.required_outputs?.profile_paths;
+  if (mode === "none" && (!Array.isArray(paths) || paths.length !== 0)) {
+    return "profile_mode=none 时 profile_paths 必须为 []，不得写入画像文件。";
+  }
+  return null;
+};
+
+function isStructuredItem(value: unknown, keys: string[]): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const item = value as Record<string, unknown>;
+  return keys.every((key) => typeof item[key] === "string" && (item[key] as string).trim().length > 0);
+}
+
 const ASSERTION_IMPLS: Record<StageOutputAssertion, AssertionImpl> = {
   review_self_consistency: reviewSelfConsistency,
   needs_rework_target_required: needsReworkTargetRequired,
@@ -557,6 +686,10 @@ const ASSERTION_IMPLS: Record<StageOutputAssertion, AssertionImpl> = {
   item_matrix_when_multi: itemMatrixWhenMulti,
   hedged_findings_demoted: hedgedFindingsDemoted,
   no_trailing_unparsed_payload: noTrailingUnparsedPayload,
+  requirements_evidence_grounded: requirementsEvidenceGrounded,
+  profile_scan_respects_assessment: profileScanRespectsAssessment,
+  profile_maintenance_scope_only: profileMaintenanceScopeOnly,
+  readonly_stage_no_implementation_claim: readonlyStageNoImplementationClaim,
   investigate_structure_present: investigateStructurePresent,
   confidence_levels_present: confidenceLevelsPresent,
   callsites_inventory_present: callsitesInventoryPresent,

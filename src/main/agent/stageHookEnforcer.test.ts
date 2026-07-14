@@ -301,6 +301,37 @@ describe("stageHookEnforcer.evaluateHook", () => {
 });
 
 describe("stageHookEnforcer.checkCommandSafety", () => {
+  it("blocks business attachments during profile maintenance", () => {
+    expectDenied(checkCommandSafety("maintain_project_profile", "Read", {
+      file_path: "/tmp/proj/.ai-coder/uploads/spec/page-01.png"
+    }));
+    expectDenied(checkCommandSafety("maintain_project_profile", "Bash", {
+      command: "cat .ai-coder/uploads/spec/page-01.png"
+    }));
+    expect(checkCommandSafety("maintain_project_profile", "Read", { file_path: "/tmp/proj/CLAUDE.md" }).allow).toBe(true);
+  });
+  it("blocks interpreter and heredoc writes in read-only stages", () => {
+    for (const command of [
+      "python3 -c \"open('src/a.ts', 'w').write('x')\"",
+      "node -e \"require('fs').writeFileSync('src/a.ts','x')\"",
+      "python3 <<'PY'\nopen('src/a.ts', 'w').write('x')\nPY",
+      "cat src/a.ts | sed 'w src/copy.ts'"
+    ]) {
+      const result = checkCommandSafety("understand", "Bash", { command });
+      expectDenied(result);
+      expect(result.message).toContain("严格取证阶段");
+    }
+  });
+
+  it("allows strict read-only evidence commands in read-only stages", () => {
+    expect(checkCommandSafety("understand", "Bash", { command: "git -C /tmp/proj diff --name-only" }).allow).toBe(true);
+    expect(checkCommandSafety("decompose", "Bash", { command: "rg -n pageName lib | head -20" }).allow).toBe(true);
+  });
+
+  it("blocks mutating find modes in read-only stages", () => {
+    const result = checkCommandSafety("understand", "Bash", { command: "find src -name '*.tmp' -delete" });
+    expectDenied(result);
+  });
   it("非 Bash 工具直接放行", () => {
     const result = checkCommandSafety("self_review", "Read", { file_path: "/tmp/a.ts" });
     expect(result.allow).toBe(true);

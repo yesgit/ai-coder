@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
-import type { AgentSession, HumanQuestion, HumanQuestionOption, SessionProgressEvent, StageAgentResult, WorkflowStage, WorkflowTemplate } from "../../shared/types.js";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+import type { AgentMessage, AgentSession, HumanQuestion, HumanQuestionOption, SessionProgressEvent, StageAgentResult, WorkflowStage, WorkflowTemplate } from "../../shared/types.js";
 import { isMeaningfulAgentText } from "../../shared/agentMessages.js";
 import {
   approveOrDenyToolUse,
@@ -23,6 +25,11 @@ export interface AgentRunInput {
 type ClaudeQuery = (params: unknown) => AsyncIterable<unknown>;
 type ToolApprovalResolution = "approved" | "denied";
 
+export interface ClaudeAgentRunnerOptions {
+  queryOverride?: ClaudeQuery;
+  pluginPaths?: string[];
+}
+
 interface PendingToolApproval {
   session: AgentSession;
   resolve: (status: ToolApprovalResolution) => void;
@@ -35,8 +42,11 @@ export class ClaudeAgentRunner {
   private readonly abortControllers = new Map<string, AbortController>();
   private readonly pendingToolApprovals = new Map<string, Map<string, PendingToolApproval>>();
   private mcpServerCache: unknown | null = null;
+  private readonly options: ClaudeAgentRunnerOptions;
 
-  constructor(private readonly queryOverride?: ClaudeQuery) {}
+  constructor(options: ClaudeAgentRunnerOptions | ClaudeQuery = {}) {
+    this.options = typeof options === "function" ? { queryOverride: options } : options;
+  }
 
   abort(sessionId: string): boolean {
     const controller = this.abortControllers.get(sessionId);
@@ -123,7 +133,22 @@ export class ClaudeAgentRunner {
       const query = await this.resolveQuery();
       const mcpServer = await this.resolveMcpServer();
 
-      const instructions = buildStageInstructions(stageAgentInput);
+      const loadedSkills = await this.loadRequiredSkills(currentStage);
+      for (const skill of loadedSkills) {
+        this.appendAssistantMessage(input.session, `宿主已加载核心 Skill：\`${skill.id}\``, "skill_usage");
+        await this.recordProgress(input, "runner", `强制加载核心 Skill：${skill.id}`, "milestone");
+      }
+      const instructions = [
+        buildStageInstructions(stageAgentInput),
+        loadedSkills.length > 0
+          ? [
+              "---",
+              "## 宿主强制加载的核心心智",
+              "以下 Skill 是当前阶段的执行契约，不是参考材料。必须在行动和最终产出中逐条体现。",
+              ...loadedSkills.map((skill) => `\n### ${skill.id}\n${skill.content}`)
+            ].join("\n")
+          : ""
+      ].filter(Boolean).join("\n\n");
       await this.recordProgress(input, "runner", `开始执行阶段：${currentStage.name || currentStage.id}`, "milestone");
       const nodeInfo = await resolveNodeExecutable();
       const sdkEnv = buildClaudeSdkEnv(nodeInfo?.env);
@@ -149,9 +174,26 @@ export class ClaudeAgentRunner {
           env: sdkEnv,
           abortController,
           mcpServers: mcpServer ? { ai_coder: mcpServer } : undefined,
+          ...(this.options.pluginPaths?.length
+            ? { plugins: this.options.pluginPaths.map((pluginPath) => ({ type: "local" as const, path: pluginPath })) }
+            : {}),
           tools: buildAllowedClaudeTools(input.workflow, currentStage),
           disallowedTools: buildDisallowedClaudeTools(input.workflow),
-          // permissionMode 不设置，使用 SDK 默认行为。工具调用的审批逻辑在 canUseTool 回调中实现
+          // 项目/用户 settings 可能预授权工具并绕过 canUseTool。PreToolUse 一律要求宿主裁决，
+          // 保证安全策略、阶段 hooks 与工具审计对每一次调用都生效。
+          hooks: {
+            PreToolUse: [{
+              hooks: [async () => ({
+                continue: true,
+                hookSpecificOutput: {
+                  hookEventName: "PreToolUse" as const,
+                  permissionDecision: "ask" as const,
+                  permissionDecisionReason: "Route every tool through the host policy and audit callback."
+                }
+              })]
+            }]
+          },
+          // permissionMode 不设置，使用 SDK 默认行为；PreToolUse 会把最终裁决交给 canUseTool。
           settingSources: ["user", "project", "local"],
           outputFormat: buildStageOutputFormat(currentStage),
           ...(Object.keys(sdkAgents).length > 0 ? { agents: sdkAgents } : {}),
@@ -160,6 +202,12 @@ export class ClaudeAgentRunner {
             if (toolName === "Task") {
               await this.recordProgress(input, "tool_policy", "允许 Task（sub-agent）调用", "transient");
               return { behavior: "allow" };
+            }
+
+            if (toolName === "Skill") {
+              const skillName = String(toolInput.skill ?? toolInput.name ?? "unknown");
+              this.appendAssistantMessage(input.session, `正在加载 Skill：\`${skillName}\``, "skill_usage");
+              await this.recordProgress(input, "runner", `加载 Skill：${skillName}`, "milestone");
             }
 
             if (isPdfPageImageRead(toolName, toolInput)) {
@@ -186,6 +234,15 @@ export class ClaudeAgentRunner {
             }
             // 拦截 ask_human：作为 HumanQuestion 挂起，等待用户回答后继续
             if (toolName === "mcp__ai_coder__ask_human") {
+              const qualityFailure = evaluateHumanQuestionRequest(toolInput);
+              if (qualityFailure) {
+                await this.recordProgress(input, "tool_policy", `拒绝低质量问题：${qualityFailure}`, "milestone");
+                return {
+                  behavior: "deny",
+                  message: `提问准入失败：${qualityFailure}。请先自行取证；若仍需询问，只问一个会实质改变决策的问题。`,
+                  interrupt: false
+                };
+              }
               const question = this.buildHumanQuestion(input.session, toolInput, options.toolUseID);
               if (question) {
                 // 去重：相同 question 文本 + 相同 stage_id 不重复创建
@@ -219,7 +276,8 @@ export class ClaudeAgentRunner {
             // 在阶段 hooks 之前执行——这是因果致效层的约束，不是 prompt 建议。
             const safetyCheck = checkCommandSafety(currentStage.id, toolName, toolInput);
             if (!safetyCheck.allow) {
-              await this.recordProgress(input, "tool_policy", `安全拦截：${safetyCheck.message}`, "milestone");
+              const attempted = describeToolAttempt(toolName, toolInput);
+              await this.recordProgress(input, "tool_policy", `安全拦截（${attempted}）：${safetyCheck.message}`, "milestone");
               return { behavior: "deny", message: safetyCheck.message, interrupt: false };
             }
             // 阶段级工序闸门：仅当 stage.hooks 显式声明时生效；与 approveOrDenyToolUse（策略层）解耦。
@@ -258,6 +316,9 @@ export class ClaudeAgentRunner {
         }
       } as never) as AsyncIterable<unknown>) {
         sdkMessages.push(message);
+        this.recordSdkToolUses(input.session, currentStage.id, message);
+        this.recordToolExecutionResult(input.session, message);
+        await this.recordDiscoveredSkills(input, message);
         const snippet = this.describeSdkMessage(message);
         if (isMeaningfulSdkProgress(snippet)) {
           await this.recordProgress(input, "sdk_message", snippet, "transient");
@@ -414,17 +475,18 @@ export class ClaudeAgentRunner {
     return input.session;
   }
 
-  private appendAssistantMessage(session: AgentSession, content: string): void {
+  private appendAssistantMessage(session: AgentSession, content: string, kind?: AgentMessage["kind"]): void {
     if (!isMeaningfulAgentText(content)) return;
     const normalized = normalizeAssistantMessageContent(content);
     const recentDuplicate = session.messages
       .slice(-10)
-      .some((message) => message.role === "assistant" && normalizeAssistantMessageContent(message.content) === normalized);
+      .some((message) => message.role === "assistant" && message.kind === kind && normalizeAssistantMessageContent(message.content) === normalized);
     if (recentDuplicate) return;
     session.messages.push({
       role: "assistant",
       content,
-      created_at: new Date().toISOString()
+      created_at: new Date().toISOString(),
+      ...(kind ? { kind } : {})
     });
   }
 
@@ -499,12 +561,13 @@ export class ClaudeAgentRunner {
 
   private buildHumanQuestion(session: AgentSession, toolInput: Record<string, unknown>, toolUseID: string): HumanQuestion | null {
     const question = typeof toolInput.question === "string" ? toolInput.question.trim() : "";
-    const type = toolInput.type;
-    if (!question || (type !== "single" && type !== "multi" && type !== "text")) {
+    const requestedType = toolInput.type;
+    if (!question || (requestedType !== "single" && requestedType !== "multi" && requestedType !== "text")) {
       return null;
     }
+    let questionType: HumanQuestion["question_type"] = requestedType;
     let options: HumanQuestionOption[] | undefined;
-    if ((type === "single" || type === "multi") && Array.isArray(toolInput.options)) {
+    if ((requestedType === "single" || requestedType === "multi") && Array.isArray(toolInput.options)) {
       options = toolInput.options
         .map((item) => {
           if (item && typeof item === "object" && "value" in item && "label" in item) {
@@ -512,16 +575,24 @@ export class ClaudeAgentRunner {
             const label = String((item as { label: unknown }).label);
             return value && label ? { value, label } : null;
           }
+          if (typeof item === "string" && item.trim()) {
+            return { value: item.trim(), label: item.trim() };
+          }
           return null;
         })
         .filter((item): item is HumanQuestionOption => item !== null);
-      if (!options || options.length === 0) return null;
+    }
+    // 模型偶尔会声明 single/multi 却漏传 options。不能让用户面对一张无法回答的灰色表单：
+    // 降级为文本问题，保留原问题并让人类直接作答；下轮模型会从 answer 获得该信息。
+    if ((requestedType === "single" || requestedType === "multi") && (!options || options.length === 0)) {
+      questionType = "text";
+      options = undefined;
     }
     return {
       id: toolUseID,
       stage_id: session.current_stage,
       question,
-      question_type: type,
+      question_type: questionType,
       options,
       status: "pending",
       created_at: new Date().toISOString()
@@ -578,8 +649,8 @@ export class ClaudeAgentRunner {
   }
 
   private async resolveQuery(): Promise<ClaudeQuery> {
-    if (this.queryOverride) {
-      return this.queryOverride;
+    if (this.options.queryOverride) {
+      return this.options.queryOverride;
     }
 
     const sdk = await import("@anthropic-ai/claude-agent-sdk");
@@ -588,6 +659,88 @@ export class ClaudeAgentRunner {
       throw new Error("Claude Agent SDK does not expose query()");
     }
     return query as ClaudeQuery;
+  }
+
+  private async loadRequiredSkills(stage: WorkflowStage): Promise<Array<{ id: string; content: string }>> {
+    const required = stage.required_skills ?? [];
+    if (required.length === 0) return [];
+    if (!this.options.pluginPaths?.length) {
+      throw new Error(`阶段 ${stage.id} 要求核心 Skill，但运行器未配置 Plugin 路径：${required.join(", ")}`);
+    }
+
+    const loaded: Array<{ id: string; content: string }> = [];
+    for (const id of required) {
+      const [namespace, skillName] = id.includes(":") ? id.split(":", 2) : [undefined, id];
+      if (!/^[a-z0-9-]+$/.test(skillName)) throw new Error(`非法 required_skills 名称：${id}`);
+      let content: string | undefined;
+      for (const pluginPath of this.options.pluginPaths) {
+        if (namespace && path.basename(pluginPath) !== namespace) continue;
+        try {
+          content = await readFile(path.join(pluginPath, "skills", skillName, "SKILL.md"), "utf8");
+          break;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+      }
+      if (!content) throw new Error(`找不到阶段 ${stage.id} 必需的 Skill：${id}`);
+      loaded.push({ id: namespace ? id : `careful-coder:${skillName}`, content });
+    }
+    return loaded;
+  }
+
+  private async recordDiscoveredSkills(input: AgentRunInput, message: unknown): Promise<void> {
+    if (!isPlainObject(message) || message.type !== "system" || message.subtype !== "init") return;
+    const data = isPlainObject(message.data) ? message.data : {};
+    const skills = Array.isArray(message.skills) ? message.skills : Array.isArray(data.skills) ? data.skills : [];
+    const plugins = Array.isArray(message.plugins) ? message.plugins : Array.isArray(data.plugins) ? data.plugins : [];
+    if (skills.length === 0 && plugins.length === 0) return;
+    await this.recordProgress(
+      input,
+      "runner",
+      `SDK 已发现 Plugins：${plugins.join(", ") || "无"}；Skills：${skills.join(", ") || "无"}`,
+      "milestone"
+    );
+  }
+
+  /**
+   * SDK 可能因版本或设置行为未调用 canUseTool。直接从真实 tool_use 消息补记请求，
+   * 作为审计韧性兜底；若策略层已创建同 id 记录则不重复。
+   */
+  private recordSdkToolUses(session: AgentSession, stageId: string, message: unknown): void {
+    for (const toolUse of extractSdkToolUses(message)) {
+      if (session.tool_calls.some((item) => item.id === toolUse.id)) continue;
+      session.tool_calls.push({
+        id: toolUse.id,
+        stage_id: stageId,
+        tool: toolUse.tool,
+        input: toolUse.input,
+        status: "requested",
+        created_at: new Date().toISOString()
+      });
+    }
+  }
+
+  /** 将 SDK 的工具执行反馈关联回审批或 tool_use 时创建的记录。 */
+  private recordToolExecutionResult(session: AgentSession, message: unknown): void {
+    const result = extractToolExecutionResult(message);
+    if (!result) return;
+    const toolCall = session.tool_calls.find((item) => item.id === result.toolUseId);
+    if (!toolCall) return;
+    if (result.exitCode !== undefined) {
+      toolCall.exit_code = result.exitCode;
+    } else if (toolCall.tool === "Bash" && result.executionSucceeded === true) {
+      // Claude Agent SDK 的 Bash 成功结果通常只有 stdout/stderr/interrupted，未必提供 exit_code。
+      // tool_result 已明确完成且没有错误/中断时，将其规范化为 0，供证据门槛使用。
+      toolCall.exit_code = 0;
+    }
+    if (result.outputSummary) toolCall.output_summary = result.outputSummary;
+    if (result.executionSucceeded === false) {
+      toolCall.status = "blocked";
+      toolCall.resolved_at = new Date().toISOString();
+    } else if (toolCall.status === "approved" || toolCall.status === "requested") {
+      toolCall.status = "completed";
+      toolCall.resolved_at = new Date().toISOString();
+    }
   }
 
   private async resolveMcpServer(): Promise<unknown | null> {
@@ -616,10 +769,12 @@ export class ClaudeAgentRunner {
         handler: (...args: unknown[]) => Promise<unknown>
       ) => unknown)(
         "ask_human",
-        "向用户提问并暂停执行等待回答。type=single 单选、multi 多选、text 自由文本。options 仅 single/multi 时必填。提问后工作流会暂停；用户回答会通过下一轮指令以问答历史的形式返回。",
+        "仅在用户原话、附件、既有回答、项目规则和代码证据都无法回答，且不同答案会改变实现、安全或验收时，向用户询问一个决策并暂停。禁止把多个问题合并成问卷。",
         {
-          question: z.string().describe("问题文本，支持 Markdown"),
+          question: z.string().describe("只包含一个待决策事项的问题文本，支持 Markdown"),
           type: z.enum(["single", "multi", "text"]).describe("问题类型"),
+          already_checked: z.array(z.string()).min(1).describe("提问前已核对的用户原话、附件、既有回答、项目规则或代码证据"),
+          why_needed: z.string().min(12).describe("不同回答将如何实质改变实现、安全边界或验收结果"),
           options: z.array(z.object({ value: z.string(), label: z.string() })).optional().describe("single/multi 时必填")
         },
         async () => ({ content: [{ type: "text", text: "(intercepted by host)" }] })
@@ -633,6 +788,27 @@ export class ClaudeAgentRunner {
       return null;
     }
   }
+}
+
+export function evaluateHumanQuestionRequest(toolInput: Record<string, unknown>): string | null {
+  const question = typeof toolInput.question === "string" ? toolInput.question.trim() : "";
+  const whyNeeded = typeof toolInput.why_needed === "string" ? toolInput.why_needed.trim() : "";
+  const checked = Array.isArray(toolInput.already_checked)
+    ? toolInput.already_checked.filter((item) => typeof item === "string" && item.trim().length > 0)
+    : [];
+
+  if (!question) return "缺少 question";
+  if (question.length > 800) return "问题过长；只保留缺失决策及其直接影响，不要复述整份需求";
+  if (checked.length === 0) return "already_checked 为空，尚未证明已检查用户原话、附件、项目规则或代码证据";
+  if (whyNeeded.length < 12) return "why_needed 不具体，尚未说明不同回答会导致什么不同动作或结果";
+
+  const questionMarks = (question.match(/[?？]/g) ?? []).length;
+  if (questionMarks > 1) return `一次只能询问一个决策，当前包含 ${questionMarks} 个问句`;
+
+  const numberedPrompts = question.match(/(?:^|\n)\s*\d+[.、)]\s*\*{0,2}[^\n]{0,80}(?:[：:?？]|\*{2})/g) ?? [];
+  if (numberedPrompts.length > 1) return `一次只能询问一个决策，当前包含 ${numberedPrompts.length} 个编号议题`;
+
+  return null;
 }
 
 function isAbortError(error: unknown): boolean {
@@ -651,6 +827,101 @@ function isPdfPageImageRead(toolName: string, toolInput: Record<string, unknown>
   if (toolName !== "Read") return false;
   const filePath = String(toolInput.file_path ?? toolInput.path ?? "");
   return /(?:^|[/\\])\.ai-coder[/\\]uploads[/\\].*[/\\]page-\d+\.(?:png|jpe?g|webp)$/i.test(filePath);
+}
+
+interface ToolExecutionResult {
+  toolUseId: string;
+  exitCode?: number;
+  executionSucceeded?: boolean;
+  outputSummary?: string;
+}
+
+interface SdkToolUse {
+  id: string;
+  tool: string;
+  input: Record<string, unknown>;
+}
+
+/** 提取 SDK assistant 消息里的标准 tool_use block，供审计兜底与测试使用。 */
+export function extractSdkToolUses(message: unknown): SdkToolUse[] {
+  if (!isPlainObject(message)) return [];
+  const content = isPlainObject(message.message) ? message.message.content : undefined;
+  if (!Array.isArray(content)) return [];
+  return content.flatMap((block): SdkToolUse[] => {
+    if (!isPlainObject(block) || block.type !== "tool_use") return [];
+    const id = String(block.id ?? block.tool_use_id ?? "");
+    const tool = String(block.name ?? block.tool_name ?? "");
+    if (!id || !tool) return [];
+    return [{ id, tool, input: isPlainObject(block.input) ? block.input : {} }];
+  });
+}
+
+/**
+ * Agent SDK 将工具结果包装为 synthetic user message，并在 tool_use_result 中保留工具特有 JSON。
+ * 测试/SDK 版本也可能只提供标准 tool_result block，故同时兼容两种形态。
+ */
+export function extractToolExecutionResult(message: unknown): ToolExecutionResult | null {
+  if (!isPlainObject(message)) return null;
+  const content = isPlainObject(message.message) ? message.message.content : undefined;
+  const blocks = Array.isArray(content) ? content : [];
+  const block = blocks.find((item) => isPlainObject(item) && item.type === "tool_result");
+  const source = message.tool_use_result ?? block;
+  if (!source) return null;
+  const result = isPlainObject(source) ? source : {};
+  const toolUseId = String(
+    result.tool_use_id ?? result.toolUseId ?? (isPlainObject(block) ? block.tool_use_id ?? block.toolUseId : "") ?? ""
+  );
+  if (!toolUseId) return null;
+  const exitCode = findExitCode(source) ?? findExitCode(block);
+  const executionSucceeded = exitCode !== undefined
+    ? exitCode === 0
+    : inferToolExecutionSucceeded(message, source, block);
+  const outputSummary = summarizeToolResult(source);
+  return {
+    toolUseId,
+    ...(exitCode !== undefined ? { exitCode } : {}),
+    ...(executionSucceeded !== undefined ? { executionSucceeded } : {}),
+    ...(outputSummary ? { outputSummary } : {})
+  };
+}
+
+function inferToolExecutionSucceeded(message: Record<string, unknown>, source: unknown, block: unknown): boolean | undefined {
+  const records = [message, source, block].filter(isPlainObject);
+  if (records.some((record) => record.is_error === true || record.isError === true || record.interrupted === true)) return false;
+  if (records.some((record) => record.is_error === false || record.isError === false || record.interrupted === false)) return true;
+  // 收到标准 tool_result 且未标记错误，本身就是 SDK 对工具正常返回的确认。
+  if (isPlainObject(block) && block.type === "tool_result") return true;
+  return undefined;
+}
+
+export function describeToolAttempt(toolName: string, toolInput: Record<string, unknown>): string {
+  const raw = toolName === "Bash"
+    ? String(toolInput.command ?? "")
+    : String(toolInput.file_path ?? toolInput.path ?? "");
+  const summary = raw.replace(/\s+/g, " ").trim();
+  return `${toolName}${summary ? `: ${summary.slice(0, 220)}` : ""}`;
+}
+
+function findExitCode(value: unknown, depth = 0): number | undefined {
+  if (depth > 4 || !isPlainObject(value)) return undefined;
+  for (const key of ["exit_code", "exitCode", "return_code", "returnCode"]) {
+    const candidate = value[key];
+    if (typeof candidate === "number" && Number.isFinite(candidate)) return candidate;
+  }
+  for (const key of ["tool_response", "result", "content", "output"]) {
+    const nested = value[key];
+    for (const item of Array.isArray(nested) ? nested : [nested]) {
+      const found = findExitCode(item, depth + 1);
+      if (found !== undefined) return found;
+    }
+  }
+  return undefined;
+}
+
+function summarizeToolResult(value: unknown): string | undefined {
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  if (!text || text === "{}") return undefined;
+  return text.replace(/\s+/g, " ").trim().slice(0, 2_000);
 }
 
 function normalizeAssistantMessageContent(content: string): string {

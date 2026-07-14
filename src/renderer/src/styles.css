@@ -77,6 +77,33 @@ button:disabled {
   flex-wrap: wrap;
 }
 
+.project-context {
+  display: flex;
+  min-width: 0;
+  max-width: 240px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #e2e7ee;
+  border-radius: 8px;
+  background: #f8fafc;
+  padding: 7px 10px;
+  color: #475467;
+  line-height: 1;
+}
+
+.project-context span {
+  flex: 0 0 auto;
+  color: #98a2b3;
+  font-size: 11px;
+}
+
+.project-context strong {
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .management-page {
   display: grid;
   gap: 18px;

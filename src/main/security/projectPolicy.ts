@@ -59,7 +59,7 @@ export function hasStageApproval(session: AgentSession, stageId: string): boolea
 
 export function buildAllowedClaudeTools(workflow: WorkflowTemplate, stage?: WorkflowStage): string[] {
   const declared = new Set(stage ? (stage.allowed_tools ?? []) : workflow.stages.flatMap((item) => item.allowed_tools ?? []));
-  const tools = new Set<string>(["Read", "Grep", "Glob", "LS"]);
+  const tools = new Set<string>(["Read", "Grep", "Glob", "LS", "Skill"]);
 
   if (declared.has("edit_file")) {
     tools.add("Edit");
@@ -152,6 +152,7 @@ export async function approveOrDenyToolUse(
   if (session.auto_approve) {
     if (toolName === "Bash") {
       assertCommandAllowed(String(input.command ?? ""));
+      await assertShellPathsInsideProject(session.project_path, String(input.command ?? ""));
     }
     for (const filePath of extractFilePaths(input)) {
       const { inside } = await checkPathInsideProject(session.project_path, filePath);
@@ -191,6 +192,7 @@ export async function approveOrDenyToolUse(
     if (toolName === "Bash") {
       const command = String(input.command ?? "");
       assertCommandAllowed(command);
+      await assertShellPathsInsideProject(session.project_path, command);
       // 自主安全 shell（只读勘察 + 常见验证/构建检查）免逐次审批；危险或会改仓库状态的命令仍走审批/阻断。
       if (requiresShellApproval(workflow) && !isAutonomousSafeShellCommand(command)) {
         record("pending_approval");
@@ -252,8 +254,7 @@ export async function approveOrDenyToolUse(
 const READONLY_SHELL_PREFIXES = [
   // git 只读操作
   "git log", "git diff", "git show", "git blame", "git status", "git ls-files", "git ls-tree",
-  "git remote -v", "git branch", "git config --get", "git rev-parse", "git grep",
-  "git describe", "git tag -l", "git name-rev", "git merge-base", "git log ",
+  "git rev-parse", "git grep", "git describe", "git name-rev", "git merge-base", "git log ",
   // 目录/文件浏览
   "cd ", "ls ", "pwd", "find ", "du ", "df ", "stat ", "file ", "head ", "tail ", "cat ", "wc ",
   // 搜索/文本处理
@@ -286,6 +287,7 @@ export function isAutonomousSafeShellCommand(command: string, options: { readonl
 
   // 快速拒绝：含危险语法（重定向/命令替换/分号）。管道在下面逐段校验。
   if (/[<>;`$()]/.test(trimmed)) return false;
+  if (/\bfind\b[^|]*(?:-delete|-exec(?:dir)?\b|-ok(?:dir)?\b|-fprint\b|-fprintf\b|-fls\b)/.test(trimmed)) return false;
 
   // 按 && / || 分割成段，逐段检查
   const segments = trimmed.split(/\s*(?:&&|\|\|)\s*/).filter(s => s.trim().length > 0);
@@ -301,13 +303,23 @@ export function isAutonomousSafeShellCommand(command: string, options: { readonl
         if (!isSafeShellSegment(part, options.readonlyOnly ?? false)) return false;
       } else {
         // 管道后的段必须是安全过滤器
-        const safeFilters = ['head', 'tail', 'wc', 'grep', 'rg', 'less', 'more', 'cat', 'sort', 'uniq', 'cut', 'awk', 'sed'];
-        if (!safeFilters.some(f => part.startsWith(f))) return false;
+        const safeFilters = options.readonlyOnly
+          ? ['head', 'tail', 'wc', 'grep', 'rg', 'less', 'more', 'cat', 'sort', 'uniq', 'cut']
+          : ['head', 'tail', 'wc', 'grep', 'rg', 'less', 'more', 'cat', 'sort', 'uniq', 'cut', 'awk', 'sed'];
+        if (!safeFilters.some(f => part.startsWith(f)) && !(options.readonlyOnly && isReadonlySedFilter(part))) return false;
       }
     }
   }
 
   return true;
+}
+
+/** 只允许作为管道过滤器的 sed -n 打印/提前退出表达式，不允许写文件、替换或执行。 */
+function isReadonlySedFilter(part: string): boolean {
+  const match = part.match(/^sed\s+-n(?:\s+-e)?\s+(['"])(.+)\1$/);
+  if (!match) return false;
+  const script = match[2].trim();
+  return /^(?:\d+(?:,\d+)?p|\d+q|\/[^/\n]+\/p|\/[^/\n]+\/,\/[^/\n]+\/p)$/.test(script);
 }
 
 function normalizeReadonlyShellCommand(command: string): string {
@@ -319,17 +331,25 @@ function normalizeReadonlyShellCommand(command: string): string {
 }
 
 function isReadonlyShellSegment(segment: string): boolean {
-  if (READONLY_SHELL_PREFIXES.some((prefix) => segment.startsWith(prefix))) {
-    return true;
-  }
   const gitMatch = segment.match(/^git\s+(.+)$/);
-  if (!gitMatch) return false;
+  if (!gitMatch) {
+    return READONLY_SHELL_PREFIXES.some((prefix) => segment.startsWith(prefix));
+  }
 
   const tokens = gitMatch[1].trim().split(/\s+/);
   while (tokens[0] === "-c" || tokens[0] === "-C") {
     if (tokens.length < 3) return false;
     tokens.splice(0, 2);
   }
+
+  const subcommand = tokens.shift();
+  if (!subcommand) return false;
+
+  // 这些 Git 子命令既有读取模式也有写入模式，不能只按子命令名前缀放行。
+  if (subcommand === "branch") return isReadonlyGitBranch(tokens);
+  if (subcommand === "remote") return isReadonlyGitRemote(tokens);
+  if (subcommand === "config") return isReadonlyGitConfig(tokens);
+  if (subcommand === "tag") return isReadonlyGitTag(tokens);
 
   const readonlyGitSubcommands = new Set([
     "log",
@@ -339,17 +359,46 @@ function isReadonlyShellSegment(segment: string): boolean {
     "status",
     "ls-files",
     "ls-tree",
-    "remote",
-    "branch",
-    "config",
     "rev-parse",
     "grep",
     "describe",
-    "tag",
     "name-rev",
     "merge-base"
   ]);
-  return readonlyGitSubcommands.has(tokens[0]);
+  return readonlyGitSubcommands.has(subcommand);
+}
+
+function isReadonlyGitBranch(args: string[]): boolean {
+  if (args.length === 0) return true;
+  const mutating = new Set([
+    "-d", "-D", "-m", "-M", "-c", "-C", "--delete", "--move", "--copy",
+    "--edit-description", "--set-upstream-to", "--unset-upstream"
+  ]);
+  if (args.some((arg) => mutating.has(arg) || arg.startsWith("--set-upstream-to="))) return false;
+  // 裸位置参数会创建分支；只有显式 --list 后的位置参数才是过滤模式。
+  return args.includes("--list") || args.every((arg) => arg.startsWith("-"));
+}
+
+function isReadonlyGitRemote(args: string[]): boolean {
+  if (args.length === 0) return true;
+  return args[0] === "-v" || args[0] === "--verbose" || args[0] === "show" || args[0] === "get-url";
+}
+
+function isReadonlyGitConfig(args: string[]): boolean {
+  if (args.length === 0) return false;
+  const readModes = new Set([
+    "--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l",
+    "--get-color", "--get-colorbool"
+  ]);
+  return args.some((arg) => readModes.has(arg));
+}
+
+function isReadonlyGitTag(args: string[]): boolean {
+  if (args.length === 0) return true;
+  const mutating = new Set(["-a", "-s", "-u", "-f", "-d", "--annotate", "--sign", "--local-user", "--force", "--delete"]);
+  if (args.some((arg) => mutating.has(arg))) return false;
+  const readModes = new Set(["-l", "--list", "--contains", "--no-contains", "--points-at", "--merged", "--no-merged"]);
+  return args.some((arg) => readModes.has(arg) || arg.startsWith("--sort=") || arg.startsWith("--format="));
 }
 
 function isSafeShellSegment(segment: string, readonlyOnly: boolean): boolean {
@@ -409,6 +458,11 @@ async function canSkipPerToolApproval(
   if (toolName === "Bash") {
     const command = String(input.command ?? "");
     if (DANGEROUS_COMMANDS.some((p) => command.toLowerCase().includes(p))) return false;
+    try {
+      await assertShellPathsInsideProject(session.project_path, command);
+    } catch {
+      return false;
+    }
     if (requiresShellApproval(workflow) && !isAutonomousSafeShellCommand(command)) return false;
     return true;
   }
@@ -423,6 +477,24 @@ async function canSkipPerToolApproval(
   // 如果阶段没声明 edit_file 我们前面就不会走到这里；如果声明了，意味着 yaml 作者
   // 已经接受"这个阶段可以改文件"，不再每个 Edit 单独审批。
   return true;
+}
+
+export function extractAbsoluteShellPaths(command: string): string[] {
+  const paths: string[] = [];
+  const pattern = /(?:^|[\s'"=])((?:\/[A-Za-z0-9._@%+,:=-]+){2,}\/?)/g;
+  for (const match of command.matchAll(pattern)) {
+    const value = match[1];
+    if (value === "/dev/null" || value.startsWith("/proc/") || value.startsWith("/sys/")) continue;
+    paths.push(value);
+  }
+  return [...new Set(paths)];
+}
+
+async function assertShellPathsInsideProject(projectPath: string, command: string): Promise<void> {
+  for (const shellPath of extractAbsoluteShellPaths(command)) {
+    const { inside } = await checkPathInsideProject(projectPath, shellPath);
+    if (!inside) throw new Error(`Blocked shell path outside project: ${shellPath}`);
+  }
 }
 
 function isWriteTool(toolName: string): boolean {

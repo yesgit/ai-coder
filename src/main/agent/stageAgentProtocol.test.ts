@@ -61,6 +61,39 @@ describe("stage agent protocol", () => {
     expect(input.allowed_tools).toEqual(["read_file", "edit_file"]);
   });
 
+  it("isolates business task text, attachments, and answers from profile maintenance", () => {
+    const profileStage = { id: "maintain_project_profile", name: "维护项目画像", required_outputs: ["profile_mode"] };
+    const profileWorkflow: WorkflowTemplate = { ...workflow, stages: [profileStage, ...workflow.stages] };
+    const profileSession: AgentSession = {
+      ...session,
+      task_prompt: "实现附件中从序号 33 开始的页面跳转",
+      current_stage: "maintain_project_profile",
+      messages: [{
+        role: "user",
+        content: "实现附件中从序号 33 开始的页面跳转",
+        created_at: "2026-01-01T00:00:00.000Z",
+        attachments: [{ type: "file_ref", path: ".ai-coder/uploads/spec/page-01.png", display_name: "需求.pdf · 第 1 页" }]
+      }],
+      pending_human_questions: [{
+        id: "q1",
+        stage_id: "maintain_project_profile",
+        question: "功能范围？",
+        question_type: "text",
+        status: "answered",
+        answer: "全部页面",
+        created_at: "2026-01-01T00:00:01.000Z"
+      }],
+      stage_runs: []
+    };
+
+    const input = buildStageAgentInput(profileSession, profileWorkflow, profileStage);
+
+    expect(input.task_prompt).toContain("业务任务正文与附件已由宿主隔离");
+    expect(input.task_prompt).not.toContain("序号 33");
+    expect(input.recent_messages).toEqual([]);
+    expect(input.human_qa_history).toEqual([]);
+  });
+
   it("keeps the initial user message with attachments when recent message history is long", () => {
     const startedAt = "2026-01-01T00:00:00.000Z";
     const longSession: AgentSession = {
@@ -122,6 +155,7 @@ describe("stage agent protocol", () => {
     const profileWorkflow: WorkflowTemplate = {
       ...workflow,
       stages: [
+        { id: "assess_project_profile", name: "判断画像更新模式", required_outputs: ["profile_mode"] },
         { id: "scan_project", name: "扫描项目画像", required_outputs: ["project_facts"] },
         { id: "update_project_profile", name: "建立或调整项目画像", required_outputs: ["profile_changes"] },
         { id: "understand", name: "理解", required_outputs: ["user_goal_restated"] },
@@ -157,6 +191,17 @@ describe("stage agent protocol", () => {
       ],
       stage_runs: [
         {
+          id: "assess-run-1",
+          stage_id: "assess_project_profile",
+          attempt: 1,
+          status: "completed",
+          input_summary: "Profile assessment",
+          output_summary: "画像模式判断完成",
+          required_outputs: { profile_mode: "incremental" },
+          started_at: new Date().toISOString(),
+          completed_at: new Date().toISOString()
+        },
+        {
           id: "scan-run-1",
           stage_id: "scan_project",
           attempt: 1,
@@ -189,7 +234,7 @@ describe("stage agent protocol", () => {
       ]
     };
 
-    const input = buildStageAgentInput(profileSession, profileWorkflow, profileWorkflow.stages[2]);
+    const input = buildStageAgentInput(profileSession, profileWorkflow, profileWorkflow.stages[3]);
 
     expect(input.previous_stage_summaries).toEqual([]);
     expect(input.recent_messages).toHaveLength(1);

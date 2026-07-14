@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { ClaudeAgentRunner } from "./agent/claudeAgentRunner.js";
+import { resolveCarefulCoderPluginPath } from "./agent/carefulCoderPlugin.js";
 import { registerIpcHandlers } from "./ipc.js";
 import { SessionStore } from "./sessions/sessionStore.js";
 import { WorkflowRegistry } from "./workflows/workflowRegistry.js";
@@ -76,10 +77,19 @@ async function createWindow(): Promise<void> {
 const builtinWorkflowDir = app.isPackaged
   ? path.join(process.resourcesPath, "workflows")
   : path.join(app.getAppPath(), "workflows");
+const carefulCoderPluginPath = resolveCarefulCoderPluginPath({
+  appPath: app.getAppPath(),
+  resourcesPath: process.resourcesPath,
+  isPackaged: app.isPackaged
+});
 
 const sessions = new SessionStore();
 
-registerIpcHandlers(new WorkflowRegistry(builtinWorkflowDir), sessions, new ClaudeAgentRunner());
+registerIpcHandlers(
+  new WorkflowRegistry(builtinWorkflowDir),
+  sessions,
+  new ClaudeAgentRunner({ pluginPaths: [carefulCoderPluginPath] })
+);
 
 /**
  * 应用启动时把磁盘上仍然停留在 running / waiting_approval 的会话标为 interrupted。

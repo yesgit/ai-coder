@@ -8,10 +8,10 @@ import type {
   ApprovalRecord,
   Attachment,
   HumanQuestion,
-  ProjectOnboardingStatus,
   ReworkRequest,
   StageRun,
   ToolCallRecord,
+  WorkflowLoadIssue,
   WorkflowTemplate
 } from "../../shared/types.js";
 import { buildSessionTimeline } from "./sessionTimeline.js";
@@ -19,6 +19,7 @@ import type { TimelineEvent } from "./sessionTimeline.js";
 import { summarizeSessionTitle } from "../../shared/sessionTitle.js";
 import { getVisibleSessions, groupSessionsByProject, resolveActiveSessionId, resolveComposerSession } from "./sessionSelection.js";
 import { buildWorkflowStageDisplays } from "./workflowStageStatus.js";
+import { formatStageRunCardDetail } from "./stageRunPresentation.js";
 import {
   formatStageName,
   formatStatus,
@@ -44,7 +45,6 @@ export default function App() {
   const [sessions, setSessions] = useState<AgentSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<AgentRuntimeStatus | null>(null);
-  const [onboardingStatus, setOnboardingStatus] = useState<ProjectOnboardingStatus | null>(null);
   const [includeProjectProfile, setIncludeProjectProfile] = useState(true);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -185,15 +185,11 @@ export default function App() {
       : result.workflows[0]?.id ?? "";
     setWorkflows(result.workflows);
     setTaskWorkflowId(nextWorkflowId);
-    return { ...result, selectedWorkflowId: nextWorkflowId };
-  }
-
-  async function refreshOnboardingStatus(nextProjectPath = projectPath) {
-    if (!nextProjectPath) {
-      setOnboardingStatus(null);
-      return;
+    if (result.workflows.length === 0) {
+      const details = result.issues.map((issue: WorkflowLoadIssue) => issue.message).join("；");
+      setError(`工作流加载失败${details ? `：${details}` : "，请检查内置工作流文件"}`);
     }
-    setOnboardingStatus(await window.aiCoder.getProjectOnboardingStatus(nextProjectPath));
+    return { ...result, selectedWorkflowId: nextWorkflowId };
   }
 
   async function refreshSessions(
@@ -240,7 +236,6 @@ export default function App() {
         setIncludeProjectProfile(true);
         setExpandedProjectPaths((current) => new Set([...current, selected]));
         await refreshWorkflows(selected);
-        await refreshOnboardingStatus(selected);
         await refreshSessions(undefined, {
           projectPath: selected,
           preferLatestForWorkflow: true
@@ -267,7 +262,6 @@ export default function App() {
       setIncludeProjectProfile(session.onboarding?.project_profile_enabled !== false);
       setExpandedProjectPaths((current) => new Set([...current, authorizedPath]));
       await refreshWorkflows(authorizedPath);
-      await refreshOnboardingStatus(authorizedPath);
       await refreshSessions(session.id, { projectPath: authorizedPath, preferLatestForWorkflow: false });
       setTaskWorkflowId(session.workflow_id);
     } catch (err) {
@@ -728,6 +722,15 @@ export default function App() {
   const canSubmitComposer = composerSession
     ? Boolean(projectPath && (taskPrompt.trim() || taskAttachments.length > 0) && !busy)
     : canStart;
+  const composerDisabledReason = !projectPath
+    ? "请先选择项目"
+    : !taskPrompt.trim() && taskAttachments.length === 0
+      ? "请输入问题或添加附件"
+      : workflows.length === 0
+        ? "工作流未加载，请查看错误提示"
+        : busy
+          ? "正在处理，请稍候"
+          : undefined;
   const pendingToolCalls = activeSession?.tool_calls.filter((toolCall) => toolCall.status === "pending_approval") ?? [];
   const pendingHumanQuestions = activeSession?.pending_human_questions?.filter((q) => q.status === "pending") ?? [];
   const approvedToolCalls = activeSession?.tool_calls.filter((toolCall) => toolCall.status === "approved") ?? [];
@@ -815,18 +818,17 @@ export default function App() {
 
       <section className="workspace">
         <header className="topbar">
-          <div className="brand"><div className="mark">慎</div><div><h1>谨慎程序员</h1><p>项目画像优先的本地编码 Agent</p></div></div>
+          <div className="brand"><div className="mark">慎</div><div><h1>谨慎程序员</h1><p>谨慎、可追溯的本地编码 Agent</p></div></div>
           <div className="topbar-actions">
             <button className="secondary" onClick={() => setHistoryOpen((open) => !open)}>会话历史</button>
+            {projectPath && <div className="project-context" title={projectPath}>
+              <span>项目</span>
+              <strong>{projectPath.split(/[\\/]/).filter(Boolean).at(-1) ?? projectPath}</strong>
+            </div>}
             <button className="secondary" disabled={busy} onClick={chooseProject}>{busy ? "选择中..." : "选择项目"}</button>
             <button className={`secondary${showTerminal ? " terminal-active" : ""}`} disabled={!projectPath} onClick={() => setShowTerminal((s) => !s)} title="Claude 终端">{">_"}</button>
           </div>
         </header>
-        <p className="path" title={projectPath}>{projectPath || "尚未选择项目"}</p>
-
-        {onboardingStatus && <section className="onboarding-box compact">
-          <div className="onboarding-status-row"><strong>项目画像</strong><span className={`status-pill ${onboardingStatus.status}`}>{formatStatus(onboardingStatus.status)}</span></div>
-        </section>}
 
         {/* 主内容区：左侧任务/聊天，右侧阶段状态和活动流 */}
         <div className={`main-content-grid${activeWorkflow ? " has-stages" : ""}`}>
@@ -929,7 +931,7 @@ export default function App() {
               )}
               <div className="actions">
                 <button className="icon-btn" title="添加附件" onClick={() => taskFileInputRef.current?.click()}>📎</button>
-                <button className="primary" disabled={!canSubmitComposer} onClick={() => void submitComposer()}>
+                <button className="primary" disabled={!canSubmitComposer} title={composerDisabledReason} onClick={() => void submitComposer()}>
                   {busy ? "处理中..." : "发送"}
                 </button>
                 {error && <span className="error">{error}</span>}
@@ -1071,13 +1073,20 @@ export default function App() {
                         const currentAnswer = questionAnswers[q.id];
                         const otherText = questionOtherTexts[q.id] ?? "";
                         const trimmedOther = otherText.trim();
+                        // 兼容旧会话：早期后端可能保存了 single/multi 但未带 options 的问题。
+                        // 这类问题此前既没有表单也无法激活提交按钮，必须给用户一个文本兜底。
+                        const isChoiceFallback =
+                          (q.question_type === "single" || q.question_type === "multi") &&
+                          (!q.options || q.options.length === 0);
                         const showOtherInput =
                           (q.question_type === "single" && currentAnswer === OTHER_OPTION_VALUE) ||
                           (q.question_type === "multi" &&
                             Array.isArray(currentAnswer) &&
                             currentAnswer.includes(OTHER_OPTION_VALUE));
                         let isValid: boolean;
-                        if (q.question_type === "multi") {
+                        if (isChoiceFallback) {
+                          isValid = typeof currentAnswer === "string" && currentAnswer.trim().length > 0;
+                        } else if (q.question_type === "multi") {
                           if (!Array.isArray(currentAnswer) || currentAnswer.length === 0) {
                             isValid = false;
                           } else if (currentAnswer.includes(OTHER_OPTION_VALUE) && trimmedOther.length === 0) {
@@ -1101,7 +1110,7 @@ export default function App() {
                             <div className="question-header">
                               <strong>助手提问</strong>
                               <small>
-                                {q.question_type === "single" ? "单选" : q.question_type === "multi" ? "多选" : "文本"}
+                                {isChoiceFallback ? "文本（选项缺失）" : q.question_type === "single" ? "单选" : q.question_type === "multi" ? "多选" : "文本"}
                                 {" · "}
                                 {formatStageName(q.stage_id)}
                               </small>
@@ -1109,7 +1118,7 @@ export default function App() {
                             <div className="question-body">
                               <MarkdownContent>{q.question}</MarkdownContent>
                             </div>
-                            {q.question_type === "single" && q.options && (
+                            {q.question_type === "single" && q.options && !isChoiceFallback && (
                               <div className="question-options">
                                 {q.options.map((opt) => (
                                   <label key={opt.value} className="question-option">
@@ -1135,7 +1144,7 @@ export default function App() {
                                 </label>
                               </div>
                             )}
-                            {q.question_type === "multi" && q.options && (
+                            {q.question_type === "multi" && q.options && !isChoiceFallback && (
                               <div className="question-options">
                             {q.options.map((opt) => {
                               const arr = Array.isArray(currentAnswer) ? currentAnswer : [];
@@ -1183,7 +1192,7 @@ export default function App() {
                                 placeholder="输入你的其他意见..."
                               />
                             )}
-                            {q.question_type === "text" && (
+                            {(q.question_type === "text" || isChoiceFallback) && (
                               <textarea
                                 className="question-textarea"
                                 rows={3}
@@ -1198,7 +1207,10 @@ export default function App() {
                                 disabled={busy || !isValid}
                                 onClick={() => {
                                   let ans: string | string[];
-                                  if (q.question_type === "multi") {
+                                  if (isChoiceFallback) {
+                                    const freeText = ((currentAnswer as string) || "").trim();
+                                    ans = q.question_type === "multi" ? [freeText] : freeText;
+                                  } else if (q.question_type === "multi") {
                                     const arr = Array.isArray(currentAnswer) ? currentAnswer : [];
                                     ans = arr
                                       .map((v) => (v === OTHER_OPTION_VALUE ? trimmedOther : v))
@@ -1253,7 +1265,7 @@ export default function App() {
                               </div>
                               <small>第 {stageRun.attempt} 次尝试</small>
                               <p className="markdown-content">
-                                <MarkdownContent>{stageRun.output_summary ?? stageRun.input_summary}</MarkdownContent>
+                                <MarkdownContent>{formatStageRunCardDetail(stageRun)}</MarkdownContent>
                               </p>
                             </article>
                           ))}

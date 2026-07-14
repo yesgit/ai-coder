@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { approveOrDenyToolUse, isAutonomousSafeShellCommand, isReadOnlyShellCommand } from "./projectPolicy.js";
+import { approveOrDenyToolUse, extractAbsoluteShellPaths, isAutonomousSafeShellCommand, isReadOnlyShellCommand } from "./projectPolicy.js";
 import type { AgentSession, WorkflowTemplate } from "../../shared/types.js";
 
 const workflow: WorkflowTemplate = {
@@ -53,6 +53,25 @@ describe("project policy", () => {
     expect(decision.allow === false ? decision.interrupt : false).toBe(true);
     expect(current.status).toBe("waiting_approval");
     expect(current.tool_calls[0].status).toBe("pending_approval");
+  });
+
+  it("blocks malformed or external absolute paths embedded in shell commands", async () => {
+    const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-project-"));
+    const current = { ...session(), project_path: projectDir };
+    const decision = await approveOrDenyToolUse(
+      current,
+      workflow,
+      "Bash",
+      { command: "ls -la /home/useruser/projects/wrong/lib" },
+      "tool-shell-outside"
+    );
+    expect(decision.allow).toBe(false);
+    expect(current.tool_calls[0].status).toBe("blocked");
+  });
+
+  it("extracts absolute shell path arguments but ignores /dev/null", () => {
+    expect(extractAbsoluteShellPaths("git -C /home/user/project status 2>/dev/null && ls /tmp/outside"))
+      .toEqual(["/home/user/project", "/tmp/outside"]);
   });
 
   it("creates pending approval for read tools outside the selected project", async () => {
@@ -254,6 +273,21 @@ describe("isReadOnlyShellCommand", () => {
     expect(isReadOnlyShellCommand("npm test")).toBe(false);
     expect(isReadOnlyShellCommand("node script.js")).toBe(false);
     expect(isReadOnlyShellCommand("mv a b")).toBe(false);
+    expect(isReadOnlyShellCommand("git branch feature/unsafe")).toBe(false);
+    expect(isReadOnlyShellCommand("git branch -D feature/unsafe")).toBe(false);
+    expect(isReadOnlyShellCommand("git remote add origin https://example.com/repo.git")).toBe(false);
+    expect(isReadOnlyShellCommand("git config user.name cautious-coder")).toBe(false);
+    expect(isReadOnlyShellCommand("git tag v1.0.0")).toBe(false);
+  });
+
+  it("仅放行 Git 混合子命令的显式读取模式", () => {
+    expect(isReadOnlyShellCommand("git branch --show-current")).toBe(true);
+    expect(isReadOnlyShellCommand("git branch --list 'feature/*'")).toBe(true);
+    expect(isReadOnlyShellCommand("git remote -v")).toBe(true);
+    expect(isReadOnlyShellCommand("git remote get-url origin")).toBe(true);
+    expect(isReadOnlyShellCommand("git config --get user.name")).toBe(true);
+    expect(isReadOnlyShellCommand("git config --list")).toBe(true);
+    expect(isReadOnlyShellCommand("git tag -l 'v*'")).toBe(true);
   });
 
   it("含管道/重定向/分隔符的命令需审批（即使首词是 read-only）", () => {
@@ -287,6 +321,12 @@ describe("isAutonomousSafeShellCommand", () => {
     expect(isAutonomousSafeShellCommand("python -m pytest tests")).toBe(true);
     expect(isAutonomousSafeShellCommand("go test ./...")).toBe(true);
     expect(isAutonomousSafeShellCommand("cargo test")).toBe(true);
+  });
+
+  it("allows only strictly read-only sed filters in readonly mode", () => {
+    expect(isAutonomousSafeShellCommand("git show develop/aiAgent:file.js | sed -n '33,42p'", { readonlyOnly: true })).toBe(true);
+    expect(isAutonomousSafeShellCommand("git show develop/aiAgent:file.js | sed -n 'w /tmp/leak'", { readonlyOnly: true })).toBe(false);
+    expect(isAutonomousSafeShellCommand("git show develop/aiAgent:file.js | sed 's/a/b/'", { readonlyOnly: true })).toBe(false);
   });
 
   it("allows dependency, publish, formatting write, and repository-state commands", () => {

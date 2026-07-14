@@ -22,6 +22,120 @@ describe("evaluateOutputAssertions", () => {
     expect(out).toEqual([]);
   });
 
+  describe("requirements_evidence_grounded", () => {
+    const s = stage({ post_output_assertions: ["requirements_evidence_grounded"] });
+    const grounded = {
+      requested_outcome: "用户执行目标操作后得到明确可观察结果",
+      observable_acceptance: [{ criterion: "结果可见", source: "用户原话", how_to_verify: "执行场景验证" }],
+      preserved_behaviors: ["既有兼容行为保持不变"],
+      evidence: [{ claim: "入口由调用方触发", source: "src/a.ts:10", confidence: "high" }],
+      behavior_paths: [{ trigger: "用户操作", consumer: "src/a.ts:10", observable_result: "结果出现", evidence: "src/a.ts:10" }],
+      critical_unknowns: [],
+      baseline_context: {
+        requested: "当前工作区",
+        effective: "working-tree",
+        evidence: "git status --short",
+        code_reads_from_effective_baseline: true
+      },
+      scope_matrix_status: "not_applicable",
+      scope_matrix: []
+    };
+
+    it("完整证据契约通过", () => {
+      expect(evaluateOutputAssertions(s, result({ status: "completed", output_summary: "已取证", required_outputs: grounded }))).toEqual([]);
+    });
+
+    it("缺行为路径或存在阻塞未知时失败", () => {
+      expect(evaluateOutputAssertions(s, result({ status: "completed", output_summary: "完成", required_outputs: { ...grounded, behavior_paths: [] } }))).toHaveLength(1);
+      expect(evaluateOutputAssertions(s, result({ status: "completed", output_summary: "完成", required_outputs: { ...grounded, critical_unknowns: [{ unknown: "入口未知", blocks_planning: true }] } }))).toHaveLength(1);
+    });
+  });
+
+  describe("readonly_stage_no_implementation_claim", () => {
+    const s = stage({ post_output_assertions: ["readonly_stage_no_implementation_claim"] });
+
+    it("rejects implementation completion claims but allows evidence completion", () => {
+      expect(evaluateOutputAssertions(s, result({ status: "completed", output_summary: "已完成所有页面的代码修改和功能添加。" }))).toHaveLength(1);
+      expect(evaluateOutputAssertions(s, result({ status: "completed", output_summary: "已完成需求证据矩阵，仍有一项未知。" }))).toEqual([]);
+      expect(evaluateOutputAssertions(s, result({ status: "completed", output_summary: "已完成 understand 阶段需求理解。用户要求实现全部页面的跳转支持。" }))).toEqual([]);
+    });
+  });
+
+  describe("profile_scan_respects_assessment", () => {
+    const s = stage({ post_output_assertions: ["profile_scan_respects_assessment"] });
+
+    it("allows the scan stage to preserve the assessed mode", () => {
+      expect(evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "按增量范围完成取证",
+          required_outputs: { profile_mode: "incremental", profile_update_needed: ["更新验证命令"] }
+        }),
+        { assess_project_profile: { profile_mode: "incremental" } }
+      )).toEqual([]);
+    });
+
+    it("rejects silent mode escalation", () => {
+      const failures = evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "改为全量扫描",
+          required_outputs: { profile_mode: "full", profile_update_needed: ["重写画像"] }
+        }),
+        { assess_project_profile: { profile_mode: "incremental" } }
+      );
+      expect(failures).toHaveLength(1);
+      expect(failures[0].message).toContain("不得改变前置决策");
+    });
+
+    it("requires none mode to produce no update work", () => {
+      expect(evaluateOutputAssertions(
+        s,
+        result({
+          status: "completed",
+          output_summary: "画像无需更新",
+          required_outputs: { profile_mode: "none", profile_update_needed: ["顺手补充模块图"] }
+        }),
+        { assess_project_profile: { profile_mode: "none" } }
+      )).toHaveLength(1);
+    });
+  });
+
+  describe("profile_maintenance_scope_only", () => {
+    const s = stage({ post_output_assertions: ["profile_maintenance_scope_only"] });
+    const validOutputs = {
+      profile_mode: "none",
+      existing_profile_assets: ["CLAUDE.md"],
+      inspected_files: [],
+      profile_changes: [{ section: "all", action: "keep", reason: "长期事实无变化" }],
+      profile_paths: [],
+      validation: { evidence_scope: "画像资产和 Git 文件名", task_semantics_excluded: true, write_scope: "无写入" }
+    };
+
+    it("accepts task-free profile maintenance output", () => {
+      expect(evaluateOutputAssertions(s, result({
+        status: "completed",
+        output_summary: "项目画像维护完成：profile_mode=none，未修改画像文件。",
+        required_outputs: validOutputs
+      }))).toEqual([]);
+    });
+
+    it("rejects requirement analysis and writes in none mode", () => {
+      expect(evaluateOutputAssertions(s, result({
+        status: "completed",
+        output_summary: "画像足够，但下一阶段需要读取 PDF 并实现页面跳转。",
+        required_outputs: validOutputs
+      }))).toHaveLength(1);
+      expect(evaluateOutputAssertions(s, result({
+        status: "completed",
+        output_summary: "项目画像维护完成。",
+        required_outputs: { ...validOutputs, profile_paths: ["CLAUDE.md"] }
+      }))).toHaveLength(1);
+    });
+  });
+
   describe("review_self_consistency", () => {
     const s = stage({ post_output_assertions: ["review_self_consistency"] });
 

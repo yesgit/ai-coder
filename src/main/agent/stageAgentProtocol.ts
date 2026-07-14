@@ -13,6 +13,7 @@ export function buildStageAgentInput(
   currentStage: WorkflowStage
 ): StageAgentInput {
   const isolateInitialTaskContext = shouldIsolateInitialTaskContext(currentStage);
+  const isolateBusinessTask = isProjectProfileStage(currentStage.id);
   const currentStageRun = [...(session.stage_runs ?? [])]
     .reverse()
     .find((stageRun) => stageRun.stage_id === currentStage.id && (stageRun.status === "running" || stageRun.status === "waiting_approval"));
@@ -78,17 +79,23 @@ export function buildStageAgentInput(
         required_outputs: stageRun.required_outputs
       })),
     current_stage: currentStage,
-    task_prompt: session.task_prompt,
+    task_prompt: isolateBusinessTask
+      ? "[业务任务正文与附件已由宿主隔离；本阶段只维护长期项目画像。]"
+      : session.task_prompt,
     project_path: session.project_path,
     allowed_tools: currentStage.allowed_tools ?? [],
     required_outputs: currentStage.required_outputs ?? [],
     gates: currentStage.gates ?? [],
     retry_context: retryContext,
     rework_context: reworkContext,
-    recent_messages: selectContextMessages(session.messages, session.initial_user_message, {
-      initialOnly: isolateInitialTaskContext
-    }),
-    human_qa_history: (session.pending_human_questions ?? []).filter((q) => q.status === "answered")
+    recent_messages: isolateBusinessTask
+      ? []
+      : selectContextMessages(session.messages, session.initial_user_message, {
+          initialOnly: isolateInitialTaskContext
+        }),
+    human_qa_history: isolateBusinessTask
+      ? []
+      : (session.pending_human_questions ?? []).filter((q) => q.status === "answered")
   };
 }
 
@@ -116,7 +123,7 @@ function shouldIsolateInitialTaskContext(stage: WorkflowStage): boolean {
 }
 
 function isProjectProfileStage(stageId: string): boolean {
-  return stageId === "scan_project" || stageId === "update_project_profile";
+  return stageId === "maintain_project_profile" || stageId === "assess_project_profile" || stageId === "scan_project" || stageId === "update_project_profile";
 }
 
 function sameMessage(left: AgentSession["messages"][number], right: AgentSession["messages"][number]): boolean {

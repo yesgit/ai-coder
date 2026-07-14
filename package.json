@@ -38,6 +38,10 @@
         "filter": [
           "*.yaml"
         ]
+      },
+      {
+        "from": "plugins/careful-coder",
+        "to": "plugins/careful-coder"
       }
     ],
     "linux": {

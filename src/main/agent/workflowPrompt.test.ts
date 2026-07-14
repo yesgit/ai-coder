@@ -3,6 +3,25 @@ import { buildStageInstructions } from "./workflowPrompt.js";
 import type { StageAgentInput } from "../../shared/types.js";
 
 describe("buildStageInstructions", () => {
+  it("keeps the original task and human answers above previous-stage summaries", () => {
+    const prompt = buildStageInstructions({
+      workflow: { id: "w", name: "w", description: "", stages: [] },
+      task_prompt: "用户要实际跳转，不只是加配置",
+      current_stage: { id: "implement", name: "Implement" },
+      previous_stage_summaries: [{ stage_id: "decompose", attempt: 1, status: "completed", output_summary: "只改常量" }],
+      human_qa_history: [{
+        id: "q1", stage_id: "understand", question: "是否需要真实导航", question_type: "text",
+        status: "answered", answer: "需要真实导航", created_at: "t", resolved_at: "t"
+      }],
+      project_path: "/tmp/project",
+      allowed_tools: [],
+      required_outputs: [],
+      gates: [],
+      recent_messages: []
+    });
+    expect(prompt).toContain("初始用户任务与后续人类问答始终是最高优先级的验收来源");
+    expect(prompt).not.toContain("原始任务描述只是背景");
+  });
   it("includes current stage instructions", () => {
     const input: StageAgentInput = {
       workflow: {
@@ -174,7 +193,7 @@ describe("buildStageInstructions", () => {
 
     expect(prompt).toContain("当前是 understand 阶段");
     expect(prompt).toContain("用户本次提交的原始任务");
-    expect(prompt).toContain("scan_project / update_project_profile 是独立的项目背景预处理");
+    expect(prompt).toContain("maintain_project_profile 是独立的项目背景预处理");
     expect(prompt).toContain("画像阶段摘要不是本阶段输入");
     expect(prompt).not.toContain("前序阶段的 required_outputs 是你最重要的输入");
   });

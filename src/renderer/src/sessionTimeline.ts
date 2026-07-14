@@ -11,6 +11,7 @@ import type {
 } from "../../shared/types.js";
 import { isMeaningfulAgentText } from "../../shared/agentMessages.js";
 import { formatApprovalKind, formatFileOperation, formatRole, formatStageName, formatStatus } from "./labels.js";
+import { formatStageRunStartDetail } from "./stageRunPresentation.js";
 
 export type TimelineEventType = "task" | "stage" | "message" | "approval" | "tool" | "file" | "rework" | "status" | "error";
 
@@ -66,8 +67,8 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
       return;
     }
     const content = message.content?.trim() ?? "";
-    // 助手消息：仅保留最后一条有意义的回答，避免中间过程与最终结果重复
-    if (message.role === "assistant" && index !== lastAssistantIndex) {
+    // 助手普通消息仅保留最终回答；Skill 使用记录是可审计的运行事实，必须保留。
+    if (message.role === "assistant" && message.kind !== "skill_usage" && index !== lastAssistantIndex) {
       return;
     }
     // 把消息文本里嵌入的 JSON 子块包成 ```json``` 代码块，使其在 markdown 中渲染为美化的代码块。
@@ -84,7 +85,9 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
     events.push({
       id: `${session.id}:message:${index}`,
       type: "message",
-      title: `${formatRole(message.role)}消息${message.attachments?.length ? ` (${message.attachments.length} 个附件)` : ""}`,
+      title: message.kind === "skill_usage"
+        ? "助手使用 Skill"
+        : `${formatRole(message.role)}消息${message.attachments?.length ? ` (${message.attachments.length} 个附件)` : ""}`,
       detail: formattedContent + (attachmentDetail ?? ""),
       timestamp: message.created_at,
       status: message.role,
@@ -97,7 +100,7 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
       id: `${session.id}:stage:${stageRun.id}:started`,
       type: "stage",
       title: `阶段开始：${formatStageName(stageRun.stage_id)} 第 ${stageRun.attempt} 次尝试`,
-      detail: stageRun.input_summary,
+      detail: formatStageRunStartDetail(stageRun),
       timestamp: stageRun.started_at,
       status: stageRun.status,
       sort_order: 15
@@ -245,7 +248,7 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
     }
   });
 
-  if (session.error) {
+  if (session.error && ["failed", "blocked", "interrupted"].includes(session.status)) {
     const errorTitle =
       session.status === "blocked"
         ? "会话已阻断"

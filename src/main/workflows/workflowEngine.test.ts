@@ -138,7 +138,8 @@ describe("WorkflowEngine", () => {
     expect(session.current_stage).toBe("understand");
     expect(session.error).toContain("Missing required outputs");
     expect(session.error).toContain("task_summary");
-    expect(session.stage_runs?.[0]).toMatchObject({ stage_id: "understand", status: "running", attempt: 2 });
+    expect(session.stage_runs?.at(-1)).toMatchObject({ stage_id: "understand", status: "running", attempt: 2 });
+    expect(session.stage_runs?.[0]).toMatchObject({ stage_id: "understand", status: "superseded", attempt: 1, output_summary: "Done" });
   });
 
   it("applies a needs_rework stage agent result", () => {
@@ -297,12 +298,12 @@ describe("WorkflowEngine", () => {
 
     // 第一次重试：attempt=2，应该继续 running
     expect(session.status).toBe("running");
-    expect(session.stage_runs?.[0]).toMatchObject({ stage_id: "understand", attempt: 2, status: "running", retry_reason: expect.stringContaining("Missing required outputs") });
-    expect(session.stage_runs?.[0].retry_reason).toContain("不要只输出 required_outputs 内部字段");
-    expect(session.stage_runs?.[0].retry_reason).toContain("不要主动嵌入 Markdown");
-    expect(session.stage_runs?.[0].retry_reason).toContain("required_outputs: full 是错误的");
-    expect(session.stage_runs?.[0].retry_reason).toContain("\"required_outputs\"");
-    expect(session.stage_runs?.[0].retry_reason).toContain("\"task_summary\"");
+    expect(session.stage_runs?.at(-1)).toMatchObject({ stage_id: "understand", attempt: 2, status: "running", retry_reason: expect.stringContaining("Missing required outputs") });
+    expect(session.stage_runs?.at(-1)?.retry_reason).toContain("不要只输出 required_outputs 内部字段");
+    expect(session.stage_runs?.at(-1)?.retry_reason).toContain("不要主动嵌入 Markdown");
+    expect(session.stage_runs?.at(-1)?.retry_reason).toContain("required_outputs: full 是错误的");
+    expect(session.stage_runs?.at(-1)?.retry_reason).toContain("\"required_outputs\"");
+    expect(session.stage_runs?.at(-1)?.retry_reason).toContain("\"task_summary\"");
     expect(session.error).toContain("Missing required outputs");
   });
 
@@ -333,7 +334,8 @@ describe("WorkflowEngine", () => {
     expect(session.current_stage).toBe("understand");
     expect(session.error).toContain("Missing required outputs");
     expect(session.error).toContain("task_summary");
-    expect(session.stage_runs?.[0]).toMatchObject({ attempt: 3, status: "running" });
+    expect(session.stage_runs).toHaveLength(3);
+    expect(session.stage_runs?.at(-1)).toMatchObject({ attempt: 3, status: "running" });
   });
 
   it("missing output retry includes schema-aware required_outputs template", () => {
@@ -423,7 +425,7 @@ describe("WorkflowEngine", () => {
     expect(session.current_stage).toBe("decompose");
     expect(session.error).toContain("Missing required outputs");
     expect(session.error).toContain("task_items");
-    expect(session.stage_runs?.[0]).toMatchObject({ attempt: 3, status: "running" });
+    expect(session.stage_runs?.at(-1)).toMatchObject({ attempt: 3, status: "running" });
   });
 
   it("uses output-contract repair retries even when stage has no auto_retry_limit", () => {
@@ -446,7 +448,7 @@ describe("WorkflowEngine", () => {
     expect(session.status).toBe("running");
     expect(session.current_stage).toBe("understand");
     expect(session.error).toContain("Missing required outputs");
-    expect(session.stage_runs?.[0]).toMatchObject({ attempt: 2, status: "running" });
+    expect(session.stage_runs?.at(-1)).toMatchObject({ attempt: 2, status: "running" });
   });
 
   it("hard-blocks output-contract repair only after the internal repair limit", () => {
@@ -540,7 +542,7 @@ describe("WorkflowEngine", () => {
     expect(session.status).toBe("running");
     expect(session.current_stage).toBe("understand");
     expect(session.error).toContain("没有解析到结构化阶段结果");
-    expect(session.stage_runs?.[0]).toMatchObject({ attempt: 2, status: "running" });
+    expect(session.stage_runs?.at(-1)).toMatchObject({ attempt: 2, status: "running" });
   });
 
   it("post_output_assertions: review_self_consistency 命中 → 走 retry → 超限 block", () => {
@@ -567,7 +569,7 @@ describe("WorkflowEngine", () => {
     });
     expect(session.status).toBe("running");
     expect(session.error).toContain("review_self_consistency");
-    expect(session.stage_runs?.[0]).toMatchObject({ attempt: 2, status: "running" });
+    expect(session.stage_runs?.at(-1)).toMatchObject({ attempt: 2, status: "running" });
 
     // 第 2 次：仍然自相矛盾 → 超限 block
     engine.applyStageResult(session, wf, {
@@ -660,7 +662,7 @@ describe("WorkflowEngine", () => {
     expect(session.status).toBe("running");
     expect(session.error).toContain("commands_run");
     expect(session.error).toContain("git log");
-    expect(session.stage_runs?.[0]).toMatchObject({ attempt: 2, status: "running" });
+    expect(session.stage_runs?.at(-1)).toMatchObject({ attempt: 2, status: "running" });
 
     // 仍没跑 → 超限 block
     engine.applyStageResult(session, wf, {
@@ -839,7 +841,7 @@ describe("WorkflowEngine", () => {
     });
     expect(session.status).toBe("running");
     expect(session.error).toContain("needs_rework_target_required");
-    expect(session.stage_runs?.[0]).toMatchObject({ attempt: 2, status: "running" });
+    expect(session.stage_runs?.at(-1)).toMatchObject({ attempt: 2, status: "running" });
 
     // 第 2 次仍缺 target → 超限 block
     engine.applyStageResult(session, wf, {

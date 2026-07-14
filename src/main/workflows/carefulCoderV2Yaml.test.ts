@@ -48,11 +48,10 @@ describe("careful-coder.yaml latest", () => {
     expect(v4.description).toContain("克制交付");
   });
 
-  it("pipeline: scan → profile → understand → decompose → implement → verify（6 阶段）", async () => {
+  it("pipeline: profile maintenance → understand → decompose → implement → verify", async () => {
     const v4 = await loadV4();
     expect(v4.stages.map((s) => s.id)).toEqual([
-      "scan_project",
-      "update_project_profile",
+      "maintain_project_profile",
       "understand",
       "decompose",
       "implement",
@@ -64,8 +63,7 @@ describe("careful-coder.yaml latest", () => {
     const v4 = await loadV4();
     expect(v4.rework?.enabled).toBe(true);
     expect(v4.rework?.allowed_targets).toEqual([
-      "scan_project",
-      "update_project_profile",
+      "maintain_project_profile",
       "understand",
       "decompose",
       "implement",
@@ -120,7 +118,7 @@ describe("careful-coder.yaml latest", () => {
 
     expect(decompose.instructions).toContain("入境验收");
     expect(decompose.instructions).toContain("施工图制度");
-    expect(decompose.instructions).toContain("task_items 是 implement 的唯一施工图");
+    expect(decompose.instructions).toContain("task_items 是 implement 的施工图，但原始需求和人类回答始终是最高验收来源");
     expect(decompose.instructions).toContain("没有 task_id 的工作后续不得执行");
 
     expect(impl.instructions).toContain("入境验收（必须先做）");
@@ -128,7 +126,7 @@ describe("careful-coder.yaml latest", () => {
     expect(impl.instructions).toContain("差异约束与红灯停");
     expect(impl.instructions).toContain("git diff 是唯一施工证据");
 
-    expect(verify.instructions).toContain("反向核对 definition_of_done");
+    expect(verify.instructions).toContain("反向核对最终需求");
     expect(verify.instructions).toContain("结论必须有证据");
     expect(verify.instructions).toContain("不接受 output_summary 中的自然语言任务清单替代 task_items");
   });
@@ -154,11 +152,18 @@ describe("careful-coder.yaml latest", () => {
     }
   });
 
-  it("understand 只留结构性断言（no_trailing_unparsed_payload）", async () => {
+  it("understand 同时校验需求证据契约与结构完整性", async () => {
     const v4 = await loadV4();
-    expect(v4.stages.find((s) => s.id === "understand")!.hooks?.post_output_assertions).toEqual([
-      "no_trailing_unparsed_payload"
+    const understand = v4.stages.find((s) => s.id === "understand")!;
+    expect(understand.required_skills).toEqual(["clarifying-requirements", "exploring-codebase"]);
+    expect(understand.hooks?.post_output_assertions).toEqual([
+      "requirements_evidence_grounded",
+      "no_trailing_unparsed_payload",
+      "readonly_stage_no_implementation_claim"
     ]);
+    expect(understand.required_outputs).toEqual(expect.arrayContaining(["baseline_context", "scope_matrix_status", "scope_matrix"]));
+    expect(v4.stages.find((s) => s.id === "implement")!.required_skills).toEqual(["preserving-existing-behavior", "safe-git-operations"]);
+    expect(v4.stages.find((s) => s.id === "verify")!.required_skills).toEqual(["verification-before-completion"]);
   });
 
   it("verify 阶段全局核对 task_items 实施结果", async () => {
@@ -173,27 +178,22 @@ describe("careful-coder.yaml latest", () => {
     expect(schema).toHaveProperty("summary");
   });
 
-  it("project profile stages preserved", async () => {
+  it("uses exactly one project profile stage", async () => {
     const v4 = await loadV4();
-    expect(v4.stages.slice(0, 2).map((s) => s.id)).toEqual(["scan_project", "update_project_profile"]);
-    expect(v4.stages[2].id).toBe("understand");
+    expect(v4.stages.slice(0, 2).map((s) => s.id)).toEqual(["maintain_project_profile", "understand"]);
+    expect(v4.stages.filter((s) => s.id.includes("project_profile"))).toHaveLength(1);
   });
 
-  it("project profile stages prefer incremental updates over full rescans", async () => {
+  it("project profile maintenance short-circuits and excludes task semantics", async () => {
     const v4 = await loadV4();
-    const scan = v4.stages.find((s) => s.id === "scan_project")!;
-    const profile = v4.stages.find((s) => s.id === "update_project_profile")!;
+    const profile = v4.stages.find((s) => s.id === "maintain_project_profile")!;
 
-    expect(scan.instructions).toContain("增量优先原则");
-    expect(scan.instructions).toContain("已有画像资产时，默认进入 incremental 或 none 候选");
-    expect(scan.instructions).toContain("incremental 模式只检查“已有画像资产 + 近期变更直接相关文件 + 必要事实来源”");
-    expect(scan.agents!["project-structure-surveyor"].prompt).toContain("只有协调者判断无画像、画像严重不足、或结构大变时才执行");
-    expect(scan.agents!["profile-asset-scanner"].prompt).toContain("recent_change_scope");
-
-    expect(profile.instructions).toContain("scan_project.profile_mode=none：不要委派起草，不要写文件");
-    expect(profile.instructions).toContain("scan_project.profile_mode=incremental：只读取已有画像资产");
-    expect(profile.instructions).toContain("增量模式禁止为了“更完整”重写整份 CLAUDE.md");
-    expect(profile.agents!["profile-drafter"].prompt).toContain("none 模式下不输出变更段落");
-    expect(profile.agents!["profile-drafter"].prompt).toContain("未受近期变更影响的长期规则必须保留原样");
+    expect(profile.name).toBe("维护项目画像");
+    expect(profile.instructions).toContain("判断 → 必要取证 → 必要更新");
+    expect(profile.instructions).toContain("`none`：没有长期事实变化迹象，立即结束");
+    expect(profile.instructions).toContain("不得猜测、复述或评价");
+    expect(profile.instructions).toContain("不判断本次任务是否可行");
+    expect(profile.agents).toBeUndefined();
+    expect(profile.hooks?.post_output_assertions).toContain("profile_maintenance_scope_only");
   });
 });

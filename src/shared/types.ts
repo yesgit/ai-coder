@@ -132,7 +132,15 @@ export type StageOutputAssertion =
    * raw 输出尾部存在未闭合 JSON（bracket_balance != 0 或 last 合法 JSON 之后还有大段 JSON 残骸）→ 失败。
    * 跨场景通用——结构性断言，不绑定具体任务类型，建议每阶段都挂。
    */
-  | "no_trailing_unparsed_payload";
+  | "no_trailing_unparsed_payload"
+  /** 理解阶段的需求、证据、行为路径与关键未知必须形成可追溯契约。 */
+  | "requirements_evidence_grounded"
+  /** 画像取证阶段必须遵循前置模式判断，不得静默升级扫描范围。 */
+  | "profile_scan_respects_assessment"
+  /** 单节点画像维护不得泄漏或分析本次业务需求语义。 */
+  | "profile_maintenance_scope_only"
+  /** 只读取证阶段不得把分析或契约描述成已经完成代码实施。 */
+  | "readonly_stage_no_implementation_claim";
 
 /**
  * 阶段产物落地时的*行为*校验——post_output_assertions 的参数化兄弟。
@@ -153,6 +161,12 @@ export interface PostOutputBehaviorCheck {
      * 同语义，但作用域为本阶段切片）。如 ["git log "] / ["git diff"] / ["npm test"]。
      */
     commands_run?: string[];
+    /** 仅 exit_code=0 的真实 Bash 结果才算满足，不能把“发起调用”当作验证成功。 */
+    successful_commands_run?: string[];
+    /** 本阶段至少产生多少条 Read/Grep/Glob/Bash 证据调用。 */
+    evidence_calls_min?: number;
+    /** 本阶段至少有多少条 Bash 命令得到 exit_code=0 的真实结果。 */
+    successful_commands_min?: number;
     /**
      * 本阶段内必须 Read/Grep/Glob 命中目标文件至少 min 次。用于强制"真看过"关键文件。
      * target 为项目相对路径或 basename（与 same_file_reads_min 同一归一化）。
@@ -184,6 +198,8 @@ export interface WorkflowStage {
   instructions?: string;
   approval_required?: boolean;
   allowed_tools?: string[];
+  /** 由宿主在阶段启动前强制加载并注入；任一缺失时阶段不得运行。 */
+  required_skills?: string[];
   required_outputs?: string[];
   output_schema?: Record<string, unknown>;
   required_checks?: string[];
@@ -244,6 +260,8 @@ export interface StageRun {
   attempt: number;
   status: StageRunStatus;
   input_summary: string;
+  /** 该尝试可复用证据的起始时间；仅用于纯输出格式修复重试。 */
+  evidence_started_at?: string;
   output_summary?: string;
   /**
    * 已通过的阶段产出（completed/waiting_approval 时由 workflowEngine 写入）。
@@ -382,6 +400,8 @@ export interface AgentMessage {
   content: string;
   created_at: string;
   attachments?: Attachment[];
+  /** 结构化运行提示；这类助手消息应保留在时间线中，不与最终回答互相覆盖。 */
+  kind?: "skill_usage";
 }
 
 export interface HumanQuestionOption {
@@ -406,9 +426,13 @@ export interface ToolCallRecord {
   stage_id: string;
   tool: string;
   input: unknown;
-  status: "pending_approval" | "approved" | "denied" | "completed" | "blocked" | "cancelled";
+  status: "requested" | "pending_approval" | "approved" | "denied" | "completed" | "blocked" | "cancelled";
   created_at: string;
   resolved_at?: string;
+  /** SDK 返回的真实退出码；未知时不伪造。 */
+  exit_code?: number;
+  /** 长度受限的执行结果摘要，供审计而非替代完整输出。 */
+  output_summary?: string;
 }
 
 export interface FileChangeRecord {
