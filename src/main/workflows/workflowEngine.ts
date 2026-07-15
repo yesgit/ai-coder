@@ -275,6 +275,13 @@ export class WorkflowEngine {
   resumeFromFailedStage(session: AgentSession, workflow: WorkflowTemplate): AgentSession {
     this.ensureState(session, workflow);
 
+    // Profile 模式：无阶段管线，只需重置状态让 runner 的自然循环接管
+    if (workflow.stages.length === 0) {
+      session.error = undefined;
+      session.status = "running";
+      return session;
+    }
+
     let targetStageId: string | undefined;
     const activeRun = this.getActiveStageRun(session);
     if (activeRun) {

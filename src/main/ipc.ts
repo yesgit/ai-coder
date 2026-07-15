@@ -742,6 +742,10 @@ async function saveBinaryAttachments(attachments: Attachment[], projectPath: str
             display_name: `${safeDisplayName} · 第 ${page.page} 页 / 共 ${totalPages} 页`
           });
         }
+        // 删除原始 PDF，防止 Agent 直接 Read 原始文件（会把整个 PDF 的 base64 发给模型导致报错）
+        await unlink(pdfPath).catch((cleanupError) => {
+          console.error(`[uploads] 清理 PDF 原文件失败: ${pdfPath}`, cleanupError);
+        });
         continue;
       }
 

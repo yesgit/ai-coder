@@ -1479,6 +1479,9 @@ function buildActivityTitle(session: AgentSession) {
   if (session.status === "failed") {
     return "执行失败";
   }
+  if (session.status === "interrupted") {
+    return "执行中断";
+  }
   if (session.status === "completed") {
     return "执行完成";
   }

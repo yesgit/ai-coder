@@ -139,8 +139,27 @@ export class ClaudeAgentRunner {
         await this.recordProgress(input, "runner", `加载 Skill 摘要：${s.id}`, "milestone");
       }
 
-      // 构建系统提示：使用 claude_code 预设 + 谨慎程序员方法论追加
+      // 构建系统提示：语言 + ReAct 循环指引 + 谨慎程序员方法论 + Skills 摘要
+      const languageGuidance = "始终使用**简体中文**回复用户。所有思考、分析和总结都用中文输出。代码、命令、文件名等技术内容保持原文。";
+
+      const reactGuidance = [
+        "## 工具使用指引（ReAct 循环）",
+        "",
+        "你必须在 **思考→行动→观察** 循环中工作，直到任务完成：",
+        "1. **分析**当前状态和已有信息",
+        "2. **调用工具**执行下一步（Read、Bash、Task、Skill 等）",
+        "3. **观察**工具返回结果，判断是否达成目标",
+        "4. 如果未完成，**回到步骤 1** 继续；如果完成，总结并结束",
+        "",
+        "关键规则：",
+        "- 每次只读你需要的内容，不要一次性读取所有文件",
+        "- 读完工具输出后，你必须继续行动——不要停在第 1 步",
+        "- 完成所有工作后，用一段清晰的总结收尾"
+      ].join("\n");
+
       const carefulCoderInstructions = [
+        languageGuidance,
+        reactGuidance,
         input.workflow.system_prompt ?? "",
         skillSummaries.length > 0
           ? [
@@ -188,7 +207,7 @@ export class ClaudeAgentRunner {
       for await (const message of query({
         prompt: instructions,
         options: {
-          // 使用 claude_code 预设系统提示（含 ReAct 工具使用引导）+ 谨慎程序员方法论
+          // 使用 claude_code 预设 + 谨慎程序员方法论追加（DeepSeek 兼容，Claude Code CLI 已验证）
           systemPrompt: {
             type: "preset" as const,
             preset: "claude_code" as const,
@@ -299,11 +318,21 @@ export class ClaudeAgentRunner {
         input.session.status = "interrupted";
         return input.session;
       }
-      input.session.status = "failed";
-      input.session.error = error instanceof Error ? error.message : String(error);
-      await this.recordProgress(input, "status", `执行失败：${input.session.error}`, "milestone");
+      // 保存已收集的部分消息，让用户可以看到执行进度
+      if (sdkMessages.length > 0) {
+        const partialTranscript = formatClaudeTranscript(sdkMessages);
+        this.appendAssistantMessage(input.session, partialTranscript);
+      }
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      input.session.error = errorMessage;
+      // API 错误标记为 interrupted（可断点恢复）而非 failed（终态）
+      input.session.status = "interrupted";
+      await this.recordProgress(input, "status", `执行中断：${errorMessage}`, "milestone");
+      await this.recordProgress(input, "status", "你可以发送消息继续，或点击「断点恢复」重新执行", "milestone");
     } finally {
-      this.abortControllers.delete(input.session.id);
+      if (this.abortControllers.get(input.session.id) === abortController) {
+        this.abortControllers.delete(input.session.id);
+      }
     }
     return input.session;
   }
