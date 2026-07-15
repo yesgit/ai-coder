@@ -136,8 +136,16 @@ export class ClaudeAgentRunner {
         await this.recordProgress(input, "runner", `加载 Skill 摘要：${s.id}`, "milestone");
       }
 
-      // 构建系统提示：人设 + Skill 摘要
-      const systemPrompt = input.workflow.system_prompt ?? "";
+      // 构建系统提示：使用 claude_code 预设 + 谨慎程序员方法论追加
+      const carefulCoderInstructions = [
+        input.workflow.system_prompt ?? "",
+        skillSummaries.length > 0
+          ? [
+              "## 可用 Skills（摘要，按需通过 Skill 工具加载完整内容）",
+              ...skillSummaries.map((s) => `- **${s.id}**: ${s.content.slice(0, 200)}`)
+            ].join("\n")
+          : ""
+      ].filter(Boolean).join("\n\n");
 
       // 构建用户任务上下文：原始任务 + 人类问答历史
       const taskPrompt = input.session.task_prompt ?? "";
@@ -153,19 +161,9 @@ export class ClaudeAgentRunner {
         .join("\n");
 
       const instructions = [
-        systemPrompt,
-        "---",
-        "## 用户任务",
         taskPrompt || "（无任务描述）",
         attachmentList ? `\n附件：\n${attachmentList}` : "",
-        humanQaHistory ? `\n人类问答历史：\n${humanQaHistory}` : "",
-        skillSummaries.length > 0
-          ? [
-              "---",
-              "## 可用 Skills（摘要，按需通过 Skill 工具加载完整内容）",
-              ...skillSummaries.map((s) => `- **${s.id}**: ${s.content.slice(0, 200)}`)
-            ].join("\n")
-          : ""
+        humanQaHistory ? `\n人类问答历史：\n${humanQaHistory}` : ""
       ].filter(Boolean).join("\n\n");
 
       await this.recordProgress(input, "runner", "开始执行（Profile 模式）", "milestone");
@@ -187,6 +185,12 @@ export class ClaudeAgentRunner {
       for await (const message of query({
         prompt: instructions,
         options: {
+          // 使用 claude_code 预设系统提示（含 ReAct 工具使用引导）+ 谨慎程序员方法论
+          systemPrompt: {
+            type: "preset" as const,
+            preset: "claude_code" as const,
+            append: carefulCoderInstructions
+          },
           cwd: input.session.project_path,
           executable: nodeInfo?.command ?? undefined,
           env: sdkEnv,
