@@ -310,6 +310,11 @@ export class WorkflowEngine {
     session.error = undefined;
     session.status = "running";
 
+    // Profile 模式：无阶段管线，只需重置状态让 runner 的自然循环接管
+    if (workflow.stages.length === 0) {
+      return session;
+    }
+
     const firstStage = startStageId
       ? workflow.stages.find((stage) => stage.id === startStageId)
       : workflow.stages[0];
@@ -333,6 +338,11 @@ export class WorkflowEngine {
     session.progress_events = [];
     session.error = undefined;
     session.status = "running";
+
+    // Profile 模式：无阶段管线，只需重置状态让 runner 的自然循环接管
+    if (workflow.stages.length === 0) {
+      return session;
+    }
 
     const firstStage = startStageId
       ? workflow.stages.find((stage) => stage.id === startStageId)
