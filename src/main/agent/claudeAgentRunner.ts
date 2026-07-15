@@ -121,6 +121,9 @@ export class ClaudeAgentRunner {
   }
 
   private async runProfileMode(input: AgentRunInput): Promise<AgentSession> {
+    input.session.status = "running";
+    await input.onProgress?.(input.session);
+
     const sdkMessages: unknown[] = [];
     const pdfPageImageReads = new Set<string>();
     const abortController = new AbortController();
