@@ -251,7 +251,7 @@ export class ClaudeAgentRunner {
               return { behavior: "deny", message: input.session.error, interrupt: true };
             }
             // 引擎层安全拦截（profile 模式下以 "careful-coder" 作为 stage id）
-            const safetyCheck = checkCommandSafety("plan", toolName, toolInput);
+            const safetyCheck = checkCommandSafety("profile", toolName, toolInput);
             if (!safetyCheck.allow) {
               return { behavior: "deny", message: safetyCheck.message, interrupt: false };
             }
@@ -277,7 +277,7 @@ export class ClaudeAgentRunner {
         }
       } as never) as AsyncIterable<unknown>) {
         sdkMessages.push(message);
-        this.recordSdkToolUses(input.session, "plan", message);
+        this.recordSdkToolUses(input.session, "profile", message);
         this.recordToolExecutionResult(input.session, message);
       }
 
