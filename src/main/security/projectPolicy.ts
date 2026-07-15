@@ -188,6 +188,17 @@ export async function approveOrDenyToolUse(
     return toolCall;
   };
 
+  // 审批排队：如果已有其他工具等待审批，当前工具也进入 pending_approval
+  // 状态（让 SDK 的 waitForToolApproval 挂住），但不创建新的审批对话框。
+  // 当用户审批完第一个工具后，resolveToolApproval 会顺带唤醒所有排队工具，
+  // 届时它们重新走 approveOrDenyToolUse，若条件已满足（如 auto_approve 开启）
+  // 则自动通过。
+  const hasExistingPending = session.tool_calls.some((tc) => tc.status === "pending_approval" && tc.id !== toolUseId);
+  if (hasExistingPending) {
+    record("pending_approval");
+    return { allow: false, message: "Queued behind another pending approval.", interrupt: true };
+  }
+
   try {
     if (toolName === "Bash") {
       const command = String(input.command ?? "");
@@ -410,19 +421,45 @@ function isSafeShellSegment(segment: string, readonlyOnly: boolean): boolean {
 
 function isAutonomousWriteShellSegment(segment: string): boolean {
   return (
-    /^(?:npm|yarn|pnpm|bun)\s+(?:test|run\s+(?:test|test:[\w:-]+|lint|lint:[\w:-]+|typecheck|type-check|check|build|build:[\w:-]+)\b)/.test(segment) ||
-    /^(?:npm|yarn|pnpm|bun)\s+(?:install|i|ci|add|remove|uninstall|update|publish)\b/.test(segment) ||
-    /^(?:npx|pnpm\s+exec|yarn\s+exec|bunx)\s+(?:vitest|jest|mocha|ava|tsc|vue-tsc|eslint|stylelint|biome|ruff|pytest)\b/.test(segment) ||
-    /^(?:npx|pnpm\s+exec|yarn\s+exec|bunx)\s+prettier\b.*\s--write\b/.test(segment) ||
-    /^\.\/node_modules\/\.bin\/(?:vitest|jest|mocha|ava|tsc|vue-tsc|eslint|stylelint|biome)\b/.test(segment) ||
+    // 包管理工具：测试/构建/检查 + 包操作
+    /^(?:npm|yarn|pnpm|bun)\s+(?:test|run\s+(?:[\w:-]+)|install|i|ci|add|remove|uninstall|update|publish)\b/.test(segment) ||
+    // npx / 本地 bin 执行器：覆盖常用开发工具
+    /^(?:npx|pnpm\s+exec|yarn\s+exec|bunx)\s+(?:vitest|jest|mocha|ava|tsc|vue-tsc|eslint|stylelint|biome|ruff|pytest|prettier|electron-builder|electron|tsx|ts-node|webpack|vite|rollup|nodemon|pm2|forever|typescript|tsc-alias)\b/.test(segment) ||
+    /^\.\/node_modules\/\.bin\/(?:vitest|jest|mocha|ava|tsc|vue-tsc|eslint|stylelint|biome|prettier|electron-builder|electron|tsx|ts-node|webpack|vite|rollup)\b/.test(segment) ||
+    // TypeScript 编译器（独立运行，不限于 npx 包裹）
+    /^tsc\b/.test(segment) ||
+    /^vue-tsc\b/.test(segment) ||
+    // Node.js：仅内置 flag 模式、版本查询、或运行 node_modules/.bin 下的已知工具
     /^node\s+--(?:test|check)\b/.test(segment) ||
-    /^python3?\s+-m\s+(?:pytest|unittest|mypy|ruff)\b/.test(segment) ||
+    /^node\s+(?:--version|-v)\b/.test(segment) ||
+    /^node\s+(?:-e|-p)\s/.test(segment) ||
+    /^node\s+\.\/node_modules\/\.bin\/[\w@/-]+\b/.test(segment) ||
+    // Python
+    /^python3?\s+-m\s+(?:pytest|unittest|mypy|ruff|pip)\b/.test(segment) ||
+    /^python3?\s+[\w./-]+\.py\b/.test(segment) ||
     /^(?:pytest|ruff\s+check|mypy|tox)\b/.test(segment) ||
-    /^(?:go\s+test|go\s+vet|go\s+build)\b/.test(segment) ||
-    /^(?:cargo\s+(?:test|check|clippy|build)|cargo\s+fmt\s+--check)\b/.test(segment) ||
-    /^(?:mvn|gradle|\.\/gradlew)\s+(?:test|check|build|verify)\b/.test(segment) ||
-    /^make\s+(?:test|check|lint|typecheck|build)\b/.test(segment) ||
-    /^git\s+(?:checkout|switch|stash|reset|clean)\b/.test(segment)
+    // Go
+    /^(?:go\s+(?:test|vet|build|run|mod|fmt)\b)/.test(segment) ||
+    // Rust
+    /^(?:cargo\s+(?:test|check|clippy|build|run|fmt)|cargo\s+fmt\s+--check)\b/.test(segment) ||
+    // JVM
+    /^(?:mvn|gradle|\.\/gradlew)\s+(?:test|check|build|verify|compile)\b/.test(segment) ||
+    // Make / just / task
+    /^(?:make|just)\s+(?:test|check|lint|typecheck|build|dev|run)\b/.test(segment) ||
+    // Git: 常用开发操作
+    /^git\s+(?:checkout|switch|stash|reset|clean|fetch|pull|merge|rebase|add|commit|push|tag|remote|branch|worktree)\b/.test(segment) ||
+    /^git\s+restore\b/.test(segment) ||
+    /^git\s+cherry-pick\b/.test(segment) ||
+    // 环境检查工具
+    /^(?:which|command|type)\s+[\w-]+/.test(segment) ||
+    /^(?:echo|printf|printenv|env|date|pwd|whoami|id)\b/.test(segment) ||
+    // 文件系统只读
+    /^(?:ls|find|du|df|stat|file|cat|head|tail|wc|tree)\b/.test(segment) ||
+    /^(?:grep|rg|awk|sed)\b/.test(segment) ||
+    // 排序/去重/文本处理
+    /^(?:sort|uniq|cut|tr|tee)\b/.test(segment) ||
+    // 压缩/归档（只读检查）
+    /^(?:tar\s+(?:t|tv|tf|tz)|unzip\s+-l|zipinfo)\b/.test(segment)
   );
 }
 

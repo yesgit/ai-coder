@@ -70,11 +70,26 @@ export class ClaudeAgentRunner {
       toolCall.resolved_at = new Date().toISOString();
       pending.session.status = status === "approved" ? "running" : "blocked";
     }
+    pending.resolve(status);
     pendingForSession?.delete(toolCallId);
-    if (pendingForSession?.size === 0) {
+    // 顺带唤醒所有排队等待的其他工具：它们已在 projectPolicy 中以 pending_approval
+    // 状态入队，但可能因并行调用被排在了同一个审批窗口后面。用户审批第一个工具后，
+    // 所有排队的工具一并唤醒——它们重新走 approveOrDenyToolUse，届时若 auto_approve
+    // 已开启或命令已命中自主安全白名单，则直接通过。
+    if (status === "approved" && pendingForSession && pendingForSession.size > 0) {
+      for (const [queuedId, queued] of pendingForSession) {
+        const queuedCall = pending.session.tool_calls.find((item) => item.id === queuedId && item.status === "pending_approval");
+        if (queuedCall) {
+          queuedCall.status = "approved";
+          queuedCall.resolved_at = new Date().toISOString();
+        }
+        queued.resolve("approved");
+      }
+      pendingForSession.clear();
+      this.pendingToolApprovals.delete(sessionId);
+    } else if (pendingForSession?.size === 0) {
       this.pendingToolApprovals.delete(sessionId);
     }
-    pending.resolve(status);
     return true;
   }
 

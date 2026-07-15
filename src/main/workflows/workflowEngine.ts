@@ -162,11 +162,13 @@ export class WorkflowEngine {
     const reason = `Output checks failed: ${allFailures.join(" | ")}`;
     const maxRetry = stage.auto_retry_limit ?? 0;
     const currentAttempt = this.getStageAttempt(session, stageRun.stage_id);
+    // 纯格式失败（仅有 no_trailing_unparsed_payload 断言）复用上一轮证据，避免重读全量代码
+    const formatOnly = textFailures.every((f) => f.assertion === "no_trailing_unparsed_payload") && behaviorFailures.length === 0;
     if (currentAttempt <= maxRetry) {
       this.retryCurrentStage(session, workflow, reason, {
         attemptedSummary: result.output_summary,
         attemptedOutputs: result.required_outputs,
-        reuseEvidence: false
+        reuseEvidence: formatOnly
       });
     } else {
       this.blockCurrentStage(session, `${reason} (after ${currentAttempt} attempts)`);
@@ -461,6 +463,7 @@ export class WorkflowEngine {
       }
       session.status = "completed";
       session.current_stage = completedStageId;
+      session.error = undefined;
       return session;
     }
 
@@ -503,6 +506,7 @@ export class WorkflowEngine {
     session.stage_runs?.push(stageRun);
     session.current_stage = stage.id;
     session.status = "running";
+    session.error = undefined;
     return stageRun;
   }
 

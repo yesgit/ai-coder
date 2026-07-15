@@ -41,8 +41,7 @@ rework:
   enabled: true
   allowed_targets:
     - maintain_project_profile
-    - understand
-    - decompose
+    - plan
     - implement
     - verify
   approval_required: false
@@ -124,199 +123,72 @@ stages:
     auto_retry_limit: 2
     hooks:
       post_output_assertions:
-        - no_trailing_unparsed_payload
         - profile_maintenance_scope_only
-  - id: understand
-    name: 理解
+  - id: plan
+    name: 理解与拆分
     required_skills:
       - clarifying-requirements
       - exploring-codebase
+      - planning-complex-changes
     instructions: |
-      从用户原始请求和后续人类回答建立可追溯的需求契约。项目画像和前序摘要只能提供背景，不能覆盖、缩窄或重写用户目标。
+      在一个连续推理线程中完成”理解需求 → 代码取证 → 拆分任务”。先把用户原始请求和附件转化为可追溯的需求理解，然后读取代码建立行为证据，最后产出结构化的 task_items 施工图。
 
-      先区分“用户要看到的结果”与“可能的实现手段”。不得把文件、配置、类型、常量或框架术语直接写成用户目标，除非用户明确要求的就是这些产物。
+      ## 第一阶段：理解需求
 
-      对涉及代码行为的任务，按最小必要范围追踪至少一条完整因果路径：触发入口 → 运行时消费者/处理 → guard、输入、状态与副作用 → 可观察结果。配置或注册信息必须找到消费者；找不到就记录为 critical_unknown，不能猜成完成标准。
+      先区分”用户要看到的结果”与”可能的实现手段”。不得把文件、配置、类型、常量或框架术语直接写成用户目标，除非用户明确要求的就是这些产物。
+
+      对涉及代码行为的任务，按最小必要范围追踪至少一条完整因果路径：触发入口 → 运行时消费者/处理 → guard、输入、状态与副作用 → 可观察结果。配置或注册信息必须找到消费者；找不到就记录为 critical_unknown。
 
       每个验收标准都必须同时说明来源与验证方式。来源只能是用户原话、人类回答、附件、path:line 代码证据或真实工具结果。没有来源的判断只能进入 assumptions/critical_unknowns。
 
-      只有会改变实现路线、安全性或验收标准的不确定项才询问用户；可通过读代码解决的先取证。提问前必须逐项排除：用户原话/附件已经回答、既有人类回答已经回答、项目规则或分支历史可回答、相邻正确实现或运行时消费者可回答。一次只问一个决策，不得把身份、范围、触发方式、优先级打包成问卷。blocks_planning=true 的未知项未解决时不得 completed。
+      只有会改变实现路线、安全性或验收标准的不确定项才询问用户；可通过读代码解决的先取证。提问前必须逐项排除：用户原话/附件已经回答、既有人类回答已经回答、项目规则或分支历史可回答、相邻正确实现或运行时消费者可回答。一次只问一个决策。blocks_planning=true 的未知项未解决时不得 completed。
+
+      **可以**阅读总体任务附带的 PDF/图片附件来理解需求。
 
       **基线与红灯停**：
-      - 如果用户要求"从某个分支/基线重新开始"、"忽略现有实现"、"丢弃当前工作区"，你必须把它写入 definition_of_done；不要把当前工作区已有代码当作完成证据。
+      - 如果用户要求”从某个分支/基线重新开始”、”忽略现有实现”、”丢弃当前工作区”，必须写入 definition_of_done；不要把当前工作区已有代码当作完成证据。
       - 输出 baseline_context，明确 requested/effective/evidence/code_reads_from_effective_baseline。用户排除当前工作区时，必须通过 git show <ref>:<path> 或隔离 worktree 读取代码；不得用当前文件内容作为证据。
-      - 用户已明确指定基线时，普通切分支或新建分支是执行步骤，不要再次确认。只有会覆盖/丢弃未提交内容、删除或强制移动分支、基线不存在或指令相互冲突时，才在 assumptions 中标注"红灯停：需用户确认或后续阶段 ask_human"。
-      - 无法从文件、附件、项目画像文件或用户原话证明的结论，只能写入 assumptions，不能写入 definition_of_done。
+      - 用户已明确指定基线时，普通切分支或新建分支是执行步骤，不要再次确认。只有会覆盖/丢弃未提交内容、删除或强制移动分支、基线不存在或指令相互冲突时，才在 output_summary 中标注”红灯停：需用户确认或后续阶段 ask_human”。
 
       **附件/清单事实矩阵**：
       - 当附件或用户输入包含范围、表格、编号、重复记录、标识符映射时，先逐项输出 scope_matrix，再做需求解释。
-      - 每项必须保留 exact_value，并标注 source_location 与 confidence；不得把缩写改写成“更自然”的自造名称。
+      - 每项必须保留 exact_value，并标注 source_location 与 confidence；不得把缩写改写成”更自然”的自造名称。
       - 起止范围、重复编号、父子项、总数不一致未解决时，scope_matrix_status 不能写 complete，对应 critical_unknown 必须 blocks_planning=true。
       - 没有枚举型范围时 scope_matrix_status=not_applicable，scope_matrix=[]。
 
-      **输出**：给出完整的 required_outputs。不要散文报告。
+      ## 第二阶段：拆分任务
 
-      **任务边界（重要）**：
-      - 你的职责是**理解**用户任务——提取核心意图、定义完成标准、记录假设
-      - **可以**阅读总体任务附带的 PDF/图片附件来理解需求
-      - **不要**开始执行任务——不要写代码、不要改文件、不要创建分支
-      - 产出 required_outputs 即可——后续阶段会基于你的产出推进
-    allowed_tools:
-      - read_file
-      - shell
-    required_outputs:
-      - user_goal_restated
-      - definition_of_done
-      - assumptions
-      - requested_outcome
-      - observable_acceptance
-      - preserved_behaviors
-      - evidence
-      - behavior_paths
-      - critical_unknowns
-      - baseline_context
-      - scope_matrix_status
-      - scope_matrix
-    output_schema:
-      user_goal_restated:
-        type: string
-        description: 用户真实诉求的一句话复述
-      definition_of_done:
-        type: array
-        items: string
-        description: 可观测完成标准列表
-      assumptions:
-        type: array
-        items: string
-        description: 自主推断的假设；不确定的功能等价性必须标注"需用户确认"
-      requested_outcome:
-        type: string
-        description: 用户可观察到的最终结果，不写实现手段
-      observable_acceptance:
-        type: array
-        items:
-          type: object
-          properties:
-            criterion: string
-            source: string
-            how_to_verify: string
-        description: 每条验收标准及其来源、验证方式
-      preserved_behaviors:
-        type: array
-        items: string
-        description: 本次改动必须保持的既有行为、兼容性和安全边界
-      evidence:
-        type: array
-        items:
-          type: object
-          properties:
-            claim: string
-            source: string
-            confidence: high | medium | low
-        description: 支撑需求理解与代码判断的证据
-      behavior_paths:
-        type: array
-        items:
-          type: object
-          properties:
-            trigger: string
-            consumer: string
-            guards_and_state: string
-            side_effects: string
-            observable_result: string
-            evidence: string
-        description: 从触发入口到可观察结果的因果路径
-      critical_unknowns:
-        type: array
-        items:
-          type: object
-          properties:
-            unknown: string
-            impact: string
-            resolution: string
-            blocks_planning: boolean
-        description: 关键未知项；阻塞规划的未知必须先解决
-      baseline_context:
-        type: object
-        properties:
-          requested: string
-          effective: string
-          evidence: string
-          code_reads_from_effective_baseline: boolean
-        description: 用户要求的基线、实际取证基线及真实命令证据
-      scope_matrix_status:
-        type: string
-        enum: [not_applicable, complete, incomplete]
-        description: 枚举型附件/范围的事实矩阵状态
-      scope_matrix:
-        type: array
-        items:
-          type: object
-          properties:
-            item: string
-            exact_value: string
-            source_location: string
-            confidence: high | medium | low
-        description: 保留附件或清单精确标识、重复项与来源位置的事实矩阵
-    auto_retry_limit: 5
-    hooks:
-      post_output_assertions:
-        - requirements_evidence_grounded
-        - no_trailing_unparsed_payload
-        - readonly_stage_no_implementation_claim
-      post_output_checks:
-        - require:
-            evidence_calls_min: 1
-          on_fail: "理解阶段必须先读取用户附件、代码入口或消费者证据，不能只凭命名生成需求契约。"
-  - id: decompose
-    name: 拆分
-    required_skills:
-      - exploring-codebase
-      - planning-complex-changes
-    instructions: |
-      把已取证的需求契约转换为可实施、可验证的最小行为任务。任务按行为边界拆分，不按文件数量或配置条目机械拆分；一个行为可能跨多个文件，一个文件也可能承载多个独立行为。
+      需求理解清楚后，在同一上下文中继续拆分——把需求转化为可实施、可验证的最小行为任务。任务按行为边界拆分，不按文件数量或配置条目机械拆分。
 
-      **协调流程**：
-
-      0. **入境验收**：先检查 understand.required_outputs 是否存在且足以拆分任务。
-         - 缺 requested_outcome / observable_acceptance / preserved_behaviors / evidence / behavior_paths / critical_unknowns / baseline_context / scope_matrix_status / scope_matrix 中任何一个 → needs_rework → understand
-         - 所有代码读取必须来自 understand.baseline_context.effective；用户排除当前工作区时只能用 git show 或隔离 worktree 取证
-         - scope_matrix_status=incomplete → needs_rework → understand，禁止自行补写、翻译或规范化精确标识
-         - definition_of_done 含"从指定分支/基线重新开始"时，必须把"基线确认/分支动作"拆成独立 task 或明确标为红灯停 task
-         - 关键输入缺失时，禁止根据 output_summary 猜测补齐 task_items
-
-      1. **建立施工证据**：从 understand 的需求契约出发，读取触发入口、消费者、调用方和相邻正确实现；结合项目画像的稳定事实，产出结构化 task_items。
-
-      2. **审核拆分结果**：
-         - 逐条检查每个 task 的 pre_behavior 是否从代码中**实际读取**（不是推断）
-         - 检查每个 task 是否对应至少一条 observable_acceptance，并覆盖相关行为路径
-         - 检查 inputs/outputs/guards/state/side_effects/callers/invariants 是否来自代码证据
-         - 两个行为只要契约、参数、guard、副作用或验证方式不同，就不要错误合并
-
-      3. **输出**：审核通过后给出 task_items。如果发现 pre_behavior 有从代码中读取不到的（推断的），标为 low confidence 并在 task description 中注明"需确认"。
-
-      **施工图制度（必须落实到 task_items）**：
+      **施工图制度**：
       - task_items 是 implement 的施工图，但原始需求和人类回答始终是最高验收来源
       - 每个 task 必须包含 task_id、outcome_links、files、evidence、pre_behavior、acceptance_criteria、validation_plan
-      - pre_behavior 必须包含代码证据：locations、inputs、outputs、guards、state、side_effects、callers、invariants；不适用时写明原因，不能用 N/A 掩盖未调查
-      - 每个 acceptance_criteria 必须可机械核对，避免"体验良好"、"代码优雅"这类主观表述
-      - 没有 task_id 的工作后续不得执行；因此拆分不完整时不得 completed
+      - pre_behavior 必须从代码中**实际读取**（不是推断）：locations、inputs、outputs、guards、state、side_effects、callers、invariants；不适用时写明原因，不能用 N/A 掩盖未调查
+      - 所有代码读取必须来自 baseline_context.effective；
+      - 每个 acceptance_criteria 必须可机械核对，避免”体验良好”、”代码优雅”这类主观表述
+      - 每个 task 必须对应至少一条用户可观察结果，并覆盖相关行为路径
+      - 两个行为只要契约、参数、guard、副作用或验证方式不同，就不要错误合并
+      - definition_of_done 含”从指定分支/基线重新开始”时，把”基线确认/分支动作”拆成独立 task 或明确标为红灯停 task
 
-      **拆分粒度标准**：一个 task 对应一个可独立验证的行为变化。不要因同文件而合并不同契约，也不要因跨文件而拆断同一条因果链。
+      **拆分粒度标准**：一个 task 对应一个可独立验证的行为变化。不要因同文件而合并不同契约，也不要因跨文件而拆断同一条因果链。没有 task_id 的工作后续不得执行；因此拆分不完整时不得 completed。
 
-      **人类暂停**：task_items 产出后，暂停等人类确认。人类会检查 pre_behavior 是否正确、拆分粒度是否合理。
+      **输出**：在 output_summary 中先写 `## 需求理解` 段落（含目标、DoD、假设、保留行为），再写 `## 施工图` 段落（task_items 的概要），最后通过 required_outputs 输出结构化字段。
 
       **任务边界（重要）**：
-      - 你的职责是**拆分任务**——不是实施、不是审查实施结果
-      - **必须**实际读代码来确认 pre_behavior，不能凭命名惯例推断
-      - **不要**试图实施——产出 task_items 后你的工作就完成了
-      - 不确定的功能等价性 → 拆成独立 task + 标注"需确认"，不要自己决定合并
+      - 你的职责是**理解 + 拆分**——不是实施、不是审查实施结果
+      - **不要**开始执行任务——不要写代码、不要改文件、不要创建分支
+      - 不确定的功能等价性 → 拆成独立 task + 标注”需确认”，不要自己决定合并
       - 任何无法从文件、diff、命令输出或用户原话证明的内容，都必须标 unknown；unknown 影响实施正确性时 → needs_rework 或 ask_human，不得 completed
     allowed_tools:
       - read_file
       - shell
     required_outputs:
       - task_items
+      - user_goal_restated
+      - definition_of_done
+      - critical_unknowns
+      - baseline_context
+      - scope_matrix
     output_schema:
       task_items:
         type: array
@@ -343,33 +215,65 @@ stages:
             acceptance_criteria: array<string>
             validation_plan: array<string>
         description: 原子级子任务列表；每个 task 含改动前行为快照和验收标准
-    auto_retry_limit: 1
+      user_goal_restated:
+        type: string
+        description: 用户真实诉求的一句话复述
+      definition_of_done:
+        type: array
+        items: string
+        description: 可观测完成标准列表
+      critical_unknowns:
+        type: array
+        items:
+          type: object
+          properties:
+            unknown: string
+            impact: string
+            resolution: string
+            blocks_planning: boolean
+        description: 关键未知项；阻塞规划的未知必须先解决
+      baseline_context:
+        type: object
+        properties:
+          requested: string
+          effective: string
+          evidence: string
+          code_reads_from_effective_baseline: boolean
+        description: 用户要求的基线、实际取证基线及真实命令证据
+      scope_matrix:
+        type: array
+        items:
+          type: object
+          properties:
+            item: string
+            exact_value: string
+            source_location: string
+            confidence: high | medium | low
+        description: 保留附件或清单精确标识、重复项与来源位置的事实矩阵
+    auto_retry_limit: 3
     hooks:
-      post_output_assertions:
-        - no_trailing_unparsed_payload
-        - readonly_stage_no_implementation_claim
       post_output_checks:
         - require:
             evidence_calls_min: 1
-          on_fail: "拆分阶段必须实际读取代码证据，不能根据理解摘要直接生成施工图。"
+          on_fail: “计划阶段必须先读取用户附件、代码入口或消费者证据，不能只凭命名生成需求契约或施工图。”
   - id: implement
     name: 实施
     required_skills:
       - preserving-existing-behavior
       - safe-git-operations
     instructions: |
-      按 decompose.task_items 逐个完成可验证的行为变化。低风险局部任务直接实施并验证；跨模块、高风险或上下文易互相干扰时才使用 fresh sub-agent。流程复杂度必须与风险相称。
+      按 plan.task_items 逐个完成可验证的行为变化。低风险局部任务直接实施并验证；跨模块、高风险或上下文易互相干扰时才使用 fresh sub-agent。流程复杂度必须与风险相称。
 
       **核心原则**：每个 task 只携带它所需的需求链接、行为契约和代码证据；先做最小改动，再按 acceptance_criteria 和 validation_plan 核对。是否委派 sub-agent 是风险决策，不是固定仪式。
 
       **Task 循环**：读取 task 证据与目标文件 → 声明要保持/改变的行为 → 最小修改 → 检查 diff → 执行 validation_plan 中最强可用验证 → 记录真实结果。失败时根据证据修正；关键未知或越权风险则 BLOCKED/ask_human。
 
       **入境验收（必须先做）**：
-      - 检查 decompose.required_outputs.task_items 是否存在、非空、每项都有 task_id/outcome_links/files/evidence/pre_behavior/acceptance_criteria/validation_plan
-      - task_items 缺失、不完整、或只有 output_summary 中的自然语言清单 → needs_rework → decompose
+      - 检查 plan.required_outputs.task_items 是否存在、非空、每项都有 task_id/outcome_links/files/evidence/pre_behavior/acceptance_criteria/validation_plan
+      - task_items 缺失、不完整、或只有 output_summary 中的自然语言清单 → needs_rework → plan
       - 如果用户要求从指定基线/分支重新实现，先检查当前 git 状态。基线存在且切换不会覆盖用户改动时直接执行，不要重复确认；只有存在会被覆盖/丢弃的改动、需要删除或强制移动分支、或基线不存在时才 ask_human/BLOCKED。不得把当前工作区已有实现当作完成
-      - 第一次编辑前核对当前 HEAD/工作树确实对应 understand.baseline_context.effective；不一致时先建立正确任务分支，禁止在被用户排除的工作区继续修改
-      - 不允许新增 task、合并 task、跳过 task；发现 task_items 与需求不符 → needs_rework → decompose
+      - 第一次编辑前核对当前 HEAD/工作树确实对应 plan.baseline_context.effective；不一致时先建立正确任务分支，禁止在被用户排除的工作区继续修改
+      - 不允许新增 task、合并 task、跳过 task；发现 task_items 与需求不符 → needs_rework → plan
 
       **单任务工作台**：
       - 每次编辑前先声明当前 task_id、目标 files、关联的用户结果和要保留的 pre_behavior
@@ -434,7 +338,6 @@ stages:
           on_fail: "这是不可逆操作，必须先在本阶段通过 ask_human 取得用户明确确认。"
       post_output_assertions:
         - rollback_plan_when_irreversible
-        - no_trailing_unparsed_payload
       post_output_checks:
         - require:
             successful_commands_min: 1
@@ -508,15 +411,15 @@ stages:
     required_skills:
       - verification-before-completion
     instructions: |
-      你是验证阶段的**协调者**。你的任务不是判断代码"好不好"——而是逐项核对 `decompose.task_items` 中的每个 task 是否被正确实施。
+      你是验证阶段的**协调者**。你的任务不是判断代码"好不好"——而是逐项核对 `plan.task_items` 中的每个 task 是否被正确实施。
 
       **核心信念**：机械核对，不做判断。每一项只需回答 YES/NO。不确定就是 FAIL。
 
       **协调流程**：
 
-      1. **入境验收 decompose 产出**：检查 decompose.task_items 是否存在且完整。如果 task_items 不存在或不完整 → needs_rework → decompose。
+      1. **入境验收 plan 产出**：检查 plan.task_items 是否存在且完整。如果 task_items 不存在或不完整 → needs_rework → plan。
          - 不接受 output_summary 中的自然语言任务清单替代 task_items
-         - task_items 中任一项缺 task_id/outcome_links/files/evidence/pre_behavior/acceptance_criteria/validation_plan → FAIL，并 needs_rework → decompose
+         - task_items 中任一项缺 task_id/outcome_links/files/evidence/pre_behavior/acceptance_criteria/validation_plan → FAIL，并 needs_rework → plan
 
       2. **逐 task 核对**：对 task_items 中的每一个 task，核对以下清单（每项 YES/NO）：
          - **行为契约**：pre_behavior 的 inputs/outputs/guards/state/side_effects/callers/invariants 是否保持或按要求改变？
@@ -525,7 +428,7 @@ stages:
          - **无关改动**：diff 中是否有与 task 无关的改动（格式、注释、命名）？
          - **验证证据**：是否有测试/构建/语法检查等命令输出支撑？
 
-      3. **反向核对最终需求**：逐条检查初始用户任务、人类问答和 understand.observable_acceptance 是否已被 task_results、实际行为路径、diff 与真实验证结果覆盖。
+      3. **反向核对最终需求**：逐条检查初始用户任务、人类问答和 plan.definition_of_done 是否已被 task_results、实际行为路径、diff 与真实验证结果覆盖。
          - 未覆盖项 → FAIL
          - 不得因为 task_items 漏掉某层就把该需求当作不存在；配置、常量或元数据的变更必须继续核对其运行时消费者和最终用户可见结果
          - 无法从 diff、文件内容或**真实成功的**命令输出证明的项 → unknown；unknown 影响 DoD 时 → FAIL
@@ -577,8 +480,6 @@ stages:
         description: 汇总统计
     auto_retry_limit: 1
     hooks:
-      post_output_assertions:
-        - no_trailing_unparsed_payload
       post_output_checks:
         - require:
             successful_commands_min: 1

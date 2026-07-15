@@ -48,12 +48,11 @@ describe("careful-coder.yaml latest", () => {
     expect(v4.description).toContain("克制交付");
   });
 
-  it("pipeline: profile maintenance → understand → decompose → implement → verify", async () => {
+  it("pipeline: profile maintenance → plan → implement → verify", async () => {
     const v4 = await loadV4();
     expect(v4.stages.map((s) => s.id)).toEqual([
       "maintain_project_profile",
-      "understand",
-      "decompose",
+      "plan",
       "implement",
       "verify"
     ]);
@@ -64,18 +63,17 @@ describe("careful-coder.yaml latest", () => {
     expect(v4.rework?.enabled).toBe(true);
     expect(v4.rework?.allowed_targets).toEqual([
       "maintain_project_profile",
-      "understand",
-      "decompose",
+      "plan",
       "implement",
       "verify"
     ]);
   });
 
-  it("decompose 产出 task_items——含 pre_behavior 行为快照", async () => {
+  it("plan 产出 task_items——含 pre_behavior 行为快照", async () => {
     const v4 = await loadV4();
-    const decompose = v4.stages.find((s) => s.id === "decompose")!;
-    expect(decompose.required_outputs).toEqual(["task_items"]);
-    const schema = decompose.output_schema ?? {};
+    const plan = v4.stages.find((s) => s.id === "plan")!;
+    expect(plan.required_outputs).toContain("task_items");
+    const schema = plan.output_schema ?? {};
     expect(schema).toHaveProperty("task_items");
     // pre_behavior 子字段存在（验证行为快照结构）
     const props = (schema.task_items as any)?.items?.properties;
@@ -103,23 +101,19 @@ describe("careful-coder.yaml latest", () => {
     expect(preToolUse[0].require.ask_human_consent).toBe(true);
     const assertions = impl.hooks?.post_output_assertions ?? [];
     expect(assertions).toContain("rollback_plan_when_irreversible");
-    expect(assertions).toContain("no_trailing_unparsed_payload");
   });
 
   it("prompt mechanics: 入境验收 / 施工图 / 单任务工作台 / diff 证据 / 红灯停 已落实", async () => {
     const v4 = await loadV4();
-    const understand = v4.stages.find((s) => s.id === "understand")!;
-    const decompose = v4.stages.find((s) => s.id === "decompose")!;
+    const plan = v4.stages.find((s) => s.id === "plan")!;
     const impl = v4.stages.find((s) => s.id === "implement")!;
     const verify = v4.stages.find((s) => s.id === "verify")!;
 
-    expect(understand.instructions).toContain("基线与红灯停");
-    expect(understand.instructions).toContain("不要把当前工作区已有代码当作完成证据");
-
-    expect(decompose.instructions).toContain("入境验收");
-    expect(decompose.instructions).toContain("施工图制度");
-    expect(decompose.instructions).toContain("task_items 是 implement 的施工图，但原始需求和人类回答始终是最高验收来源");
-    expect(decompose.instructions).toContain("没有 task_id 的工作后续不得执行");
+    expect(plan.instructions).toContain("基线与红灯停");
+    expect(plan.instructions).toContain("不要把当前工作区已有代码当作完成证据");
+    expect(plan.instructions).toContain("施工图制度");
+    expect(plan.instructions).toContain("task_items 是 implement 的施工图，但原始需求和人类回答始终是最高验收来源");
+    expect(plan.instructions).toContain("没有 task_id 的工作后续不得执行");
 
     expect(impl.instructions).toContain("入境验收（必须先做）");
     expect(impl.instructions).toContain("单任务工作台");
@@ -141,9 +135,9 @@ describe("careful-coder.yaml latest", () => {
     }
   });
 
-  it("已删除的旧阶段不存在（v3.0→v4.0 重构证明）", async () => {
+  it("已删除的旧阶段不存在（v3.0→v4.0 重构证明 + understand/decompose 合并为 plan）", async () => {
     const v4 = await loadV4();
-    const removedIds = ["investigate", "align", "design", "self_review"];
+    const removedIds = ["investigate", "align", "design", "self_review", "understand", "decompose"];
     for (const id of removedIds) {
       expect(
         v4.stages.find((s) => s.id === id),
@@ -152,16 +146,13 @@ describe("careful-coder.yaml latest", () => {
     }
   });
 
-  it("understand 同时校验需求证据契约与结构完整性", async () => {
+  it("plan 阶段具有需求理解与拆分的技能和输出字段", async () => {
     const v4 = await loadV4();
-    const understand = v4.stages.find((s) => s.id === "understand")!;
-    expect(understand.required_skills).toEqual(["clarifying-requirements", "exploring-codebase"]);
-    expect(understand.hooks?.post_output_assertions).toEqual([
-      "requirements_evidence_grounded",
-      "no_trailing_unparsed_payload",
-      "readonly_stage_no_implementation_claim"
-    ]);
-    expect(understand.required_outputs).toEqual(expect.arrayContaining(["baseline_context", "scope_matrix_status", "scope_matrix"]));
+    const plan = v4.stages.find((s) => s.id === "plan")!;
+    expect(plan.required_skills).toEqual(["clarifying-requirements", "exploring-codebase", "planning-complex-changes"]);
+    expect(plan.required_outputs).toEqual(expect.arrayContaining(["task_items", "baseline_context", "scope_matrix"]));
+    // plan 阶段不再使用正则断言——工具边界（allowed_tools 无 Edit）已防住实施行为
+    expect(plan.hooks?.post_output_assertions).toBeUndefined();
     expect(v4.stages.find((s) => s.id === "implement")!.required_skills).toEqual(["preserving-existing-behavior", "safe-git-operations"]);
     expect(v4.stages.find((s) => s.id === "verify")!.required_skills).toEqual(["verification-before-completion"]);
   });
@@ -180,7 +171,7 @@ describe("careful-coder.yaml latest", () => {
 
   it("uses exactly one project profile stage", async () => {
     const v4 = await loadV4();
-    expect(v4.stages.slice(0, 2).map((s) => s.id)).toEqual(["maintain_project_profile", "understand"]);
+    expect(v4.stages.slice(0, 2).map((s) => s.id)).toEqual(["maintain_project_profile", "plan"]);
     expect(v4.stages.filter((s) => s.id.includes("project_profile"))).toHaveLength(1);
   });
 

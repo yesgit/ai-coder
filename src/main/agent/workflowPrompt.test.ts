@@ -154,7 +154,7 @@ describe("buildStageInstructions", () => {
     expect(prompt).toContain("请先在脑内组装完整对象");
   });
 
-  it("treats understand as initial task understanding instead of consuming profile stage outputs", () => {
+  it("treats plan as initial task understanding instead of consuming profile stage outputs", () => {
     const input: StageAgentInput = {
       workflow: {
         id: "careful-coder",
@@ -163,21 +163,21 @@ describe("buildStageInstructions", () => {
         stages: [
           { id: "scan_project", name: "扫描项目画像", approval_required: false, required_outputs: ["project_facts"], required_checks: [], gates: [] },
           { id: "update_project_profile", name: "建立或调整项目画像", approval_required: false, required_outputs: ["profile_changes"], required_checks: [], gates: [] },
-          { id: "understand", name: "理解", approval_required: false, required_outputs: ["user_goal_restated"], required_checks: [], gates: [] }
+          { id: "plan", name: "理解与拆分", approval_required: false, required_outputs: ["user_goal_restated", "task_items"], required_checks: [], gates: [] }
         ]
       },
       previous_stage_summaries: [],
       current_stage: {
-        id: "understand",
-        name: "理解",
-        instructions: "理解用户任务。",
+        id: "plan",
+        name: "理解与拆分",
+        instructions: "理解用户任务并拆分。",
         approval_required: false,
-        required_outputs: ["user_goal_restated"]
+        required_outputs: ["user_goal_restated", "task_items"]
       },
       task_prompt: "修复登录页跳转问题",
       project_path: "/tmp/project",
       allowed_tools: ["read_file"],
-      required_outputs: ["user_goal_restated"],
+      required_outputs: ["user_goal_restated", "task_items"],
       gates: [],
       recent_messages: [
         {
@@ -191,7 +191,7 @@ describe("buildStageInstructions", () => {
 
     const prompt = buildStageInstructions(input);
 
-    expect(prompt).toContain("当前是 understand 阶段");
+    expect(prompt).toContain("当前是 plan 阶段");
     expect(prompt).toContain("用户本次提交的原始任务");
     expect(prompt).toContain("maintain_project_profile 是独立的项目背景预处理");
     expect(prompt).toContain("画像阶段摘要不是本阶段输入");

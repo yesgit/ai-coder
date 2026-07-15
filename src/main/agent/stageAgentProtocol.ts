@@ -119,7 +119,7 @@ function selectContextMessages(
 }
 
 function shouldIsolateInitialTaskContext(stage: WorkflowStage): boolean {
-  return stage.id === "understand";
+  return stage.id === "plan" || stage.id === "understand";
 }
 
 function isProjectProfileStage(stageId: string): boolean {

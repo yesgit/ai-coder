@@ -7,7 +7,7 @@ const MAX_STRING_LENGTH = 200;
 const RECENT_STAGE_COUNT = 2; // 最近 N 个阶段保留截断后的 required_outputs，更早的只保留 output_summary
 
 export function buildStageInstructions(input: StageAgentInput): string {
-  const isTaskUnderstandingStage = input.current_stage.id === "understand";
+  const isTaskUnderstandingStage = input.current_stage.id === "plan";
   const isProfileMaintenanceStage = input.current_stage.id === "maintain_project_profile";
   const completedStageIds = new Set(input.previous_stage_summaries.map((s) => s.stage_id));
   const stageProgressLines = input.workflow.stages
@@ -55,7 +55,7 @@ export function buildStageInstructions(input: StageAgentInput): string {
       : [
           "⚠️ 上方的「总体任务」和后续人类问答定义最终验收；你只执行当前阶段，但不得让阶段字段或前序摘要缩窄这个目标。",
           "你的职责仅限于当前阶段的 required_outputs。它们服务于总体任务，而不是替代总体任务。",
-          "除非你在 `understand` 阶段，否则不要阅读总体任务附带的 PDF/图片——那是给 understand 阶段理解需求用的。"
+          "除非你在 `plan` 阶段，否则不要阅读总体任务附带的 PDF/图片——那是给 plan 阶段理解需求用的。"
         ]),
     "",
     "工作流引擎负责控制阶段流转。你只需要完成当前阶段。",
@@ -71,7 +71,7 @@ export function buildStageInstructions(input: StageAgentInput): string {
     "如果当前阶段发现需要返工到更早阶段，请说明目标阶段和原因，不要自行改变工作流状态。",
     ...(isTaskUnderstandingStage
       ? [
-          "当前是 understand 阶段：你的任务语义输入是用户本次提交的原始任务、附件和后续明确回答。",
+          "当前是 plan 阶段：你的任务语义输入是用户本次提交的原始任务、附件和后续明确回答。",
           "maintain_project_profile 是独立的项目背景预处理，不是本次用户任务的语义上游；不要把画像阶段总结、画像更新事项或画像 required_outputs 当作用户需求、验收标准或待办。"
         ]
       : [
@@ -235,12 +235,12 @@ export function buildStageInstructions(input: StageAgentInput): string {
       "1. **你只需要完成「当前阶段」的工作**。总体任务会在后续阶段中逐步推进，不要提前执行后续阶段的工作。",
       isProfileMaintenanceStage
         ? "2. **宿主没有向本阶段提供业务任务正文、问答或附件；不得从文件名或 Git 变更猜测它们。**"
-        : "2. **不要阅读总体任务附带的 PDF/图片附件**——除非当前阶段指令明确允许（只有 `understand` 阶段需要读附件理解需求；其他阶段的输入是前序阶段的 required_outputs，不是原始附件）。",
+        : "2. **不要阅读总体任务附带的 PDF/图片附件**——除非当前阶段指令明确允许（只有 `plan` 阶段需要读附件理解需求；其他阶段的输入是前序阶段的 required_outputs，不是原始附件）。",
       "3. **每个阶段都有明确的 required_outputs**——聚焦于产出这些字段，但它们只是工作产物，不得缩窄、改写或覆盖用户要达成的结果。",
       isProfileMaintenanceStage
         ? "4. **只维护长期项目事实；不得输出本次需求结论、实现建议、业务文件清单或后续阶段安排。**"
         : isTaskUnderstandingStage
-        ? "4. **当前 understand 阶段必须从初始用户任务和附件理解需求**。项目画像文件只能作为背景证据按需读取；画像阶段摘要不是本阶段输入。"
+        ? "4. **当前 plan 阶段必须从初始用户任务和附件理解需求**。项目画像文件只能作为背景证据按需读取；画像阶段摘要不是本阶段输入。"
         : "4. **初始用户任务与后续人类问答始终是最高优先级的验收来源**。前序阶段的 required_outputs 只是证据和可质疑的工作假设；发现它们遗漏、误解或缩窄需求时，必须纠正并明确记录，而不是机械继承。",
       "5. **提问是昂贵的阻塞动作，不是需求访谈。调用 ask_human 前必须回看用户原话/附件/既有回答，并用只读工具检查项目规则、相邻实现、消费者和 git 证据。只有答案会导致不同实现、安全边界或验收结果，且证据无法回答时才提问。**",
       "6. **一次只问一个决策。用户已经明确的范围（如“全部”“从 N 开始”）、仓库可查的事实、可按惯例采取的可逆默认值，一律不要再问。**",
@@ -535,11 +535,11 @@ function buildReviewChangeSummary(input: StageAgentInput): string | null {
 
   const lines: string[] = [];
 
-  // 从 understand 提取目标与 DoD
-  const understandOutputs = summaries.find((s) => s.stage_id === "understand")?.required_outputs;
-  if (understandOutputs) {
-    const goal = typeof understandOutputs.user_goal_restated === "string" ? understandOutputs.user_goal_restated : null;
-    const dod = Array.isArray(understandOutputs.definition_of_done) ? understandOutputs.definition_of_done : [];
+  // 从 plan 提取目标与 DoD
+  const planOutputs = summaries.find((s) => s.stage_id === "plan")?.required_outputs;
+  if (planOutputs) {
+    const goal = typeof planOutputs.user_goal_restated === "string" ? planOutputs.user_goal_restated : null;
+    const dod = Array.isArray(planOutputs.definition_of_done) ? planOutputs.definition_of_done : [];
     if (goal) lines.push(`- 用户目标：${truncateString(goal, 150)}`);
     for (const d of dod.slice(0, 5)) {
       if (typeof d === "string") lines.push(`  - DoD：${truncateString(d, 100)}`);

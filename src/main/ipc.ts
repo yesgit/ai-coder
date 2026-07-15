@@ -687,7 +687,7 @@ function buildOnboardingSnapshot(
 function resolveStartStageId(workflow: NonNullable<Awaited<ReturnType<WorkflowRegistry["get"]>>>, includeProjectProfile = true): string | undefined {
   if (includeProjectProfile) return undefined;
   if (workflow.id !== "careful-coder") return undefined;
-  return workflow.stages.find((stage) => stage.id === "understand")?.id;
+  return workflow.stages.find((stage) => stage.id === "plan")?.id;
 }
 
 async function saveBinaryAttachments(attachments: Attachment[], projectPath: string): Promise<Attachment[]> {

@@ -346,4 +346,40 @@ describe("isAutonomousSafeShellCommand", () => {
     expect(isAutonomousSafeShellCommand("npx some-random-tool --write")).toBe(false);
     expect(isAutonomousSafeShellCommand("mv a b")).toBe(false);
   });
+
+  it("allows common git and dev workflow commands", () => {
+    expect(isAutonomousSafeShellCommand("git fetch")).toBe(true);
+    expect(isAutonomousSafeShellCommand("git pull")).toBe(true);
+    expect(isAutonomousSafeShellCommand("git merge feature/x")).toBe(true);
+    expect(isAutonomousSafeShellCommand("git add lib/Const/index.js")).toBe(true);
+    expect(isAutonomousSafeShellCommand("git commit -m 'fix'")).toBe(true);
+    expect(isAutonomousSafeShellCommand("git push origin main")).toBe(true);
+    expect(isAutonomousSafeShellCommand("git branch -d old-branch")).toBe(true);
+    expect(isAutonomousSafeShellCommand("tsc -p tsconfig.main.json")).toBe(true);
+    expect(isAutonomousSafeShellCommand("which node")).toBe(true);
+  });
 });
+
+  it("serializes approval requests — queues behind existing pending tool", async () => {
+    const current = session();
+    // 先创建一个 pending_approval
+    current.tool_calls.push({
+      id: "existing-pending", stage_id: "implement", tool: "Bash",
+      input: { command: "git push" }, status: "pending_approval", created_at: new Date().toISOString()
+    });
+
+    const decision = await approveOrDenyToolUse(
+      current, workflow, "Bash", { command: "yarn lint" }, "tool-new"
+    );
+
+    // 已有 pending 时，新工具也进入 pending_approval 排队，但不改变 session 状态
+    expect(decision.allow).toBe(false);
+    if (!decision.allow) {
+      expect(decision.interrupt).toBe(true);
+      expect(decision.message).toContain("Queued");
+    }
+    // 新工具被记录为 pending_approval（排队等待），不是被静默丢弃
+    expect(current.tool_calls.length).toBe(2);
+    expect(current.tool_calls[1].status).toBe("pending_approval");
+    expect(current.status).toBe("running"); // 状态不覆盖（第一个 pending 已设过 waiting_approval）
+  });
