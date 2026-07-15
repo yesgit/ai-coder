@@ -138,8 +138,27 @@ export class ClaudeAgentRunner {
 
       // 构建系统提示：人设 + Skill 摘要
       const systemPrompt = input.workflow.system_prompt ?? "";
+
+      // 构建用户任务上下文：原始任务 + 人类问答历史
+      const taskPrompt = input.session.task_prompt ?? "";
+      const humanQaHistory = (input.session.pending_human_questions ?? [])
+        .filter((q) => q.status === "answered")
+        .map((q) => `- 问：${q.question}\n  答：${Array.isArray(q.answer) ? q.answer.join(", ") : (q.answer ?? "")}`)
+        .join("\n");
+
+      // 初始用户消息中的附件信息
+      const initialMessage = input.session.initial_user_message ?? input.session.messages.find((m) => m.role === "user");
+      const attachmentList = (initialMessage?.attachments ?? [])
+        .map((a) => `- ${a.display_name ?? ("path" in a ? (a as { path: string }).path : "附件")}`)
+        .join("\n");
+
       const instructions = [
         systemPrompt,
+        "---",
+        "## 用户任务",
+        taskPrompt || "（无任务描述）",
+        attachmentList ? `\n附件：\n${attachmentList}` : "",
+        humanQaHistory ? `\n人类问答历史：\n${humanQaHistory}` : "",
         skillSummaries.length > 0
           ? [
               "---",
