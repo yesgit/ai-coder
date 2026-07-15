@@ -750,9 +750,12 @@ export default function App() {
   );
   const timeline = useMemo(() => timelineAll.slice(0, timelineLimit), [timelineAll, timelineLimit]);
   const showMoreTimeline = timelineAll.length > timelineLimit;
+  const isProfileMode = (activeWorkflow?.stages.length ?? 0) === 0;
   const activityEvents = useMemo(
-    () => (activeSession?.progress_events ?? []).filter((p) => p.visibility === "transient").slice(-80),
-    [activeSession]
+    () => (activeSession?.progress_events ?? [])
+      .filter((p) => isProfileMode || p.visibility === "transient")
+      .slice(isProfileMode ? -200 : -80),
+    [activeSession, isProfileMode]
   );
   const activityStreamRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -1232,82 +1235,106 @@ export default function App() {
                       })}
                     </div>
                   )}
-                  {/* 实时活动流：放在阶段执行和返工请求上方，优先展示当前状态。 */}
-                  {activityEvents.length > 0 && (
-                    <section className="activity-stream">
-                      <div className="activity-stream-header">实时活动（滚动）</div>
+                  {/* 实时活动流：Profile 模式下始终可见并增强；Stage 模式放在阶段执行上方 */}
+                  {isProfileMode ? (
+                    <section className="activity-stream profile-activity">
+                      <div className="panel-heading">
+                        <h3>实时活动</h3>
+                        <small>{activityEvents.length} 条记录</small>
+                      </div>
                       <div className="activity-stream-body" ref={activityStreamRef}>
-                        {activityEvents.map((p) => (
-                          <div key={p.id} className="activity-item">
-                            <time>{formatTimestamp(p.created_at)}</time>
-                            <span className="muted">{p.message}</span>
+                        {activityEvents.length > 0 ? (
+                          activityEvents.map((p) => (
+                            <div key={p.id} className={`activity-item activity-${p.type}`}>
+                              <time>{formatTimestamp(p.created_at)}</time>
+                              <span className={`activity-type-badge ${p.visibility}`}>{p.type}</span>
+                              <span className="muted">{p.message}</span>
+                            </div>
+                          ))
+                        ) : (
+                          <p className="muted">等待活动...</p>
+                        )}
+                      </div>
+                    </section>
+                  ) : (
+                    <>
+                      {activityEvents.length > 0 && (
+                        <section className="activity-stream">
+                          <div className="activity-stream-header">实时活动（滚动）</div>
+                          <div className="activity-stream-body" ref={activityStreamRef}>
+                            {activityEvents.map((p) => (
+                              <div key={p.id} className="activity-item">
+                                <time>{formatTimestamp(p.created_at)}</time>
+                                <span className="muted">{p.message}</span>
+                              </div>
+                            ))}
                           </div>
-                        ))}
-                      </div>
-                    </section>
-                  )}
-                  <div className="run-panels">
-                    <section className="run-panel">
-                      <div className="panel-heading">
-                        <h3>阶段执行</h3>
-                        <small>{stageRuns.length} 次尝试</small>
-                      </div>
-                      {stageRuns.length > 0 ? (
-                        <div className="stage-run-list">
-                          {stageRuns.map((stageRun: StageRun) => (
-                            <article
-                              key={stageRun.id}
-                              className={stageRun.stage_id === activeSession.current_stage ? "stage-run current" : "stage-run"}
-                            >
-                              <div className="stage-run-title">
-                                <strong>{formatStageName(stageRun.stage_id)}</strong>
-                                <span className={`status-pill ${stageRun.status}`}>{formatStatus(stageRun.status)}</span>
-                              </div>
-                              <small>第 {stageRun.attempt} 次尝试</small>
-                              <p className="markdown-content">
-                                <MarkdownContent>{formatStageRunCardDetail(stageRun)}</MarkdownContent>
-                              </p>
-                            </article>
-                          ))}
-                        </div>
-                      ) : (
-                        <p className="muted">暂无阶段执行记录。</p>
+                        </section>
                       )}
-                    </section>
+                      <div className="run-panels">
+                        <section className="run-panel">
+                          <div className="panel-heading">
+                            <h3>阶段执行</h3>
+                            <small>{stageRuns.length} 次尝试</small>
+                          </div>
+                          {stageRuns.length > 0 ? (
+                            <div className="stage-run-list">
+                              {stageRuns.map((stageRun: StageRun) => (
+                                <article
+                                  key={stageRun.id}
+                                  className={stageRun.stage_id === activeSession.current_stage ? "stage-run current" : "stage-run"}
+                                >
+                                  <div className="stage-run-title">
+                                    <strong>{formatStageName(stageRun.stage_id)}</strong>
+                                    <span className={`status-pill ${stageRun.status}`}>{formatStatus(stageRun.status)}</span>
+                                  </div>
+                                  <small>第 {stageRun.attempt} 次尝试</small>
+                                  <p className="markdown-content">
+                                    <MarkdownContent>{formatStageRunCardDetail(stageRun)}</MarkdownContent>
+                                  </p>
+                                </article>
+                              ))}
+                            </div>
+                          ) : (
+                            <p className="muted">暂无阶段执行记录。</p>
+                          )}
+                        </section>
 
-                    <section className="run-panel">
-                      <div className="panel-heading">
-                        <h3>返工请求</h3>
-                        <small>{reworkRequests.length} 个请求</small>
+                        <section className="run-panel">
+                          <div className="panel-heading">
+                            <h3>返工请求</h3>
+                            <small>{reworkRequests.length} 个请求</small>
+                          </div>
+                          {reworkRequests.length > 0 ? (
+                            <div className="rework-list">
+                              {reworkRequests.map((request: ReworkRequest) => (
+                                <article key={request.id} className="rework-request">
+                                  <div className="stage-run-title">
+                                    <strong>
+                                      {formatStageName(request.from_stage_id)} -&gt; {formatStageName(request.target_stage_id)}
+                                    </strong>
+                                    <span className={`status-pill ${request.status}`}>{formatStatus(request.status)}</span>
+                                  </div>
+                                  <p className="markdown-content">
+                                    <MarkdownContent>{request.reason}</MarkdownContent>
+                                  </p>
+                                  {request.status === "pending" && (
+                                    <div className="actions">
+                                      <button className="primary" disabled={busy} onClick={() => approveReworkRequest(activeSession, request)}>
+                                        批准返工
+                                      </button>
+                                    </div>
+                                  )}
+                                </article>
+                              ))}
+                            </div>
+                          ) : (
+                            <p className="muted">暂无返工请求。</p>
+                          )}
+                        </section>
                       </div>
-                      {reworkRequests.length > 0 ? (
-                        <div className="rework-list">
-                          {reworkRequests.map((request: ReworkRequest) => (
-                            <article key={request.id} className="rework-request">
-                              <div className="stage-run-title">
-                                <strong>
-                                  {formatStageName(request.from_stage_id)} -&gt; {formatStageName(request.target_stage_id)}
-                                </strong>
-                                <span className={`status-pill ${request.status}`}>{formatStatus(request.status)}</span>
-                              </div>
-                              <p className="markdown-content">
-                                <MarkdownContent>{request.reason}</MarkdownContent>
-                              </p>
-                              {request.status === "pending" && (
-                                <div className="actions">
-                                  <button className="primary" disabled={busy} onClick={() => approveReworkRequest(activeSession, request)}>
-                                    批准返工
-                                  </button>
-                                </div>
-                              )}
-                            </article>
-                          ))}
-                        </div>
-                      ) : (
-                        <p className="muted">暂无返工请求。</p>
-                      )}
-                    </section>
-                  </div>
+                    </>
+                  )}
                   {pendingReworkRequests.length > 0 && (
                     <div className="pending-banner">{pendingReworkRequests.length} 个返工请求等待审批。</div>
                   )}
@@ -1357,24 +1384,62 @@ export default function App() {
 
           {activeWorkflow && (
             <div className="right-panel">
-              <div className="stages-panel">
-                <h3>阶段状态</h3>
-                <div className="stages stages-stepper">
-                  {workflowStageDisplays.map(({ stage, status, attempt, isCurrent }) => (
-                    <div key={stage.id} className={`stage ${status}${isCurrent ? " current" : ""}`}>
-                      <span className={`stage-indicator ${status}`} aria-label={formatStatus(status)} />
-                      <div>
-                        <span>{formatStageName(stage.id, stage.name)}</span>
-                        <small>
-                          {formatStatus(status)}
-                          {attempt ? ` · 第 ${attempt} 次` : ""}
-                          {stage.approval_required ? " · 需审批" : ""}
-                        </small>
+              {isProfileMode ? (
+                <div className="stages-panel">
+                  <h3>{activeWorkflow.name}</h3>
+                  <p className="muted" style={{ fontSize: "0.85em", marginBottom: "12px" }}>
+                    {activeWorkflow.description?.split("\n")[0]}
+                  </p>
+                  {activeWorkflow.skills && activeWorkflow.skills.length > 0 && (
+                    <div style={{ marginBottom: "12px" }}>
+                      <small className="muted">Skills</small>
+                      <div className="stages">
+                        {activeWorkflow.skills.map((s) => (
+                          <div key={s} className="stage not_started">
+                            <span className="stage-indicator not_started" />
+                            <div><small>{s}</small></div>
+                          </div>
+                        ))}
                       </div>
                     </div>
-                  ))}
+                  )}
+                  {activeWorkflow.agents && Object.keys(activeWorkflow.agents).length > 0 && (
+                    <div style={{ marginBottom: "12px" }}>
+                      <small className="muted">Sub-Agents</small>
+                      <div className="stages">
+                        {Object.entries(activeWorkflow.agents).map(([name, def]) => (
+                          <div key={name} className="stage not_started">
+                            <span className="stage-indicator not_started" />
+                            <div>
+                              <small><strong>{name}</strong></small>
+                              <small className="muted">{def.description}</small>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
-              </div>
+              ) : (
+                <div className="stages-panel">
+                  <h3>阶段状态</h3>
+                  <div className="stages stages-stepper">
+                    {workflowStageDisplays.map(({ stage, status, attempt, isCurrent }) => (
+                      <div key={stage.id} className={`stage ${status}${isCurrent ? " current" : ""}`}>
+                        <span className={`stage-indicator ${status}`} aria-label={formatStatus(status)} />
+                        <div>
+                          <span>{formatStageName(stage.id, stage.name)}</span>
+                          <small>
+                            {formatStatus(status)}
+                            {attempt ? ` · 第 ${attempt} 次` : ""}
+                            {stage.approval_required ? " · 需审批" : ""}
+                          </small>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </div>

@@ -98,6 +98,12 @@ export class ClaudeAgentRunner {
       return input.session;
     }
 
+    // Profile 模式：workflow 无阶段管线，单次 query() 完成整个 session
+    if (input.workflow.stages.length === 0) {
+      return this.runProfileMode(input);
+    }
+
+    // Stage 模式（向后兼容）：逐阶段推进
     for (let iteration = 0; iteration < this.maxStageIterations; iteration += 1) {
       const updated = await this.runCurrentStage(input);
       if (updated.status !== "running") {
@@ -111,6 +117,163 @@ export class ClaudeAgentRunner {
     input.session.status = "failed";
     input.session.error = `Workflow exceeded ${this.maxStageIterations} automatic stage iterations.`;
     await this.recordProgress(input, "status", input.session.error, "milestone");
+    return input.session;
+  }
+
+  private async runProfileMode(input: AgentRunInput): Promise<AgentSession> {
+    const sdkMessages: unknown[] = [];
+    const pdfPageImageReads = new Set<string>();
+    const abortController = new AbortController();
+    this.abortControllers.set(input.session.id, abortController);
+    try {
+      const query = await this.resolveQuery();
+      const mcpServer = await this.resolveMcpServer();
+
+      // 加载配置的 Skills 摘要（不加载完整内容——按需通过 Skill 工具加载）
+      const skillIds = input.workflow.skills ?? [];
+      const skillSummaries = await this.loadSkillSummaries(skillIds);
+      for (const s of skillSummaries) {
+        await this.recordProgress(input, "runner", `加载 Skill 摘要：${s.id}`, "milestone");
+      }
+
+      // 构建系统提示：人设 + Skill 摘要
+      const systemPrompt = input.workflow.system_prompt ?? "";
+      const instructions = [
+        systemPrompt,
+        skillSummaries.length > 0
+          ? [
+              "---",
+              "## 可用 Skills（摘要，按需通过 Skill 工具加载完整内容）",
+              ...skillSummaries.map((s) => `- **${s.id}**: ${s.content.slice(0, 200)}`)
+            ].join("\n")
+          : ""
+      ].filter(Boolean).join("\n\n");
+
+      await this.recordProgress(input, "runner", "开始执行（Profile 模式）", "milestone");
+      const nodeInfo = await resolveNodeExecutable();
+      const sdkEnv = buildClaudeSdkEnv(nodeInfo?.env);
+
+      // 构建 SDK agents：注册顶层 sub-agents
+      const sdkAgents: Record<string, { description: string; tools?: string[]; prompt: string; model?: string }> = {};
+      const workflowAgents = input.workflow.agents ?? {};
+      for (const [name, def] of Object.entries(workflowAgents)) {
+        sdkAgents[name] = {
+          description: def.description,
+          prompt: def.prompt,
+          ...(def.tools && def.tools.length > 0 ? { tools: def.tools } : {}),
+          ...(def.model ? { model: def.model } : {})
+        };
+      }
+
+      for await (const message of query({
+        prompt: instructions,
+        options: {
+          cwd: input.session.project_path,
+          executable: nodeInfo?.command ?? undefined,
+          env: sdkEnv,
+          abortController,
+          mcpServers: mcpServer ? { ai_coder: mcpServer } : undefined,
+          ...(this.options.pluginPaths?.length
+            ? { plugins: this.options.pluginPaths.map((pluginPath) => ({ type: "local" as const, path: pluginPath })) }
+            : {}),
+          tools: buildAllowedClaudeTools(input.workflow, undefined),
+          disallowedTools: buildDisallowedClaudeTools(input.workflow),
+          hooks: {
+            PreToolUse: [{
+              hooks: [async () => ({
+                continue: true,
+                hookSpecificOutput: {
+                  hookEventName: "PreToolUse" as const,
+                  permissionDecision: "ask" as const,
+                  permissionDecisionReason: "Route every tool through the host policy and audit callback."
+                }
+              })]
+            }]
+          },
+          settingSources: ["user", "project", "local"],
+          ...(Object.keys(sdkAgents).length > 0 ? { agents: sdkAgents } : {}),
+          canUseTool: async (toolName: string, toolInput: Record<string, unknown>, options: { toolUseID: string }) => {
+            if (toolName === "Task") {
+              await this.recordProgress(input, "tool_policy", "允许 Task（sub-agent）调用", "transient");
+              return { behavior: "allow" };
+            }
+            if (toolName === "Skill") {
+              const skillName = String(toolInput.skill ?? toolInput.name ?? "unknown");
+              this.appendAssistantMessage(input.session, `正在加载 Skill：\`${skillName}\``, "skill_usage");
+              await this.recordProgress(input, "runner", `加载 Skill：${skillName}`, "milestone");
+            }
+            if (isPdfPageImageRead(toolName, toolInput)) {
+              const filePath = String(toolInput.file_path ?? toolInput.path ?? "");
+              pdfPageImageReads.add(filePath);
+              if (pdfPageImageReads.size > this.maxPdfPageImageReadsPerStage) {
+                return { behavior: "deny", message: `已读取 ${this.maxPdfPageImageReadsPerStage} 张 PDF 拆页图片，请基于已读取内容继续。`, interrupt: false };
+              }
+            }
+            if (isUnsupportedDocumentRead(toolName, toolInput)) {
+              return { behavior: "deny", message: "请读取已拆页 PNG，不要直接 Read PDF。", interrupt: false };
+            }
+            if (toolName === "mcp__ai_coder__ask_human") {
+              const qualityFailure = evaluateHumanQuestionRequest(toolInput);
+              if (qualityFailure) {
+                return { behavior: "deny", message: `提问准入失败：${qualityFailure}`, interrupt: false };
+              }
+              const question = this.buildHumanQuestion(input.session, toolInput, options.toolUseID);
+              if (question) {
+                input.session.pending_human_questions = [...(input.session.pending_human_questions ?? []), question];
+                await this.recordProgress(input, "tool_policy", `等待用户回答：${question.question.slice(0, 60)}`, "milestone");
+                return { behavior: "deny", message: "等待用户回答，已暂停执行", interrupt: true };
+              }
+              input.session.status = "failed";
+              input.session.error = "ask_human 工具输入格式错误";
+              return { behavior: "deny", message: input.session.error, interrupt: true };
+            }
+            // 引擎层安全拦截（profile 模式下以 "careful-coder" 作为 stage id）
+            const safetyCheck = checkCommandSafety("plan", toolName, toolInput);
+            if (!safetyCheck.allow) {
+              return { behavior: "deny", message: safetyCheck.message, interrupt: false };
+            }
+            const decision = await approveOrDenyToolUse(input.session, input.workflow, toolName, toolInput, options.toolUseID);
+            if (decision.allow) {
+              return { behavior: "allow", updatedInput: decision.updatedInput };
+            }
+            if (this.hasPendingToolCall(input.session, options.toolUseID)) {
+              const resolved = await this.waitForToolApproval(input.session, options.toolUseID, abortController.signal);
+              if (resolved === "approved") {
+                const approvedDecision = await approveOrDenyToolUse(input.session, input.workflow, toolName, toolInput, options.toolUseID);
+                if (approvedDecision.allow) {
+                  input.session.status = "running";
+                  return { behavior: "allow", updatedInput: approvedDecision.updatedInput };
+                }
+                return { behavior: "deny", message: approvedDecision.message, interrupt: approvedDecision.interrupt };
+              }
+              input.session.status = "running";
+              return { behavior: "deny", message: "Tool call was denied by the user.", interrupt: false };
+            }
+            return { behavior: "deny", message: decision.message, interrupt: decision.interrupt };
+          }
+        }
+      } as never) as AsyncIterable<unknown>) {
+        sdkMessages.push(message);
+        this.recordSdkToolUses(input.session, "plan", message);
+        this.recordToolExecutionResult(input.session, message);
+      }
+
+      // Profile 模式：查询结束后直接完成 session，不经过阶段引擎
+      const transcript = formatClaudeTranscript(sdkMessages);
+      this.appendAssistantMessage(input.session, transcript);
+      input.session.status = "completed";
+      await this.recordProgress(input, "status", "Profile 模式执行完成", "milestone");
+    } catch (error) {
+      if (isAbortError(error)) {
+        input.session.status = "interrupted";
+        return input.session;
+      }
+      input.session.status = "failed";
+      input.session.error = error instanceof Error ? error.message : String(error);
+      await this.recordProgress(input, "status", `执行失败：${input.session.error}`, "milestone");
+    } finally {
+      this.abortControllers.delete(input.session.id);
+    }
     return input.session;
   }
 
@@ -699,6 +862,32 @@ export class ClaudeAgentRunner {
       }
       if (!content) throw new Error(`找不到阶段 ${stage.id} 必需的 Skill：${id}`);
       loaded.push({ id: namespace ? id : `careful-coder:${skillName}`, content });
+    }
+    return loaded;
+  }
+
+  /** Profile 模式：只加载 Skill 摘要（前 200 字），完整内容通过 Skill 工具按需加载。 */
+  private async loadSkillSummaries(skillIds: string[]): Promise<Array<{ id: string; content: string }>> {
+    if (skillIds.length === 0) return [];
+    if (!this.options.pluginPaths?.length) return [];
+
+    const loaded: Array<{ id: string; content: string }> = [];
+    for (const id of skillIds) {
+      const [namespace, skillName] = id.includes(":") ? id.split(":", 2) : [undefined, id];
+      if (!/^[a-z0-9-]+$/.test(skillName)) continue;
+      for (const pluginPath of this.options.pluginPaths) {
+        if (namespace && path.basename(pluginPath) !== namespace) continue;
+        try {
+          const fullContent = await readFile(path.join(pluginPath, "skills", skillName, "SKILL.md"), "utf8");
+          loaded.push({
+            id: namespace ? id : `careful-coder:${skillName}`,
+            content: fullContent.slice(0, 200)
+          });
+          break;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+      }
     }
     return loaded;
   }

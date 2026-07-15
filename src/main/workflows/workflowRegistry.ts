@@ -215,6 +215,19 @@ const workflowSchema = z.object({
       examples: stringArraySchema
     })
     .default({ enabled: false, auto_start: false, keywords: [], examples: [] }),
+  system_prompt: z.string().optional(),
+  skills: stringArraySchema,
+  agents: z
+    .record(
+      z.string(),
+      z.object({
+        description: z.string().min(1),
+        tools: stringArraySchema,
+        prompt: z.string().min(1),
+        model: z.string().optional()
+      })
+    )
+    .optional(),
   stages: z
     .array(
       z.object({
@@ -266,7 +279,7 @@ const workflowSchema = z.object({
         }
       })
     )
-    .min(1)
+    .default([])
 });
 
 function normalizeWorkflow(input: unknown, sourceType: WorkflowSourceType, filePath: string): WorkflowTemplate {
@@ -292,6 +305,9 @@ function normalizeWorkflow(input: unknown, sourceType: WorkflowSourceType, fileP
     permissions: workflow.permissions,
     rework: workflow.rework,
     routing: workflow.routing,
+    system_prompt: workflow.system_prompt,
+    skills: workflow.skills,
+    agents: workflow.agents,
     stages: workflow.stages.map((stage) => ({
       id: stage.id,
       name: stage.name,

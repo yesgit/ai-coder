@@ -58,6 +58,11 @@ export function hasStageApproval(session: AgentSession, stageId: string): boolea
 }
 
 export function buildAllowedClaudeTools(workflow: WorkflowTemplate, stage?: WorkflowStage): string[] {
+  // Profile 模式（无阶段管线）：允许全部常用工具
+  if (!stage) {
+    return ["Read", "Grep", "Glob", "LS", "Skill", "Edit", "MultiEdit", "Write", "Bash", "Task"];
+  }
+
   const declared = new Set(stage ? (stage.allowed_tools ?? []) : workflow.stages.flatMap((item) => item.allowed_tools ?? []));
   const tools = new Set<string>(["Read", "Grep", "Glob", "LS", "Skill"]);
 

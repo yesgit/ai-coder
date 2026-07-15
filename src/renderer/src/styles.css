@@ -1434,6 +1434,50 @@ textarea {
   color: #98a2b3;
 }
 
+/* Profile 模式增强活动流 */
+.profile-activity {
+  max-height: 300px;
+  border-color: #b7c5d9;
+}
+.profile-activity .panel-heading {
+  padding: 8px 12px;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  border-bottom: 1px solid #d9e2ec;
+  background: #f2f4f7;
+}
+.profile-activity .panel-heading h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: #344054;
+}
+.profile-activity .activity-item {
+  grid-template-columns: 55px 70px 1fr;
+  padding: 3px 0;
+}
+.activity-type-badge {
+  font-size: 10px;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: #e4e7ec;
+  color: #667085;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: center;
+  line-height: 1.6;
+}
+.activity-type-badge.milestone {
+  background: #dbeafe;
+  color: #1e40af;
+}
+.activity-type-badge.transient {
+  background: #f2f4f7;
+  color: #667085;
+}
+
 .timeline-meta {
   display: flex;
   min-width: 0;

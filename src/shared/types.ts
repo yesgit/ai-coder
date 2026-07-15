@@ -221,6 +221,12 @@ export interface WorkflowTemplate {
   rework: WorkflowReworkPolicy;
   routing?: WorkflowRoutingConfig;
   stages: WorkflowStage[];
+  /** v5.0 profile 模式：注入到系统提示的人设文本 */
+  system_prompt?: string;
+  /** v5.0 profile 模式：session 启动时自动加载摘要的 Skill ID 列表 */
+  skills?: string[];
+  /** v5.0 profile 模式：顶层 sub-agents（无阶段管线时使用） */
+  agents?: Record<string, WorkflowStageAgentDefinition>;
 }
 
 export interface WorkflowLoadIssue {

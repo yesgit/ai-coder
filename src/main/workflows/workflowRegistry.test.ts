@@ -76,7 +76,7 @@ describe("WorkflowRegistry", () => {
       path.join(dir, "valid.yaml"),
       ["id: valid", "name: Valid", "version: 1.0.0", "stages:", "  - id: plan", "    name: Plan"].join("\n")
     );
-    await fs.writeFile(path.join(dir, "invalid.yaml"), ["id: invalid", "name: Invalid", "version: 1.0.0"].join("\n"));
+    await fs.writeFile(path.join(dir, "invalid.yaml"), ["id: invalid", "name: Invalid", "version: 1.0.0", "stages:", "  - id: plan"].join("\n"));
 
     const result = await new WorkflowRegistry(dir).listWithIssues();
 
