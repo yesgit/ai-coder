@@ -282,6 +282,11 @@ export class ClaudeAgentRunner {
         sdkMessages.push(message);
         this.recordSdkToolUses(input.session, "profile", message);
         this.recordToolExecutionResult(input.session, message);
+        // 实时输出活动：每个 SDK 消息都生成一条进度事件，让 UI 能跟踪执行过程
+        const snippet = describeSdkMessageSnippet(message);
+        if (isMeaningfulSdkProgress(snippet)) {
+          await this.recordProgress(input, "runner", snippet, "transient");
+        }
       }
 
       // Profile 模式：查询结束后直接完成 session，不经过阶段引擎
