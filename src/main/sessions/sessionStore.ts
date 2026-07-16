@@ -23,7 +23,8 @@ export class SessionStore {
     taskPrompt: string,
     onboarding?: SessionOnboardingSnapshot,
     attachments?: Attachment[],
-    routing?: SessionRoutingSnapshot
+    routing?: SessionRoutingSnapshot,
+    model?: string
   ): Promise<AgentSession> {
     const now = new Date().toISOString();
     const firstStage = workflow.stages[0]?.id ?? "start";
@@ -46,6 +47,7 @@ export class SessionStore {
       rework_requests: [],
       onboarding,
       routing,
+      ...(model ? { model } : {}),
       created_at: now,
       updated_at: now
     };

@@ -6,7 +6,7 @@ import { BrowserWindow, dialog, ipcMain } from "electron";
 import type { OpenDialogOptions } from "electron";
 import type { AgentSession, Attachment, ProjectOnboardingStatus, ResolveWorkflowInput, SessionOnboardingSnapshot, SessionRoutingSnapshot, StartSessionInput } from "../shared/types.js";
 import { ClaudeAgentRunner } from "./agent/claudeAgentRunner.js";
-import { getClaudeRuntimeStatus } from "./agent/claudeRuntime.js";
+import { fetchAvailableModels, getClaudeRuntimeStatus } from "./agent/claudeRuntime.js";
 import { OnboardingStore } from "./onboarding/onboardingStore.js";
 import { AuthorizedProjects } from "./security/authorizedProjects.js";
 import { SessionStore } from "./sessions/sessionStore.js";
@@ -68,6 +68,8 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
   });
 
   ipcMain.handle("agent:get-status", async () => getClaudeRuntimeStatus());
+
+  ipcMain.handle("agent:get-models", async () => fetchAvailableModels());
 
   ipcMain.handle("project:onboarding-status", async (_event, projectPath: string) => {
     const authorizedProjectPath = await authorizedProjects.assertAuthorized(projectPath);
@@ -163,6 +165,17 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
   ipcMain.handle("sessions:toggle-auto-approve", async (_event, sessionId: string) => {
     const session = await sessions.toggleAutoApprove(sessionId);
     await authorizedProjects.assertAuthorized(session.project_path);
+    return session;
+  });
+
+  ipcMain.handle("sessions:set-model", async (_event, sessionId: string, model: string) => {
+    const session = await sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session not found: ${sessionId}`);
+    }
+    await authorizedProjects.assertAuthorized(session.project_path);
+    session.model = model;
+    await sessions.save(session);
     return session;
   });
 
@@ -371,7 +384,8 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
       input.taskPrompt.trim(),
       buildOnboardingSnapshot(onboardingStatus, Boolean(input.onboardingOverride), includeProjectProfile),
       processedAttachments,
-      normalizeRoutingSnapshot(input)
+      normalizeRoutingSnapshot(input),
+      input.model
     );
     const startStageId = resolveStartStageId(workflow, includeProjectProfile);
     if (startStageId) {

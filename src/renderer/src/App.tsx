@@ -7,6 +7,7 @@ import type {
   AgentRuntimeStatus,
   ApprovalRecord,
   Attachment,
+  AvailableModel,
   HumanQuestion,
   ReworkRequest,
   StageRun,
@@ -45,6 +46,7 @@ export default function App() {
   const [sessions, setSessions] = useState<AgentSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<AgentRuntimeStatus | null>(null);
+  const [availableModels, setAvailableModels] = useState<AvailableModel[]>([]);
   const [includeProjectProfile, setIncludeProjectProfile] = useState(true);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -66,6 +68,16 @@ export default function App() {
     setQuestionAnswers({});
     setQuestionOtherTexts({});
   }, [activeSessionId]);
+
+  // 启动时从 SDK 获取可用模型列表
+  useEffect(() => {
+    let cancelled = false;
+    window.aiCoder.getAvailableModels().then((models: AvailableModel[]) => {
+      if (cancelled) return;
+      if (models.length > 0) setAvailableModels(models);
+    }).catch(() => { /* SDK 不可用时保留空列表，UI 显示默认模型 */ });
+    return () => { cancelled = true; };
+  }, []);
 
   // 可上传的非图片二进制文件 MIME 与扩展名（PDF、文档、表格等）
   const UPLOADABLE_MIME = new Set([
@@ -379,6 +391,17 @@ export default function App() {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function setModel(session: AgentSession, model: string) {
+    setError("");
+    try {
+      const updated = await window.aiCoder.setModel(session.id, model);
+      upsertSession(updated);
+      await refreshSessions(updated.id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
     }
   }
 
@@ -974,6 +997,27 @@ export default function App() {
                             停止
                           </button>
                         )}
+                        <select
+                          className="model-select"
+                          value={activeSession.model || ""}
+                          disabled={busy || activeSession.status === "completed"}
+                          onChange={(e) => setModel(activeSession, e.target.value)}
+                          title="切换 AI 模型"
+                        >
+                          <option value="">默认模型</option>
+                          {availableModels.length > 0
+                            ? availableModels.map((m) => (
+                                <option key={m.value} value={m.value}>
+                                  {m.displayName}
+                                </option>
+                              ))
+                            : <>
+                                <option value="claude-sonnet-5">Claude Sonnet 5</option>
+                                <option value="claude-opus-4-8">Claude Opus 4.8</option>
+                                <option value="claude-haiku-4-5">Claude Haiku 4.5</option>
+                                <option value="deepseek-v4">DeepSeek V4</option>
+                              </>}
+                        </select>
                         {(activeSession.status === "running" || activeSession.status === "waiting_approval") && (
                           <button
                             className={activeSession.auto_approve ? "primary" : "secondary"}
@@ -1248,7 +1292,7 @@ export default function App() {
                             <div key={p.id} className={`activity-item activity-${p.type}`}>
                               <time>{formatTimestamp(p.created_at)}</time>
                               <span className={`activity-type-badge ${p.visibility}`}>{p.type}</span>
-                              <span className="muted">{p.message}</span>
+                              <span className="muted">{p.message.length > MAX_ACTIVITY_MESSAGE_LENGTH ? p.message.slice(0, MAX_ACTIVITY_MESSAGE_LENGTH) + "…" : p.message}</span>
                             </div>
                           ))
                         ) : (
@@ -1265,7 +1309,7 @@ export default function App() {
                             {activityEvents.map((p) => (
                               <div key={p.id} className="activity-item">
                                 <time>{formatTimestamp(p.created_at)}</time>
-                                <span className="muted">{p.message}</span>
+                                <span className="muted">{p.message.length > MAX_ACTIVITY_MESSAGE_LENGTH ? p.message.slice(0, MAX_ACTIVITY_MESSAGE_LENGTH) + "…" : p.message}</span>
                               </div>
                             ))}
                           </div>
@@ -1290,7 +1334,7 @@ export default function App() {
                                   </div>
                                   <small>第 {stageRun.attempt} 次尝试</small>
                                   <p className="markdown-content">
-                                    <MarkdownContent>{formatStageRunCardDetail(stageRun)}</MarkdownContent>
+                                    <MarkdownContent>{truncateDetail(formatStageRunCardDetail(stageRun))}</MarkdownContent>
                                   </p>
                                 </article>
                               ))}
@@ -1348,7 +1392,7 @@ export default function App() {
                         <div className="timeline-body">
                           <strong>{event.title}</strong>
                           {event.detail && (
-                            <MarkdownContent>{event.detail}</MarkdownContent>
+                            <MarkdownContent>{truncateDetail(event.detail)}</MarkdownContent>
                           )}
                         </div>
                       </article>
@@ -1594,6 +1638,14 @@ const markdownComponents: Components = {
 };
 
 /** 统一的 Markdown 渲染组件 */
+const MAX_DETAIL_LENGTH = 3000;
+const MAX_ACTIVITY_MESSAGE_LENGTH = 200;
+
+function truncateDetail(text: string): string {
+  if (text.length <= MAX_DETAIL_LENGTH) return text;
+  return text.slice(0, MAX_DETAIL_LENGTH) + "\n\n> ⚠️ 内容过长已截断，完整内容请查看原始消息。";
+}
+
 function MarkdownContent({ children }: { children: string }) {
   return (
     <div className="markdown-content">

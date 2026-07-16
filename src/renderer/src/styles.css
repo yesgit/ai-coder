@@ -958,6 +958,17 @@ textarea {
   gap: 6px;
 }
 
+.session-actions .model-select {
+  min-height: 34px;
+  padding: 4px 8px;
+  font-size: 13px;
+  border: 1px solid #d7dde5;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #182026;
+  cursor: pointer;
+}
+
 .session-actions button {
   min-height: 34px;
   padding: 6px 12px;
