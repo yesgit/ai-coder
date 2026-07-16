@@ -21,6 +21,7 @@ import { summarizeSessionTitle } from "../../shared/sessionTitle.js";
 import { getVisibleSessions, groupSessionsByProject, resolveActiveSessionId, resolveComposerSession } from "./sessionSelection.js";
 import { buildWorkflowStageDisplays } from "./workflowStageStatus.js";
 import { formatStageRunCardDetail } from "./stageRunPresentation.js";
+import TaskTreePanel from "./TaskTreePanel.js";
 import {
   formatStageName,
   formatStatus,
@@ -143,10 +144,26 @@ export default function App() {
     () => visibleSessions.find((session) => session.id === activeSessionId) ?? null,
     [activeSessionId, visibleSessions]
   );
-  const activeWorkflow = useMemo(
-    () => workflows.find((workflow) => workflow.id === activeSession?.workflow_id) ?? null,
-    [activeSession?.workflow_id, workflows]
-  );
+  const activeWorkflow = useMemo(() => {
+    const found = workflows.find((workflow) => workflow.id === activeSession?.workflow_id);
+    if (found) return found;
+    // workflows 尚未加载但已知 workflow_id：提供最小 fallback，避免右侧面板完全消失
+    if (activeSession?.workflow_id) {
+      return {
+        id: activeSession.workflow_id,
+        name: activeSession.workflow_id,
+        version: "0.0.0",
+        description: "",
+        source: { type: "builtin" as const, id: activeSession.workflow_id },
+        permissions: { shell: { approval_required: true }, network: { enabled: false } },
+        rework: { enabled: false, allowed_targets: [], approval_required: false, invalidate_downstream: false },
+        stages: [],
+        skills: [],
+        agents: {}
+      } as WorkflowTemplate;
+    }
+    return null;
+  }, [activeSession?.workflow_id, workflows]);
   const runningVisibleSessionIds = useMemo(
     () =>
       visibleSessions
@@ -1082,6 +1099,9 @@ export default function App() {
                       </div>
                     )}
                   </div>
+                  {activeSession.task_tree && (
+                    <TaskTreePanel taskTree={activeSession.task_tree} />
+                  )}
                   <div className={`activity-strip ${activeSession.status}`}>
                     <span className="activity-dot" />
                     <div>
@@ -1463,6 +1483,9 @@ export default function App() {
                       </div>
                     </div>
                   )}
+                  {activeSession?.task_tree && (
+                    <TaskTreePanel taskTree={activeSession.task_tree} />
+                  )}
                 </div>
               ) : (
                 <div className="stages-panel">
@@ -1482,6 +1505,9 @@ export default function App() {
                       </div>
                     ))}
                   </div>
+                  {activeSession?.task_tree && (
+                    <TaskTreePanel taskTree={activeSession.task_tree} />
+                  )}
                 </div>
               )}
             </div>

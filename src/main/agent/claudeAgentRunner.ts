@@ -36,11 +36,26 @@ interface ProfileQueryResult {
   preQueryTcCount: number;
   apiError?: unknown;
   finalSession?: AgentSession;
+  effectiveModel?: string;
 }
 
 interface PendingToolApproval {
   session: AgentSession;
   resolve: (status: ToolApprovalResolution) => void;
+}
+
+/** 已知不支持多模态（图片）输入的模型名称片段。用小写匹配。 */
+const NON_MULTIMODAL_MODEL_PATTERNS = ["deepseek"];
+
+function isModelMultimodal(model: string | undefined | null): boolean {
+  if (!model) return true; // 无指定 → 默认 Claude，支持多模态
+  const lower = model.toLowerCase();
+  return !NON_MULTIMODAL_MODEL_PATTERNS.some((p) => lower.includes(p));
+}
+
+function isModelDeepSeek(model: string | undefined | null): boolean {
+  if (!model) return false;
+  return model.toLowerCase().includes("deepseek");
 }
 
 export class ClaudeAgentRunner {
@@ -52,6 +67,7 @@ export class ClaudeAgentRunner {
   private mcpServerCache: unknown | null = null;
   private activeSession: AgentSession | null = null;
   private readonly options: ClaudeAgentRunnerOptions;
+  private resolvedEffectiveModel: string | null = null;
 
   constructor(options: ClaudeAgentRunnerOptions | ClaudeQuery = {}) {
     this.options = typeof options === "function" ? { queryOverride: options } : options;
@@ -182,13 +198,24 @@ export class ClaudeAgentRunner {
     await this.recordProgress(input, "status", "将错误信息呈现给 LLM，由其判断是否继续...", "milestone");
 
     // ── 第二次执行：让 LLM 根据错误决定下一步 ──
-    // DeepSeek 在续写/重试模式下容易输出 DSML 格式的工具调用，
-    // 而 SDK 只认 Anthropic tool_use content blocks，导致工具不执行。
-    // 检测到 DSML 后自动切换到 Claude 模型重试。
-    const isDeepSeek = input.session.model?.toLowerCase().includes("deepseek");
-    const retryModel = isDeepSeek ? "claude-sonnet-5" : (input.session.model || "");
+    // 检测运行的真实模型（session.model 可能为空/undefined，实际默认是系统级配置）：
+    //   1. session.model 显式指定
+    //   2. 第一次查询时从 SDK init 消息中捕获的有效模型
+    //   3. API 错误消息中暴露的模型名（如 "DeepSeek-V4 is not a multimodal model"）
+    const effectiveModel = firstResult.effectiveModel
+      ?? input.session.model
+      ?? this.resolvedEffectiveModel;
+    const errorModelHint = /deepseek/i.test(errorMessage) ? "deepseek" : "";
+    const isDeepSeek = isModelDeepSeek(effectiveModel)
+      || isModelDeepSeek(errorModelHint);
+    const retryModel = isDeepSeek ? "claude-sonnet-5" : (effectiveModel || "");
     if (isDeepSeek) {
-      await this.recordProgress(input, "status", `检测到 DeepSeek，切换到 ${retryModel} 重试（避免 DSML 格式不兼容）`, "milestone");
+      const reason = !effectiveModel
+        ? "从 API 错误中检测到 DeepSeek"
+        : effectiveModel !== input.session.model
+          ? `当前模型 ${effectiveModel} 不支持多模态（API 错误提示），切换到 Claude`
+          : "检测到 DeepSeek，切换到 Claude（避免 DSML 格式不兼容及多模态限制）";
+      await this.recordProgress(input, "status", `${reason}，改用 ${retryModel} 重试`, "milestone");
     }
     const savedModel = input.session.model;
     input.session.model = retryModel;
@@ -249,6 +276,8 @@ export class ClaudeAgentRunner {
     const pdfPageImageReads = new Set<string>();
     const preQueryMsgCount = input.session.messages.length;
     const preQueryTcCount = input.session.tool_calls.length;
+    // 运行时解析的有效模型：初始用 session.model，init 消息到达后更新
+    let effectiveModel = input.session.model || "";
 
     this.activeSession = input.session;
 
@@ -264,7 +293,7 @@ export class ClaudeAgentRunner {
         }
       }
 
-      const carefulCoderInstructions = this.buildProfileSystemPrompt(skillSummaries, input.workflow.system_prompt);
+      const carefulCoderInstructions = this.buildProfileSystemPrompt(skillSummaries, input.workflow.system_prompt, isLlmRetry ? effectiveModel : undefined);
 
       const taskPrompt = input.session.task_prompt ?? "";
       const humanQaHistory = (input.session.pending_human_questions ?? [])
@@ -378,6 +407,22 @@ export class ClaudeAgentRunner {
             }
             if (isPdfPageImageRead(toolName, toolInput)) {
               const filePath = String(toolInput.file_path ?? toolInput.path ?? "");
+              // 非多模态模型（如 DeepSeek）无法处理图片 → 拒绝读 PNG，提示用文本工具
+              if (!isModelMultimodal(effectiveModel)) {
+                await this.recordProgress(input, "tool_policy", `拒绝 PNG 读取（${effectiveModel || "当前模型"}不支持多模态）：${filePath}`, "milestone");
+                return {
+                  behavior: "deny",
+                  message: [
+                    `${effectiveModel || "当前模型"}不支持多模态（图片）输入，无法处理 PNG 拆页。`,
+                    "请使用纯文本方式获取 PDF 内容，例如：",
+                    "- `pdftotext <pdf路径> -` 提取文本",
+                    "- `python3 -c \"import PyPDF2; ...\"` 读取文本",
+                    "- 其他命令行文本提取工具",
+                    "如果以上工具不可用，请切换到支持多模态的模型（如 claude-sonnet-5）再试。"
+                  ].join("\n"),
+                  interrupt: false
+                };
+              }
               pdfPageImageReads.add(filePath);
               if (pdfPageImageReads.size > this.maxPdfPageImageReadsPerStage) {
                 return { behavior: "deny", message: `已读取 ${this.maxPdfPageImageReadsPerStage} 张 PDF 拆页图片，请基于已读取内容继续。`, interrupt: false };
@@ -432,6 +477,12 @@ export class ClaudeAgentRunner {
         }
       } as never) as AsyncIterable<unknown>) {
         sdkMessages.push(message);
+        // 从 SDK init 消息中捕获运行时实际使用的模型
+        captureEffectiveModelFromInitMessage(message, (model) => {
+          if (model && !effectiveModel) {
+            effectiveModel = model;
+          }
+        });
         this.recordSdkToolUses(input.session, "profile", message);
         this.recordToolExecutionResult(input.session, message);
         const snippet = describeSdkMessageSnippet(message);
@@ -445,7 +496,12 @@ export class ClaudeAgentRunner {
         }
       }
 
-      return { sdkMessages, preQueryMsgCount, preQueryTcCount };
+      // 缓存跨查询的有效模型
+      if (effectiveModel) {
+        this.resolvedEffectiveModel = effectiveModel;
+      }
+
+      return { sdkMessages, preQueryMsgCount, preQueryTcCount, effectiveModel: effectiveModel || undefined };
     } catch (error) {
       if (isAbortError(error) || abortController.signal.aborted) {
         input.session.status = "interrupted";
@@ -470,11 +526,13 @@ export class ClaudeAgentRunner {
     }
   }
 
-  /** 构建 Profile 模式的系统提示词 */
+/** 构建 Profile 模式的系统提示词 */
   private buildProfileSystemPrompt(
     skillSummaries: Array<{ id: string; content: string }>,
-    workflowSystemPrompt?: string
+    workflowSystemPrompt?: string,
+    effectiveModel?: string
   ): string {
+    const modelSupportsImages = isModelMultimodal(effectiveModel ?? null);
     const languageGuidance = [
       "## 语言要求（最高优先级）",
       "**必须使用简体中文**进行所有思考、分析和回复。",
@@ -507,26 +565,38 @@ export class ClaudeAgentRunner {
       "1. **启动**：理解任务后，先读相关代码了解项目结构，然后调用 `update_task_tree(action=\"bootstrap\")` 建立初始任务树。",
       "   - 每个子任务必须独立可验证——改不同文件、有不同验收标准",
       "   - 声明依赖关系：A 依赖 B 意味着 A 的输出是 B 的输入",
-      "2. **聚焦**：开始做某个任务时调用 `update_task_tree(action=\"update_status\", new_status=\"in_progress\")`，设置 `next_focus`",
-      "3. **完成**：工具执行结果证明任务完成后，立即调用 `update_task_tree(action=\"update_status\", new_status=\"completed\")`，**必须附 evidence**（验证命令 + 关键输出）",
-      "4. **发现**：执行中发现新的必要工作时，调用 `update_task_tree(action=\"add\")` 加入新节点，说明为什么此时发现",
-      "5. **声明下一步**：每次调用都必须填 `next_focus` 和 `next_reason`——始终清楚\"我现在聚焦哪个任务、为什么、完成后去哪\"",
+      "2. **执行**：选定任务后，先调用 `update_task_tree(action=\"update_status\", new_status=\"in_progress\")` 将其标为 in_progress，然后：",
+      "   - **复杂子任务**：使用 `Task` 工具 spawn `task-executor` sub-agent 来执行",
+      "     `Task({ subagent_type: \"task-executor\", description: \"执行 tN: <描述>\", prompt: \"项目路径: <path>\\n任务: <描述>\\n验收标准: <criteria>\\n已知上下文: ...\" })`",
+      "     sub-agent 返回结构化 JSON（status + evidence）后，根据 evidence 调用 update_task_tree 标记 completed/blocked",
+      "   - **简单子任务**（如\"确认文件 X 存在\"、\"读取配置 Y\"）：直接在主上下文执行，完成后立即调用 update_task_tree 标 completed 并附 evidence",
+      "   - **多个无依赖的子任务可以并行 spawn 多个 task-executor**，加速执行",
+      "3. **发现**：执行中发现新的必要工作时，调用 `update_task_tree(action=\"add\")` 加入新节点，说明为什么此时发现",
+      "4. **声明下一步**：每次调用都必须填 `next_focus` 和 `next_reason`——始终清楚\"我现在聚焦哪个任务、为什么、完成后去哪\"",
       "",
       "关键规则：",
       "- 任务树是**执行控制器**，不是文档——工具调用时机取决于树的状态",
-      "- completed 的证据必须来自真实的工具执行结果，不能编造",
+      "- completed 的证据必须来自真实的工具执行结果（或 sub-agent 返回的 evidence），不能编造",
       "- 简单任务可以只有一个任务节点，但必须在 strategy 中说明原因",
-      "- 发现当前计划有误时，用 update_status 标 blocked/skipped 并说明原因，不要静默偏离"
+      "- 发现当前计划有误时，用 update_status 标 blocked/skipped 并说明原因，不要静默偏离",
+      "- **上下文管理**：复杂子任务委托给 task-executor，主 Agent 只接收结构化结论——避免上下文膨胀"
     ].join("\n");
 
     return [
       languageGuidance,
-      [
-        "## 文件读取规则",
-        "- **禁止直接 Read PDF 文件**：PDF base64 编码太大会导致 API 400 错误。请改用 Read 读取已拆页的 PNG 图片",
-        "- PDF 上传后已自动拆为 .ai-coder/uploads/<id>/page-*.png，每页一张图片",
-        "- 每次只读取当前需要的页面，不要一次性读取所有页面"
-      ].join("\n"),
+      modelSupportsImages
+        ? [
+            "## 文件读取规则",
+            "- **禁止直接 Read PDF 文件**：PDF base64 编码太大会导致 API 400 错误。请改用 Read 读取已拆页的 PNG 图片",
+            "- PDF 上传后已自动拆为 .ai-coder/uploads/<id>/page-*.png，每页一张图片",
+            "- 每次只读取当前需要的页面，不要一次性读取所有页面"
+          ].join("\n")
+        : [
+            "## 文件读取规则",
+            "- **禁止直接 Read PDF 文件**：PDF base64 编码太大会导致 API 400 错误",
+            `- **当前模型（${effectiveModel || "默认"}）不支持图片输入**：请使用命令行文本工具提取 PDF 内容，例如 ` + "`pdftotext <pdf路径> -` 或 `python3 -c \"import PyPDF2; ...\"`",
+            "- PDF 上传后已自动拆为 .ai-coder/uploads/<id>/page-*.png，但你必须用文本工具而非 Read 来获取其内容"
+          ].join("\n"),
       reactGuidance,
       taskTreeGuidance,
       workflowSystemPrompt ?? "",
@@ -724,6 +794,20 @@ export class ClaudeAgentRunner {
 
             if (isPdfPageImageRead(toolName, toolInput)) {
               const filePath = String(toolInput.file_path ?? toolInput.path ?? "");
+              // 非多模态模型无法处理图片 → 拒绝读 PNG
+              const stageEffectiveModel = input.session.model || this.resolvedEffectiveModel;
+              if (!isModelMultimodal(stageEffectiveModel)) {
+                await this.recordProgress(input, "tool_policy", `拒绝 PNG 读取（${stageEffectiveModel || "当前模型"}不支持多模态）：${filePath}`, "milestone");
+                return {
+                  behavior: "deny",
+                  message: [
+                    `${stageEffectiveModel || "当前模型"}不支持多模态（图片）输入，无法处理 PNG 拆页。`,
+                    "请使用 `pdftotext`、`python3 -c \"import PyPDF2; ...\"` 等命令行文本工具提取 PDF 内容，",
+                    "或切换到支持多模态的模型（如 claude-sonnet-5）再试。"
+                  ].join("\n"),
+                  interrupt: false
+                };
+              }
               pdfPageImageReads.add(filePath);
               if (pdfPageImageReads.size > this.maxPdfPageImageReadsPerStage) {
                 const message = [
@@ -1462,6 +1546,22 @@ function buildLlmDecisionContext(
   return parts.join("\n\n");
 }
 
+/** 从 SDK system/init 消息中提取运行时实际使用的模型名。
+ *  init 消息的 data.models[0] 通常是当前会话的默认模型。 */
+function captureEffectiveModelFromInitMessage(
+  message: unknown,
+  onModel: (model: string) => void
+): void {
+  if (!isPlainObject(message)) return;
+  if (message.type !== "system" || message.subtype !== "init") return;
+  const data = isPlainObject(message.data) ? message.data : {};
+  const models = Array.isArray(data.models) ? (data.models as Array<{ value?: string }>) : [];
+  if (models.length === 0) return;
+  // data.models[0] 是 CLI 实际使用的模型
+  const effective = typeof models[0].value === "string" ? models[0].value : "";
+  if (effective) onModel(effective);
+}
+
 function isAbortError(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
   const name = (error as { name?: unknown }).name;
@@ -1921,8 +2021,9 @@ function buildTaskTreePromptSection(tree: TaskTree): string {
   lines.push(
     "",
     "操作规则：",
-    "- 开始做某个任务前，调用 update_task_tree 将其标为 in_progress",
-    "- 工具执行结果证明任务完成后，立即调用 update_task_tree 标为 completed 并附 evidence",
+    "- 开始做某个任务前，调用 update_task_tree 将其标为 in_progress（委托给 task-executor 前也要先标）",
+    "- 委托执行：Task({ subagent_type: \"task-executor\", ... }) → 根据返回的 evidence 调 update_task_tree 标 completed",
+    "- 简单任务可直接在主上下文完成，完成后立即调 update_task_tree 标 completed 并附 evidence",
     "- 如果发现当前任务需要先做其他事，加新节点并声明依赖",
     "- 始终让 next_focus 指向你正在做或即将做的任务"
   );
