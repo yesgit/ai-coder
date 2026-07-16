@@ -57,6 +57,7 @@ skills:
   - planning-complex-changes
   - preserving-existing-behavior
   - safe-git-operations
+  - task-decomposition
   - verification-before-completion
   - systematic-debugging
 

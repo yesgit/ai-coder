@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import type { AgentMessage, AgentSession, HumanQuestion, HumanQuestionOption, SessionProgressEvent, StageAgentResult, WorkflowStage, WorkflowTemplate } from "../../shared/types.js";
+import type { AgentMessage, AgentSession, HumanQuestion, HumanQuestionOption, SessionProgressEvent, StageAgentResult, TaskTree, WorkflowStage, WorkflowTemplate } from "../../shared/types.js";
 import { isMeaningfulAgentText } from "../../shared/agentMessages.js";
 import {
   approveOrDenyToolUse,
@@ -50,6 +50,7 @@ export class ClaudeAgentRunner {
   private readonly abortControllers = new Map<string, AbortController>();
   private readonly pendingToolApprovals = new Map<string, Map<string, PendingToolApproval>>();
   private mcpServerCache: unknown | null = null;
+  private activeSession: AgentSession | null = null;
   private readonly options: ClaudeAgentRunnerOptions;
 
   constructor(options: ClaudeAgentRunnerOptions | ClaudeQuery = {}) {
@@ -249,6 +250,8 @@ export class ClaudeAgentRunner {
     const preQueryMsgCount = input.session.messages.length;
     const preQueryTcCount = input.session.tool_calls.length;
 
+    this.activeSession = input.session;
+
     try {
       const query = await this.resolveQuery();
       const mcpServer = await this.resolveMcpServer();
@@ -277,7 +280,10 @@ export class ClaudeAgentRunner {
       let instructions = [
         taskPrompt || "（无任务描述）",
         attachmentList ? `\n附件：\n${attachmentList}` : "",
-        humanQaHistory ? `\n人类问答历史：\n${humanQaHistory}` : ""
+        humanQaHistory ? `\n人类问答历史：\n${humanQaHistory}` : "",
+        input.session.task_tree
+          ? buildTaskTreePromptSection(input.session.task_tree)
+          : ""
       ].filter(Boolean).join("\n\n");
 
       if (isLlmRetry && llmDecisionContext) {
@@ -379,6 +385,9 @@ export class ClaudeAgentRunner {
             }
             if (isUnsupportedDocumentRead(toolName, toolInput)) {
               return { behavior: "deny", message: "请读取已拆页 PNG，不要直接 Read PDF。PDF base64 太大会导致 API 400 错误。", interrupt: false };
+            }
+            if (toolName === "mcp__ai_coder__update_task_tree") {
+              return { behavior: "allow" };
             }
             if (toolName === "mcp__ai_coder__ask_human") {
               const qualityFailure = evaluateHumanQuestionRequest(toolInput);
@@ -490,6 +499,26 @@ export class ClaudeAgentRunner {
       "- **调用工具时使用标准的 tool_use 格式，禁止使用 DSML 标记**（如 `<|DSML|tool_calls>`、`<|DSML|invoke>`、`Calling:` 等文本格式）"
     ].join("\n");
 
+    const taskTreeGuidance = [
+      "## 任务树驱动（贯穿全程的工作方式）",
+      "",
+      "你的行动必须由一个动态维护的**任务树**驱动。使用 `update_task_tree` MCP 工具：",
+      "",
+      "1. **启动**：理解任务后，先读相关代码了解项目结构，然后调用 `update_task_tree(action=\"bootstrap\")` 建立初始任务树。",
+      "   - 每个子任务必须独立可验证——改不同文件、有不同验收标准",
+      "   - 声明依赖关系：A 依赖 B 意味着 A 的输出是 B 的输入",
+      "2. **聚焦**：开始做某个任务时调用 `update_task_tree(action=\"update_status\", new_status=\"in_progress\")`，设置 `next_focus`",
+      "3. **完成**：工具执行结果证明任务完成后，立即调用 `update_task_tree(action=\"update_status\", new_status=\"completed\")`，**必须附 evidence**（验证命令 + 关键输出）",
+      "4. **发现**：执行中发现新的必要工作时，调用 `update_task_tree(action=\"add\")` 加入新节点，说明为什么此时发现",
+      "5. **声明下一步**：每次调用都必须填 `next_focus` 和 `next_reason`——始终清楚\"我现在聚焦哪个任务、为什么、完成后去哪\"",
+      "",
+      "关键规则：",
+      "- 任务树是**执行控制器**，不是文档——工具调用时机取决于树的状态",
+      "- completed 的证据必须来自真实的工具执行结果，不能编造",
+      "- 简单任务可以只有一个任务节点，但必须在 strategy 中说明原因",
+      "- 发现当前计划有误时，用 update_status 标 blocked/skipped 并说明原因，不要静默偏离"
+    ].join("\n");
+
     return [
       languageGuidance,
       [
@@ -499,6 +528,7 @@ export class ClaudeAgentRunner {
         "- 每次只读取当前需要的页面，不要一次性读取所有页面"
       ].join("\n"),
       reactGuidance,
+      taskTreeGuidance,
       workflowSystemPrompt ?? "",
       skillSummaries.length > 0
         ? [
@@ -548,6 +578,8 @@ export class ClaudeAgentRunner {
 
     // 跨重试的已完成工具结果缓存：key = `${toolName}::${normalizedInput}`
     const completedToolCache = new Map<string, { outputSummary?: string; exitCode?: number }>();
+
+    this.activeSession = input.session;
 
     for (let attempt = 0; attempt <= MAX_API_RETRIES; attempt++) {
       if (attempt > 0) {
@@ -711,6 +743,10 @@ export class ClaudeAgentRunner {
                 message: "当前后端不支持 PDF document content block。PDF 上传时已拆成 .ai-coder/uploads/.../page-*.png，请改用 Read 读取对应 PNG 页面，或用只读 shell 工具提取文本后继续。",
                 interrupt: false
               };
+            }
+            // 拦截 update_task_tree：MCP handler 自行处理校验与持久化
+            if (toolName === "mcp__ai_coder__update_task_tree") {
+              return { behavior: "allow" };
             }
             // 拦截 ask_human：作为 HumanQuestion 挂起，等待用户回答后继续
             if (toolName === "mcp__ai_coder__ask_human") {
@@ -1312,9 +1348,52 @@ export class ClaudeAgentRunner {
         },
         async () => ({ content: [{ type: "text", text: "(intercepted by host)" }] })
       );
+      const taskTreeTool = (tool as (
+        name: string,
+        description: string,
+        schema: Record<string, unknown>,
+        handler: (...args: unknown[]) => Promise<unknown>
+      ) => unknown)(
+        "update_task_tree",
+        "维护动态任务树——贯穿整个执行过程：初始化任务拆分、标记任务状态（附工具执行证据）、发现新任务时添加节点、声明当前聚焦与下一步。任务树是你的执行控制器，不是文档。",
+        {
+          action: z.enum(["bootstrap", "add", "update_status"]).describe("操作类型：bootstrap=首次建立任务树，add=执行中发现新子任务，update_status=更新任务状态"),
+          tasks: z.array(z.object({
+            id: z.string().describe("任务唯一标识，如 t1、t2"),
+            description: z.string().describe("要完成什么"),
+            dependencies: z.array(z.string()).describe("依赖的任务 ID 列表"),
+          })).optional().describe("bootstrap 时必填：初始任务列表"),
+          goal_restated: z.string().optional().describe("bootstrap 时必填：重述的用户可观测目标"),
+          strategy: z.string().optional().describe("bootstrap 时必填：拆分策略说明（如'按模块边界拆分'）"),
+          new_tasks: z.array(z.object({
+            id: z.string().describe("新任务唯一标识"),
+            description: z.string().describe("要完成什么"),
+            dependencies: z.array(z.string()).describe("依赖的任务 ID"),
+          })).optional().describe("add 时必填：新发现的子任务"),
+          add_reason: z.string().optional().describe("add 时必填：为什么此时发现这些任务"),
+          task_id: z.string().optional().describe("update_status 时必填：要更新的任务 ID"),
+          new_status: z.enum(["in_progress", "completed", "blocked", "skipped"]).optional().describe("update_status 时必填：新状态"),
+          status_reason: z.string().optional().describe("状态变更原因"),
+          evidence: z.string().optional().describe("completed 时必填：验证证据（工具输出、命令结果等）"),
+          next_focus: z.string().optional().describe("下一步聚焦的 task_id"),
+          next_reason: z.string().optional().describe("为什么聚焦此任务"),
+        },
+        async (args) => {
+          const session = (this as ClaudeAgentRunner).activeSession;
+          if (!session) {
+            return { content: [{ type: "text", text: "错误：没有活动会话。" }] };
+          }
+          try {
+            const result = applyTaskTreeMutation(session, args as TaskTreeMutationArgs);
+            return { content: [{ type: "text", text: result }] };
+          } catch (err) {
+            return { content: [{ type: "text", text: `任务树更新失败：${err instanceof Error ? err.message : String(err)}` }] };
+          }
+        }
+      );
       this.mcpServerCache = (createSdkMcpServer as (opts: { name: string; tools: unknown[] }) => unknown)({
         name: "ai_coder",
-        tools: [askHumanTool]
+        tools: [askHumanTool, taskTreeTool]
       });
       return this.mcpServerCache;
     } catch {
@@ -1662,4 +1741,245 @@ function isMeaningfulSdkProgress(snippet: string): boolean {
   if (trimmed === "助手消息（无文本）") return false;
   if (trimmed === "收到 Claude SDK 消息。") return false;
   return true;
+}
+
+// ── 任务树 mutation 辅助类型与函数 ──
+
+interface TaskTreeMutationArgs {
+  action: "bootstrap" | "add" | "update_status";
+  tasks?: { id: string; description: string; dependencies: string[] }[];
+  goal_restated?: string;
+  strategy?: string;
+  new_tasks?: { id: string; description: string; dependencies: string[] }[];
+  add_reason?: string;
+  task_id?: string;
+  new_status?: "in_progress" | "completed" | "blocked" | "skipped";
+  status_reason?: string;
+  evidence?: string;
+  next_focus?: string;
+  next_reason?: string;
+}
+
+function applyTaskTreeMutation(session: AgentSession, args: TaskTreeMutationArgs): string {
+  const now = new Date().toISOString();
+
+  if (args.action === "bootstrap") {
+    if (!args.tasks || args.tasks.length === 0) {
+      throw new Error("bootstrap 需要至少一个任务节点");
+    }
+    if (!args.goal_restated || !args.strategy) {
+      throw new Error("bootstrap 需要 goal_restated 和 strategy");
+    }
+    const seen = new Set(args.tasks.map((t) => t.id));
+    if (seen.size !== args.tasks.length) {
+      throw new Error("任务 ID 重复");
+    }
+    for (const t of args.tasks) {
+      for (const dep of t.dependencies) {
+        if (!seen.has(dep)) {
+          throw new Error(`任务 ${t.id} 依赖了不存在的任务 ${dep}`);
+        }
+      }
+    }
+    // 检测循环依赖：拓扑排序——能全部排完则无环
+    if (!hasValidTopologicalOrder(args.tasks)) {
+      throw new Error("任务依赖存在循环——无法确定执行顺序，请消除循环依赖");
+    }
+    session.task_tree = {
+      tasks: args.tasks.map((t) => ({
+        id: t.id,
+        description: t.description,
+        dependencies: t.dependencies,
+        status: "pending" as const,
+      })),
+      goal_restated: args.goal_restated,
+      strategy: args.strategy,
+      current_focus: args.next_focus,
+      focus_reason: args.next_reason,
+      created_at: now,
+      updated_at: now,
+    };
+    return formatTaskTreeResponse(session.task_tree, "任务树已初始化");
+  }
+
+  if (!session.task_tree) {
+    throw new Error("任务树尚未初始化，请先调用 action=bootstrap");
+  }
+
+  if (args.action === "add") {
+    if (!args.new_tasks || args.new_tasks.length === 0) {
+      throw new Error("add 需要 new_tasks");
+    }
+    const existing = new Set(session.task_tree.tasks.map((t) => t.id));
+    for (const t of args.new_tasks) {
+      if (existing.has(t.id)) {
+        throw new Error(`任务 ID ${t.id} 已存在`);
+      }
+      existing.add(t.id);
+      for (const dep of t.dependencies) {
+        if (!existing.has(dep) && !args.new_tasks.some((nt) => nt.id === dep)) {
+          throw new Error(`新任务 ${t.id} 依赖了不存在的任务 ${dep}`);
+        }
+      }
+    }
+    for (const t of args.new_tasks) {
+      session.task_tree.tasks.push({
+        id: t.id,
+        description: t.description,
+        dependencies: t.dependencies,
+        status: "pending",
+      });
+    }
+    session.task_tree.updated_at = now;
+    if (args.next_focus) {
+      session.task_tree.current_focus = args.next_focus;
+      session.task_tree.focus_reason = args.next_reason;
+    }
+    const reasonText = args.add_reason ? `（原因：${args.add_reason}）` : "";
+    return formatTaskTreeResponse(session.task_tree, `已添加 ${args.new_tasks.length} 个任务节点${reasonText}`);
+  }
+
+  if (args.action === "update_status") {
+    if (!args.task_id || !args.new_status) {
+      throw new Error("update_status 需要 task_id 和 new_status");
+    }
+    const node = session.task_tree.tasks.find((t) => t.id === args.task_id);
+    if (!node) {
+      throw new Error(`任务 ${args.task_id} 不存在`);
+    }
+
+    // 校验状态迁移合法性
+    const validTransitions: Record<string, string[]> = {
+      pending: ["in_progress", "skipped"],
+      in_progress: ["completed", "blocked"],
+      completed: [],
+      blocked: ["in_progress", "skipped"],
+      skipped: [],
+    };
+    const allowed = validTransitions[node.status];
+    if (!allowed || !allowed.includes(args.new_status)) {
+      throw new Error(`不允许从 ${node.status} 迁移到 ${args.new_status}`);
+    }
+
+    // completed 必须有 evidence
+    if (args.new_status === "completed" && !args.evidence) {
+      throw new Error("标记 completed 必须提供 evidence（验证命令输出或文件路径）");
+    }
+
+    // completed 时校验依赖：所有依赖必须先 completed
+    if (args.new_status === "completed") {
+      const incompleteDeps = node.dependencies.filter((depId) => {
+        const dep = session.task_tree!.tasks.find((t) => t.id === depId);
+        return !dep || dep.status !== "completed";
+      });
+      if (incompleteDeps.length > 0) {
+        throw new Error(`不能完成 ${args.task_id}：依赖任务 ${incompleteDeps.join(", ")} 尚未完成`);
+      }
+    }
+
+    node.status = args.new_status;
+    node.status_reason = args.status_reason;
+    if (args.evidence) node.evidence = args.evidence;
+    session.task_tree.updated_at = now;
+    if (args.next_focus) {
+      session.task_tree.current_focus = args.next_focus;
+      session.task_tree.focus_reason = args.next_reason;
+    }
+    return formatTaskTreeResponse(session.task_tree, `${args.task_id} → ${args.new_status}`);
+  }
+
+  throw new Error(`未知 action: ${args.action}`);
+}
+
+function buildTaskTreePromptSection(tree: TaskTree): string {
+  const statusIcon: Record<string, string> = {
+    pending: "⏳",
+    in_progress: "🔄",
+    completed: "✅",
+    blocked: "🚫",
+    skipped: "⏭️",
+  };
+  const lines = [
+    "## 当前任务树（你的执行路线图——每次工具调用后审视是否需要更新）",
+    "",
+    `目标：${tree.goal_restated}`,
+    `策略：${tree.strategy}`,
+    "",
+    "任务节点：",
+  ];
+  for (const t of tree.tasks) {
+    const icon = statusIcon[t.status] ?? "❓";
+    const focus = t.id === tree.current_focus ? " ← 当前聚焦" : "";
+    const evidence = t.evidence ? ` [证据: ${t.evidence.slice(0, 120)}]` : "";
+    const deps = t.dependencies.length > 0 ? ` (依赖: ${t.dependencies.join(", ")})` : "";
+    const reason = t.status_reason ? ` — ${t.status_reason}` : "";
+    lines.push(`  ${icon} ${t.id}: ${t.description}${deps}${evidence}${reason}${focus}`);
+  }
+  if (tree.current_focus && tree.focus_reason) {
+    lines.push("", `当前聚焦：${tree.current_focus}——${tree.focus_reason}`);
+  }
+  lines.push(
+    "",
+    "操作规则：",
+    "- 开始做某个任务前，调用 update_task_tree 将其标为 in_progress",
+    "- 工具执行结果证明任务完成后，立即调用 update_task_tree 标为 completed 并附 evidence",
+    "- 如果发现当前任务需要先做其他事，加新节点并声明依赖",
+    "- 始终让 next_focus 指向你正在做或即将做的任务"
+  );
+  return lines.join("\n");
+}
+
+/** 拓扑排序检测循环依赖：能全部排完返回 true；存在循环返回 false */
+function hasValidTopologicalOrder(tasks: { id: string; dependencies: string[] }[]): boolean {
+  const idSet = new Set(tasks.map((t) => t.id));
+  const inDegree = new Map<string, number>();
+  const adjacency = new Map<string, string[]>();
+  for (const t of tasks) {
+    inDegree.set(t.id, 0);
+    adjacency.set(t.id, []);
+  }
+  for (const t of tasks) {
+    for (const dep of t.dependencies) {
+      if (!idSet.has(dep)) continue; // 不存在的依赖已在前置校验中拦截
+      adjacency.get(dep)!.push(t.id);
+      inDegree.set(t.id, (inDegree.get(t.id) ?? 0) + 1);
+    }
+  }
+  const queue: string[] = [];
+  for (const [id, deg] of inDegree) {
+    if (deg === 0) queue.push(id);
+  }
+  let sorted = 0;
+  while (queue.length > 0) {
+    const node = queue.shift()!;
+    sorted += 1;
+    for (const neighbor of adjacency.get(node) ?? []) {
+      const newDeg = (inDegree.get(neighbor) ?? 1) - 1;
+      inDegree.set(neighbor, newDeg);
+      if (newDeg === 0) queue.push(neighbor);
+    }
+  }
+  return sorted === tasks.length;
+}
+
+function formatTaskTreeResponse(tree: TaskTree, header: string): string {
+  const statusIcon: Record<string, string> = {
+    pending: "⏳",
+    in_progress: "🔄",
+    completed: "✅",
+    blocked: "🚫",
+    skipped: "⏭️",
+  };
+  const lines = [header, "", `目标：${tree.goal_restated}`, `策略：${tree.strategy}`, ""];
+  for (const t of tree.tasks) {
+    const icon = statusIcon[t.status] ?? "❓";
+    const focus = t.id === tree.current_focus ? " ← 当前聚焦" : "";
+    const evidence = t.evidence ? ` [证据: ${t.evidence.slice(0, 80)}]` : "";
+    const deps = t.dependencies.length > 0 ? ` (依赖: ${t.dependencies.join(", ")})` : "";
+    lines.push(`${icon} ${t.id}: ${t.description}${deps}${evidence}${focus}`);
+  }
+  if (tree.current_focus && tree.focus_reason) {
+    lines.push(`\n当前聚焦：${tree.current_focus}——${tree.focus_reason}`);
+  }
+  return lines.join("\n");
 }

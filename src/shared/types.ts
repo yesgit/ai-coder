@@ -469,6 +469,35 @@ export interface ApprovalRecord {
   resolved_at?: string;
 }
 
+export interface TaskNode {
+  /** 唯一标识（如 "t1", "t2"） */
+  id: string;
+  /** 要完成什么 */
+  description: string;
+  /** 依赖的任务 ID 列表 */
+  dependencies: string[];
+  /** 当前状态 */
+  status: "pending" | "in_progress" | "completed" | "blocked" | "skipped";
+  /** 为什么是这个状态 */
+  status_reason?: string;
+  /** completed 时的验证证据（命令输出、文件路径等） */
+  evidence?: string;
+}
+
+export interface TaskTree {
+  tasks: TaskNode[];
+  /** 重述的用户可观测目标 */
+  goal_restated: string;
+  /** 拆分策略说明 */
+  strategy: string;
+  /** 当前聚焦的 task_id */
+  current_focus?: string;
+  /** 为什么聚焦此任务 */
+  focus_reason?: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface AgentSession {
   id: string;
   project_path: string;
@@ -496,6 +525,8 @@ export interface AgentSession {
   auto_approve?: boolean;
   /** 模型标识：传给 SDK query，如 "claude-sonnet-5"、"deepseek-v4" 等 */
   model?: string;
+  /** 动态任务树：LLM 通过 update_task_tree MCP 工具维护，贯穿整个执行过程 */
+  task_tree?: TaskTree;
   created_at: string;
   updated_at: string;
   error?: string;

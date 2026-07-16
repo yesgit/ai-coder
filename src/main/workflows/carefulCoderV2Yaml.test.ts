@@ -58,7 +58,7 @@ describe("careful-coder.yaml latest", () => {
     expect(v5.system_prompt).toContain("重新阅读用户原始请求");
   });
 
-  it("has all 7 skills configured", async () => {
+  it("has all 8 skills configured", async () => {
     const v5 = await loadV5();
     expect(v5.skills).toEqual([
       "clarifying-requirements",
@@ -66,6 +66,7 @@ describe("careful-coder.yaml latest", () => {
       "planning-complex-changes",
       "preserving-existing-behavior",
       "safe-git-operations",
+      "task-decomposition",
       "verification-before-completion",
       "systematic-debugging"
     ]);
