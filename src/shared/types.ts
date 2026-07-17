@@ -523,8 +523,6 @@ export interface AgentSession {
   archived_at?: string;
   /** 自动审批模式：为 true 时跳过逐工具审批（硬安全规则仍生效） */
   auto_approve?: boolean;
-  /** 模型标识：传给 SDK query，如 "claude-sonnet-5"、"deepseek-v4" 等 */
-  model?: string;
   /** 动态任务树：LLM 通过 update_task_tree MCP 工具维护，贯穿整个执行过程 */
   task_tree?: TaskTree;
   created_at: string;
@@ -579,7 +577,6 @@ export interface StartSessionInput {
   includeProjectProfile?: boolean;
   attachments?: Attachment[];
   routing?: SessionRoutingSnapshot;
-  model?: string;
 }
 
 export interface StartSessionResult {
@@ -592,13 +589,6 @@ export interface AgentRuntimeStatus {
   node_runtime_available: boolean;
   auth_env_available: boolean;
   diagnostics: string[];
-}
-
-/** 可用模型信息（从 SDK supportedModels 返回） */
-export interface AvailableModel {
-  value: string;
-  displayName: string;
-  description: string;
 }
 
 export interface ProjectOnboardingStatus {
@@ -615,7 +605,6 @@ export interface AppApi {
   selectProjectDirectory(): Promise<string | null>;
   authorizeSessionProject(projectPath: string): Promise<string>;
   getAgentRuntimeStatus(): Promise<AgentRuntimeStatus>;
-  getAvailableModels(): Promise<AvailableModel[]>;
   getProjectOnboardingStatus(projectPath: string): Promise<ProjectOnboardingStatus>;
   confirmProjectOnboarding(projectPath: string): Promise<ProjectOnboardingStatus>;
   listWorkflows(projectPath?: string): Promise<WorkflowListResult>;
@@ -637,7 +626,6 @@ export interface AppApi {
   setSessionPinned(sessionId: string, pinned: boolean): Promise<AgentSession>;
   setSessionArchived(sessionId: string, archived: boolean): Promise<AgentSession>;
   toggleAutoApprove(sessionId: string): Promise<AgentSession>;
-  setModel(sessionId: string, model: string): Promise<AgentSession>;
   deleteSession(sessionId: string): Promise<void>;
   listProjectFiles(projectPath: string, query?: string): Promise<string[]>;
   readProjectFile(projectPath: string, filePath: string): Promise<string>;

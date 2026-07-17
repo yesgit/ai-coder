@@ -172,7 +172,7 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
       title: `工具请求：${toolCall.tool}`,
       detail: formatJson(toolCall.input),
       timestamp: toolCall.created_at,
-      status: toolCall.status,
+      status: isPending ? "pending_approval" : "requested",
       sort_order: 30,
       needs_user_action: isPending
     });

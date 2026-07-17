@@ -23,8 +23,7 @@ export class SessionStore {
     taskPrompt: string,
     onboarding?: SessionOnboardingSnapshot,
     attachments?: Attachment[],
-    routing?: SessionRoutingSnapshot,
-    model?: string
+    routing?: SessionRoutingSnapshot
   ): Promise<AgentSession> {
     const now = new Date().toISOString();
     const firstStage = workflow.stages[0]?.id ?? "start";
@@ -45,9 +44,9 @@ export class SessionStore {
       progress_events: [],
       stage_runs: [],
       rework_requests: [],
+      auto_approve: true,
       onboarding,
       routing,
-      ...(model ? { model } : {}),
       created_at: now,
       updated_at: now
     };
@@ -130,7 +129,13 @@ export class SessionStore {
   private async readFile(filePath: string): Promise<AgentSession | null> {
     try {
       const raw = await fs.readFile(filePath, "utf8");
-      return JSON.parse(raw) as AgentSession;
+      const session = JSON.parse(raw) as AgentSession;
+      // 兼容旧会话：历史版本没有持久化该字段。缺省值迁移为自动审批；
+      // 用户明确切换到手动审批时会保存 false，不会被这里覆盖。
+      if (session.auto_approve === undefined) {
+        session.auto_approve = true;
+      }
+      return session;
     } catch (error) {
       if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
         return null;

@@ -76,7 +76,6 @@ describe("WorkflowEngine", () => {
     engine.completeCurrentStage(session, workflow, "Requirements understood");
     engine.completeCurrentStage(session, workflow, "Implementation plan");
     engine.approveStage(session, workflow, "plan");
-
     expect(session.status).toBe("running");
     expect(session.current_stage).toBe("execute");
     expect(session.stage_runs?.at(-1)).toMatchObject({ stage_id: "execute", attempt: 1, status: "running" });

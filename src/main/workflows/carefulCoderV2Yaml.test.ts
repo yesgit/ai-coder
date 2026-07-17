@@ -58,7 +58,7 @@ describe("careful-coder.yaml latest", () => {
     expect(v5.system_prompt).toContain("重新阅读用户原始请求");
   });
 
-  it("has all 8 skills configured", async () => {
+  it("has all 9 skills configured", async () => {
     const v5 = await loadV5();
     expect(v5.skills).toEqual([
       "clarifying-requirements",
@@ -68,24 +68,26 @@ describe("careful-coder.yaml latest", () => {
       "safe-git-operations",
       "task-decomposition",
       "verification-before-completion",
-      "systematic-debugging"
+      "systematic-debugging",
+      "cautious-calling"
     ]);
   });
 
-  it("registers 3 top-level sub-agents for independent verification", async () => {
+  it("registers 4 sub-agents (3 verification + 1 task-executor)", async () => {
     const v5 = await loadV5();
     expect(v5.agents).toBeDefined();
-    expect(Object.keys(v5.agents!)).toHaveLength(3);
+    expect(Object.keys(v5.agents!)).toHaveLength(4);
     expect(v5.agents).toHaveProperty("task-verifier");
     expect(v5.agents).toHaveProperty("pre-behavior-snapshot");
     expect(v5.agents).toHaveProperty("completeness-checker");
+    expect(v5.agents).toHaveProperty("task-executor");
 
-    // task-verifier is read-only
+    // verification agents are read-only
     expect(v5.agents!["task-verifier"].tools).not.toContain("edit_file");
-    // pre-behavior-snapshot is read-only
     expect(v5.agents!["pre-behavior-snapshot"].tools).not.toContain("edit_file");
-    // completeness-checker is read-only
     expect(v5.agents!["completeness-checker"].tools).not.toContain("edit_file");
+    // task-executor can write
+    expect(v5.agents!["task-executor"].tools).toContain("Edit");
   });
 
   it("shell approval is required (engine-level safety unchanged)", async () => {

@@ -30,6 +30,7 @@ describe("SessionStore", () => {
     expect(session.title).toBe("Fix bug");
     expect(session.current_stage).toBe("plan");
     expect(session.initial_user_message).toMatchObject({ role: "user", content: "Fix bug" });
+    expect(session.auto_approve).toBe(true);
     expect(session.approvals).toHaveLength(0);
     expect(session.stage_runs).toHaveLength(1);
     expect(session.stage_runs?.[0]).toMatchObject({ stage_id: "plan", attempt: 1, status: "running" });
@@ -103,6 +104,30 @@ describe("SessionStore", () => {
     await store.setPinned(session.id, false);
     await store.save(staleRunnerSession);
     expect((await store.get(session.id))?.pinned_at).toBeUndefined();
+  });
+
+  it("preserves an explicit manual-approval choice when a stale runner session saves", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-sessions-"));
+    const store = new SessionStore(dir);
+    const staleRunnerSession = await store.create("/tmp/project", workflow, "Fix bug");
+
+    const manualSession = await store.toggleAutoApprove(staleRunnerSession.id);
+    expect(manualSession.auto_approve).toBe(false);
+
+    await store.save(staleRunnerSession);
+    expect((await store.get(staleRunnerSession.id))?.auto_approve).toBe(false);
+  });
+
+  it("defaults legacy sessions without an approval preference to automatic approval", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-sessions-"));
+    const store = new SessionStore(dir);
+    const session = await store.create("/tmp/project", workflow, "Fix bug");
+    const filePath = path.join(dir, `${session.id}.json`);
+    const legacy = JSON.parse(await fs.readFile(filePath, "utf8")) as Record<string, unknown>;
+    delete legacy.auto_approve;
+    await fs.writeFile(filePath, JSON.stringify(legacy), "utf8");
+
+    expect((await store.get(session.id))?.auto_approve).toBe(true);
   });
 
   it("does not recreate a deleted session when its runner saves again", async () => {

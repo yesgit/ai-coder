@@ -69,6 +69,20 @@ describe("project policy", () => {
     expect(current.tool_calls[0].status).toBe("blocked");
   });
 
+  it("deduplicates an identical command that was already blocked", async () => {
+    const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-project-"));
+    const current = { ...session(), project_path: projectDir };
+    const input = { command: "find / -maxdepth 2 -type f" };
+
+    const first = await approveOrDenyToolUse(current, workflow, "Bash", input, "blocked-1");
+    const second = await approveOrDenyToolUse(current, workflow, "Bash", input, "blocked-2");
+
+    expect(first.allow).toBe(false);
+    expect(second).toMatchObject({ allow: false, interrupt: false });
+    expect(current.tool_calls).toHaveLength(1);
+    expect(current.tool_calls[0].status).toBe("blocked");
+  });
+
   it("extracts absolute shell path arguments but ignores /dev/null", () => {
     expect(extractAbsoluteShellPaths("git -C /home/user/project status 2>/dev/null && ls /tmp/outside"))
       .toEqual(["/home/user/project", "/tmp/outside"]);

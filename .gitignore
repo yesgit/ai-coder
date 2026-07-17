@@ -7,3 +7,5 @@ coverage
 
 release
 .claude/settings.local.json
+squashfs-root/__pycache__
+squashfs-root/

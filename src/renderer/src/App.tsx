@@ -7,7 +7,6 @@ import type {
   AgentRuntimeStatus,
   ApprovalRecord,
   Attachment,
-  AvailableModel,
   HumanQuestion,
   ReworkRequest,
   StageRun,
@@ -47,7 +46,6 @@ export default function App() {
   const [sessions, setSessions] = useState<AgentSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<AgentRuntimeStatus | null>(null);
-  const [availableModels, setAvailableModels] = useState<AvailableModel[]>([]);
   const [includeProjectProfile, setIncludeProjectProfile] = useState(true);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -69,16 +67,6 @@ export default function App() {
     setQuestionAnswers({});
     setQuestionOtherTexts({});
   }, [activeSessionId]);
-
-  // 启动时从 SDK 获取可用模型列表
-  useEffect(() => {
-    let cancelled = false;
-    window.aiCoder.getAvailableModels().then((models: AvailableModel[]) => {
-      if (cancelled) return;
-      if (models.length > 0) setAvailableModels(models);
-    }).catch(() => { /* SDK 不可用时保留空列表，UI 显示默认模型 */ });
-    return () => { cancelled = true; };
-  }, []);
 
   // 可上传的非图片二进制文件 MIME 与扩展名（PDF、文档、表格等）
   const UPLOADABLE_MIME = new Set([
@@ -411,36 +399,11 @@ export default function App() {
     }
   }
 
-  async function setModel(session: AgentSession, model: string) {
-    setError("");
-    try {
-      const updated = await window.aiCoder.setModel(session.id, model);
-      upsertSession(updated);
-      await refreshSessions(updated.id);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
-  }
-
   async function toggleAutoApprove(session: AgentSession) {
     setBusy(true);
     setError("");
     try {
       const updated = await window.aiCoder.toggleAutoApprove(session.id);
-      upsertSession(updated);
-      await refreshSessions(updated.id);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function continueSession(session: AgentSession) {
-    setBusy(true);
-    setError("");
-    try {
-      const updated = await window.aiCoder.continueSession(session.id);
       upsertSession(updated);
       await refreshSessions(updated.id);
     } catch (err) {
@@ -773,7 +736,6 @@ export default function App() {
           : undefined;
   const pendingToolCalls = activeSession?.tool_calls.filter((toolCall) => toolCall.status === "pending_approval") ?? [];
   const pendingHumanQuestions = activeSession?.pending_human_questions?.filter((q) => q.status === "pending") ?? [];
-  const approvedToolCalls = activeSession?.tool_calls.filter((toolCall) => toolCall.status === "approved") ?? [];
   const stageRuns = activeSession?.stage_runs ?? [];
   const reworkRequests = activeSession?.rework_requests ?? [];
   const pendingReworkRequests = useMemo(
@@ -1014,27 +976,6 @@ export default function App() {
                             停止
                           </button>
                         )}
-                        <select
-                          className="model-select"
-                          value={activeSession.model || ""}
-                          disabled={busy || activeSession.status === "completed"}
-                          onChange={(e) => setModel(activeSession, e.target.value)}
-                          title="切换 AI 模型"
-                        >
-                          <option value="">默认模型</option>
-                          {availableModels.length > 0
-                            ? availableModels.map((m) => (
-                                <option key={m.value} value={m.value}>
-                                  {m.displayName}
-                                </option>
-                              ))
-                            : <>
-                                <option value="claude-sonnet-5">Claude Sonnet 5</option>
-                                <option value="claude-opus-4-8">Claude Opus 4.8</option>
-                                <option value="claude-haiku-4-5">Claude Haiku 4.5</option>
-                                <option value="deepseek-v4">DeepSeek V4</option>
-                              </>}
-                        </select>
                         {(activeSession.status === "running" || activeSession.status === "waiting_approval") && (
                           <button
                             className={activeSession.auto_approve ? "primary" : "secondary"}
@@ -1045,26 +986,14 @@ export default function App() {
                             {activeSession.auto_approve ? "自动审批" : "手动审批"}
                           </button>
                         )}
-                        {activeSession.status === "waiting_approval" && (
-                          <>
-                            {activeSession.approvals.some(
-                              (approval) => approval.kind === "stage" && approval.status === "pending"
-                            ) && (
-                              <button className="primary" disabled={busy} onClick={() => approvePendingStage(activeSession)}>
-                                批准阶段
-                              </button>
-                            )}
-                            {approvedToolCalls.length > 0 && (
-                              <button
-                                className="secondary"
-                                disabled={busy}
-                                onClick={() => continueSession(activeSession)}
-                              >
-                                继续
-                              </button>
-                            )}
-                          </>
-                        )}
+                        {activeSession.status === "waiting_approval" &&
+                          activeSession.approvals.some(
+                            (approval) => approval.kind === "stage" && approval.status === "pending"
+                          ) && (
+                            <button className="primary" disabled={busy} onClick={() => approvePendingStage(activeSession)}>
+                              批准阶段
+                            </button>
+                          )}
                         {(activeSession.status === "failed" ||
                           activeSession.status === "blocked" ||
                           activeSession.status === "interrupted") && (
@@ -1099,9 +1028,6 @@ export default function App() {
                       </div>
                     )}
                   </div>
-                  {activeSession.task_tree && (
-                    <TaskTreePanel taskTree={activeSession.task_tree} />
-                  )}
                   <div className={`activity-strip ${activeSession.status}`}>
                     <span className="activity-dot" />
                     <div>
@@ -1448,6 +1374,7 @@ export default function App() {
 
           {activeWorkflow && (
             <div className="right-panel">
+              <TaskTreePanel taskTree={activeSession?.task_tree} />
               {isProfileMode ? (
                 <div className="stages-panel">
                   <h3>{activeWorkflow.name}</h3>
@@ -1483,9 +1410,6 @@ export default function App() {
                       </div>
                     </div>
                   )}
-                  {activeSession?.task_tree && (
-                    <TaskTreePanel taskTree={activeSession.task_tree} />
-                  )}
                 </div>
               ) : (
                 <div className="stages-panel">
@@ -1505,9 +1429,6 @@ export default function App() {
                       </div>
                     ))}
                   </div>
-                  {activeSession?.task_tree && (
-                    <TaskTreePanel taskTree={activeSession.task_tree} />
-                  )}
                 </div>
               )}
             </div>
@@ -1541,6 +1462,9 @@ function buildActivityTitle(session: AgentSession) {
     return `正在执行：${formatStageName(session.current_stage)}`;
   }
   if (session.status === "waiting_approval") {
+    if ((session.pending_human_questions ?? []).some((question) => question.status === "pending")) {
+      return "等待用户回答";
+    }
     return "等待人工审批";
   }
   if (session.status === "blocked") {

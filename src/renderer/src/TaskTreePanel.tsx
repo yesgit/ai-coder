@@ -1,7 +1,7 @@
 import type { TaskTree } from "../../shared/types.js";
 
 interface TaskTreePanelProps {
-  taskTree: TaskTree;
+  taskTree?: TaskTree;
 }
 
 const STATUS_ICON: Record<string, string> = {
@@ -29,9 +29,31 @@ const STATUS_LABEL: Record<string, string> = {
 };
 
 export default function TaskTreePanel({ taskTree }: TaskTreePanelProps) {
+  if (!taskTree || taskTree.tasks.length === 0) {
+    return (
+      <section className="stages-panel task-tree-panel" aria-live="polite">
+        <div className="task-tree-heading">
+          <h3>任务树</h3>
+          <span className="task-tree-count">0 项</span>
+        </div>
+        <div className="task-tree-empty">
+          <strong>等待 Agent 初始化任务树</strong>
+          <small>理解任务并完成初步取证后，子任务和执行状态会实时显示在这里。</small>
+        </div>
+      </section>
+    );
+  }
+
+  const completedCount = taskTree.tasks.filter(
+    (task) => task.status === "completed" || task.status === "skipped"
+  ).length;
+
   return (
-    <div className="stages-panel task-tree-panel">
-      <h3>任务树</h3>
+    <section className="stages-panel task-tree-panel" aria-live="polite">
+      <div className="task-tree-heading">
+        <h3>任务树</h3>
+        <span className="task-tree-count">{completedCount}/{taskTree.tasks.length}</span>
+      </div>
 
       <div className="task-tree-goal">
         <small className="muted">目标：{taskTree.goal_restated}</small>
@@ -87,6 +109,6 @@ export default function TaskTreePanel({ taskTree }: TaskTreePanelProps) {
           </small>
         </div>
       )}
-    </div>
+    </section>
   );
 }

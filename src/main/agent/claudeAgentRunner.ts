@@ -6,7 +6,7 @@ import { isMeaningfulAgentText } from "../../shared/agentMessages.js";
 import {
   approveOrDenyToolUse,
   buildAllowedClaudeTools,
-  buildDisallowedClaudeTools,
+  buildDisallowedClaudeTools
 } from "../security/projectPolicy.js";
 import { WorkflowEngine } from "../workflows/workflowEngine.js";
 import { buildStageInstructions } from "./workflowPrompt.js";
@@ -24,7 +24,6 @@ export interface AgentRunInput {
 
 type ClaudeQuery = (params: unknown) => AsyncIterable<unknown>;
 type ToolApprovalResolution = "approved" | "denied";
-
 export interface ClaudeAgentRunnerOptions {
   queryOverride?: ClaudeQuery;
   pluginPaths?: string[];
@@ -53,19 +52,11 @@ function isModelMultimodal(model: string | undefined | null): boolean {
   return !NON_MULTIMODAL_MODEL_PATTERNS.some((p) => lower.includes(p));
 }
 
-function isModelDeepSeek(model: string | undefined | null): boolean {
-  if (!model) return false;
-  return model.toLowerCase().includes("deepseek");
-}
-
 export class ClaudeAgentRunner {
   private readonly workflowEngine = new WorkflowEngine();
   private readonly maxStageIterations = 50;
-  private readonly maxPdfPageImageReadsPerStage = 8;
   private readonly abortControllers = new Map<string, AbortController>();
   private readonly pendingToolApprovals = new Map<string, Map<string, PendingToolApproval>>();
-  private mcpServerCache: unknown | null = null;
-  private activeSession: AgentSession | null = null;
   private readonly options: ClaudeAgentRunnerOptions;
   private resolvedEffectiveModel: string | null = null;
 
@@ -89,7 +80,10 @@ export class ClaudeAgentRunner {
     if (!pending) {
       return false;
     }
-    const toolCall = pending.session.tool_calls.find((item) => item.id === toolCallId && item.status === "pending_approval");
+
+    const toolCall = pending.session.tool_calls.find(
+      (item) => item.id === toolCallId && item.status === "pending_approval"
+    );
     if (toolCall) {
       toolCall.status = status;
       toolCall.resolved_at = new Date().toISOString();
@@ -97,13 +91,12 @@ export class ClaudeAgentRunner {
     }
     pending.resolve(status);
     pendingForSession?.delete(toolCallId);
-    // 顺带唤醒所有排队等待的其他工具：它们已在 projectPolicy 中以 pending_approval
-    // 状态入队，但可能因并行调用被排在了同一个审批窗口后面。用户审批第一个工具后，
-    // 所有排队的工具一并唤醒——它们重新走 approveOrDenyToolUse，届时若 auto_approve
-    // 已开启或命令已命中自主安全白名单，则直接通过。
+
     if (status === "approved" && pendingForSession && pendingForSession.size > 0) {
       for (const [queuedId, queued] of pendingForSession) {
-        const queuedCall = pending.session.tool_calls.find((item) => item.id === queuedId && item.status === "pending_approval");
+        const queuedCall = pending.session.tool_calls.find(
+          (item) => item.id === queuedId && item.status === "pending_approval"
+        );
         if (queuedCall) {
           queuedCall.status = "approved";
           queuedCall.resolved_at = new Date().toISOString();
@@ -151,117 +144,102 @@ export class ClaudeAgentRunner {
 
     const abortController = new AbortController();
     this.abortControllers.set(input.session.id, abortController);
-
-    // 跨重试的已完成工具结果缓存：key = `${toolName}::${normalizedInput}`
-    // 当 API 错误后 LLM 决定重试时，已完成的工具结果不会丢失，
-    // 后续若模型再次请求相同工具，canUseTool 会直接返回缓存结果，跳过重复审批和执行。
     const completedToolCache = new Map<string, { outputSummary?: string; exitCode?: number }>();
+    const maxContinuationAttempts = 3;
+    let continuationContext = "";
 
-    // ── 第一次执行 ──
-    const firstResult = await this.runProfileQuery(input, abortController, completedToolCache, false, "");
-    if (firstResult.finalSession) return firstResult.finalSession;
-    if (!firstResult.apiError) {
-      // 正常完成或等待审批
-      const transcript = formatClaudeTranscript(firstResult.sdkMessages);
-      this.appendAssistantMessage(input.session, transcript);
-      if (transcript) {
-        await this.recordProgress(input, "runner", transcript, "milestone");
+    try {
+      for (let attempt = 0; attempt < maxContinuationAttempts; attempt += 1) {
+        const result = await this.runProfileQuery(
+          input,
+          abortController,
+          completedToolCache,
+          attempt > 0,
+          continuationContext
+        );
+        if (result.finalSession) return result.finalSession;
+
+        const transcript = formatClaudeTranscript(result.sdkMessages);
+        if (transcript) {
+          this.appendAssistantMessage(input.session, transcript);
+          await this.recordProgress(input, "runner", transcript, "milestone");
+        }
+
+        if (result.apiError) {
+          this.saveCompletedToolsToCache(input.session, completedToolCache);
+          const errorMessage = result.apiError instanceof Error
+            ? result.apiError.message
+            : String(result.apiError);
+          const errorName = result.apiError instanceof Error
+            ? result.apiError.name
+            : typeof result.apiError;
+          input.session.messages = input.session.messages.slice(0, result.preQueryMsgCount);
+          input.session.tool_calls = input.session.tool_calls.slice(0, result.preQueryTcCount);
+          input.session.status = "running";
+          input.session.error = undefined;
+          await this.recordProgress(input, "status", `API 调用失败：${errorMessage.slice(0, 120)}`, "milestone");
+          continuationContext = buildLlmDecisionContext(
+            errorName,
+            errorMessage,
+            transcript,
+            completedToolCache
+          );
+          if (attempt + 1 < maxContinuationAttempts && isRetriableApiError(result.apiError)) {
+            continue;
+          }
+          input.session.status = "interrupted";
+          input.session.error = errorMessage;
+          await this.recordProgress(input, "status", "SDK 调用失败，任务未完成。可使用断点恢复继续。", "milestone");
+          return input.session;
+        }
+
+        if (this.hasPendingHumanQuestion(input.session)) {
+          input.session.status = "waiting_approval";
+          await this.recordProgress(input, "status", "等待用户回答", "milestone");
+          return input.session;
+        }
+        if (input.session.tool_calls.some((toolCall) => toolCall.status === "pending_approval")) {
+          input.session.status = "waiting_approval";
+          await this.recordProgress(input, "status", "等待工具审批", "milestone");
+          return input.session;
+        }
+
+        const terminalError = extractSdkTerminalError(result.sdkMessages);
+        if (terminalError) {
+          input.session.status = "interrupted";
+          input.session.error = terminalError;
+          await this.recordProgress(input, "status", `SDK 查询异常结束：${terminalError.slice(0, 160)}`, "milestone");
+          return input.session;
+        }
+
+        const incompleteReasons = evaluateProfileCompletion(input.session);
+        if (incompleteReasons.length === 0) {
+          input.session.status = "completed";
+          input.session.error = undefined;
+          await this.recordProgress(input, "status", "Profile 模式执行完成（完成闸门已通过）", "milestone");
+          return input.session;
+        }
+
+        continuationContext = buildCompletionContinuationContext(incompleteReasons, transcript);
+        input.session.status = "running";
+        await this.recordProgress(
+          input,
+          "status",
+          `任务尚未完成，自动继续（${attempt + 1}/${maxContinuationAttempts}）：${incompleteReasons.join("；").slice(0, 240)}`,
+          "milestone"
+        );
       }
-      if (this.hasPendingToolCall(input.session) || this.hasPendingHumanQuestion(input.session)) {
-        input.session.status = "waiting_approval";
-        await this.recordProgress(input, "status", "等待审批或用户回答", "milestone");
-      } else {
-        input.session.status = "completed";
-        await this.recordProgress(input, "status", "Profile 模式执行完成", "milestone");
-      }
-      return input.session;
-    }
 
-    // ── API 错误：保存已完成的工具，让 LLM 决定如何处理 ──
-    this.saveCompletedToolsToCache(input.session, completedToolCache);
-    const partialTranscript = formatClaudeTranscript(firstResult.sdkMessages);
-
-    const errorMessage = firstResult.apiError instanceof Error
-      ? firstResult.apiError.message
-      : String(firstResult.apiError);
-    const errorName = firstResult.apiError instanceof Error
-      ? firstResult.apiError.name
-      : typeof firstResult.apiError;
-
-    // 回滚会话状态到查询前
-    input.session.messages = input.session.messages.slice(0, firstResult.preQueryMsgCount);
-    input.session.tool_calls = input.session.tool_calls.slice(0, firstResult.preQueryTcCount);
-    input.session.error = undefined;
-    input.session.status = "running";
-
-    await this.recordProgress(input, "status", `API 调用失败：${errorMessage.slice(0, 120)}`, "milestone");
-    await this.recordProgress(input, "status", "将错误信息呈现给 LLM，由其判断是否继续...", "milestone");
-
-    // ── 第二次执行：让 LLM 根据错误决定下一步 ──
-    // 检测运行的真实模型（session.model 可能为空/undefined，实际默认是系统级配置）：
-    //   1. session.model 显式指定
-    //   2. 第一次查询时从 SDK init 消息中捕获的有效模型
-    //   3. API 错误消息中暴露的模型名（如 "DeepSeek-V4 is not a multimodal model"）
-    const effectiveModel = firstResult.effectiveModel
-      ?? input.session.model
-      ?? this.resolvedEffectiveModel;
-    const errorModelHint = /deepseek/i.test(errorMessage) ? "deepseek" : "";
-    const isDeepSeek = isModelDeepSeek(effectiveModel)
-      || isModelDeepSeek(errorModelHint);
-    const retryModel = isDeepSeek ? "claude-sonnet-5" : (effectiveModel || "");
-    if (isDeepSeek) {
-      const reason = !effectiveModel
-        ? "从 API 错误中检测到 DeepSeek"
-        : effectiveModel !== input.session.model
-          ? `当前模型 ${effectiveModel} 不支持多模态（API 错误提示），切换到 Claude`
-          : "检测到 DeepSeek，切换到 Claude（避免 DSML 格式不兼容及多模态限制）";
-      await this.recordProgress(input, "status", `${reason}，改用 ${retryModel} 重试`, "milestone");
-    }
-    const savedModel = input.session.model;
-    input.session.model = retryModel;
-
-    const secondResult = await this.runProfileQuery(
-      input, abortController, completedToolCache, true,
-      buildLlmDecisionContext(errorName, errorMessage, partialTranscript, completedToolCache)
-    );
-
-    // 恢复模型
-    input.session.model = savedModel;
-
-    // 清理
-    if (this.abortControllers.get(input.session.id) === abortController) {
-      this.abortControllers.delete(input.session.id);
-    }
-
-    if (secondResult.finalSession) return secondResult.finalSession;
-    if (secondResult.apiError) {
-      // LLM 重试也失败了
-      const transcript = formatClaudeTranscript(secondResult.sdkMessages);
-      if (transcript) this.appendAssistantMessage(input.session, transcript);
-      const secondError = secondResult.apiError instanceof Error
-        ? secondResult.apiError.message
-        : String(secondResult.apiError);
-      input.session.error = secondError;
+      const incompleteReasons = evaluateProfileCompletion(input.session);
       input.session.status = "interrupted";
-      await this.recordProgress(input, "status", `LLM 重试后仍失败：${secondError.slice(0, 120)}`, "milestone");
-      await this.recordProgress(input, "status", "你可以发送消息继续，或点击「断点恢复」重新执行", "milestone");
+      input.session.error = `完成闸门未通过：${incompleteReasons.join("；")}`;
+      await this.recordProgress(input, "status", "达到自动续跑上限，任务未完成。可使用断点恢复继续。", "milestone");
       return input.session;
+    } finally {
+      if (this.abortControllers.get(input.session.id) === abortController) {
+        this.abortControllers.delete(input.session.id);
+      }
     }
-
-    // LLM 决定继续后正常完成
-    const transcript = formatClaudeTranscript(secondResult.sdkMessages);
-    this.appendAssistantMessage(input.session, transcript);
-    if (transcript) {
-      await this.recordProgress(input, "runner", transcript, "milestone");
-    }
-    if (this.hasPendingToolCall(input.session) || this.hasPendingHumanQuestion(input.session)) {
-      input.session.status = "waiting_approval";
-      await this.recordProgress(input, "status", "等待审批或用户回答", "milestone");
-    } else {
-      input.session.status = "completed";
-      await this.recordProgress(input, "status", "Profile 模式执行完成", "milestone");
-    }
-    return input.session;
   }
 
   /** 单次 Profile 查询的返回结果 */
@@ -273,17 +251,14 @@ export class ClaudeAgentRunner {
     llmDecisionContext: string
   ): Promise<ProfileQueryResult> {
     const sdkMessages: unknown[] = [];
-    const pdfPageImageReads = new Set<string>();
     const preQueryMsgCount = input.session.messages.length;
     const preQueryTcCount = input.session.tool_calls.length;
-    // 运行时解析的有效模型：初始用 session.model，init 消息到达后更新
-    let effectiveModel = input.session.model || "";
-
-    this.activeSession = input.session;
+    // 运行时解析的有效模型只来自 SDK init；宿主不指定或切换模型。
+    let effectiveModel = "";
 
     try {
       const query = await this.resolveQuery();
-      const mcpServer = await this.resolveMcpServer();
+      const mcpServer = await this.resolveMcpServer(input);
 
       const skillIds = input.workflow.skills ?? [];
       const skillSummaries = await this.loadSkillSummaries(skillIds);
@@ -334,10 +309,9 @@ export class ClaudeAgentRunner {
         };
       }
 
-      for await (const message of query({
+      const queryInstance = query({
         prompt: instructions,
         options: {
-          model: input.session.model,
           systemPrompt: {
             type: "preset" as const,
             preset: "claude_code" as const,
@@ -351,118 +325,79 @@ export class ClaudeAgentRunner {
           ...(this.options.pluginPaths?.length
             ? { plugins: this.options.pluginPaths.map((pluginPath) => ({ type: "local" as const, path: pluginPath })) }
             : {}),
-          tools: buildAllowedClaudeTools(input.workflow, undefined),
+          tools: buildAllowedClaudeTools(input.workflow),
           disallowedTools: buildDisallowedClaudeTools(input.workflow),
-          hooks: {
-            PreToolUse: [{
-              hooks: [async (hookInput: unknown) => {
-                const hi = hookInput as { tool_name?: string; tool_input?: unknown };
-                if (hi.tool_name === "Read") {
-                  const ti = hi.tool_input as Record<string, unknown> | undefined;
-                  const fp = String(ti?.file_path ?? ti?.path ?? "");
-                  if (/\.pdf(?:$|[?#])/i.test(fp)) {
-                    return {
-                      continue: true,
-                      hookSpecificOutput: {
-                        hookEventName: "PreToolUse" as const,
-                        permissionDecision: "deny" as const,
-                        permissionDecisionReason: "请读取已拆页 PNG，不要直接 Read PDF。PDF base64 太大会导致 API 400 错误。"
-                      }
-                    };
-                  }
-                }
-                return {
-                  continue: true,
-                  hookSpecificOutput: {
-                    hookEventName: "PreToolUse" as const,
-                    permissionDecision: "ask" as const,
-                    permissionDecisionReason: "Route every tool through the host policy and audit callback."
-                  }
-                };
-              }]
-            }]
-          },
-          settingSources: ["user", "project", "local"],
+          permissionMode: "default",
+          // 只使用 ai-coder 自己的权限策略，避免用户/项目 hooks 形成第二套审批链。
+          settingSources: [],
           ...(Object.keys(sdkAgents).length > 0 ? { agents: sdkAgents } : {}),
           canUseTool: async (toolName: string, toolInput: Record<string, unknown>, options: { toolUseID: string }) => {
-            if (toolName === "Task") {
-              await this.recordProgress(input, "tool_policy", "允许 Task（sub-agent）调用", "transient");
-              return { behavior: "allow" };
-            }
             if (toolName === "Skill") {
               const skillName = String(toolInput.skill ?? toolInput.name ?? "unknown");
               this.appendAssistantMessage(input.session, `正在加载 Skill：\`${skillName}\``, "skill_usage");
               await this.recordProgress(input, "runner", `加载 Skill：${skillName}`, "milestone");
             }
-            if (completedToolCache.size > 0) {
-              const cacheKey = makeToolCacheKey(toolName, toolInput);
-              const cached = completedToolCache.get(cacheKey);
-              if (cached) {
-                await this.recordProgress(input, "tool_policy", `跳过重复工具（已缓存）：${toolName}`, "transient");
-                const resultHint = cached.outputSummary
-                  ? `\n\n该工具已在上一次尝试中成功完成。结果摘要：\n${cached.outputSummary.slice(0, 500)}`
-                  : "\n\n该工具已在上一次尝试中成功完成（退出码 0）。";
-                return { behavior: "deny", message: `此操作已在前序尝试中完成，无需重复执行。${resultHint}\n\n请基于此结果继续，不要再次调用相同工具。`, interrupt: false };
-              }
-            }
-            if (isPdfPageImageRead(toolName, toolInput)) {
-              const filePath = String(toolInput.file_path ?? toolInput.path ?? "");
-              // 非多模态模型（如 DeepSeek）无法处理图片 → 拒绝读 PNG，提示用文本工具
-              if (!isModelMultimodal(effectiveModel)) {
-                await this.recordProgress(input, "tool_policy", `拒绝 PNG 读取（${effectiveModel || "当前模型"}不支持多模态）：${filePath}`, "milestone");
-                return {
-                  behavior: "deny",
-                  message: [
-                    `${effectiveModel || "当前模型"}不支持多模态（图片）输入，无法处理 PNG 拆页。`,
-                    "请使用纯文本方式获取 PDF 内容，例如：",
-                    "- `pdftotext <pdf路径> -` 提取文本",
-                    "- `python3 -c \"import PyPDF2; ...\"` 读取文本",
-                    "- 其他命令行文本提取工具",
-                    "如果以上工具不可用，请切换到支持多模态的模型（如 claude-sonnet-5）再试。"
-                  ].join("\n"),
-                  interrupt: false
-                };
-              }
-              pdfPageImageReads.add(filePath);
-              if (pdfPageImageReads.size > this.maxPdfPageImageReadsPerStage) {
-                return { behavior: "deny", message: `已读取 ${this.maxPdfPageImageReadsPerStage} 张 PDF 拆页图片，请基于已读取内容继续。`, interrupt: false };
-              }
-            }
-            if (isUnsupportedDocumentRead(toolName, toolInput)) {
-              return { behavior: "deny", message: "请读取已拆页 PNG，不要直接 Read PDF。PDF base64 太大会导致 API 400 错误。", interrupt: false };
-            }
-            if (toolName === "mcp__ai_coder__update_task_tree") {
+            if (
+              toolName === "Skill" ||
+              toolName === "Task" ||
+              toolName === "mcp__ai_coder__ask_human" ||
+              toolName === "mcp__ai_coder__update_task_tree"
+            ) {
               return { behavior: "allow" };
             }
-            if (toolName === "mcp__ai_coder__ask_human") {
-              const qualityFailure = evaluateHumanQuestionRequest(toolInput);
-              if (qualityFailure) {
-                return { behavior: "deny", message: `提问准入失败：${qualityFailure}`, interrupt: false };
-              }
-              const question = this.buildHumanQuestion(input.session, toolInput, options.toolUseID);
-              if (question) {
-                input.session.pending_human_questions = [...(input.session.pending_human_questions ?? []), question];
-                await this.recordProgress(input, "tool_policy", `等待用户回答：${question.question.slice(0, 60)}`, "milestone");
-                return { behavior: "deny", message: "等待用户回答，已暂停执行", interrupt: true };
-              }
-              input.session.status = "failed";
-              input.session.error = "ask_human 工具输入格式错误";
-              return { behavior: "deny", message: input.session.error, interrupt: true };
+            const cached = completedToolCache.get(makeToolCacheKey(toolName, toolInput));
+            if (cached) {
+              const resultHint = cached.outputSummary
+                ? `结果摘要：${cached.outputSummary.slice(0, 500)}`
+                : `退出码：${cached.exitCode ?? 0}`;
+              await this.recordProgress(input, "tool_policy", `跳过重复工具（已缓存）：${toolName}`, "transient");
+              return {
+                behavior: "deny",
+                message: `此操作已在前序尝试中成功完成，无需重复执行。${resultHint}。请基于该结果继续。`,
+                interrupt: false
+              };
             }
-            const safetyCheck = checkCommandSafety("profile", toolName, toolInput);
-            if (!safetyCheck.allow) {
-              return { behavior: "deny", message: safetyCheck.message, interrupt: false };
+            const safety = checkCommandSafety("profile", toolName, toolInput);
+            if (!safety.allow) {
+              await this.recordProgress(input, "tool_policy", `安全拦截：${safety.message}`, "milestone");
+              return { behavior: "deny", message: safety.message, interrupt: false };
             }
-            const decision = await approveOrDenyToolUse(input.session, input.workflow, toolName, toolInput, options.toolUseID);
+            const decision = await approveOrDenyToolUse(
+              input.session,
+              input.workflow,
+              toolName,
+              toolInput,
+              options.toolUseID
+            );
+            await this.recordProgress(
+              input,
+              "tool_policy",
+              decision.allow ? `工具已允许：${toolName}` : `工具未允许：${toolName}（${decision.message}）`,
+              decision.allow ? "transient" : "milestone"
+            );
             if (decision.allow) {
               return { behavior: "allow", updatedInput: decision.updatedInput };
             }
             if (this.hasPendingToolCall(input.session, options.toolUseID)) {
-              const approvalPromise = this.waitForToolApproval(input.session, options.toolUseID, abortController.signal);
-              await this.recordProgress(input, "tool_policy", this.describeToolDecision(toolName, false), "milestone");
-              const resolved = await approvalPromise;
+              const resolved = await this.waitForToolApproval(
+                input.session,
+                options.toolUseID,
+                abortController.signal
+              );
               if (resolved === "approved") {
-                const approvedDecision = await approveOrDenyToolUse(input.session, input.workflow, toolName, toolInput, options.toolUseID);
+                const approvedDecision = await approveOrDenyToolUse(
+                  input.session,
+                  input.workflow,
+                  toolName,
+                  toolInput,
+                  options.toolUseID
+                );
+                await this.recordProgress(
+                  input,
+                  "tool_policy",
+                  this.describeToolDecision(toolName, approvedDecision.allow),
+                  "milestone"
+                );
                 if (approvedDecision.allow) {
                   input.session.status = "running";
                   return { behavior: "allow", updatedInput: approvedDecision.updatedInput };
@@ -470,12 +405,17 @@ export class ClaudeAgentRunner {
                 return { behavior: "deny", message: approvedDecision.message, interrupt: approvedDecision.interrupt };
               }
               input.session.status = "running";
-              return { behavior: "deny", message: "Tool call was denied by the user.", interrupt: false };
+              return {
+                behavior: "deny",
+                message: "Tool call was denied by the user. Continue without this tool or choose an allowed alternative.",
+                interrupt: false
+              };
             }
             return { behavior: "deny", message: decision.message, interrupt: decision.interrupt };
           }
         }
-      } as never) as AsyncIterable<unknown>) {
+      } as never);
+      for await (const message of queryInstance) {
         sdkMessages.push(message);
         // 从 SDK init 消息中捕获运行时实际使用的模型
         captureEffectiveModelFromInitMessage(message, (model) => {
@@ -504,10 +444,17 @@ export class ClaudeAgentRunner {
       return { sdkMessages, preQueryMsgCount, preQueryTcCount, effectiveModel: effectiveModel || undefined };
     } catch (error) {
       if (isAbortError(error) || abortController.signal.aborted) {
-        input.session.status = "interrupted";
+        const resolved = this.resolveInterruptedStatus(input.session);
+        input.session.status = resolved === "completed" ? "interrupted" : resolved;
         return { sdkMessages, preQueryMsgCount, preQueryTcCount, finalSession: input.session };
       }
-      return { sdkMessages, preQueryMsgCount, preQueryTcCount, apiError: error };
+      return {
+        sdkMessages,
+        preQueryMsgCount,
+        preQueryTcCount,
+        apiError: preferSdkReportedError(sdkMessages, error),
+        effectiveModel: effectiveModel || undefined
+      };
     }
   }
 
@@ -587,13 +534,13 @@ export class ClaudeAgentRunner {
       modelSupportsImages
         ? [
             "## 文件读取规则",
-            "- **禁止直接 Read PDF 文件**：PDF base64 编码太大会导致 API 400 错误。请改用 Read 读取已拆页的 PNG 图片",
+            "- 读取 PDF 时优先使用已拆页 PNG，避免 PDF base64 过大导致 API 400；必要时仍可自行选择其他工具",
             "- PDF 上传后已自动拆为 .ai-coder/uploads/<id>/page-*.png，每页一张图片",
             "- 每次只读取当前需要的页面，不要一次性读取所有页面"
           ].join("\n")
         : [
             "## 文件读取规则",
-            "- **禁止直接 Read PDF 文件**：PDF base64 编码太大会导致 API 400 错误",
+            "- 读取 PDF 时优先使用文本提取工具，避免 PDF base64 过大导致 API 400；必要时仍可自行选择其他工具",
             `- **当前模型（${effectiveModel || "默认"}）不支持图片输入**：请使用命令行文本工具提取 PDF 内容，例如 ` + "`pdftotext <pdf路径> -` 或 `python3 -c \"import PyPDF2; ...\"`",
             "- PDF 上传后已自动拆为 .ai-coder/uploads/<id>/page-*.png，但你必须用文本工具而非 Read 来获取其内容"
           ].join("\n"),
@@ -622,9 +569,11 @@ export class ClaudeAgentRunner {
       return input.session;
     }
 
-    // 检查阶段是否需要预先授权（仅针对需要写权限的阶段，如 write_memory）
-    // 只有当阶段配置了 approval_required 且包含 edit_file 工具时，才需要在开始前授权
-    if (currentStage.approval_required && currentStage.allowed_tools?.includes("edit_file") && !this.hasStageApproval(input.session, currentStage.id)) {
+    if (
+      currentStage.approval_required &&
+      currentStage.allowed_tools?.includes("edit_file") &&
+      !this.hasStageApproval(input.session, currentStage.id)
+    ) {
       return this.requestStageApprovalIfNeeded(input, currentStage);
     }
 
@@ -636,7 +585,6 @@ export class ClaudeAgentRunner {
     }
 
     const sdkMessages: unknown[] = [];
-    const pdfPageImageReads = new Set<string>();
     const abortController = new AbortController();
     this.abortControllers.set(input.session.id, abortController);
 
@@ -648,8 +596,6 @@ export class ClaudeAgentRunner {
 
     // 跨重试的已完成工具结果缓存：key = `${toolName}::${normalizedInput}`
     const completedToolCache = new Map<string, { outputSummary?: string; exitCode?: number }>();
-
-    this.activeSession = input.session;
 
     for (let attempt = 0; attempt <= MAX_API_RETRIES; attempt++) {
       if (attempt > 0) {
@@ -667,7 +613,6 @@ export class ClaudeAgentRunner {
         }
         // 回滚会话状态到查询前
         sdkMessages.length = 0;
-        pdfPageImageReads.clear();
         input.session.messages = input.session.messages.slice(0, preQueryMsgCount);
         input.session.tool_calls = input.session.tool_calls.slice(0, preQueryTcCount);
         input.session.error = undefined;
@@ -679,7 +624,7 @@ export class ClaudeAgentRunner {
 
       try {
         const query = await this.resolveQuery();
-        const mcpServer = await this.resolveMcpServer();
+        const mcpServer = await this.resolveMcpServer(input);
 
         const loadedSkills = await this.loadRequiredSkills(currentStage);
         if (attempt === 0) {
@@ -719,7 +664,6 @@ export class ClaudeAgentRunner {
       for await (const message of query({
         prompt: instructions,
         options: {
-          model: input.session.model,
           cwd: input.session.project_path,
           executable: nodeInfo?.command ?? undefined,
           env: sdkEnv,
@@ -730,158 +674,42 @@ export class ClaudeAgentRunner {
             : {}),
           tools: buildAllowedClaudeTools(input.workflow, currentStage),
           disallowedTools: buildDisallowedClaudeTools(input.workflow),
-          // 项目/用户 settings 可能预授权工具并绕过 canUseTool。PreToolUse 一律要求宿主裁决，
-          // 保证安全策略、阶段 hooks 与工具审计对每一次调用都生效。
-          hooks: {
-            PreToolUse: [{
-              hooks: [async (hookInput: unknown) => {
-                // Hook 层拦截 PDF Read：belt and suspenders —— SDK 可能不调 canUseTool
-                const hi = hookInput as { tool_name?: string; tool_input?: unknown };
-                if (hi.tool_name === "Read") {
-                  const ti = hi.tool_input as Record<string, unknown> | undefined;
-                  const fp = String(ti?.file_path ?? ti?.path ?? "");
-                  if (/\.pdf(?:$|[?#])/i.test(fp)) {
-                    return {
-                      continue: true,
-                      hookSpecificOutput: {
-                        hookEventName: "PreToolUse" as const,
-                        permissionDecision: "deny" as const,
-                        permissionDecisionReason: "请读取已拆页 PNG，不要直接 Read PDF。PDF base64 太大会导致 API 400 错误。"
-                      }
-                    };
-                  }
-                }
-                return {
-                  continue: true,
-                  hookSpecificOutput: {
-                    hookEventName: "PreToolUse" as const,
-                    permissionDecision: "ask" as const,
-                    permissionDecisionReason: "Route every tool through the host policy and audit callback."
-                  }
-                };
-              }]
-            }]
-          },
-          // permissionMode 不设置，使用 SDK 默认行为；PreToolUse 会把最终裁决交给 canUseTool。
-          settingSources: ["user", "project", "local"],
+          permissionMode: "default",
+          // 只使用 ai-coder 自己的权限策略，避免用户/项目 hooks 形成第二套审批链。
+          settingSources: [],
           outputFormat: buildStageOutputFormat(currentStage),
           ...(Object.keys(sdkAgents).length > 0 ? { agents: sdkAgents } : {}),
           canUseTool: async (toolName: string, toolInput: Record<string, unknown>, options: { toolUseID: string }) => {
-            // SDK 原生 Task 工具：sub-agent 调用由 SDK 内部管理，直接放行
-            if (toolName === "Task") {
-              await this.recordProgress(input, "tool_policy", "允许 Task（sub-agent）调用", "transient");
-              return { behavior: "allow" };
-            }
-
             if (toolName === "Skill") {
               const skillName = String(toolInput.skill ?? toolInput.name ?? "unknown");
               this.appendAssistantMessage(input.session, `正在加载 Skill：\`${skillName}\``, "skill_usage");
               await this.recordProgress(input, "runner", `加载 Skill：${skillName}`, "milestone");
             }
-
-            // 重试缓存检测：如果该工具已在前序尝试中成功完成，直接返回缓存结果
-            if (completedToolCache.size > 0) {
-              const cacheKey = makeToolCacheKey(toolName, toolInput);
-              const cached = completedToolCache.get(cacheKey);
-              if (cached) {
-                await this.recordProgress(input, "tool_policy", `跳过重复工具（已缓存）：${toolName}`, "transient");
-                const resultHint = cached.outputSummary
-                  ? `\n\n该工具已在上一次尝试中成功完成。结果摘要：\n${cached.outputSummary.slice(0, 500)}`
-                  : "\n\n该工具已在上一次尝试中成功完成（退出码 0）。";
-                return { behavior: "deny", message: `此操作已在前序尝试中完成，无需重复执行。${resultHint}\n\n请基于此结果继续，不要再次调用相同工具。`, interrupt: false };
-              }
+            if (
+              toolName === "Skill" ||
+              toolName === "Task" ||
+              toolName === "mcp__ai_coder__ask_human" ||
+              toolName === "mcp__ai_coder__update_task_tree"
+            ) {
+              return { behavior: "allow" };
             }
-
-            if (isPdfPageImageRead(toolName, toolInput)) {
-              const filePath = String(toolInput.file_path ?? toolInput.path ?? "");
-              // 非多模态模型无法处理图片 → 拒绝读 PNG
-              const stageEffectiveModel = input.session.model || this.resolvedEffectiveModel;
-              if (!isModelMultimodal(stageEffectiveModel)) {
-                await this.recordProgress(input, "tool_policy", `拒绝 PNG 读取（${stageEffectiveModel || "当前模型"}不支持多模态）：${filePath}`, "milestone");
-                return {
-                  behavior: "deny",
-                  message: [
-                    `${stageEffectiveModel || "当前模型"}不支持多模态（图片）输入，无法处理 PNG 拆页。`,
-                    "请使用 `pdftotext`、`python3 -c \"import PyPDF2; ...\"` 等命令行文本工具提取 PDF 内容，",
-                    "或切换到支持多模态的模型（如 claude-sonnet-5）再试。"
-                  ].join("\n"),
-                  interrupt: false
-                };
-              }
-              pdfPageImageReads.add(filePath);
-              if (pdfPageImageReads.size > this.maxPdfPageImageReadsPerStage) {
-                const message = [
-                  `本阶段已读取 ${this.maxPdfPageImageReadsPerStage} 张 PDF 拆页图片，继续读取会导致模型上下文过大。`,
-                  "请停止继续 Read page-*.png，基于已读取页面完成当前阶段 required_outputs；",
-                  "未覆盖的页码或需求请写入 assumptions/unknown，不要为了补全而继续读图。"
-                ].join("");
-                await this.recordProgress(input, "tool_policy", `限制 PDF 拆页读取：${filePath}`, "milestone");
-                return { behavior: "deny", message, interrupt: false };
-              }
-            }
-
-            if (isUnsupportedDocumentRead(toolName, toolInput)) {
-              await this.recordProgress(input, "tool_policy", "拦截 PDF Read：请读取已拆页 PNG 或用 shell 文本工具查看，不要直接 Read PDF。", "milestone");
+            const cached = completedToolCache.get(makeToolCacheKey(toolName, toolInput));
+            if (cached) {
+              const resultHint = cached.outputSummary
+                ? `结果摘要：${cached.outputSummary.slice(0, 500)}`
+                : `退出码：${cached.exitCode ?? 0}`;
+              await this.recordProgress(input, "tool_policy", `跳过重复工具（已缓存）：${toolName}`, "transient");
               return {
                 behavior: "deny",
-                message: "当前后端不支持 PDF document content block。PDF 上传时已拆成 .ai-coder/uploads/.../page-*.png，请改用 Read 读取对应 PNG 页面，或用只读 shell 工具提取文本后继续。",
+                message: `此操作已在前序尝试中成功完成，无需重复执行。${resultHint}。请基于该结果继续。`,
                 interrupt: false
               };
             }
-            // 拦截 update_task_tree：MCP handler 自行处理校验与持久化
-            if (toolName === "mcp__ai_coder__update_task_tree") {
-              return { behavior: "allow" };
+            const safety = checkCommandSafety(currentStage.id, toolName, toolInput);
+            if (!safety.allow) {
+              await this.recordProgress(input, "tool_policy", `安全拦截：${safety.message}`, "milestone");
+              return { behavior: "deny", message: safety.message, interrupt: false };
             }
-            // 拦截 ask_human：作为 HumanQuestion 挂起，等待用户回答后继续
-            if (toolName === "mcp__ai_coder__ask_human") {
-              const qualityFailure = evaluateHumanQuestionRequest(toolInput);
-              if (qualityFailure) {
-                await this.recordProgress(input, "tool_policy", `拒绝低质量问题：${qualityFailure}`, "milestone");
-                return {
-                  behavior: "deny",
-                  message: `提问准入失败：${qualityFailure}。请先自行取证；若仍需询问，只问一个会实质改变决策的问题。`,
-                  interrupt: false
-                };
-              }
-              const question = this.buildHumanQuestion(input.session, toolInput, options.toolUseID);
-              if (question) {
-                // 去重：相同 question 文本 + 相同 stage_id 不重复创建
-                const existing = (input.session.pending_human_questions ?? []).find(
-                  (q) => q.question === question.question && q.stage_id === question.stage_id
-                );
-                if (existing) {
-                  if (existing.status === "answered") {
-                    // 已经回答过：不重复问，不中断，让模型继续
-                    await this.recordProgress(input, "tool_policy", `重复问题已跳过（已回答）：${question.question.slice(0, 60)}`, "transient");
-                    return { behavior: "deny", message: "此问题已回答，请基于已有回答继续。", interrupt: false };
-                  }
-                  // 仍在 pending：不创建新问题，但仍需中断等待用户回答
-                  await this.recordProgress(input, "tool_policy", `重复问题等待中：${question.question.slice(0, 60)}`, "transient");
-                  return { behavior: "deny", message: "等待用户回答，已暂停执行", interrupt: true };
-                }
-                input.session.pending_human_questions = [
-                  ...(input.session.pending_human_questions ?? []),
-                  question
-                ];
-                await this.recordProgress(input, "tool_policy", `等待用户回答：${question.question.slice(0, 60)}`, "milestone");
-                return { behavior: "deny", message: "等待用户回答，已暂停执行", interrupt: true };
-              }
-              // 工具输入非法：明确标记会话失败，避免被当作正常完成
-              input.session.status = "failed";
-              input.session.error = "ask_human 工具输入格式错误（缺少 question / type / options）";
-              await this.recordProgress(input, "status", input.session.error, "milestone");
-              return { behavior: "deny", message: input.session.error, interrupt: true };
-            }
-            // ── 引擎层 Bash 命令安全拦截（硬编码，不依赖 YAML 配置）──
-            // 在阶段 hooks 之前执行——这是因果致效层的约束，不是 prompt 建议。
-            const safetyCheck = checkCommandSafety(currentStage.id, toolName, toolInput);
-            if (!safetyCheck.allow) {
-              const attempted = describeToolAttempt(toolName, toolInput);
-              await this.recordProgress(input, "tool_policy", `安全拦截（${attempted}）：${safetyCheck.message}`, "milestone");
-              return { behavior: "deny", message: safetyCheck.message, interrupt: false };
-            }
-            // 阶段级工序闸门：仅当 stage.hooks 显式声明时生效；与 approveOrDenyToolUse（策略层）解耦。
-            // 失败时 interrupt:false——让模型读到拒绝原因后自行补齐前置步骤，不打断整个会话。
             if (currentStage.hooks) {
               const hookDecision = evaluateHook(currentStage, input.session, toolName, toolInput);
               if (!hookDecision.allow) {
@@ -889,18 +717,30 @@ export class ClaudeAgentRunner {
                 return { behavior: "deny", message: hookDecision.message, interrupt: false };
               }
             }
-            const decision = await approveOrDenyToolUse(input.session, input.workflow, toolName, toolInput, options.toolUseID);
+            const decision = await approveOrDenyToolUse(
+              input.session,
+              input.workflow,
+              toolName,
+              toolInput,
+              options.toolUseID
+            );
             if (decision.allow) {
-              await this.recordProgress(input, "tool_policy", this.describeToolDecision(toolName, true), "milestone");
               return { behavior: "allow", updatedInput: decision.updatedInput };
             }
             if (this.hasPendingToolCall(input.session, options.toolUseID)) {
-              const approvalPromise = this.waitForToolApproval(input.session, options.toolUseID, abortController.signal);
-              await this.recordProgress(input, "tool_policy", this.describeToolDecision(toolName, false), "milestone");
-              const resolved = await approvalPromise;
+              const resolved = await this.waitForToolApproval(
+                input.session,
+                options.toolUseID,
+                abortController.signal
+              );
               if (resolved === "approved") {
-                const approvedDecision = await approveOrDenyToolUse(input.session, input.workflow, toolName, toolInput, options.toolUseID);
-                await this.recordProgress(input, "tool_policy", this.describeToolDecision(toolName, approvedDecision.allow), "milestone");
+                const approvedDecision = await approveOrDenyToolUse(
+                  input.session,
+                  input.workflow,
+                  toolName,
+                  toolInput,
+                  options.toolUseID
+                );
                 if (approvedDecision.allow) {
                   input.session.status = "running";
                   return { behavior: "allow", updatedInput: approvedDecision.updatedInput };
@@ -908,9 +748,12 @@ export class ClaudeAgentRunner {
                 return { behavior: "deny", message: approvedDecision.message, interrupt: approvedDecision.interrupt };
               }
               input.session.status = "running";
-              return { behavior: "deny", message: "Tool call was denied by the user. Continue without this tool or choose an allowed alternative.", interrupt: false };
+              return {
+                behavior: "deny",
+                message: "Tool call was denied by the user. Continue without this tool or choose an allowed alternative.",
+                interrupt: false
+              };
             }
-            await this.recordProgress(input, "tool_policy", this.describeToolDecision(toolName, false), "milestone");
             return { behavior: "deny", message: decision.message, interrupt: decision.interrupt };
           }
         }
@@ -943,10 +786,13 @@ export class ClaudeAgentRunner {
       const stageOutput = extractClaudeStageOutput(sdkMessages);
       const transcript = formatClaudeTranscript(sdkMessages) || formatStructuredOutput(stageOutput.structuredOutput);
 
-      if (this.hasPendingToolCall(input.session) || this.hasPendingHumanQuestion(input.session)) {
-        // 有待审批工具/问题：push transcript 后中断
+      if (
+        this.hasPendingHumanQuestion(input.session) ||
+        input.session.tool_calls.some((toolCall) => toolCall.status === "pending_approval")
+      ) {
+        // 有待审批工具或待回答问题：push transcript 后中断
         this.appendAssistantMessage(input.session, transcript);
-        input.session.status = this.resolveInterruptedStatus(input.session);
+        input.session.status = "waiting_approval";
         await this.recordProgress(input, "status", `阶段已中断：${input.session.status}`, "milestone");
         if (this.abortControllers.get(input.session.id) === abortController) {
           this.abortControllers.delete(input.session.id);
@@ -993,7 +839,7 @@ export class ClaudeAgentRunner {
       const status = input.session.status;
       const error = input.session.error;
       if (status === "waiting_approval") {
-        await this.recordProgress(input, "status", `阶段已完成，等待审批：${stageName}`, "milestone");
+        await this.recordProgress(input, "status", `等待用户回答：${stageName}`, "milestone");
       } else if (status === "blocked") {
         await this.recordProgress(input, "status", `阶段被拦截：${stageName}${error ? `（${error}）` : ""}`, "milestone");
       } else if (status === "failed") {
@@ -1062,9 +908,9 @@ export class ClaudeAgentRunner {
       return false;
     }
 
-    const stage = input.workflow.stages.find((item) => item.id === approval?.stage_id);
+    const stage = input.workflow.stages.find((item) => item.id === approval.stage_id);
     input.session.status = "waiting_approval";
-    input.session.current_stage = approval?.stage_id ?? input.session.current_stage;
+    input.session.current_stage = approval.stage_id;
     const content = `已为"${input.session.task_prompt}"准备工作流计划。等待审批后继续执行${stage?.name ?? "下一阶段"}。`;
     this.appendAssistantMessage(input.session, content);
     return true;
@@ -1085,20 +931,19 @@ export class ClaudeAgentRunner {
       return input.session;
     }
 
-    const approval = {
+    input.session.approvals.push({
       id: randomUUID(),
       stage_id: stage.id,
-      kind: "stage" as const,
-      status: "pending" as const,
+      kind: "stage",
+      status: "pending",
       message: `阶段"${stage.name}"需要授权才能继续执行。该阶段需要使用文件编辑工具，请确认是否允许。`,
       created_at: new Date().toISOString()
-    };
-    input.session.approvals.push(approval);
+    });
     input.session.status = "waiting_approval";
-
-    const content = `阶段"${stage.name}"需要授权才能继续执行。该阶段将使用文件编辑工具写入项目文件，请审批。`;
-    this.appendAssistantMessage(input.session, content);
-
+    this.appendAssistantMessage(
+      input.session,
+      `阶段"${stage.name}"需要授权才能继续执行。该阶段将使用文件编辑工具写入项目文件，请审批。`
+    );
     return input.session;
   }
 
@@ -1131,7 +976,7 @@ export class ClaudeAgentRunner {
       visibility,
       created_at: new Date().toISOString()
     });
-    input.session.progress_events = progress.slice(-80);
+    input.session.progress_events = progress.slice(-2000);
     await input.onProgress?.(input.session);
   }
 
@@ -1141,49 +986,6 @@ export class ClaudeAgentRunner {
 
   private describeSdkMessage(message: unknown): string {
     return describeSdkMessageSnippet(message);
-  }
-
-  private hasBlockedToolCall(session: AgentSession): boolean {
-    return session.tool_calls.some((toolCall) => toolCall.status === "blocked" || toolCall.status === "denied");
-  }
-
-  private hasPendingToolCall(session: AgentSession, toolCallId?: string): boolean {
-    return session.tool_calls.some(
-      (toolCall) => toolCall.status === "pending_approval" && (!toolCallId || toolCall.id === toolCallId)
-    );
-  }
-
-  private async waitForToolApproval(
-    session: AgentSession,
-    toolCallId: string,
-    signal: AbortSignal
-  ): Promise<ToolApprovalResolution> {
-    return new Promise<ToolApprovalResolution>((resolve) => {
-      if (signal.aborted) {
-        resolve("denied");
-        return;
-      }
-      const pendingForSession = this.pendingToolApprovals.get(session.id) ?? new Map<string, PendingToolApproval>();
-      pendingForSession.set(toolCallId, { session, resolve });
-      this.pendingToolApprovals.set(session.id, pendingForSession);
-      signal.addEventListener(
-        "abort",
-        () => {
-          const toolCall = session.tool_calls.find((item) => item.id === toolCallId && item.status === "pending_approval");
-          if (toolCall) {
-            toolCall.status = "cancelled";
-            toolCall.resolved_at = new Date().toISOString();
-          }
-          session.status = "interrupted";
-          pendingForSession.delete(toolCallId);
-          if (pendingForSession.size === 0) {
-            this.pendingToolApprovals.delete(session.id);
-          }
-          resolve("denied");
-        },
-        { once: true }
-      );
-    });
   }
 
   private buildHumanQuestion(session: AgentSession, toolInput: Record<string, unknown>, toolUseID: string): HumanQuestion | null {
@@ -1226,12 +1028,56 @@ export class ClaudeAgentRunner {
     };
   }
 
+  private hasPendingToolCall(session: AgentSession, toolCallId?: string): boolean {
+    return session.tool_calls.some(
+      (toolCall) => toolCall.status === "pending_approval" && (!toolCallId || toolCall.id === toolCallId)
+    );
+  }
+
+  private async waitForToolApproval(
+    session: AgentSession,
+    toolCallId: string,
+    signal: AbortSignal
+  ): Promise<ToolApprovalResolution> {
+    return new Promise<ToolApprovalResolution>((resolve) => {
+      if (signal.aborted) {
+        resolve("denied");
+        return;
+      }
+      const pendingForSession = this.pendingToolApprovals.get(session.id) ?? new Map<string, PendingToolApproval>();
+      pendingForSession.set(toolCallId, { session, resolve });
+      this.pendingToolApprovals.set(session.id, pendingForSession);
+      signal.addEventListener(
+        "abort",
+        () => {
+          const toolCall = session.tool_calls.find(
+            (item) => item.id === toolCallId && item.status === "pending_approval"
+          );
+          if (toolCall) {
+            toolCall.status = "cancelled";
+            toolCall.resolved_at = new Date().toISOString();
+          }
+          session.status = "interrupted";
+          pendingForSession.delete(toolCallId);
+          if (pendingForSession.size === 0) {
+            this.pendingToolApprovals.delete(session.id);
+          }
+          resolve("denied");
+        },
+        { once: true }
+      );
+    });
+  }
+
   private hasPendingHumanQuestion(session: AgentSession): boolean {
     return (session.pending_human_questions ?? []).some((q) => q.status === "pending");
   }
 
   private resolveInterruptedStatus(session: AgentSession): AgentSession["status"] {
-    if (this.hasPendingToolCall(session) || this.hasPendingHumanQuestion(session)) {
+    if (
+      this.hasPendingHumanQuestion(session) ||
+      session.tool_calls.some((toolCall) => toolCall.status === "pending_approval")
+    ) {
       return "waiting_approval";
     }
     return "completed";
@@ -1396,8 +1242,7 @@ export class ClaudeAgentRunner {
     }
   }
 
-  private async resolveMcpServer(): Promise<unknown | null> {
-    if (this.mcpServerCache) return this.mcpServerCache;
+  private async resolveMcpServer(input: AgentRunInput): Promise<unknown | null> {
     try {
       const sdk = await import("@anthropic-ai/claude-agent-sdk");
       const createSdkMcpServer = (sdk as { createSdkMcpServer?: unknown }).createSdkMcpServer;
@@ -1406,15 +1251,8 @@ export class ClaudeAgentRunner {
       if (typeof createSdkMcpServer !== "function" || typeof tool !== "function") {
         return null;
       }
-      // 注意：ask_human 是"宿主拦截工具"——SDK 看到的工具 handler 永远返回占位符 `(intercepted by host)`，
-      // 因为真正的拦截发生在 canUseTool（本文件 canUseTool 回调内 `toolName === "mcp__ai_coder__ask_human"` 分支）：
-      //   1. 模型尝试调用 ask_human → canUseTool 命中该分支
-      //   2. 解析 toolInput 构造 HumanQuestion，挂到 session.pending_human_questions
-      //   3. 返回 { behavior: "deny", interrupt: true } 暂停 SDK 循环
-      //   4. 用户在前端回答后 IPC 写回 session，下一轮以问答历史形式注入 prompt
-      // 为什么仍然要在 MCP 注册：SDK 只允许模型调用"已声明"的工具；不注册的话模型无法发起调用。
-      // 暴露面：MCP 工具走 `mcpServers` 通道独立注册，**不**经过 buildAllowedClaudeTools 过滤
-      // （后者只控制 Read/Edit/Bash 等标准工具）。所以 ask_human 对所有阶段永远可见，唯一守门人是 canUseTool。
+      // ask_human 是业务信息询问工具，不属于权限审批。它在自身 handler 中记录问题并中止
+      // 当前 query；用户回答后会话恢复。其余工具仍必须经过宿主项目策略。
       const askHumanTool = (tool as (
         name: string,
         description: string,
@@ -1430,7 +1268,30 @@ export class ClaudeAgentRunner {
           why_needed: z.string().min(12).describe("不同回答将如何实质改变实现、安全边界或验收结果"),
           options: z.array(z.object({ value: z.string(), label: z.string() })).optional().describe("single/multi 时必填")
         },
-        async () => ({ content: [{ type: "text", text: "(intercepted by host)" }] })
+        async (args) => {
+          const session = input.session;
+          const toolInput = args as Record<string, unknown>;
+          const qualityFailure = evaluateHumanQuestionRequest(toolInput);
+          if (qualityFailure) {
+            return { content: [{ type: "text", text: `提问准入失败：${qualityFailure}` }] };
+          }
+          const question = this.buildHumanQuestion(session, toolInput, randomUUID());
+          if (!question) {
+            return { content: [{ type: "text", text: "ask_human 输入格式错误。" }] };
+          }
+          const existing = (session.pending_human_questions ?? []).find(
+            (item) => item.question === question.question && item.stage_id === question.stage_id
+          );
+          if (existing?.status === "answered") {
+            return { content: [{ type: "text", text: "此问题已回答，请基于已有回答继续。" }] };
+          }
+          if (!existing) {
+            session.pending_human_questions = [...(session.pending_human_questions ?? []), question];
+          }
+          session.status = "waiting_approval";
+          this.abortControllers.get(session.id)?.abort();
+          return { content: [{ type: "text", text: "已向用户提问并暂停，等待回答。" }] };
+        }
       );
       const taskTreeTool = (tool as (
         name: string,
@@ -1463,23 +1324,20 @@ export class ClaudeAgentRunner {
           next_reason: z.string().optional().describe("为什么聚焦此任务"),
         },
         async (args) => {
-          const session = (this as ClaudeAgentRunner).activeSession;
-          if (!session) {
-            return { content: [{ type: "text", text: "错误：没有活动会话。" }] };
-          }
+          const session = input.session;
           try {
             const result = applyTaskTreeMutation(session, args as TaskTreeMutationArgs);
+            await this.recordProgress(input, "runner", result.split("\n")[0] || "任务树已更新", "milestone");
             return { content: [{ type: "text", text: result }] };
           } catch (err) {
             return { content: [{ type: "text", text: `任务树更新失败：${err instanceof Error ? err.message : String(err)}` }] };
           }
         }
       );
-      this.mcpServerCache = (createSdkMcpServer as (opts: { name: string; tools: unknown[] }) => unknown)({
+      return (createSdkMcpServer as (opts: { name: string; tools: unknown[] }) => unknown)({
         name: "ai_coder",
         tools: [askHumanTool, taskTreeTool]
       });
-      return this.mcpServerCache;
     } catch {
       return null;
     }
@@ -1546,20 +1404,87 @@ function buildLlmDecisionContext(
   return parts.join("\n\n");
 }
 
-/** 从 SDK system/init 消息中提取运行时实际使用的模型名。
- *  init 消息的 data.models[0] 通常是当前会话的默认模型。 */
+export function evaluateProfileCompletion(session: AgentSession): string[] {
+  const tree = session.task_tree;
+  if (!tree || tree.tasks.length === 0) {
+    return ["尚未建立任务树"];
+  }
+
+  const reasons: string[] = [];
+  const unfinished = tree.tasks.filter((task) => task.status !== "completed" && task.status !== "skipped");
+  if (unfinished.length > 0) {
+    reasons.push(`仍有未完成任务：${unfinished.map((task) => `${task.id}(${task.status})`).join(", ")}`);
+  }
+  const completedWithoutEvidence = tree.tasks.filter(
+    (task) => task.status === "completed" && !task.evidence?.trim()
+  );
+  if (completedWithoutEvidence.length > 0) {
+    reasons.push(`完成节点缺少证据：${completedWithoutEvidence.map((task) => task.id).join(", ")}`);
+  }
+  return reasons;
+}
+
+function buildCompletionContinuationContext(incompleteReasons: string[], partialTranscript: string): string {
+  return [
+    "## 宿主完成闸门未通过",
+    ...incompleteReasons.map((reason) => `- ${reason}`),
+    "",
+    "当前回复不能作为任务完成。请立即继续执行剩余工作：维护 update_task_tree，完成实现与验证，",
+    "并确保每个 completed 节点都包含真实工具输出或文件位置作为 evidence。",
+    "不要重复已经完成的勘察，不要只输出下一步计划。",
+    partialTranscript ? `\n上一轮末尾内容：\n${partialTranscript.slice(-3000)}` : ""
+  ].filter(Boolean).join("\n");
+}
+
+export function extractSdkTerminalError(messages: unknown[]): string | null {
+  const terminal = [...messages].reverse().find(
+    (message) => isPlainObject(message) && message.type === "result"
+  );
+  if (!isPlainObject(terminal)) return null;
+  const subtype = typeof terminal.subtype === "string" ? terminal.subtype : "unknown";
+  if (terminal.is_error !== true && subtype === "success") return null;
+
+  const details = [
+    typeof terminal.result === "string" ? terminal.result.trim() : "",
+    Array.isArray(terminal.errors)
+      ? terminal.errors.filter((item): item is string => typeof item === "string").join("; ")
+      : ""
+  ].filter(Boolean).join("; ");
+  return details ? `${subtype}: ${details}` : `SDK result subtype=${subtype}`;
+}
+
+/** 从 SDK system/init 消息中提取运行时实际使用的模型名。 */
 function captureEffectiveModelFromInitMessage(
   message: unknown,
   onModel: (model: string) => void
 ): void {
   if (!isPlainObject(message)) return;
   if (message.type !== "system" || message.subtype !== "init") return;
+
+  // Agent SDK 0.1.x 的 SDKSystemMessage 把实际模型直接放在顶层。
+  // 优先读取该字段；旧版/测试夹具的 data.models 仅作为兼容兜底。
+  if (typeof message.model === "string" && message.model.trim()) {
+    onModel(message.model.trim());
+    return;
+  }
+
   const data = isPlainObject(message.data) ? message.data : {};
   const models = Array.isArray(data.models) ? (data.models as Array<{ value?: string }>) : [];
   if (models.length === 0) return;
-  // data.models[0] 是 CLI 实际使用的模型
   const effective = typeof models[0].value === "string" ? models[0].value : "";
   if (effective) onModel(effective);
+}
+
+/**
+ * Claude 子进程经常在已经产出具体 API 错误消息后，再以 code 1 退出。
+ * 后者只是进程级包装；应优先展示并分类 SDK 消息里的真正原因。
+ */
+function preferSdkReportedError(sdkMessages: unknown[], processError: unknown): unknown {
+  const sdkError = extractClaudeStageOutput(sdkMessages).error?.trim();
+  if (!sdkError) return processError;
+  const error = new Error(sdkError);
+  error.name = processError instanceof Error ? processError.name : "ClaudeSdkError";
+  return error;
 }
 
 function isAbortError(error: unknown): boolean {
@@ -1622,18 +1547,6 @@ function isRetriableApiError(error: unknown): boolean {
   if (/rate.?limit|overloaded|too many requests/i.test(message)) return true;
   if (/timeout|timed.?out|ECONNRESET|ETIMEDOUT|ENOTFOUND|ECONNREFUSED|network|fetch failed/i.test(message)) return true;
   return false;
-}
-
-function isUnsupportedDocumentRead(toolName: string, toolInput: Record<string, unknown>): boolean {
-  if (toolName !== "Read") return false;
-  const filePath = String(toolInput.file_path ?? toolInput.path ?? "");
-  return /\.pdf(?:$|[?#])/i.test(filePath);
-}
-
-function isPdfPageImageRead(toolName: string, toolInput: Record<string, unknown>): boolean {
-  if (toolName !== "Read") return false;
-  const filePath = String(toolInput.file_path ?? toolInput.path ?? "");
-  return /(?:^|[/\\])\.ai-coder[/\\]uploads[/\\].*[/\\]page-\d+\.(?:png|jpe?g|webp)$/i.test(filePath);
 }
 
 interface ToolExecutionResult {
@@ -1801,6 +1714,11 @@ export function describeSdkMessageSnippet(message: unknown): string {
   const msg = message as Record<string, unknown>;
   const type = typeof msg.type === "string" ? msg.type : "";
 
+  if (type === "system" && msg.subtype === "init") {
+    const model = typeof msg.model === "string" && msg.model.trim() ? msg.model.trim() : "未知";
+    return `SDK 初始化：模型 ${model}`;
+  }
+
   if (type === "assistant") {
     const inner = isPlainObject(msg.message) ? (msg.message as Record<string, unknown>) : undefined;
     const content = Array.isArray(inner?.content) ? inner!.content : [];
@@ -1818,7 +1736,11 @@ export function describeSdkMessageSnippet(message: unknown): string {
     return parts.length > 0 ? parts.join(" | ") : "助手消息（无文本）";
   }
   if (type === "tool_result") return "工具结果";
-  if (type === "result") return "阶段结果";
+  if (type === "result") {
+    const subtype = typeof msg.subtype === "string" ? msg.subtype : "unknown";
+    const suffix = msg.is_error === true ? "，错误" : "";
+    return `SDK 查询结束：${subtype}${suffix}`;
+  }
   return type ? `SDK:${type}` : "收到 Claude SDK 消息。";
 }
 

@@ -112,6 +112,9 @@ export async function approveOrDenyToolUse(
   if (existingToolCall?.status === "denied") {
     return { allow: false, message: "Tool call was denied by the user. Continue without this tool or choose an allowed alternative.", interrupt: false };
   }
+  if (existingToolCall?.status === "blocked") {
+    return { allow: false, message: "The same tool call was already blocked by the host safety policy. Correct the command or choose an allowed alternative.", interrupt: false };
+  }
   if (existingToolCall?.status === "pending_approval") {
     return { allow: false, message: "Tool call is waiting for user approval.", interrupt: true };
   }
@@ -523,7 +526,9 @@ async function canSkipPerToolApproval(
 
 export function extractAbsoluteShellPaths(command: string): string[] {
   const paths: string[] = [];
-  const pattern = /(?:^|[\s'"=])((?:\/[A-Za-z0-9._@%+,:=-]+){2,}\/?)/g;
+  // 同时识别根目录 `/`、单段路径 `/tmp` 和多段路径。旧正则要求至少两个路径段，
+  // 导致运行记录里的 `find / ...` 没有被项目边界策略发现。
+  const pattern = /(?:^|[\s'"=])(\/(?:[A-Za-z0-9._@%+,:=-]+(?:\/[A-Za-z0-9._@%+,:=-]+)*)?\/?)/g;
   for (const match of command.matchAll(pattern)) {
     const value = match[1];
     if (value === "/dev/null" || value.startsWith("/proc/") || value.startsWith("/sys/")) continue;
@@ -569,7 +574,8 @@ function findExistingToolCall(
   return (
     session.tool_calls.find((toolCall) => toolCall.id === toolUseId && sameToolCall(toolCall, toolName, input)) ??
     session.tool_calls.find((toolCall) => toolCall.status === "approved" && sameToolCall(toolCall, toolName, input)) ??
-    session.tool_calls.find((toolCall) => toolCall.status === "pending_approval" && sameToolCall(toolCall, toolName, input))
+    session.tool_calls.find((toolCall) => toolCall.status === "pending_approval" && sameToolCall(toolCall, toolName, input)) ??
+    session.tool_calls.find((toolCall) => toolCall.status === "blocked" && sameToolCall(toolCall, toolName, input))
   );
 }
 

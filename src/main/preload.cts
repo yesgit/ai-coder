@@ -6,7 +6,6 @@ const api: AppApi = {
   selectProjectDirectory: () => ipcRenderer.invoke("project:select"),
   authorizeSessionProject: (projectPath: string) => ipcRenderer.invoke("project:authorize-session-project", projectPath),
   getAgentRuntimeStatus: () => ipcRenderer.invoke("agent:get-status"),
-  getAvailableModels: () => ipcRenderer.invoke("agent:get-models"),
   getProjectOnboardingStatus: (projectPath: string) => ipcRenderer.invoke("project:onboarding-status", projectPath),
   confirmProjectOnboarding: (projectPath: string) => ipcRenderer.invoke("project:confirm-onboarding", projectPath),
   listWorkflows: (projectPath?: string) => ipcRenderer.invoke("workflows:list", projectPath),
@@ -33,7 +32,6 @@ const api: AppApi = {
   setSessionPinned: (sessionId: string, pinned: boolean) => ipcRenderer.invoke("sessions:set-pinned", sessionId, pinned),
   setSessionArchived: (sessionId: string, archived: boolean) => ipcRenderer.invoke("sessions:set-archived", sessionId, archived),
   toggleAutoApprove: (sessionId: string) => ipcRenderer.invoke("sessions:toggle-auto-approve", sessionId),
-  setModel: (sessionId: string, model: string) => ipcRenderer.invoke("sessions:set-model", sessionId, model),
   deleteSession: (sessionId: string) => ipcRenderer.invoke("sessions:delete", sessionId),
   listProjectFiles: (projectPath: string, query?: string) =>
     ipcRenderer.invoke("project:list-files", projectPath, query),

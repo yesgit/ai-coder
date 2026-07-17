@@ -4,14 +4,11 @@ import { existsSync, readdirSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { promisify } from "node:util";
-import type { AgentRuntimeStatus, AvailableModel } from "../../shared/types.js";
+import type { AgentRuntimeStatus } from "../../shared/types.js";
 
 const execFileAsync = promisify(execFile);
 
 let nodeExecutablePromise: Promise<NodeExecutableInfo | null> | undefined;
-
-/** 从 SDK 获取的可用模型列表缓存 */
-let cachedModelsPromise: Promise<AvailableModel[]> | null = null;
 
 export interface NodeExecutableInfo {
   /** Absolute path to the binary to spawn. */
@@ -20,6 +17,35 @@ export interface NodeExecutableInfo {
   env?: Record<string, string>;
   /** Source used for diagnostics. */
   source: "system" | "electron";
+}
+
+export function normalizeAnthropicBaseUrl(value: string | undefined): string | undefined {
+  if (!value) return value;
+  try {
+    const url = new URL(value);
+    if (url.hostname === "api.deepseek.com" && (url.pathname === "" || url.pathname === "/")) {
+      url.pathname = "/anthropic";
+      return url.toString().replace(/\/$/, "");
+    }
+  } catch {
+    // Preserve invalid/custom values so Claude Code can report them verbatim.
+  }
+  return value;
+}
+
+export function selectClaudeProviderEnvironment(
+  source: Record<string, unknown>
+): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(source).filter(([key, value]) => (
+      typeof value === "string"
+      && (
+        key.startsWith("ANTHROPIC_")
+        || key === "CLAUDE_CODE_SUBAGENT_MODEL"
+        || key === "CLAUDE_CODE_EFFORT_LEVEL"
+      )
+    ))
+  ) as Record<string, string>;
 }
 
 export async function getClaudeRuntimeStatus(): Promise<AgentRuntimeStatus> {
@@ -197,73 +223,6 @@ async function hasClaudeAuth(): Promise<boolean> {
     }
   }
   return false;
-}
-
-/**
- * 从 Claude Agent SDK 动态获取可用模型列表。
- * 结果会被缓存，多次调用共享同一个 Promise。
- */
-export async function fetchAvailableModels(): Promise<AvailableModel[]> {
-  if (!cachedModelsPromise) {
-    cachedModelsPromise = doFetchModels();
-  }
-  return cachedModelsPromise;
-}
-
-async function doFetchModels(): Promise<AvailableModel[]> {
-  try {
-    const sdk = await import("@anthropic-ai/claude-agent-sdk");
-    const queryFn = (sdk as { query?: unknown }).query;
-    if (typeof queryFn !== "function") {
-      return [];
-    }
-
-    const nodeInfo = await resolveNodeExecutable();
-    const abortController = new AbortController();
-
-    // 5 秒超时——获取模型列表不应该花太长时间
-    const timeout = setTimeout(() => abortController.abort(), 5000);
-
-    try {
-      const q = (queryFn as (params: {
-        prompt: string;
-        options?: Record<string, unknown>;
-      }) => AsyncIterable<unknown>)({
-        prompt: ".",
-        options: {
-          cwd: process.cwd(),
-          executable: nodeInfo?.command ?? undefined,
-          env: nodeInfo?.env ? { ...process.env, ...nodeInfo.env } : undefined,
-          abortController,
-          // 禁用所有工具，只跑 init 即可
-          tools: [],
-          settingSources: ["user", "project", "local"] as string[]
-        }
-      });
-
-      for await (const msg of q) {
-        if (isPlainObject(msg) && (msg as Record<string, unknown>).type === "system" && (msg as Record<string, unknown>).subtype === "init") {
-          const data = isPlainObject((msg as Record<string, unknown>).data)
-            ? ((msg as Record<string, unknown>).data as Record<string, unknown>)
-            : (msg as Record<string, unknown>);
-          const models = Array.isArray(data.models) ? (data.models as AvailableModel[]) : [];
-          // 中断后续处理——拿到模型列表就够了
-          try { await (q as { interrupt?: () => Promise<void> }).interrupt?.(); } catch { /* ignore */ }
-          return models;
-        }
-        break; // 第一个消息不是 init 就放弃
-      }
-    } finally {
-      clearTimeout(timeout);
-    }
-  } catch {
-    // SDK 不可用时返回空列表
-  }
-  return [];
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 async function isCredentialsFileValid(filePath: string): Promise<boolean> {

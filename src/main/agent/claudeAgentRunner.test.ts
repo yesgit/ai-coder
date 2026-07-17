@@ -2,7 +2,7 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildClaudeSdkEnv, ClaudeAgentRunner, describeSdkMessageSnippet, describeToolAttempt, evaluateHumanQuestionRequest, extractSdkToolUses, extractToolExecutionResult, parseBestStageAgentResult } from "./claudeAgentRunner.js";
+import { buildClaudeSdkEnv, ClaudeAgentRunner, describeSdkMessageSnippet, describeToolAttempt, evaluateHumanQuestionRequest, evaluateProfileCompletion, extractSdkTerminalError, extractSdkToolUses, extractToolExecutionResult, parseBestStageAgentResult } from "./claudeAgentRunner.js";
 import type { AgentSession, WorkflowTemplate } from "../../shared/types.js";
 
 const workflow: WorkflowTemplate = {
@@ -19,7 +19,161 @@ const workflow: WorkflowTemplate = {
   ]
 };
 
+async function waitFor(assertion: () => boolean): Promise<void> {
+  const started = Date.now();
+  while (!assertion()) {
+    if (Date.now() - started > 1000) {
+      throw new Error("Timed out waiting for condition");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 describe("ClaudeAgentRunner", () => {
+  it("does not override the configured provider model when retrying a Profile timeout", async () => {
+    const profileWorkflow: WorkflowTemplate = {
+      ...workflow,
+      id: "profile-workflow",
+      stages: []
+    };
+    const attemptedModels: Array<string | undefined> = [];
+    let attempt = 0;
+    async function* query(params: unknown) {
+      const model = (params as { options: { model?: string } }).options.model;
+      attemptedModels.push(model);
+      attempt += 1;
+      if (attempt === 1) {
+        yield {
+          type: "system",
+          subtype: "init",
+          model: "deepseek-v4-pro",
+          session_id: "sdk-session-1"
+        };
+        yield {
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          result: "Request timed out"
+        };
+        throw new Error("Claude Code process exited with code 1");
+      }
+      yield {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: "Recovered"
+      };
+    }
+    const session: AgentSession = {
+      id: "00000000-0000-4000-8000-000000000080",
+      project_path: "/tmp/project",
+      workflow_id: profileWorkflow.id,
+      task_prompt: "Complete the task",
+      status: "running",
+      current_stage: "profile",
+      messages: [],
+      tool_calls: [],
+      file_changes: [],
+      approvals: [],
+      stage_runs: [],
+      rework_requests: [],
+      progress_events: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+
+    const updated = await new ClaudeAgentRunner(query).run({ session, workflow: profileWorkflow });
+
+    expect(attemptedModels).toEqual([undefined, undefined, undefined]);
+    expect(updated.status).toBe("interrupted");
+    expect(updated.error).toContain("尚未建立任务树");
+    expect(updated.messages.at(-1)?.content).toBe("Recovered");
+    expect(updated.progress_events?.some((event) => event.message === "API 调用失败：Request timed out")).toBe(true);
+    expect(updated.progress_events?.some((event) => event.message.includes("切换到 Claude"))).toBe(false);
+  });
+
+  it("keeps Profile mode active while a tool approval is pending", async () => {
+    const profileWorkflow: WorkflowTemplate = {
+      ...workflow,
+      id: "profile-workflow",
+      stages: []
+    };
+    const projectPath = await mkdtemp(path.join(tmpdir(), "ai-coder-profile-approval-"));
+    async function* query(params: unknown) {
+      const canUseTool = (params as {
+        options: {
+          canUseTool: (
+            toolName: string,
+            input: Record<string, unknown>,
+            options: { toolUseID: string }
+          ) => Promise<unknown>;
+        };
+      }).options.canUseTool;
+      await canUseTool("Bash", { command: "node script.js" }, { toolUseID: "profile-tool-approval" });
+      yield {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: "Script completed"
+      };
+    }
+    const session: AgentSession = {
+      id: "00000000-0000-4000-8000-000000000090",
+      project_path: projectPath,
+      workflow_id: profileWorkflow.id,
+      task_prompt: "Run the script",
+      status: "running",
+      current_stage: "profile",
+      messages: [],
+      tool_calls: [],
+      file_changes: [],
+      approvals: [],
+      stage_runs: [],
+      rework_requests: [],
+      progress_events: [],
+      task_tree: {
+        goal_restated: "运行脚本",
+        strategy: "执行并验证",
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        tasks: [
+          {
+            id: "t1",
+            description: "运行脚本",
+            dependencies: [],
+            status: "completed",
+            evidence: "node script.js exited with code 0"
+          }
+        ]
+      },
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+
+    const runner = new ClaudeAgentRunner(query);
+    const run = runner.run({ session, workflow: profileWorkflow });
+    await waitFor(() =>
+      session.tool_calls.some(
+        (toolCall) => toolCall.id === "profile-tool-approval" && toolCall.status === "pending_approval"
+      )
+    );
+
+    expect(session.status).toBe("waiting_approval");
+    expect(session.error).toBeUndefined();
+    expect(session.tool_calls).toContainEqual(expect.objectContaining({
+      id: "profile-tool-approval",
+      status: "pending_approval"
+    }));
+    expect(runner.resolveToolApproval(session.id, "profile-tool-approval", "approved")).toBe(true);
+
+    const updated = await run;
+    expect(updated.status).toBe("completed");
+    expect(updated.tool_calls).toContainEqual(expect.objectContaining({
+      id: "profile-tool-approval",
+      status: "completed"
+    }));
+  });
+
   it("never persists an unanswerable choice question when options are missing", () => {
     const runner = new ClaudeAgentRunner() as unknown as {
       buildHumanQuestion: (session: Pick<AgentSession, "current_stage">, input: Record<string, unknown>, id: string) => unknown;
@@ -202,12 +356,9 @@ describe("ClaudeAgentRunner", () => {
     expect(receivedOptions?.plugins).toEqual([
       { type: "local", path: "/tmp/careful-coder-plugin" }
     ]);
-    const preToolUseHook = ((receivedOptions?.hooks as {
-      PreToolUse: Array<{ hooks: Array<(input: unknown) => Promise<unknown>> }>;
-    }).PreToolUse[0].hooks[0]);
-    await expect(preToolUseHook({})).resolves.toMatchObject({
-      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "ask" }
-    });
+    expect(receivedOptions?.hooks).toBeUndefined();
+    expect(receivedOptions?.permissionMode).toBe("default");
+    expect(receivedOptions?.allowDangerouslySkipPermissions).toBeUndefined();
   });
 
   it("injects required core Skill content before a stage can run", async () => {
@@ -413,7 +564,6 @@ describe("ClaudeAgentRunner", () => {
   it("waits for stage approval before live or mock execution", async () => {
     const previousKey = process.env.ANTHROPIC_API_KEY;
     process.env.ANTHROPIC_API_KEY = "test-key";
-
     const session: AgentSession = {
       id: "00000000-0000-4000-8000-000000000000",
       project_path: "/tmp/project",
@@ -519,16 +669,23 @@ describe("ClaudeAgentRunner", () => {
 
   it("waits inside the active SDK tool callback until a pending tool approval is resolved", async () => {
     let permissionResult: unknown;
+    let permissionMode: unknown;
+    let allowDangerouslySkipPermissions: unknown;
     async function* query(params: unknown) {
-      const canUseTool = (params as {
+      const options = (params as {
         options: {
+          permissionMode?: unknown;
+          allowDangerouslySkipPermissions?: unknown;
           canUseTool: (
             toolName: string,
             input: Record<string, unknown>,
             options: { toolUseID: string }
           ) => Promise<unknown>;
         };
-      }).options.canUseTool;
+      }).options;
+      permissionMode = options.permissionMode;
+      allowDangerouslySkipPermissions = options.allowDangerouslySkipPermissions;
+      const canUseTool = options.canUseTool;
       permissionResult = await canUseTool("Bash", { command: "node script.js" }, { toolUseID: "tool-await" });
       yield {
         type: "result",
@@ -536,7 +693,7 @@ describe("ClaudeAgentRunner", () => {
         is_error: false,
         result: JSON.stringify({
           status: "completed",
-          output_summary: "Executed after approval"
+          output_summary: "Executed"
         })
       };
     }
@@ -570,18 +727,27 @@ describe("ClaudeAgentRunner", () => {
 
     const runner = new ClaudeAgentRunner(query);
     const run = runner.run({ session, workflow });
-    await waitFor(() => session.tool_calls.some((toolCall) => toolCall.id === "tool-await" && toolCall.status === "pending_approval"));
+    await waitFor(() =>
+      session.tool_calls.some(
+        (toolCall) => toolCall.id === "tool-await" && toolCall.status === "pending_approval"
+      )
+    );
 
     expect(session.status).toBe("waiting_approval");
     expect(runner.resolveToolApproval(session.id, "tool-await", "approved")).toBe(true);
-
     const updated = await run;
-    expect(permissionResult).toMatchObject({ behavior: "allow", updatedInput: { command: "node script.js" } });
-    expect(updated.tool_calls.find((toolCall) => toolCall.id === "tool-await")).toMatchObject({ status: "completed" });
+
+    expect(permissionMode).toBe("default");
+    expect(allowDangerouslySkipPermissions).toBeUndefined();
+    expect(permissionResult).toMatchObject({ behavior: "allow" });
+    expect(updated.tool_calls).toContainEqual(expect.objectContaining({
+      id: "tool-await",
+      status: "completed"
+    }));
     expect(updated.status).toBe("completed");
   });
 
-  it("does not block the session when a tool call is denied by policy", async () => {
+  it("blocks dangerous commands even when the model requests them", async () => {
     let permissionResult: unknown;
     async function* query(params: unknown) {
       const canUseTool = (params as {
@@ -635,13 +801,19 @@ describe("ClaudeAgentRunner", () => {
     const updated = await new ClaudeAgentRunner(query).run({ session, workflow });
 
     expect(permissionResult).toMatchObject({ behavior: "deny", interrupt: false });
-    expect(updated.tool_calls.find((toolCall) => toolCall.id === "tool-blocked")).toMatchObject({ status: "blocked" });
+    expect(updated.tool_calls.find((toolCall) => toolCall.id === "tool-blocked")).toMatchObject({
+      status: "blocked"
+    });
     expect(updated.status).toBe("completed");
     expect(updated.error).toBeUndefined();
   });
 
-  it("denies direct PDF Read so unsupported document blocks are not sent to the backend", async () => {
+  it("allows direct PDF Read without host-side tool blocking", async () => {
     let permissionResult: unknown;
+    const projectPath = await mkdtemp(path.join(tmpdir(), "ai-coder-pdf-"));
+    const pdfPath = path.join(projectPath, ".ai-coder", "uploads", "spec.pdf");
+    await mkdir(path.dirname(pdfPath), { recursive: true });
+    await writeFile(pdfPath, "");
     async function* query(params: unknown) {
       const canUseTool = (params as {
         options: {
@@ -652,7 +824,7 @@ describe("ClaudeAgentRunner", () => {
           ) => Promise<unknown>;
         };
       }).options.canUseTool;
-      permissionResult = await canUseTool("Read", { file_path: ".ai-coder/uploads/spec.pdf" }, { toolUseID: "read-pdf" });
+      permissionResult = await canUseTool("Read", { file_path: pdfPath }, { toolUseID: "read-pdf" });
       yield {
         type: "result",
         subtype: "success",
@@ -666,7 +838,7 @@ describe("ClaudeAgentRunner", () => {
 
     const session: AgentSession = {
       id: "00000000-0000-4000-8000-000000000050",
-      project_path: "/tmp/project",
+      project_path: projectPath,
       workflow_id: workflow.id,
       task_prompt: "Read a PDF",
       status: "running",
@@ -693,12 +865,11 @@ describe("ClaudeAgentRunner", () => {
 
     const updated = await new ClaudeAgentRunner(query).run({ session, workflow });
 
-    expect(permissionResult).toMatchObject({ behavior: "deny", interrupt: false });
-    expect(JSON.stringify(permissionResult)).toContain("不支持 PDF document content block");
+    expect(permissionResult).toMatchObject({ behavior: "allow" });
     expect(updated.status).toBe("completed");
   });
 
-  it("caps PDF page image reads in a stage so large documents do not exhaust context", async () => {
+  it("does not cap PDF page image reads in the host permission callback", async () => {
     const permissionResults: unknown[] = [];
     const projectPath = await mkdtemp(path.join(tmpdir(), "ai-coder-runner-"));
     const uploadPath = path.join(projectPath, ".ai-coder", "uploads", "spec");
@@ -771,11 +942,8 @@ describe("ClaudeAgentRunner", () => {
     const updated = await new ClaudeAgentRunner(query).run({ session, workflow });
 
     expect(permissionResults).toHaveLength(9);
-    expect(permissionResults.slice(0, 8).every((result) => JSON.stringify(result).includes("\"allow\""))).toBe(true);
-    const deniedResult = permissionResults.find((result) => JSON.stringify(result).includes("\"deny\""));
-    expect(deniedResult).toMatchObject({ behavior: "deny", interrupt: false });
-    expect(JSON.stringify(deniedResult)).toContain("本阶段已读取 8 张 PDF 拆页图片");
-    expect(updated.progress_events?.some((event) => event.message.includes("限制 PDF 拆页读取"))).toBe(true);
+    expect(permissionResults.every((result) => JSON.stringify(result).includes("\"allow\""))).toBe(true);
+    expect(updated.progress_events?.some((event) => event.message.includes("限制 PDF 拆页读取"))).toBe(false);
     expect(updated.status).toBe("completed");
   });
 
@@ -919,16 +1087,6 @@ describe("ClaudeAgentRunner", () => {
   });
 });
 
-async function waitFor(assertion: () => boolean): Promise<void> {
-  const started = Date.now();
-  while (!assertion()) {
-    if (Date.now() - started > 1000) {
-      throw new Error("Timed out waiting for condition");
-    }
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-}
-
 describe("describeSdkMessageSnippet", () => {
   it("assistant 文本 block 提取前 80 字", () => {
     const msg = {
@@ -938,10 +1096,10 @@ describe("describeSdkMessageSnippet", () => {
     expect(describeSdkMessageSnippet(msg)).toBe("正在查看登录模块的实现，确认鉴权逻辑...");
   });
 
-  it("assistant 文本超长截断 80 字", () => {
-    const long = "x".repeat(120);
+  it("assistant 文本超长截断 500 字", () => {
+    const long = "x".repeat(600);
     const msg = { type: "assistant", message: { content: [{ type: "text", text: long }] } };
-    expect(describeSdkMessageSnippet(msg).length).toBe(80);
+    expect(describeSdkMessageSnippet(msg).length).toBe(500);
   });
 
   it("assistant tool_use 提取工具名 + file_path", () => {
@@ -978,8 +1136,66 @@ describe("describeSdkMessageSnippet", () => {
   });
 
   it("result / tool_result / 其他类型", () => {
-    expect(describeSdkMessageSnippet({ type: "result" })).toBe("阶段结果");
+    expect(describeSdkMessageSnippet({ type: "result", subtype: "success", is_error: false })).toBe("SDK 查询结束：success");
+    expect(describeSdkMessageSnippet({ type: "result", subtype: "error_max_turns", is_error: true })).toBe("SDK 查询结束：error_max_turns，错误");
     expect(describeSdkMessageSnippet({ type: "tool_result" })).toBe("工具结果");
     expect(describeSdkMessageSnippet({ type: "system" })).toBe("SDK:system");
+  });
+});
+
+describe("evaluateProfileCompletion", () => {
+  it("rejects a natural SDK stop before a task tree exists", () => {
+    expect(evaluateProfileCompletion({ task_tree: undefined } as AgentSession)).toContain("尚未建立任务树");
+  });
+
+  it("rejects unfinished nodes and completed nodes without evidence", () => {
+    const session = {
+      task_tree: {
+        goal_restated: "完成修复",
+        strategy: "按实现和验证拆分",
+        created_at: "t",
+        updated_at: "t",
+        tasks: [
+          { id: "t1", description: "实现", dependencies: [], status: "completed" },
+          { id: "t2", description: "验证", dependencies: ["t1"], status: "in_progress" }
+        ]
+      }
+    } as AgentSession;
+
+    expect(evaluateProfileCompletion(session)).toEqual([
+      "仍有未完成任务：t2(in_progress)",
+      "完成节点缺少证据：t1"
+    ]);
+  });
+
+  it("accepts only completed or skipped nodes with evidence", () => {
+    const session = {
+      task_tree: {
+        goal_restated: "完成修复",
+        strategy: "按实现和验证拆分",
+        created_at: "t",
+        updated_at: "t",
+        tasks: [
+          { id: "t1", description: "实现", dependencies: [], status: "completed", evidence: "src/a.ts:10" },
+          { id: "t2", description: "无需修改", dependencies: ["t1"], status: "skipped", status_reason: "已有覆盖" }
+        ]
+      }
+    } as AgentSession;
+
+    expect(evaluateProfileCompletion(session)).toEqual([]);
+  });
+});
+
+describe("extractSdkTerminalError", () => {
+  it("does not treat a successful result as an error", () => {
+    expect(extractSdkTerminalError([
+      { type: "result", subtype: "success", is_error: false, result: "done" }
+    ])).toBeNull();
+  });
+
+  it("preserves max-turn termination instead of treating it as completion", () => {
+    expect(extractSdkTerminalError([
+      { type: "result", subtype: "error_max_turns", is_error: true, result: "Reached max turns" }
+    ])).toBe("error_max_turns: Reached max turns");
   });
 });
