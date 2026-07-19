@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import path from "node:path";
-import type { AgentMessage, AgentSession, HumanQuestion, HumanQuestionOption, SessionProgressEvent, StageAgentResult, TaskTree, WorkflowStage, WorkflowTemplate } from "../../shared/types.js";
+import type { AgentMessage, AgentSession, Attachment, HumanQuestion, HumanQuestionOption, SessionProgressEvent, StageAgentResult, TaskTree, WorkflowStage, WorkflowTemplate } from "../../shared/types.js";
 import { isMeaningfulAgentText } from "../../shared/agentMessages.js";
+import { analyzeSymbolContract } from "../analysis/symbolContractAnalyzer.js";
 import {
   approveOrDenyToolUse,
+  assertPathInsideProject,
   buildAllowedClaudeTools,
   buildDisallowedClaudeTools
 } from "../security/projectPolicy.js";
@@ -34,6 +36,7 @@ interface ProfileQueryResult {
   preQueryMsgCount: number;
   preQueryTcCount: number;
   apiError?: unknown;
+  postResultProcessError?: unknown;
   finalSession?: AgentSession;
   effectiveModel?: string;
 }
@@ -140,16 +143,34 @@ export class ClaudeAgentRunner {
 
   private async runProfileMode(input: AgentRunInput): Promise<AgentSession> {
     input.session.status = "running";
+    const attachmentErrors = await findUnreadableProfileAttachments(input.session);
+    if (attachmentErrors.length > 0) {
+      input.session.status = "interrupted";
+      input.session.error = [
+        "附件完整性检查失败，任务尚未开始。",
+        ...attachmentErrors,
+        "请重新附加缺失文件后再重新开始，宿主不会根据旧提交或文件名猜测附件需求。"
+      ].join("\n");
+      await this.recordProgress(input, "status", input.session.error, "milestone");
+      return input.session;
+    }
+    const taskTreeBootstrapped = ensureProfileTaskTree(input.session);
     await input.onProgress?.(input.session);
+    if (taskTreeBootstrapped) {
+      await this.recordProgress(input, "status", "宿主已建立 Profile 根任务，等待执行与验证证据。", "milestone");
+    }
 
     const abortController = new AbortController();
     this.abortControllers.set(input.session.id, abortController);
     const completedToolCache = new Map<string, { outputSummary?: string; exitCode?: number }>();
-    const maxContinuationAttempts = 3;
+    const maxProfileQueries = 24;
+    const maxStalledQueries = 3;
+    let stalledQueries = 0;
     let continuationContext = "";
 
     try {
-      for (let attempt = 0; attempt < maxContinuationAttempts; attempt += 1) {
+      for (let attempt = 0; attempt < maxProfileQueries; attempt += 1) {
+        const progressBeforeQuery = buildProfileProgressFingerprint(input.session);
         const result = await this.runProfileQuery(
           input,
           abortController,
@@ -163,6 +184,18 @@ export class ClaudeAgentRunner {
         if (transcript) {
           this.appendAssistantMessage(input.session, transcript);
           await this.recordProgress(input, "runner", transcript, "milestone");
+        }
+
+        if (result.postResultProcessError) {
+          const warning = result.postResultProcessError instanceof Error
+            ? result.postResultProcessError.message
+            : String(result.postResultProcessError);
+          await this.recordProgress(
+            input,
+            "status",
+            `SDK 已返回成功结果；子进程随后异常退出，本轮结果已保留：${warning.slice(0, 120)}`,
+            "milestone"
+          );
         }
 
         if (result.apiError) {
@@ -184,7 +217,7 @@ export class ClaudeAgentRunner {
             transcript,
             completedToolCache
           );
-          if (attempt + 1 < maxContinuationAttempts && isRetriableApiError(result.apiError)) {
+          if (attempt + 1 < maxProfileQueries && isRetriableApiError(result.apiError)) {
             continue;
           }
           input.session.status = "interrupted";
@@ -220,12 +253,26 @@ export class ClaudeAgentRunner {
           return input.session;
         }
 
+        this.saveCompletedToolsToCache(input.session, completedToolCache);
         continuationContext = buildCompletionContinuationContext(incompleteReasons, transcript);
+        const progressAfterQuery = buildProfileProgressFingerprint(input.session);
+        stalledQueries = progressAfterQuery === progressBeforeQuery ? stalledQueries + 1 : 0;
+        if (stalledQueries >= maxStalledQueries) {
+          input.session.status = "interrupted";
+          input.session.error = `连续 ${maxStalledQueries} 轮没有可验证进展：${incompleteReasons.join("；")}`;
+          await this.recordProgress(
+            input,
+            "status",
+            `连续 ${maxStalledQueries} 轮没有任务状态、非重复工具证据或文件改动，已暂停以避免空转。可使用断点恢复继续。`,
+            "milestone"
+          );
+          return input.session;
+        }
         input.session.status = "running";
         await this.recordProgress(
           input,
           "status",
-          `任务尚未完成，自动继续（${attempt + 1}/${maxContinuationAttempts}）：${incompleteReasons.join("；").slice(0, 240)}`,
+          `任务尚未完成，自动继续（工作轮次 ${attempt + 1}/${maxProfileQueries}，连续无进展 ${stalledQueries}/${maxStalledQueries}）：${incompleteReasons.join("；").slice(0, 240)}`,
           "milestone"
         );
       }
@@ -233,7 +280,7 @@ export class ClaudeAgentRunner {
       const incompleteReasons = evaluateProfileCompletion(input.session);
       input.session.status = "interrupted";
       input.session.error = `完成闸门未通过：${incompleteReasons.join("；")}`;
-      await this.recordProgress(input, "status", "达到自动续跑上限，任务未完成。可使用断点恢复继续。", "milestone");
+      await this.recordProgress(input, "status", "达到 Profile 工作轮次安全上限，任务未完成。可使用断点恢复继续。", "milestone");
       return input.session;
     } finally {
       if (this.abortControllers.get(input.session.id) === abortController) {
@@ -261,14 +308,14 @@ export class ClaudeAgentRunner {
       const mcpServer = await this.resolveMcpServer(input);
 
       const skillIds = input.workflow.skills ?? [];
-      const skillSummaries = await this.loadSkillSummaries(skillIds);
+      const profileSkills = await this.loadProfileSkills(skillIds);
       if (!isLlmRetry) {
-        for (const s of skillSummaries) {
-          await this.recordProgress(input, "runner", `加载 Skill 摘要：${s.id}`, "milestone");
+        for (const skill of profileSkills) {
+          await this.recordProgress(input, "runner", `宿主强制加载 Skill：${skill.id}`, "milestone");
         }
       }
 
-      const carefulCoderInstructions = this.buildProfileSystemPrompt(skillSummaries, input.workflow.system_prompt, isLlmRetry ? effectiveModel : undefined);
+      const carefulCoderInstructions = this.buildProfileSystemPrompt(profileSkills, input.workflow.system_prompt, isLlmRetry ? effectiveModel : undefined);
 
       const taskPrompt = input.session.task_prompt ?? "";
       const humanQaHistory = (input.session.pending_human_questions ?? [])
@@ -277,9 +324,7 @@ export class ClaudeAgentRunner {
         .join("\n");
 
       const initialMessage = input.session.initial_user_message ?? input.session.messages.find((m) => m.role === "user");
-      const attachmentList = (initialMessage?.attachments ?? [])
-        .map((a) => `- ${a.display_name ?? ("path" in a ? (a as { path: string }).path : "附件")}`)
-        .join("\n");
+      const attachmentList = formatProfileAttachmentList(initialMessage?.attachments ?? []);
 
       let instructions = [
         taskPrompt || "（无任务描述）",
@@ -337,13 +382,71 @@ export class ClaudeAgentRunner {
               this.appendAssistantMessage(input.session, `正在加载 Skill：\`${skillName}\``, "skill_usage");
               await this.recordProgress(input, "runner", `加载 Skill：${skillName}`, "milestone");
             }
+            if (toolName === "mcp__ai_coder__update_task_tree") {
+              try {
+                const mutationResult = applyTaskTreeMutation(
+                  input.session,
+                  normalizeTaskTreeMutationArgs(toolInput)
+                );
+                await this.recordProgress(
+                  input,
+                  "runner",
+                  `${mutationResult.split("\n")[0] || "任务树已更新"}（宿主兜底）`,
+                  "milestone"
+                );
+              } catch (error) {
+                await this.recordProgress(
+                  input,
+                  "runner",
+                  `任务树宿主兜底未应用，将交由 MCP handler 处理：${error instanceof Error ? error.message : String(error)}`,
+                  "transient"
+                );
+              }
+              return { behavior: "allow" };
+            }
+            if (toolName === "Task") {
+              const subagentType = optionalString(toolInput.subagent_type);
+              const allowedSubagents = new Set(Object.keys(input.workflow.agents ?? {}));
+              if (!subagentType || !allowedSubagents.has(subagentType)) {
+                return {
+                  behavior: "deny",
+                  message: `禁止调用未由当前工作流声明的 Agent：${subagentType ?? "未指定"}。可用 Agent：${[...allowedSubagents].join(", ") || "无"}。`,
+                  interrupt: false
+                };
+              }
+              if (profileNeedsPlanning(input.session) && subagentType !== "task-planner") {
+                return {
+                  behavior: "deny",
+                  message: "宿主仍处于 PLAN 阶段。必须先调用 task-planner，依据其结构化结果用 update_task_tree 建立详细任务 DAG，之后才能调用执行或检查 Agent。",
+                  interrupt: false
+                };
+              }
+              const startedTask = startCurrentProfileTask(input.session);
+              if (startedTask) {
+                await this.recordProgress(input, "runner", `${startedTask}（宿主兜底）`, "milestone");
+              }
+              return { behavior: "allow" };
+            }
             if (
               toolName === "Skill" ||
-              toolName === "Task" ||
               toolName === "mcp__ai_coder__ask_human" ||
-              toolName === "mcp__ai_coder__update_task_tree"
+              toolName === "mcp__ai_coder__analyze_symbol_contract"
             ) {
               return { behavior: "allow" };
+            }
+            if (profileNeedsPlanning(input.session) && ["Edit", "Write", "NotebookEdit"].includes(toolName)) {
+              return {
+                behavior: "deny",
+                message: "宿主仍处于 PLAN 阶段：task-planner 尚未产出详细任务 DAG，禁止修改文件。",
+                interrupt: false
+              };
+            }
+            if (profileNeedsPlanning(input.session) && toolName === "Bash" && isMutatingShellCommand(toolInput.command)) {
+              return {
+                behavior: "deny",
+                message: "宿主仍处于 PLAN 阶段：禁止通过 Bash 修改工作区、分支、索引或提交历史。先完成 task-planner 并由宿主建立详细任务 DAG。",
+                interrupt: false
+              };
             }
             const cached = completedToolCache.get(makeToolCacheKey(toolName, toolInput));
             if (cached) {
@@ -448,6 +551,15 @@ export class ClaudeAgentRunner {
         input.session.status = resolved === "completed" ? "interrupted" : resolved;
         return { sdkMessages, preQueryMsgCount, preQueryTcCount, finalSession: input.session };
       }
+      if (hasSuccessfulSdkTerminalResult(sdkMessages)) {
+        return {
+          sdkMessages,
+          preQueryMsgCount,
+          preQueryTcCount,
+          postResultProcessError: error,
+          effectiveModel: effectiveModel || undefined
+        };
+      }
       return {
         sdkMessages,
         preQueryMsgCount,
@@ -475,7 +587,7 @@ export class ClaudeAgentRunner {
 
 /** 构建 Profile 模式的系统提示词 */
   private buildProfileSystemPrompt(
-    skillSummaries: Array<{ id: string; content: string }>,
+    profileSkills: Array<{ id: string; content: string }>,
     workflowSystemPrompt?: string,
     effectiveModel?: string
   ): string {
@@ -547,10 +659,11 @@ export class ClaudeAgentRunner {
       reactGuidance,
       taskTreeGuidance,
       workflowSystemPrompt ?? "",
-      skillSummaries.length > 0
+      profileSkills.length > 0
         ? [
-            "## 可用 Skills（摘要，按需通过 Skill 工具加载完整内容）",
-            ...skillSummaries.map((s) => `- **${s.id}**: ${s.content.slice(0, 200)}`)
+            "## 宿主强制加载的 Skills（执行契约）",
+            "以下内容不是可选参考。必须在计划、任务状态、实现和验证证据中体现；无需再次调用 Skill 工具。",
+            ...profileSkills.map((skill) => `\n### ${skill.id}\n${skill.content}`)
           ].join("\n")
         : ""
     ].filter(Boolean).join("\n\n");
@@ -1161,8 +1274,8 @@ export class ClaudeAgentRunner {
     return loaded;
   }
 
-  /** Profile 模式：只加载 Skill 摘要（前 200 字），完整内容通过 Skill 工具按需加载。 */
-  private async loadSkillSummaries(skillIds: string[]): Promise<Array<{ id: string; content: string }>> {
+  /** Profile 模式：宿主加载完整 Skill 内容，避免把关键执行契约交给模型自行决定是否读取。 */
+  private async loadProfileSkills(skillIds: string[]): Promise<Array<{ id: string; content: string }>> {
     if (skillIds.length === 0) return [];
     if (!this.options.pluginPaths?.length) return [];
 
@@ -1176,7 +1289,7 @@ export class ClaudeAgentRunner {
           const fullContent = await readFile(path.join(pluginPath, "skills", skillName, "SKILL.md"), "utf8");
           loaded.push({
             id: namespace ? id : `careful-coder:${skillName}`,
-            content: fullContent.slice(0, 200)
+            content: fullContent
           });
           break;
         } catch (error) {
@@ -1225,6 +1338,11 @@ export class ClaudeAgentRunner {
     if (!result) return;
     const toolCall = session.tool_calls.find((item) => item.id === result.toolUseId);
     if (!toolCall) return;
+    const taskFailedSemantically = toolCall.tool === "Task"
+      && (
+        isSemanticallyFailedTaskResult(result.outputSummary)
+        || isSemanticallyFailedTaskMessage(message)
+      );
     if (result.exitCode !== undefined) {
       toolCall.exit_code = result.exitCode;
     } else if (toolCall.tool === "Bash" && result.executionSucceeded === true) {
@@ -1233,12 +1351,28 @@ export class ClaudeAgentRunner {
       toolCall.exit_code = 0;
     }
     if (result.outputSummary) toolCall.output_summary = result.outputSummary;
-    if (result.executionSucceeded === false) {
+    if (result.executionSucceeded === false || taskFailedSemantically) {
       toolCall.status = "blocked";
       toolCall.resolved_at = new Date().toISOString();
     } else if (toolCall.status === "approved" || toolCall.status === "requested") {
       toolCall.status = "completed";
       toolCall.resolved_at = new Date().toISOString();
+    }
+    if (
+      toolCall.tool === "Task"
+      && toolCall.status === "completed"
+      && isPlainObject(toolCall.input)
+      && toolCall.input.subagent_type === "task-planner"
+      && profileNeedsPlanning(session)
+    ) {
+      const plannerMutation = extractPlannerTaskTreeMutation(message, session);
+      if (plannerMutation) {
+        try {
+          applyTaskTreeMutation(session, plannerMutation);
+        } catch {
+          // 计划结果不符合 DAG 契约时保持 host-goal，要求下一轮重新规划，不能让结果记录中断查询。
+        }
+      }
     }
   }
 
@@ -1326,7 +1460,7 @@ export class ClaudeAgentRunner {
         async (args) => {
           const session = input.session;
           try {
-            const result = applyTaskTreeMutation(session, args as TaskTreeMutationArgs);
+            const result = applyTaskTreeMutation(session, normalizeTaskTreeMutationArgs(args));
             await this.recordProgress(input, "runner", result.split("\n")[0] || "任务树已更新", "milestone");
             return { content: [{ type: "text", text: result }] };
           } catch (err) {
@@ -1334,9 +1468,58 @@ export class ClaudeAgentRunner {
           }
         }
       );
+      const analyzeSymbolContractTool = (tool as (
+        name: string,
+        description: string,
+        schema: Record<string, unknown>,
+        handler: (...args: unknown[]) => Promise<unknown>
+      ) => unknown)(
+        "analyze_symbol_contract",
+        "只读分析 TypeScript/JavaScript/React 中已有函数、方法或组件的定义契约、全部静态调用点、参数组合、局部前置条件、公共封装函数和非直接调用引用。调用点按页返回，必须继续请求直到 next_offset 为 null。",
+        {
+          target_file: z.string().min(1).describe("目标符号定义文件，相对于项目根目录"),
+          symbol: z.string().min(1).describe("函数、方法、类或组件的精确符号名"),
+          target_line: z.number().int().min(1).optional().describe("同一文件存在同名符号时，用定义所在行消歧"),
+          section: z.enum(["all", "contract", "calls", "wrappers", "references"]).optional()
+            .describe("返回部分；调用点很多时优先分部分请求"),
+          offset: z.number().int().min(0).optional().describe("calls 分页起始位置"),
+          limit: z.number().int().min(1).max(100).optional().describe("calls 每页数量，默认 50，最大 100")
+        },
+        async (args) => {
+          const toolInput = args as {
+            target_file: string;
+            symbol: string;
+            target_line?: number;
+            section?: "all" | "contract" | "calls" | "wrappers" | "references";
+            offset?: number;
+            limit?: number;
+          };
+          try {
+            await assertPathInsideProject(input.session.project_path, toolInput.target_file);
+            const result = analyzeSymbolContract({
+              projectPath: input.session.project_path,
+              targetFile: toolInput.target_file,
+              symbol: toolInput.symbol,
+              targetLine: toolInput.target_line,
+              section: toolInput.section,
+              offset: toolInput.offset,
+              limit: toolInput.limit
+            });
+            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+          } catch (error) {
+            return {
+              content: [{
+                type: "text",
+                text: `调用契约分析失败：${error instanceof Error ? error.message : String(error)}`
+              }],
+              isError: true
+            };
+          }
+        }
+      );
       return (createSdkMcpServer as (opts: { name: string; tools: unknown[] }) => unknown)({
         name: "ai_coder",
-        tools: [askHumanTool, taskTreeTool]
+        tools: [askHumanTool, taskTreeTool, analyzeSymbolContractTool]
       });
     } catch {
       return null;
@@ -1424,6 +1607,79 @@ export function evaluateProfileCompletion(session: AgentSession): string[] {
   return reasons;
 }
 
+export function ensureProfileTaskTree(session: AgentSession): boolean {
+  if (session.task_tree) return false;
+  const now = new Date().toISOString();
+  session.task_tree = {
+    goal_restated: session.task_prompt.trim() || "完成用户请求",
+    strategy: "宿主根任务：由 Agent 根据代码与附件证据细化，并在实现、验证完成后附证据关闭。",
+    current_focus: "host-goal",
+    focus_reason: "先建立可审计的执行状态，避免遗漏任务树导致无法完成。",
+    tasks: [{
+      id: "host-goal",
+      description: "完成用户请求并提供实现与验证证据",
+      dependencies: [],
+      status: "in_progress"
+    }],
+    created_at: now,
+    updated_at: now
+  };
+  return true;
+}
+
+function profileNeedsPlanning(session: AgentSession): boolean {
+  return !session.task_tree
+    || (session.task_tree.tasks.length === 1 && session.task_tree.tasks[0]?.id === "host-goal");
+}
+
+export function buildProfileProgressFingerprint(session: AgentSession): string {
+  const taskState = (session.task_tree?.tasks ?? []).map((task) => ({
+    id: task.id,
+    status: task.status,
+    evidence: task.evidence ?? "",
+    reason: task.status_reason ?? ""
+  }));
+  const completedTools = [...new Set(
+    session.tool_calls
+      .filter((toolCall) => toolCall.status === "completed" || toolCall.exit_code === 0)
+      .map((toolCall) => makeToolCacheKey(toolCall.tool, toolCall.input))
+  )].sort();
+  const fileChanges = [...new Set(
+    session.file_changes.map((change) => `${change.operation}:${change.path}`)
+  )].sort();
+  return JSON.stringify({ taskState, completedTools, fileChanges });
+}
+
+export function formatProfileAttachmentList(attachments: Attachment[]): string {
+  return attachments.map((attachment) => {
+    if (attachment.type === "file_ref") {
+      return `- [可读取文件] ${attachment.path}（显示名: ${attachment.display_name}）`;
+    }
+    if (attachment.type === "image") {
+      return `- [内联图片] ${attachment.display_name}（没有磁盘路径）`;
+    }
+    return `- [未落盘文件] ${attachment.display_name}`;
+  }).join("\n");
+}
+
+async function findUnreadableProfileAttachments(session: AgentSession): Promise<string[]> {
+  const attachments = session.initial_user_message?.attachments ?? [];
+  const failures: string[] = [];
+  for (const attachment of attachments) {
+    if (attachment.type !== "file_ref") continue;
+    const resolvedPath = path.isAbsolute(attachment.path)
+      ? attachment.path
+      : path.resolve(session.project_path, attachment.path);
+    try {
+      await assertPathInsideProject(session.project_path, resolvedPath);
+      await access(resolvedPath);
+    } catch {
+      failures.push(`- 无法读取附件：${attachment.path}（${attachment.display_name}）`);
+    }
+  }
+  return failures;
+}
+
 function buildCompletionContinuationContext(incompleteReasons: string[], partialTranscript: string): string {
   return [
     "## 宿主完成闸门未通过",
@@ -1451,6 +1707,15 @@ export function extractSdkTerminalError(messages: unknown[]): string | null {
       : ""
   ].filter(Boolean).join("; ");
   return details ? `${subtype}: ${details}` : `SDK result subtype=${subtype}`;
+}
+
+export function hasSuccessfulSdkTerminalResult(messages: unknown[]): boolean {
+  const terminal = [...messages].reverse().find(
+    (message) => isPlainObject(message) && message.type === "result"
+  );
+  return isPlainObject(terminal)
+    && terminal.subtype === "success"
+    && terminal.is_error !== true;
 }
 
 /** 从 SDK system/init 消息中提取运行时实际使用的模型名。 */
@@ -1536,9 +1801,12 @@ function normalizeToolInputForCache(input: Record<string, unknown>): string {
 function isRetriableApiError(error: unknown): boolean {
   if (isAbortError(error)) return false;
   const message = error instanceof Error ? error.message : String(error);
-  // 鉴权 / 进程崩溃 / SDK 内部错误不可重试
+  // 鉴权错误不可重试。
   if (/\b401\b/.test(message) || /\b403\b/.test(message)) return false;
   if (/authentication|unauthorized|invalid.*api.*key|\/login/i.test(message)) return false;
+  // SDK 子进程在终态前崩溃时可用全新进程进行有限重试。成功终态后的崩溃由
+  // hasSuccessfulSdkTerminalResult 单独处理，不会进入这里。
+  if (/terminated by signal SIG(?:SEGV|ABRT|BUS|ILL)|signal SIG(?:SEGV|ABRT|BUS|ILL)/i.test(message)) return true;
   if (/exited with code|process exited/i.test(message)) return false;
   // 已知瞬时性错误：HTTP 状态码、限流、超时、网络中断
   if (/\b400\b/.test(message)) return true;
@@ -1642,6 +1910,58 @@ function summarizeToolResult(value: unknown): string | undefined {
   const text = typeof value === "string" ? value : JSON.stringify(value);
   if (!text || text === "{}") return undefined;
   return text.replace(/\s+/g, " ").trim().slice(0, 2_000);
+}
+
+function isSemanticallyFailedTaskResult(outputSummary: string | undefined): boolean {
+  if (!outputSummary) return false;
+  return [
+    /\bAPI Error:/i,
+    /\bModel not found\b/i,
+    /\bInputValidationError\b/i,
+    /"status"\s*:\s*"(?:failed|error|blocked)"/i,
+    /"is_error"\s*:\s*true/i
+  ].some((pattern) => pattern.test(outputSummary));
+}
+
+function isSemanticallyFailedTaskMessage(message: unknown): boolean {
+  if (!isPlainObject(message)) return false;
+  const source = isPlainObject(message.tool_use_result) ? message.tool_use_result : undefined;
+  if (source) {
+    const status = typeof source.status === "string" ? source.status.toLowerCase() : "";
+    if (status === "failed" || status === "error" || status === "blocked") return true;
+    const contentText = typeof source.content === "string"
+      ? source.content
+      : source.content === undefined
+        ? ""
+        : JSON.stringify(source.content);
+    if (isSemanticallyFailedTaskResult(contentText)) return true;
+  }
+  const blocks = isPlainObject(message.message) && Array.isArray(message.message.content)
+    ? message.message.content
+    : [];
+  const toolResultText = blocks
+    .filter((block) => isPlainObject(block) && block.type === "tool_result")
+    .map((block) => JSON.stringify(block))
+    .join("\n");
+  return isSemanticallyFailedTaskResult(toolResultText);
+}
+
+function isMutatingShellCommand(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const command = value
+    .replace(/\b(?:\d*>)\s*\/dev\/null\b/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!command) return false;
+  return [
+    /(?:^|[;&|]\s*)git(?:\s+(?:-[cC]\s+\S+|--(?:git-dir|work-tree)=\S+))*\s+(?:add|am|apply|branch\s+(?:-[dDmM]|--delete|--move)|checkout|cherry-pick|clean|commit|merge|mv|pull|push|rebase|reset|restore|revert|rm|stash|switch|tag)\b/i,
+    /(?:^|[;&|]\s*)(?:rm|mv|cp|install|mkdir|rmdir|touch|truncate|tee|patch)\b/i,
+    /(?:^|[;&|]\s*)(?:sed|perl)\s+[^;&|]*\s-i(?:\s|$)/i,
+    /(?:^|[;&|]\s*)(?:npm|pnpm|yarn|bun)\s+(?:add|install|remove|uninstall|update|upgrade)\b/i,
+    /(?:^|[;&|]\s*)(?:cargo\s+(?:add|remove)|go\s+mod\s+(?:edit|tidy)|pip(?:3)?\s+install)\b/i,
+    /(^|[^<])>>?(?![>&])/,
+    /<<\s*['"]?[A-Za-z_][A-Za-z0-9_]*['"]?/
+  ].some((pattern) => pattern.test(command));
 }
 
 function normalizeAssistantMessageContent(content: string): string {
@@ -1782,10 +2102,168 @@ interface TaskTreeMutationArgs {
   next_reason?: string;
 }
 
+function extractPlannerTaskTreeMutation(
+  message: unknown,
+  session: AgentSession
+): TaskTreeMutationArgs | null {
+  const candidates: string[] = [];
+  collectTextCandidates(message, candidates);
+  for (const text of candidates) {
+    const jsonCandidates = [
+      ...[...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)].map((match) => match[1] ?? ""),
+      text
+    ];
+    for (const candidate of jsonCandidates) {
+      const parsed = parsePlannerJson(candidate);
+      const tasks = normalizeTaskItems(parsed?.tasks);
+      if (!tasks?.length) continue;
+      return {
+        action: "bootstrap",
+        tasks,
+        goal_restated: optionalString(parsed?.goal_restated) ?? (session.task_prompt.trim() || "完成用户请求"),
+        strategy: optionalString(parsed?.strategy) ?? "采用 task-planner 输出的需求契约、影响地图与依赖 DAG",
+        next_focus: tasks[0]?.id,
+        next_reason: "从第一个依赖就绪的计划节点开始"
+      };
+    }
+  }
+  return null;
+}
+
+function collectTextCandidates(value: unknown, target: string[], depth = 0): void {
+  if (depth > 8 || target.length > 200) return;
+  if (typeof value === "string") {
+    if (value.trim()) target.push(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectTextCandidates(item, target, depth + 1);
+    return;
+  }
+  if (!isPlainObject(value)) return;
+  for (const nested of Object.values(value)) {
+    collectTextCandidates(nested, target, depth + 1);
+  }
+}
+
+function parsePlannerJson(value: string): Record<string, unknown> | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    return isPlainObject(parsed) ? parsed : null;
+  } catch {
+    const start = trimmed.indexOf("{");
+    const end = trimmed.lastIndexOf("}");
+    if (start < 0 || end <= start) return null;
+    try {
+      const parsed = JSON.parse(trimmed.slice(start, end + 1));
+      return isPlainObject(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+}
+
+function normalizeTaskTreeMutationArgs(value: unknown): TaskTreeMutationArgs {
+  if (!isPlainObject(value)) {
+    throw new Error("任务树参数必须是对象");
+  }
+  const action = value.action;
+  if (action !== "bootstrap" && action !== "add" && action !== "update_status") {
+    throw new Error(`未知 action: ${String(action)}`);
+  }
+  return {
+    action,
+    tasks: normalizeTaskItems(value.tasks),
+    goal_restated: optionalString(value.goal_restated),
+    strategy: optionalString(value.strategy),
+    new_tasks: normalizeTaskItems(value.new_tasks),
+    add_reason: optionalString(value.add_reason),
+    task_id: optionalString(value.task_id),
+    new_status: normalizeTaskStatus(value.new_status),
+    status_reason: optionalString(value.status_reason),
+    evidence: optionalString(value.evidence),
+    next_focus: optionalString(value.next_focus),
+    next_reason: optionalString(value.next_reason)
+  };
+}
+
+function normalizeTaskItems(value: unknown): TaskTreeMutationArgs["tasks"] {
+  let candidate = value;
+  if (typeof candidate === "string") {
+    try {
+      candidate = JSON.parse(candidate);
+    } catch {
+      return undefined;
+    }
+  }
+  if (isPlainObject(candidate)) {
+    const nested = candidate.items ?? candidate.tasks;
+    if (Array.isArray(nested)) {
+      candidate = nested;
+    } else if (typeof candidate.id === "string") {
+      candidate = [candidate];
+    } else {
+      candidate = Object.entries(candidate).map(([id, item]) => (
+        isPlainObject(item) ? { id, ...item } : item
+      ));
+    }
+  }
+  if (!Array.isArray(candidate)) return undefined;
+  const tasks = candidate.flatMap((item) => {
+    if (!isPlainObject(item)) return [];
+    const id = optionalString(item.id);
+    const description = optionalString(item.description);
+    if (!id || !description) return [];
+    const dependencies = Array.isArray(item.dependencies)
+      ? item.dependencies.filter((dependency): dependency is string => typeof dependency === "string")
+      : typeof item.dependencies === "string" && item.dependencies.trim()
+        ? item.dependencies.split(",").map((dependency) => dependency.trim()).filter(Boolean)
+        : [];
+    return [{ id, description, dependencies }];
+  });
+  return tasks.length > 0 ? tasks : undefined;
+}
+
+function normalizeTaskStatus(value: unknown): TaskTreeMutationArgs["new_status"] {
+  return value === "in_progress" || value === "completed" || value === "blocked" || value === "skipped"
+    ? value
+    : undefined;
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function startCurrentProfileTask(session: AgentSession): string | null {
+  const tree = session.task_tree;
+  if (!tree) return null;
+  const focusedTask = tree.tasks.find((item) => item.id === tree.current_focus);
+  const task = (focusedTask?.status === "pending" ? focusedTask : undefined)
+    ?? tree.tasks.find((item) =>
+      item.status === "pending"
+      && item.dependencies.every((dependencyId) =>
+        tree.tasks.some((dependency) => dependency.id === dependencyId && dependency.status === "completed")
+      )
+    );
+  if (!task || task.status !== "pending") return null;
+  task.status = "in_progress";
+  task.status_reason = "委托 Task 子代理时由宿主自动开始";
+  tree.current_focus = task.id;
+  tree.updated_at = new Date().toISOString();
+  return `${task.id} → in_progress`;
+}
+
 function applyTaskTreeMutation(session: AgentSession, args: TaskTreeMutationArgs): string {
   const now = new Date().toISOString();
 
   if (args.action === "bootstrap") {
+    const existingIsHostRoot = session.task_tree?.tasks.length === 1
+      && session.task_tree.tasks[0]?.id === "host-goal";
+    if (session.task_tree && !existingIsHostRoot) {
+      return formatTaskTreeResponse(session.task_tree, "任务树已存在，忽略重复 bootstrap");
+    }
     if (!args.tasks || args.tasks.length === 0) {
       throw new Error("bootstrap 需要至少一个任务节点");
     }
@@ -1807,8 +2285,9 @@ function applyTaskTreeMutation(session: AgentSession, args: TaskTreeMutationArgs
     if (!hasValidTopologicalOrder(args.tasks)) {
       throw new Error("任务依赖存在循环——无法确定执行顺序，请消除循环依赖");
     }
+    const plannedTasks = appendFinalAuditTask(args.tasks);
     session.task_tree = {
-      tasks: args.tasks.map((t) => ({
+      tasks: plannedTasks.map((t) => ({
         id: t.id,
         description: t.description,
         dependencies: t.dependencies,
@@ -1821,7 +2300,10 @@ function applyTaskTreeMutation(session: AgentSession, args: TaskTreeMutationArgs
       created_at: now,
       updated_at: now,
     };
-    return formatTaskTreeResponse(session.task_tree, "任务树已初始化");
+    const provenance = hasCompletedSubagent(session, "task-planner")
+      ? "task-planner 计划已由宿主校验并接管"
+      : "主 Agent 计划已由宿主降级校验并接管";
+    return formatTaskTreeResponse(session.task_tree, `任务树已初始化（${provenance}）`);
   }
 
   if (!session.task_tree) {
@@ -1869,6 +2351,12 @@ function applyTaskTreeMutation(session: AgentSession, args: TaskTreeMutationArgs
     if (!node) {
       throw new Error(`任务 ${args.task_id} 不存在`);
     }
+    if (node.status === args.new_status) {
+      if (args.status_reason) node.status_reason = args.status_reason;
+      if (args.evidence) node.evidence = args.evidence;
+      session.task_tree.updated_at = now;
+      return formatTaskTreeResponse(session.task_tree, `${args.task_id} 已是 ${args.new_status}`);
+    }
 
     // 校验状态迁移合法性
     const validTransitions: Record<string, string[]> = {
@@ -1886,6 +2374,18 @@ function applyTaskTreeMutation(session: AgentSession, args: TaskTreeMutationArgs
     // completed 必须有 evidence
     if (args.new_status === "completed" && !args.evidence) {
       throw new Error("标记 completed 必须提供 evidence（验证命令输出或文件路径）");
+    }
+    if (args.new_status === "completed" && node.id === "host-final-audit") {
+      if (!hasCompletedSubagentForTask(session, "completeness-checker", node.id)) {
+        throw new Error("FINAL_AUDIT 门禁未通过：必须先成功运行 completeness-checker，并在调用中明确关联 host-final-audit");
+      }
+    } else if (args.new_status === "completed") {
+      if (!hasCompletedSubagentForTask(session, "task-executor", node.id)) {
+        throw new Error(`EXECUTE_ONE 门禁未通过：必须先成功运行 task-executor，并在调用中明确关联 ${node.id}`);
+      }
+      if (!hasCompletedSubagentForTask(session, "task-verifier", node.id)) {
+        throw new Error(`VERIFY_ONE 门禁未通过：必须先成功运行 task-verifier，并在调用中明确关联 ${node.id}`);
+      }
     }
 
     // completed 时校验依赖：所有依赖必须先 completed
@@ -1911,6 +2411,56 @@ function applyTaskTreeMutation(session: AgentSession, args: TaskTreeMutationArgs
   }
 
   throw new Error(`未知 action: ${args.action}`);
+}
+
+function appendFinalAuditTask(
+  tasks: NonNullable<TaskTreeMutationArgs["tasks"]>
+): NonNullable<TaskTreeMutationArgs["tasks"]> {
+  if (tasks.some((task) => task.id === "host-final-audit")) return tasks;
+  return [
+    ...tasks,
+    {
+      id: "host-final-audit",
+      description: "调用 completeness-checker 对全部 R-ID、最终 diff 和验证证据做独立完整性审计",
+      dependencies: tasks.map((task) => task.id)
+    }
+  ];
+}
+
+function hasCompletedSubagent(session: AgentSession, subagentType: string): boolean {
+  return session.tool_calls.some((toolCall) =>
+    toolCall.tool === "Task"
+    && toolCall.status === "completed"
+    && isPlainObject(toolCall.input)
+    && toolCall.input.subagent_type === subagentType
+  );
+}
+
+function hasCompletedSubagentForTask(
+  session: AgentSession,
+  subagentType: string,
+  taskId: string
+): boolean {
+  return session.tool_calls.some((toolCall) => {
+    if (
+      toolCall.tool !== "Task"
+      || toolCall.status !== "completed"
+      || !isPlainObject(toolCall.input)
+      || toolCall.input.subagent_type !== subagentType
+    ) {
+      return false;
+    }
+    const assignment = [
+      toolCall.input.description,
+      toolCall.input.prompt,
+      toolCall.input.task_id
+    ].filter((value): value is string => typeof value === "string").join("\n");
+    return new RegExp(`(^|[^A-Za-z0-9_-])${escapeRegExp(taskId)}([^A-Za-z0-9_-]|$)`).test(assignment);
+  });
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function buildTaskTreePromptSection(tree: TaskTree): string {

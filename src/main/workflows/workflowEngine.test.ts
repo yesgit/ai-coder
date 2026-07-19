@@ -391,6 +391,44 @@ describe("WorkflowEngine", () => {
     expect(session.stage_runs?.[0]).toMatchObject({ stage_id: "understand", stage_name: "Understand" });
   });
 
+  it("clears the task tree when restarting or resetting Profile mode", () => {
+    const engine = new WorkflowEngine();
+    const profileWorkflow: WorkflowTemplate = { ...workflow, stages: [] };
+    const session = createSession();
+    session.task_tree = {
+      goal_restated: "旧目标",
+      strategy: "旧计划",
+      current_focus: "old-task",
+      created_at: "old",
+      updated_at: "old",
+      tasks: [{
+        id: "old-task",
+        description: "旧任务",
+        dependencies: [],
+        status: "completed",
+        evidence: "旧证据"
+      }]
+    };
+
+    engine.restartFromBeginning(session, profileWorkflow);
+    expect(session.task_tree).toBeUndefined();
+
+    session.task_tree = {
+      goal_restated: "另一旧目标",
+      strategy: "另一旧计划",
+      created_at: "old",
+      updated_at: "old",
+      tasks: [{
+        id: "old-task-2",
+        description: "另一旧任务",
+        dependencies: [],
+        status: "pending"
+      }]
+    };
+    engine.resetSessionContext(session, profileWorkflow);
+    expect(session.task_tree).toBeUndefined();
+  });
+
   it("keeps repairing critical required output misses before hard blocking", () => {
     const engine = new WorkflowEngine();
     const session = createSession();

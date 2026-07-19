@@ -5,13 +5,18 @@ description: Diagnose a bug, failing test, unexpected runtime behavior, or unkno
 
 # Systematic Debugging
 
-Do not patch the first plausible cause.
+Do not patch the first plausible cause. Maintain a small hypothesis ledger:
 
-1. Reproduce or locate the observable failure. Record the exact symptom and boundary.
-2. Trace the execution path from the input or entry point to the failing behavior.
-3. Form a small, falsifiable hypothesis. State what observation would disprove it.
-4. Run the cheapest discriminating check. Update the hypothesis from the result.
-5. Change code only after the root cause is supported by evidence.
-6. Verify both that the original failure is fixed and that the closest related behavior still works.
+| Hypothesis | Supporting evidence | Disproving observation | Next discriminating check | State |
+|---|---|---|---|---|
+| H1 | observed fact | concrete result | one check | open/rejected/supported |
 
-If the failure cannot be reproduced or a critical input is missing, report that uncertainty instead of guessing.
+1. Record the exact symptom, input, environment, boundary, and expected behavior.
+2. Trace the execution path from the input or entry point to the first point where actual and expected state diverge.
+3. Form the smallest falsifiable hypothesis. Do not use “something is wrong with X.”
+4. Run the cheapest check that distinguishes competing hypotheses. Record the actual result.
+5. Treat every surprise as new evidence: update or reject the hypothesis before running another command. Never repeat an unchanged failed attempt.
+6. Change code only when one hypothesis is supported and explains the complete observed sequence.
+7. When practical, capture a regression test that fails before the fix. After editing, verify the original failure, the causal mechanism, and the closest related behavior.
+
+If the failure is intermittent, record frequency and control variables; do not call one passing run a fix. If it cannot be reproduced or a critical input is missing, report the bounded uncertainty and evidence collected instead of guessing.

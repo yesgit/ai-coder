@@ -5,13 +5,22 @@ description: Plan a change that spans multiple modules, has multiple viable desi
 
 # Plan a Complex Change
 
-First establish the user-visible result and the existing behavior that must survive.
+First establish requirement IDs and the existing behavior that must survive.
 
-Create a short plan with only the steps needed to reach that result. For each step, include:
+Before choosing an implementation, build a change-impact map from repository evidence:
 
-- the behavior it changes;
-- the files or symbols expected to be involved;
-- dependencies or risks;
-- how the result will be verified.
+| Surface | Current contract | Proposed effect | Evidence | Risk |
+|---|---|---|---|---|
+| callers/wrappers | arguments and assumptions | preserved/changed | path:line | low/medium/high |
 
-Prefer a plan organized by observable behavior, not by file or configuration entry. If a key design choice remains uncertain, investigate or ask before implementation. Do not turn a simple task into a ceremonial plan.
+Check at least the applicable surfaces: direct and indirect callers, shared wrappers, public API/types, persisted data and migrations, state transitions, events/jobs, configuration/defaults, permissions, external integrations, concurrency/ordering, and deployment/runtime packaging. Mark an applicable but unresolved surface `unknown`; do not omit it.
+
+Create a short plan organized by observable behavior. Each step must include:
+
+- linked requirement IDs and preserved invariants;
+- symbols/files and why each is causally required;
+- dependencies and failure modes;
+- verification oracle, including a negative or regression path where relevant;
+- migration, rollout, and rollback action when contracts or stored state can outlive one process.
+
+No high-risk or `unknown` impact may be hidden inside an implementation step. Investigate it, split a reversible seam, or obtain the missing decision first. Do not turn a simple task into a ceremonial plan.

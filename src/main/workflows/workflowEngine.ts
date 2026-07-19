@@ -314,6 +314,7 @@ export class WorkflowEngine {
     session.stage_runs = [];
     session.rework_requests = [];
     session.approvals = [];
+    session.task_tree = undefined;
     session.error = undefined;
     session.status = "running";
 
@@ -343,6 +344,7 @@ export class WorkflowEngine {
     session.rework_requests = [];
     session.pending_human_questions = [];
     session.progress_events = [];
+    session.task_tree = undefined;
     session.error = undefined;
     session.status = "running";
 

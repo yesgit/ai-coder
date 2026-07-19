@@ -7,11 +7,27 @@ description: Preserve the user's actual outcome before planning, debugging, or c
 
 The user's observable outcome is the contract. Existing plans, configuration names, and earlier agent summaries are evidence, not replacement requirements.
 
-1. State the requested user-visible result in one sentence.
-2. Separate it from proposed mechanisms. “Add navigation” is not the same as “add route metadata.”
-3. List in-scope behavior, preserved behavior, and the smallest evidence needed to prove each.
-4. Treat user answers as binding. Carry them forward verbatim enough that later work cannot silently narrow them.
-5. Ask a question only when the answer would materially change the implementation, safety, or acceptance criteria. Otherwise make the smallest reversible assumption and label it.
+Before planning, produce a requirement contract. Keep it in the task tree or working notes so later steps can cite stable IDs:
+
+| ID | Observable result | Source | Verification oracle | Status |
+|---|---|---|---|---|
+| R1 | What a user or caller can observe | request/answer/spec location | test, command, or manual observation | confirmed/assumed/blocked |
+
+The contract must also name:
+
+- `preserved_behaviors`: behavior explicitly or implicitly required to remain;
+- `out_of_scope`: nearby work that must not be absorbed;
+- `blocking_unknowns`: unknowns whose answers would change behavior, safety, or acceptance;
+- `assumptions`: reversible defaults, their evidence, and how they will be verified.
+
+Rules:
+
+1. State each requested user-visible result separately. Do not combine multiple obligations into “support the feature.”
+2. Separate outcomes from proposed mechanisms. “Add navigation” is not the same as “add route metadata.”
+3. Give every requirement an independent observable oracle. “Code changed” and “configuration exists” are not oracles unless that is itself the requested result.
+4. Treat user answers as binding and update the same requirement IDs. Never silently narrow “all”, a range, or an earlier answer.
+5. Map every implementation task to one or more requirement IDs. A task with no requirement link is scope expansion.
+6. Ask a question only when the answer would materially change the implementation, safety, or acceptance criteria. Otherwise make the smallest reversible assumption and label it.
 
 If the user names a branch, revision, snapshot, generated artifact, or other baseline, establish it before using code as evidence. Record the effective baseline with a command result. When the user says to ignore the current working tree, inspect code through that baseline (`git show`, an isolated worktree, or an equivalent immutable source); never cite the ignored tree as evidence.
 
@@ -42,6 +58,6 @@ Reject these patterns:
 - Asking how an existing feature is triggered before tracing the adjacent implementation and its runtime consumer.
 - Asking for priority when the request requires the whole stated scope and no ordering decision blocks implementation.
 
-Before implementation, check: “Would the user recognize the requested result as working, even if they never saw this diff?” If not, the requirement is not yet represented.
+Do not plan implementation while a `blocking_unknown` remains unresolved. Before implementation, check: “Would the user recognize every R-ID as working, even if they never saw this diff?” If not, the requirement is not yet represented.
 
 For code behavior, express acceptance as `observable result + source + verification`. Keep implementation guesses out of acceptance criteria until code evidence supports them.

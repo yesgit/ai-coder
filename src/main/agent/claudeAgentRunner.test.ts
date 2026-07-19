@@ -2,7 +2,7 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildClaudeSdkEnv, ClaudeAgentRunner, describeSdkMessageSnippet, describeToolAttempt, evaluateHumanQuestionRequest, evaluateProfileCompletion, extractSdkTerminalError, extractSdkToolUses, extractToolExecutionResult, parseBestStageAgentResult } from "./claudeAgentRunner.js";
+import { buildClaudeSdkEnv, ClaudeAgentRunner, describeSdkMessageSnippet, describeToolAttempt, evaluateHumanQuestionRequest, evaluateProfileCompletion, extractSdkTerminalError, extractSdkToolUses, extractToolExecutionResult, formatProfileAttachmentList, hasSuccessfulSdkTerminalResult, parseBestStageAgentResult } from "./claudeAgentRunner.js";
 import type { AgentSession, WorkflowTemplate } from "../../shared/types.js";
 
 const workflow: WorkflowTemplate = {
@@ -30,6 +30,284 @@ async function waitFor(assertion: () => boolean): Promise<void> {
 }
 
 describe("ClaudeAgentRunner", () => {
+  it("preserves a successful Profile result when the SDK process crashes during cleanup", async () => {
+    const profileWorkflow: WorkflowTemplate = {
+      ...workflow,
+      id: "profile-workflow",
+      stages: []
+    };
+    async function* query() {
+      yield {
+        type: "assistant",
+        message: { content: [{ type: "text", text: "Implementation and verification completed." }] }
+      };
+      yield {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        result: "Done"
+      };
+      throw new Error("Claude Code process terminated by signal SIGSEGV");
+    }
+    const session = {
+      id: "00000000-0000-4000-8000-000000000071",
+      project_path: "/tmp/project",
+      workflow_id: profileWorkflow.id,
+      task_prompt: "Complete the task",
+      status: "running",
+      current_stage: "profile",
+      messages: [],
+      tool_calls: [],
+      file_changes: [],
+      approvals: [],
+      stage_runs: [],
+      rework_requests: [],
+      progress_events: [],
+      task_tree: {
+        goal_restated: "完成任务",
+        strategy: "实现并验证",
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        tasks: [{
+          id: "t1",
+          description: "实现并验证",
+          dependencies: [],
+          status: "completed",
+          evidence: "tests passed"
+        }]
+      },
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    } as AgentSession;
+
+    const updated = await new ClaudeAgentRunner(query).run({ session, workflow: profileWorkflow });
+
+    expect(updated.status, updated.error).toBe("completed");
+    expect(updated.error).toBeUndefined();
+    expect(updated.messages.at(-1)?.content).toContain("Implementation and verification completed.");
+    expect(updated.progress_events?.some((event) =>
+      event.message.includes("SDK 已返回成功结果；子进程随后异常退出，本轮结果已保留")
+    )).toBe(true);
+    expect(updated.progress_events?.some((event) => event.message.startsWith("API 调用失败："))).toBe(false);
+  });
+
+  it("retries a Profile subprocess crash that occurs before a successful terminal result", async () => {
+    const profileWorkflow: WorkflowTemplate = {
+      ...workflow,
+      id: "profile-workflow",
+      stages: []
+    };
+    let attempt = 0;
+    async function* query() {
+      attempt += 1;
+      if (attempt === 1) {
+        throw new Error("Claude Code process terminated by signal SIGSEGV");
+      }
+      yield { type: "result", subtype: "success", is_error: false, result: "Recovered" };
+    }
+    const session = {
+      id: "00000000-0000-4000-8000-000000000072",
+      project_path: "/tmp/project",
+      workflow_id: profileWorkflow.id,
+      task_prompt: "Complete the task",
+      status: "running",
+      current_stage: "profile",
+      messages: [],
+      tool_calls: [],
+      file_changes: [],
+      approvals: [],
+      stage_runs: [],
+      rework_requests: [],
+      progress_events: [],
+      task_tree: {
+        goal_restated: "完成任务",
+        strategy: "实现并验证",
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        tasks: [{
+          id: "t1",
+          description: "实现并验证",
+          dependencies: [],
+          status: "completed",
+          evidence: "tests passed"
+        }]
+      },
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    } as AgentSession;
+
+    const updated = await new ClaudeAgentRunner(query).run({ session, workflow: profileWorkflow });
+
+    expect(attempt).toBe(2);
+    expect(updated.status, updated.error).toBe("completed");
+    expect(updated.messages.at(-1)?.content).toBe("Recovered");
+  });
+
+  it("applies task-tree mutations in the host permission callback when the MCP handler produces no state", async () => {
+    const projectPath = await mkdtemp(path.join(tmpdir(), "ai-coder-profile-"));
+    await mkdir(path.join(projectPath, ".ai-coder/uploads/spec"), { recursive: true });
+    await writeFile(path.join(projectPath, ".ai-coder/uploads/spec/page-19.png"), "fixture");
+    const profileWorkflow: WorkflowTemplate = {
+      ...workflow,
+      id: "profile-workflow",
+      stages: [],
+      agents: {
+        "task-planner": { description: "plan", prompt: "plan" },
+        "task-executor": { description: "execute", prompt: "execute" },
+        "task-verifier": { description: "verify", prompt: "verify" },
+        "completeness-checker": { description: "audit", prompt: "audit" }
+      }
+    };
+    let receivedPrompt = "";
+    async function* query(params: unknown) {
+      const typed = params as {
+        prompt: string;
+        options: {
+          canUseTool: (
+            toolName: string,
+            input: Record<string, unknown>,
+            options: { toolUseID: string }
+          ) => Promise<unknown>;
+        };
+      };
+      receivedPrompt = typed.prompt;
+      await typed.options.canUseTool("mcp__ai_coder__update_task_tree", {
+        action: "bootstrap",
+        goal_restated: "实现附件需求",
+        strategy: "按实现和验证拆分",
+        tasks: {
+          t1: { description: "实现并验证", dependencies: [] }
+        },
+        next_focus: "t1",
+        next_reason: "开始实现"
+      }, { toolUseID: "tree-bootstrap" });
+      await typed.options.canUseTool("mcp__ai_coder__update_task_tree", {
+        action: "bootstrap",
+        tasks: { malformed: "not-a-task" }
+      }, { toolUseID: "tree-duplicate-bootstrap" });
+      await typed.options.canUseTool("Task", {
+        subagent_type: "task-executor",
+        description: "执行 t1"
+      }, { toolUseID: "task-t1" });
+      await typed.options.canUseTool("mcp__ai_coder__update_task_tree", {
+        action: "update_status",
+        task_id: "t1",
+        new_status: "completed",
+        evidence: "npm test: passed"
+      }, { toolUseID: "tree-complete" });
+      await typed.options.canUseTool("Task", {
+        subagent_type: "completeness-checker",
+        description: "审计 host-final-audit"
+      }, { toolUseID: "task-final-audit" });
+      await typed.options.canUseTool("mcp__ai_coder__update_task_tree", {
+        action: "update_status",
+        task_id: "host-final-audit",
+        new_status: "completed",
+        evidence: "completeness-checker: all requirements covered"
+      }, { toolUseID: "tree-final-audit" });
+      yield { type: "result", subtype: "success", is_error: false, result: "Done" };
+    }
+    const session = {
+      id: "00000000-0000-4000-8000-000000000073",
+      project_path: projectPath,
+      workflow_id: profileWorkflow.id,
+      task_prompt: "实现附件需求",
+      initial_user_message: {
+        role: "user",
+        content: "实现附件需求",
+        created_at: new Date().toISOString(),
+        attachments: [{
+          type: "file_ref",
+          path: ".ai-coder/uploads/spec/page-19.png",
+          display_name: "需求.pdf · 第 19 页 / 共 21 页"
+        }]
+      },
+      status: "running",
+      current_stage: "profile",
+      messages: [],
+      tool_calls: [
+        {
+          id: "executor-completed",
+          stage_id: "profile",
+          tool: "Task",
+          input: { subagent_type: "task-executor", description: "执行 t1" },
+          status: "completed",
+          created_at: new Date().toISOString()
+        },
+        {
+          id: "verifier-completed",
+          stage_id: "profile",
+          tool: "Task",
+          input: { subagent_type: "task-verifier", description: "验证 t1" },
+          status: "completed",
+          created_at: new Date().toISOString()
+        },
+        {
+          id: "audit-completed",
+          stage_id: "profile",
+          tool: "Task",
+          input: { subagent_type: "completeness-checker", description: "审计 host-final-audit" },
+          status: "completed",
+          created_at: new Date().toISOString()
+        }
+      ],
+      file_changes: [],
+      approvals: [],
+      stage_runs: [],
+      rework_requests: [],
+      progress_events: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    } as AgentSession;
+
+    const updated = await new ClaudeAgentRunner(query).run({ session, workflow: profileWorkflow });
+
+    expect(updated.status, updated.error).toBe("completed");
+    expect(updated.task_tree?.tasks).toEqual([
+      expect.objectContaining({ id: "t1", status: "completed", evidence: "npm test: passed" }),
+      expect.objectContaining({ id: "host-final-audit", status: "completed" })
+    ]);
+    expect(receivedPrompt).toContain(".ai-coder/uploads/spec/page-19.png");
+    expect(receivedPrompt).toContain("需求.pdf · 第 19 页 / 共 21 页");
+  });
+
+  it("stops after three successful queries with no verifiable progress", async () => {
+    const profileWorkflow: WorkflowTemplate = {
+      ...workflow,
+      id: "profile-workflow",
+      stages: []
+    };
+    let attempts = 0;
+    async function* query() {
+      attempts += 1;
+      yield { type: "result", subtype: "success", is_error: false, result: "Still planning" };
+    }
+    const session = {
+      id: "00000000-0000-4000-8000-000000000074",
+      project_path: "/tmp/project",
+      workflow_id: profileWorkflow.id,
+      task_prompt: "Complete the task",
+      status: "running",
+      current_stage: "profile",
+      messages: [],
+      tool_calls: [],
+      file_changes: [],
+      approvals: [],
+      stage_runs: [],
+      rework_requests: [],
+      progress_events: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    } as AgentSession;
+
+    const updated = await new ClaudeAgentRunner(query).run({ session, workflow: profileWorkflow });
+
+    expect(attempts).toBe(3);
+    expect(updated.status).toBe("interrupted");
+    expect(updated.error).toContain("连续 3 轮没有可验证进展");
+    expect(updated.error).toContain("host-goal(in_progress)");
+  });
+
   it("does not override the configured provider model when retrying a Profile timeout", async () => {
     const profileWorkflow: WorkflowTemplate = {
       ...workflow,
@@ -78,15 +356,28 @@ describe("ClaudeAgentRunner", () => {
       stage_runs: [],
       rework_requests: [],
       progress_events: [],
+      task_tree: {
+        goal_restated: "完成任务",
+        strategy: "实现并验证",
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        tasks: [{
+          id: "t1",
+          description: "实现并验证",
+          dependencies: [],
+          status: "completed",
+          evidence: "tests passed"
+        }]
+      },
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString()
     };
 
     const updated = await new ClaudeAgentRunner(query).run({ session, workflow: profileWorkflow });
 
-    expect(attemptedModels).toEqual([undefined, undefined, undefined]);
-    expect(updated.status).toBe("interrupted");
-    expect(updated.error).toContain("尚未建立任务树");
+    expect(attemptedModels).toEqual([undefined, undefined]);
+    expect(updated.status).toBe("completed");
+    expect(updated.error).toBeUndefined();
     expect(updated.messages.at(-1)?.content).toBe("Recovered");
     expect(updated.progress_events?.some((event) => event.message === "API 调用失败：Request timed out")).toBe(true);
     expect(updated.progress_events?.some((event) => event.message.includes("切换到 Claude"))).toBe(false);
@@ -311,6 +602,159 @@ describe("ClaudeAgentRunner", () => {
     expect(session.tool_calls[0]).toMatchObject({ id: "read-1", stage_id: "understand", tool: "Read", status: "completed" });
   });
 
+  it("marks Task results containing an embedded API error as blocked", () => {
+    const runner = new ClaudeAgentRunner(async function* () {});
+    const session = {
+      id: "task-error", project_path: "/tmp/project", workflow_id: workflow.id, task_prompt: "inspect",
+      status: "running", current_stage: "profile", messages: [], tool_calls: [{
+        id: "explore-1",
+        stage_id: "profile",
+        tool: "Task",
+        input: { subagent_type: "Explore" },
+        status: "requested",
+        created_at: new Date().toISOString()
+      }], file_changes: [], approvals: [], stage_runs: [], rework_requests: [],
+      created_at: new Date().toISOString(), updated_at: new Date().toISOString()
+    } as AgentSession;
+
+    (runner as unknown as { recordToolExecutionResult(session: AgentSession, message: unknown): void })
+      .recordToolExecutionResult(session, {
+        type: "user",
+        tool_use_result: {
+          status: "completed",
+          prompt: "long planner context ".repeat(300),
+          content: [{ type: "text", text: "API Error: 404 Model not found: claude-haiku" }]
+        },
+        message: { content: [{ type: "tool_result", tool_use_id: "explore-1", is_error: false }] }
+      });
+
+    expect(session.tool_calls[0]).toMatchObject({ status: "blocked" });
+  });
+
+  it("turns a successful task-planner JSON result into the host task DAG", () => {
+    const runner = new ClaudeAgentRunner(async function* () {});
+    const session = {
+      id: "planner-result", project_path: "/tmp/project", workflow_id: workflow.id, task_prompt: "实现 R1",
+      status: "running", current_stage: "profile", messages: [], tool_calls: [{
+        id: "planner-1",
+        stage_id: "profile",
+        tool: "Task",
+        input: { subagent_type: "task-planner" },
+        status: "requested",
+        created_at: new Date().toISOString()
+      }], file_changes: [], approvals: [], stage_runs: [], rework_requests: [],
+      task_tree: {
+        goal_restated: "实现 R1",
+        strategy: "宿主根任务",
+        current_focus: "host-goal",
+        tasks: [{ id: "host-goal", description: "完成用户请求", dependencies: [], status: "in_progress" }],
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      },
+      created_at: new Date().toISOString(), updated_at: new Date().toISOString()
+    } as AgentSession;
+    const plannerJson = {
+      requirements: [{ id: "R1", observable_result: "可跳转" }],
+      tasks: [
+        { id: "t1", description: "R1: 实现跳转", dependencies: [] },
+        { id: "t2", description: "R1: 验证跳转", dependencies: ["t1"] }
+      ],
+      blocking_unknowns: []
+    };
+
+    (runner as unknown as { recordToolExecutionResult(session: AgentSession, message: unknown): void })
+      .recordToolExecutionResult(session, {
+        type: "user",
+        tool_use_result: {
+          status: "completed",
+          content: [{ type: "text", text: `计划如下：\n\`\`\`json\n${JSON.stringify(plannerJson)}\n\`\`\`` }]
+        },
+        message: { content: [{ type: "tool_result", tool_use_id: "planner-1", is_error: false }] }
+      });
+
+    expect(session.tool_calls[0]).toMatchObject({ status: "completed" });
+    expect(session.task_tree?.tasks.map((task) => task.id)).toEqual(["t1", "t2", "host-final-audit"]);
+    expect(session.task_tree?.current_focus).toBe("t1");
+  });
+
+  it("interrupts before querying when a declared file_ref attachment is missing", async () => {
+    let queried = false;
+    const projectPath = await mkdtemp(path.join(tmpdir(), "ai-coder-missing-attachment-"));
+    const profileWorkflow: WorkflowTemplate = { ...workflow, id: "profile-workflow", stages: [] };
+    const session = {
+      id: "missing-attachment", project_path: projectPath, workflow_id: profileWorkflow.id,
+      task_prompt: "实现附件需求", status: "running", current_stage: "profile", messages: [],
+      initial_user_message: {
+        role: "user",
+        content: "实现附件需求",
+        created_at: new Date().toISOString(),
+        attachments: [{
+          type: "file_ref",
+          path: ".ai-coder/uploads/spec/page-21.png",
+          display_name: "需求.pdf · 第 21 页"
+        }]
+      },
+      tool_calls: [], file_changes: [], approvals: [], stage_runs: [], rework_requests: [],
+      created_at: new Date().toISOString(), updated_at: new Date().toISOString()
+    } as AgentSession;
+
+    const updated = await new ClaudeAgentRunner(async function* () {
+      queried = true;
+    }).run({ session, workflow: profileWorkflow });
+
+    expect(queried).toBe(false);
+    expect(updated.status).toBe("interrupted");
+    expect(updated.error).toContain("附件完整性检查失败");
+    expect(updated.task_tree).toBeUndefined();
+  });
+
+  it("denies undeclared subagents and mutating Bash commands while PLAN is active", async () => {
+    const decisions: unknown[] = [];
+    const profileWorkflow: WorkflowTemplate = {
+      ...workflow,
+      id: "profile-workflow",
+      stages: [],
+      agents: {
+        "task-planner": { description: "plan", prompt: "plan" }
+      }
+    };
+    async function* query(params: unknown) {
+      const canUseTool = (params as {
+        options: {
+          canUseTool: (
+            toolName: string,
+            input: Record<string, unknown>,
+            options: { toolUseID: string }
+          ) => Promise<unknown>;
+        };
+      }).options.canUseTool;
+      decisions.push(await canUseTool("Task", {
+        subagent_type: "Explore",
+        description: "scan"
+      }, { toolUseID: "unknown-agent" }));
+      decisions.push(await canUseTool("Bash", {
+        command: "git -C /tmp/project cherry-pick abc123"
+      }, { toolUseID: "mutating-bash" }));
+      yield { type: "result", subtype: "success", is_error: false, result: "not done" };
+    }
+    const session = {
+      id: "plan-gates", project_path: "/tmp/project", workflow_id: profileWorkflow.id,
+      task_prompt: "implement", status: "running", current_stage: "profile", messages: [],
+      tool_calls: [], file_changes: [], approvals: [], stage_runs: [], rework_requests: [],
+      created_at: new Date().toISOString(), updated_at: new Date().toISOString()
+    } as AgentSession;
+
+    const updated = await new ClaudeAgentRunner(query).run({ session, workflow: profileWorkflow });
+
+    expect(updated.status).toBe("interrupted");
+    expect(decisions).not.toHaveLength(0);
+    expect(decisions.every((decision) =>
+      (decision as { behavior?: string }).behavior === "deny"
+    )).toBe(true);
+    expect(JSON.stringify(decisions)).toContain("未由当前工作流声明");
+    expect(JSON.stringify(decisions)).toContain("禁止通过 Bash 修改");
+  });
+
   it("loads configured local Plugins into the SDK session", async () => {
     let receivedOptions: Record<string, unknown> | undefined;
     async function* query(params: unknown) {
@@ -359,6 +803,72 @@ describe("ClaudeAgentRunner", () => {
     expect(receivedOptions?.hooks).toBeUndefined();
     expect(receivedOptions?.permissionMode).toBe("default");
     expect(receivedOptions?.allowDangerouslySkipPermissions).toBeUndefined();
+  });
+
+  it("injects full Profile Skill bodies as host-enforced contracts", async () => {
+    const pluginPath = await mkdtemp(path.join(tmpdir(), "careful-profile-skill-"));
+    const skillPath = path.join(pluginPath, "skills", "profile-contract");
+    await mkdir(skillPath, { recursive: true });
+    const longBody = `${"evidence ".repeat(40)}FULL_CONTRACT_SENTINEL`;
+    await writeFile(
+      path.join(skillPath, "SKILL.md"),
+      `---\nname: profile-contract\ndescription: Profile contract.\n---\n\n${longBody}\n`
+    );
+    let systemAppend = "";
+    async function* query(params: unknown) {
+      systemAppend = String((params as {
+        options?: { systemPrompt?: { append?: unknown } };
+      }).options?.systemPrompt?.append ?? "");
+      yield { type: "result", subtype: "success", is_error: false, result: "Done" };
+    }
+    const profileWorkflow: WorkflowTemplate = {
+      ...workflow,
+      id: "profile-workflow",
+      stages: [],
+      skills: ["profile-contract"]
+    };
+    const session = {
+      id: "00000000-0000-4000-8000-000000000075",
+      project_path: "/tmp/project",
+      workflow_id: profileWorkflow.id,
+      task_prompt: "Complete the task",
+      status: "running",
+      current_stage: "profile",
+      messages: [],
+      tool_calls: [],
+      file_changes: [],
+      approvals: [],
+      stage_runs: [],
+      rework_requests: [],
+      progress_events: [],
+      task_tree: {
+        goal_restated: "完成任务",
+        strategy: "已完成",
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        tasks: [{
+          id: "done",
+          description: "完成",
+          dependencies: [],
+          status: "completed",
+          evidence: "tests passed"
+        }]
+      },
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    } as AgentSession;
+
+    const updated = await new ClaudeAgentRunner({
+      queryOverride: query,
+      pluginPaths: [pluginPath]
+    }).run({ session, workflow: profileWorkflow });
+
+    expect(updated.status).toBe("completed");
+    expect(systemAppend).toContain("宿主强制加载的 Skills");
+    expect(systemAppend).toContain("FULL_CONTRACT_SENTINEL");
+    expect(updated.progress_events?.some((event) =>
+      event.message === "宿主强制加载 Skill：careful-coder:profile-contract"
+    )).toBe(true);
   });
 
   it("injects required core Skill content before a stage can run", async () => {
@@ -1186,6 +1696,16 @@ describe("evaluateProfileCompletion", () => {
   });
 });
 
+describe("formatProfileAttachmentList", () => {
+  it("keeps the exact readable path instead of only the display name", () => {
+    expect(formatProfileAttachmentList([{
+      type: "file_ref",
+      path: ".ai-coder/uploads/id/page-21.png",
+      display_name: "需求.pdf · 第 21 页 / 共 21 页"
+    }])).toContain(".ai-coder/uploads/id/page-21.png");
+  });
+});
+
 describe("extractSdkTerminalError", () => {
   it("does not treat a successful result as an error", () => {
     expect(extractSdkTerminalError([
@@ -1197,5 +1717,14 @@ describe("extractSdkTerminalError", () => {
     expect(extractSdkTerminalError([
       { type: "result", subtype: "error_max_turns", is_error: true, result: "Reached max turns" }
     ])).toBe("error_max_turns: Reached max turns");
+  });
+
+  it("recognizes only a non-error success as a successful terminal result", () => {
+    expect(hasSuccessfulSdkTerminalResult([
+      { type: "result", subtype: "success", is_error: false, result: "done" }
+    ])).toBe(true);
+    expect(hasSuccessfulSdkTerminalResult([
+      { type: "result", subtype: "error_during_execution", is_error: true, result: "failed" }
+    ])).toBe(false);
   });
 });

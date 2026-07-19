@@ -1,0 +1,4 @@
+interface:
+  display_name: "调用契约调查"
+  short_description: "调查函数或组件的调用方、参数组合、前置条件与输入输出契约"
+  default_prompt: "Use $investigating-call-contracts to investigate this existing function or component before changing it."

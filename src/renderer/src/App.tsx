@@ -20,6 +20,7 @@ import { summarizeSessionTitle } from "../../shared/sessionTitle.js";
 import { getVisibleSessions, groupSessionsByProject, resolveActiveSessionId, resolveComposerSession } from "./sessionSelection.js";
 import { buildWorkflowStageDisplays } from "./workflowStageStatus.js";
 import { formatStageRunCardDetail } from "./stageRunPresentation.js";
+import { getProfileAgentStatus, getProfileSkillStatus } from "./profileCapabilityStatus.js";
 import TaskTreePanel from "./TaskTreePanel.js";
 import {
   formatStageName,
@@ -1385,12 +1386,15 @@ export default function App() {
                     <div style={{ marginBottom: "12px" }}>
                       <small className="muted">Skills</small>
                       <div className="stages">
-                        {activeWorkflow.skills.map((s) => (
-                          <div key={s} className="stage not_started">
-                            <span className="stage-indicator not_started" />
-                            <div><small>{s}</small></div>
-                          </div>
-                        ))}
+                        {activeWorkflow.skills.map((s) => {
+                          const status = getProfileSkillStatus(activeSession, s);
+                          return (
+                            <div key={s} className={`stage ${status}`}>
+                              <span className={`stage-indicator ${status}`} />
+                              <div><small>{s}</small></div>
+                            </div>
+                          );
+                        })}
                       </div>
                     </div>
                   )}
@@ -1398,15 +1402,18 @@ export default function App() {
                     <div style={{ marginBottom: "12px" }}>
                       <small className="muted">Sub-Agents</small>
                       <div className="stages">
-                        {Object.entries(activeWorkflow.agents).map(([name, def]) => (
-                          <div key={name} className="stage not_started">
-                            <span className="stage-indicator not_started" />
-                            <div>
-                              <small><strong>{name}</strong></small>
-                              <small className="muted">{def.description}</small>
+                        {Object.entries(activeWorkflow.agents).map(([name, def]) => {
+                          const status = getProfileAgentStatus(activeSession, name);
+                          return (
+                            <div key={name} className={`stage ${status}`}>
+                              <span className={`stage-indicator ${status}`} />
+                              <div>
+                                <small><strong>{name}</strong></small>
+                                <small className="muted">{def.description}</small>
+                              </div>
                             </div>
-                          </div>
-                        ))}
+                          );
+                        })}
                       </div>
                     </div>
                   )}

@@ -3,7 +3,7 @@ import path from "node:path";
 import { WorkflowRegistry } from "./workflowRegistry.js";
 
 /**
- * 谨慎程序员 yaml v5.0 快照验证。
+ * 谨慎程序员 yaml v5.2 快照验证。
  *
  * v5.0 根本架构变更（v4.0 阶段引擎 → Profile 模式）：
  * - 砍掉所有阶段管线（maintain_project_profile / plan / implement / verify）
@@ -30,7 +30,7 @@ describe("careful-coder.yaml latest", () => {
     expect(listed.map((workflow) => workflow.id)).toEqual(["careful-coder"]);
 
     const v5 = await loadV5();
-    expect(v5.version).toBe("5.0.0");
+    expect(v5.version).toBe("5.2.0");
     expect(v5.name).toBe("谨慎程序员");
     expect(v5.routing?.auto_start).toBe(true);
   });
@@ -56,9 +56,18 @@ describe("careful-coder.yaml latest", () => {
     expect(v5.system_prompt).toContain("验证命令");
     expect(v5.system_prompt).toContain("unknown");
     expect(v5.system_prompt).toContain("重新阅读用户原始请求");
+    expect(v5.system_prompt).toContain("investigating-call-contracts");
+    expect(v5.system_prompt).toContain("未完成调查不得编辑目标");
+    expect(v5.system_prompt).toContain("稳定 R-ID");
+    expect(v5.system_prompt).toContain("影响地图");
+    expect(v5.system_prompt).toContain("验证矩阵");
+    expect(v5.system_prompt).toContain("PLAN");
+    expect(v5.system_prompt).toContain("EXECUTE_ONE");
+    expect(v5.system_prompt).toContain("VERIFY_ONE");
+    expect(v5.system_prompt).toContain("FINAL_AUDIT");
   });
 
-  it("has all 9 skills configured", async () => {
+  it("has all 10 skills configured", async () => {
     const v5 = await loadV5();
     expect(v5.skills).toEqual([
       "clarifying-requirements",
@@ -69,23 +78,29 @@ describe("careful-coder.yaml latest", () => {
       "task-decomposition",
       "verification-before-completion",
       "systematic-debugging",
-      "cautious-calling"
+      "cautious-calling",
+      "investigating-call-contracts"
     ]);
   });
 
-  it("registers 4 sub-agents (3 verification + 1 task-executor)", async () => {
+  it("registers the planner/executor/verifier/auditor roles and contract investigator", async () => {
     const v5 = await loadV5();
     expect(v5.agents).toBeDefined();
-    expect(Object.keys(v5.agents!)).toHaveLength(4);
+    expect(Object.keys(v5.agents!)).toHaveLength(6);
+    expect(v5.agents).toHaveProperty("task-planner");
     expect(v5.agents).toHaveProperty("task-verifier");
     expect(v5.agents).toHaveProperty("pre-behavior-snapshot");
     expect(v5.agents).toHaveProperty("completeness-checker");
+    expect(v5.agents).toHaveProperty("call-contract-investigator");
     expect(v5.agents).toHaveProperty("task-executor");
 
     // verification agents are read-only
     expect(v5.agents!["task-verifier"].tools).not.toContain("edit_file");
+    expect(v5.agents!["task-planner"].tools).not.toContain("Edit");
     expect(v5.agents!["pre-behavior-snapshot"].tools).not.toContain("edit_file");
     expect(v5.agents!["completeness-checker"].tools).not.toContain("edit_file");
+    expect(v5.agents!["call-contract-investigator"].tools).not.toContain("Edit");
+    expect(v5.agents!["call-contract-investigator"].tools).toContain("mcp__ai_coder__analyze_symbol_contract");
     // task-executor can write
     expect(v5.agents!["task-executor"].tools).toContain("Edit");
   });
