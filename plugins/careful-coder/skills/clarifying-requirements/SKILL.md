@@ -33,6 +33,8 @@ If the user names a branch, revision, snapshot, generated artifact, or other bas
 
 For an attachment or specification containing a range, table, repeated records, identifiers, or mappings, build a source-of-truth matrix before interpreting implementation. Preserve exact identifiers and duplicates. Each row must include `item/range identity + exact value + source location + confidence`. Resolve missing endpoints, duplicate numbers, parent/child relationships, and count mismatches before planning.
 
+If any attachment listed in the manifest returns empty or unreadable content (e.g., Read returns no text, image cannot be decoded), stop the extraction immediately. Record the failing path as a `blocking_unknown` with the exact path and the reason `"Attachment <path> returned no content — requirements cannot be confirmed"`. Do not substitute with similarly-named files found elsewhere in the project.
+
 ## Evidence-before-question gate
 
 Treat a human question as an expensive blocking operation, not as an interview.

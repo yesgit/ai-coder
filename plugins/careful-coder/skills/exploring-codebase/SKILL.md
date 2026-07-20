@@ -20,3 +20,10 @@ When requirements use Chinese business terms, or the repository contains pinyin 
 Represent the result as a causal path: `trigger → consumer/processing → guards and state → side effects → observable result`, with a source for every non-obvious claim. For non-runtime artifacts, use the equivalent production path from authoring input to consumed output.
 
 Before declaring the investigation sufficient, answer: “What invokes this code at runtime, and what proves the requested outcome happens after invocation?”
+
+## 附件边界
+
+- 需求来源只能是宿主”精确附件清单”中明确列出的路径。
+- 不得自行发现并假设项目内的图片、文档、配置文件为需求来源。
+- 如果附件清单中的文件 Read 返回空内容，这是 blocking_unknown——不要搜索替代文件。
+- 附件路径中包含 UUID 目录名——不得猜测、缩写、补写页码或修改路径的任何部分。

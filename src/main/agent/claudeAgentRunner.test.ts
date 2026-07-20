@@ -2,7 +2,7 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildClaudeSdkEnv, buildCompletionContinuationContext, ClaudeAgentRunner, describeSdkMessageSnippet, describeToolAttempt, evaluateHumanQuestionRequest, evaluateProfileCompletion, extractSdkTerminalError, extractSdkToolUses, extractToolExecutionResult, formatProfileAttachmentList, hasSuccessfulSdkTerminalResult, parseBestStageAgentResult, validateProfileToolInput } from "./claudeAgentRunner.js";
+import { buildClaudeSdkEnv, buildCompletionContinuationContext, ClaudeAgentRunner, describeSdkMessageSnippet, describeToolAttempt, detectCorruptedToolName, evaluateHumanQuestionRequest, evaluateProfileCompletion, extractSdkTerminalError, extractSdkToolUses, extractToolExecutionResult, formatProfileAttachmentList, hasSuccessfulSdkTerminalResult, parseBestStageAgentResult, validateProfileToolInput } from "./claudeAgentRunner.js";
 import type { AgentSession, WorkflowTemplate } from "../../shared/types.js";
 
 const workflow: WorkflowTemplate = {
@@ -1060,7 +1060,7 @@ describe("ClaudeAgentRunner", () => {
         goal_restated: "实现附件需求",
         strategy: "按实现和验证拆分",
         tasks: {
-          t1: { description: "实现并验证", dependencies: [] }
+          t1: { description: "实现并验证", dependencies: [], acceptance: ["可观察断言1", "可观察断言2"] }
         },
         next_focus: "t1",
         next_reason: "开始实现"
@@ -1159,6 +1159,7 @@ describe("ClaudeAgentRunner", () => {
       expect.objectContaining({ id: "t1", status: "completed", evidence: "npm test: passed" }),
       expect.objectContaining({ id: "host-final-audit", status: "completed" })
     ]);
+    expect(updated.task_tree?.tasks[0]?.acceptance).toEqual(["可观察断言1", "可观察断言2"]);
     expect(receivedPrompt).toContain(".ai-coder/uploads/spec/page-19.png");
     expect(receivedPrompt).toContain("需求.pdf · 第 19 页 / 共 21 页");
   });
@@ -1264,6 +1265,214 @@ describe("ClaudeAgentRunner", () => {
     });
     expect(updated.progress_events?.some((event) => event.message.includes("宿主安全补齐"))).toBe(true);
     expect(updated.progress_events?.some((event) => event.message.includes("未兜底"))).toBe(false);
+  });
+
+  it("reuses tasks from a prior corrupted-name bootstrap when the retry drops tasks", async () => {
+    let decision: unknown;
+    const profileWorkflow: WorkflowTemplate = {
+      ...workflow, id: "profile-workflow", stages: [],
+      agents: {
+        "task-planner": { description: "plan", prompt: "plan" },
+        "task-executor": { description: "execute", prompt: "execute" }
+      }
+    };
+    const session = {
+      id: "profile-bootstrap-reuse", project_path: "/tmp/project", workflow_id: profileWorkflow.id,
+      task_prompt: "实现附件需求", status: "running", current_stage: "profile", messages: [],
+      file_changes: [], approvals: [], stage_runs: [], rework_requests: [], progress_events: [],
+      // 仅 host-goal 占位 -> profileNeedsPlanning=true，允许 bootstrap
+      task_tree: {
+        goal_restated: "实现附件需求", strategy: "待 planner 细化",
+        tasks: [{ id: "host-goal", description: "完成用户请求", dependencies: [], status: "in_progress" }],
+        current_focus: "host-goal",
+        created_at: new Date().toISOString(), updated_at: new Date().toISOString()
+      },
+      tool_calls: [
+        // task-planner 已完成 -> 放行 update_task_tree
+        {
+          id: "planner-done", stage_id: "profile", tool: "Task",
+          input: { subagent_type: "task-planner", description: "制定 DAG" },
+          status: "completed", created_at: new Date().toISOString()
+        },
+        // 前序 bootstrap 用了损坏的工具名 mcp__ai_c__update_task_tree 且携带完整 tasks，
+        // SDK 回 "No such tool available" 后被记录为 failed，但 input（含 tasks）仍在。
+        {
+          id: "prior-corrupted-bootstrap", stage_id: "profile", tool: "mcp__ai_c__update_task_tree",
+          input: {
+            action: "bootstrap",
+            goal_restated: "实现附件需求",
+            strategy: "按模块边界拆分",
+            tasks: [
+              { id: "t1", description: "实现 A", dependencies: [] },
+              { id: "t2", description: "实现 B", dependencies: ["t1"] }
+            ],
+            next_focus: "t1",
+            next_reason: "从 t1 开始"
+          },
+          status: "failed", created_at: new Date().toISOString()
+        }
+      ],
+      created_at: new Date().toISOString(), updated_at: new Date().toISOString()
+    } as AgentSession;
+    async function* query(params: unknown) {
+      const canUseTool = (params as {
+        options: {
+          canUseTool: (
+            toolName: string,
+            input: Record<string, unknown>,
+            options: { toolUseID: string }
+          ) => Promise<unknown>;
+        }
+      }).options.canUseTool;
+      // 重试时模型用了正确工具名，但丢掉了 tasks 参数，且 next_focus 写成了非任务标识。
+      decision = await canUseTool("mcp__ai_coder__update_task_tree", {
+        action: "bootstrap",
+        goal_restated: "实现附件需求",
+        strategy: "按模块边界拆分",
+        next_focus: "checkout-branch",
+        next_reason: "先切分支"
+      }, { toolUseID: "tree-retry" });
+      // 任务树已由宿主复用建立；标记完成以满足完成闸门
+      for (const task of session.task_tree!.tasks) {
+        task.status = "completed";
+        task.evidence = "test cleanup";
+      }
+      yield { type: "result", subtype: "success", is_error: false, result: "Done" };
+    }
+
+    const updated = await new ClaudeAgentRunner(query).run({ session, workflow: profileWorkflow });
+
+    expect(updated.status, updated.error).toBe("completed");
+    expect((decision as { behavior?: string }).behavior).toBe("allow");
+    // 复用了前序的 t1/t2，且补齐了 host-final-audit
+    const ids = updated.task_tree!.tasks.map((task) => task.id);
+    expect(ids).toEqual(["t1", "t2", "host-final-audit"]);
+    // next_focus="checkout-branch" 不是真实任务 id，应回退到首个任务 t1
+    expect(updated.task_tree!.current_focus).toBe("t1");
+    expect(updated.progress_events?.some((event) =>
+      event.message.includes("宿主复用前序 bootstrap")
+    )).toBe(true);
+  });
+
+  it("denies a task-less bootstrap with no prior attempt and points back to the planner DAG", async () => {
+    let decision: unknown;
+    const profileWorkflow: WorkflowTemplate = {
+      ...workflow, id: "profile-workflow", stages: [],
+      agents: { "task-planner": { description: "plan", prompt: "plan" } }
+    };
+    const session = {
+      id: "profile-bootstrap-empty", project_path: "/tmp/project", workflow_id: profileWorkflow.id,
+      task_prompt: "实现附件需求", status: "running", current_stage: "profile", messages: [],
+      tool_calls: [
+        {
+          id: "planner-done", stage_id: "profile", tool: "Task",
+          input: { subagent_type: "task-planner", description: "制定 DAG" },
+          status: "completed", created_at: new Date().toISOString()
+        }
+      ],
+      file_changes: [], approvals: [], stage_runs: [], rework_requests: [], progress_events: [],
+      task_tree: {
+        goal_restated: "实现附件需求", strategy: "待细化",
+        tasks: [{ id: "host-goal", description: "完成用户请求", dependencies: [], status: "in_progress" }],
+        current_focus: "host-goal",
+        created_at: new Date().toISOString(), updated_at: new Date().toISOString()
+      },
+      created_at: new Date().toISOString(), updated_at: new Date().toISOString()
+    } as AgentSession;
+    async function* query(params: unknown) {
+      const canUseTool = (params as {
+        options: {
+          canUseTool: (
+            toolName: string,
+            input: Record<string, unknown>,
+            options: { toolUseID: string }
+          ) => Promise<unknown>;
+        }
+      }).options.canUseTool;
+      decision = await canUseTool("mcp__ai_coder__update_task_tree", {
+        action: "bootstrap",
+        goal_restated: "实现附件需求",
+        strategy: "按模块拆分"
+      }, { toolUseID: "tree-empty" });
+      yield { type: "result", subtype: "success", is_error: false, result: "Done" };
+    }
+
+    const updated = await new ClaudeAgentRunner(query).run({ session, workflow: profileWorkflow });
+
+    expect((decision as { behavior?: string }).behavior).toBe("deny");
+    expect((decision as { message?: string }).message).toContain("请把 task-planner 刚产出的 DAG 作为 tasks 传入");
+    // 没有前序可复用时不应误建任务树
+    expect(updated.task_tree!.tasks.every((task) => task.id === "host-goal")).toBe(true);
+  });
+
+  it("defaults current_focus to the first no-dependency entry task, not tasks[0]", async () => {
+    let decision: unknown;
+    const profileWorkflow: WorkflowTemplate = {
+      ...workflow, id: "profile-workflow", stages: [],
+      agents: {
+        "task-planner": { description: "plan", prompt: "plan" },
+        "task-executor": { description: "execute", prompt: "execute" }
+      }
+    };
+    const session = {
+      id: "profile-bootstrap-focus", project_path: "/tmp/project", workflow_id: profileWorkflow.id,
+      task_prompt: "实现附件需求", status: "running", current_stage: "profile", messages: [],
+      tool_calls: [
+        {
+          id: "planner-done", stage_id: "profile", tool: "Task",
+          input: { subagent_type: "task-planner", description: "制定 DAG" },
+          status: "completed", created_at: new Date().toISOString()
+        }
+      ],
+      file_changes: [], approvals: [], stage_runs: [], rework_requests: [], progress_events: [],
+      task_tree: {
+        goal_restated: "实现附件需求", strategy: "待细化",
+        tasks: [{ id: "host-goal", description: "完成用户请求", dependencies: [], status: "in_progress" }],
+        current_focus: "host-goal",
+        created_at: new Date().toISOString(), updated_at: new Date().toISOString()
+      },
+      created_at: new Date().toISOString(), updated_at: new Date().toISOString()
+    } as AgentSession;
+    async function* query(params: unknown) {
+      const canUseTool = (params as {
+        options: {
+          canUseTool: (
+            toolName: string,
+            input: Record<string, unknown>,
+            options: { toolUseID: string }
+          ) => Promise<unknown>;
+        }
+      }).options.canUseTool;
+      // tasks[0]=t2 有依赖；t1 无依赖是真正的入口。模型没给 next_focus。
+      decision = await canUseTool("mcp__ai_coder__update_task_tree", {
+        action: "bootstrap",
+        goal_restated: "实现附件需求",
+        strategy: "按依赖拆分",
+        tasks: [
+          { id: "t2", description: "实现 B", dependencies: ["t1"] },
+          { id: "t1", description: "实现 A", dependencies: [] }
+        ]
+      }, { toolUseID: "tree-focus" });
+      for (const task of session.task_tree!.tasks) {
+        task.status = "completed";
+        task.evidence = "test cleanup";
+      }
+      yield { type: "result", subtype: "success", is_error: false, result: "Done" };
+    }
+
+    const updated = await new ClaudeAgentRunner(query).run({ session, workflow: profileWorkflow });
+
+    expect(updated.status, updated.error).toBe("completed");
+    expect((decision as { behavior?: string }).behavior).toBe("allow");
+    // current_focus 必须落到无依赖入口 t1，而不是 tasks[0] 的 t2，避免跳过 DAG 顺序
+    expect(updated.task_tree!.current_focus).toBe("t1");
+  });
+
+  it("detects corrupted tool names the SDK would reject before canUseTool", () => {
+    expect(detectCorruptedToolName("mcp__ai_c__update_task_tree")).toContain("mcp__ai_coder__update_task_tree");
+    expect(detectCorruptedToolName('"Bash" <parameter=command')).toContain("损坏的协议标记");
+    expect(detectCorruptedToolName("mcp__ai_coder__update_task_tree")).toBeNull();
+    expect(detectCorruptedToolName("Read")).toBeNull();
   });
 
   it("denies an ambiguous empty update_status call with an actionable error", async () => {

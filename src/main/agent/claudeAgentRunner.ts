@@ -782,6 +782,17 @@ export class ClaudeAgentRunner {
                 let normalizedMutation = normalizeTaskTreeMutationArgs(toolInput, input.session);
                 normalizedMutation = repairIncompleteTaskStatusMutation(input.session, normalizedMutation);
                 normalizedMutation = normalizePrematureTaskCompletion(input.session, normalizedMutation);
+                const reusedMutation = reusePriorBootstrapTasks(input.session, normalizedMutation, options.toolUseID);
+                const reusedPriorBootstrap = reusedMutation !== normalizedMutation;
+                normalizedMutation = reusedMutation;
+                if (reusedPriorBootstrap) {
+                  await this.recordProgress(
+                    input,
+                    "runner",
+                    `宿主复用前序 bootstrap 携带的 ${normalizedMutation.tasks?.length ?? 0} 个任务节点（前序因工具名损坏或参数丢失未生效）`,
+                    "milestone"
+                  );
+                }
                 effectiveInput = taskTreeMutationToToolInput(normalizedMutation);
                 rewrittenToolInputs.set(options.toolUseID, effectiveInput);
                 const recordedToolCall = input.session.tool_calls.find(
@@ -956,6 +967,37 @@ export class ClaudeAgentRunner {
           }
         });
         this.recordSdkToolUses(input.session, "profile", message);
+        // SDK 对未知工具名（如损坏的 mcp__ai_c__update_task_tree、"Bash" <parameter）会直接
+        // 回 "No such tool available"，绕过 canUseTool/PreToolUse，宿主的工具名校验无法触达。
+        // 这里在流上检测并记录里程碑，让活动日志可见，便于排查模型工具名损坏。
+        for (const toolUse of extractSdkToolUses(message)) {
+          const corruption = detectCorruptedToolName(toolUse.tool);
+          if (corruption) {
+            await this.recordProgress(input, "tool_policy", corruption, "milestone");
+            continue;
+          }
+          // Task 缺少 subagent_type 时记录里程碑。redirectTaskToPlanner 的条件
+          // (subagent_type !== "task-planner") 对缺值同样成立、理论上能改写；但运行日志
+          // 显示缺值调用被 SDK 以 InputValidationError 拒绝，说明 schema 校验先于 redirect 生效。
+          // 本检测只记录、不拦截：若 redirect 已成功补齐，此里程碑为冗余但无害；用于排查
+          // "Task 调用为何失败"。
+          if (toolUse.tool === "Task") {
+            const subagentType = optionalString(toolUse.input.subagent_type);
+            if (!subagentType) {
+              const needsPlanner = profileNeedsPlanning(input.session);
+              const allowed = Object.keys(input.workflow.agents ?? {});
+              const hint = needsPlanner && allowed.includes("task-planner")
+                ? "当前处于 PLAN 阶段，请使用 subagent_type=task-planner"
+                : `请提供有效的 subagent_type（可用：${allowed.join(", ") || "无"}）`;
+              await this.recordProgress(
+                input,
+                "tool_policy",
+                `Task 调用缺少 subagent_type；若 SDK 未由 redirectTaskToPlanner 自动补齐，将拒绝执行。${hint}`,
+                "milestone"
+              );
+            }
+          }
+        }
         for (const [toolUseId, updatedInput] of rewrittenToolInputs) {
           const recordedToolCall = input.session.tool_calls.find(
             (toolCall) => toolCall.id === toolUseId
@@ -1104,13 +1146,29 @@ export class ClaudeAgentRunner {
             "- 读取 PDF 时优先使用已拆页 PNG，避免 PDF base64 过大导致 API 400；必要时仍可自行选择其他工具",
             "- PDF 上传后已自动拆页；只能逐字使用当前提示中的“宿主精确附件清单”，不得推导目录、页码或替代路径",
             "- 每次只读取当前需要的页面，不要一次性读取所有页面",
-            "- 图片已经可以直接用 Read 查看；禁止为了查看尺寸、base64 或图片文本再编写 Python/PIL 临时脚本"
+            "- 图片已经可以直接用 Read 查看；禁止为了查看尺寸、base64 或图片文本再编写 Python/PIL 临时脚本",
+            "",
+            "### 附件 Read 失败处理（重要）",
+            "- 如果按照“宿主精确附件清单”中列出的路径 Read 返回空内容或明显不完整：",
+            "  1. 这是阻塞性问题——附件内容缺失意味着需求不完整，无法确认用户请求的具体范围",
+            "  2. 立即停止尝试项目内其他路径或自行搜索同名/相似文件作为替代",
+            "  3. 在 task-planner 的 blocking_unknowns 中写明哪个附件路径返回空、尝试了几次",
+            "  4. 通过 ask_human 说明哪些附件无法读取，请求重新提供",
+            "  5. 绝对不要：使用项目内碰巧存在的 img/、assets/ 等目录下的同名或相似文件作为需求来源"
           ].join("\n")
         : [
             "## 文件读取规则",
             "- 读取 PDF 时优先使用文本提取工具，避免 PDF base64 过大导致 API 400；必要时仍可自行选择其他工具",
             `- **当前模型（${effectiveModel || "默认"}）不支持图片输入**：请使用命令行文本工具提取 PDF 内容，例如 ` + "`pdftotext <pdf路径> -` 或 `python3 -c \"import PyPDF2; ...\"`",
-            "- PDF 上传后已自动拆页；只能逐字使用当前提示中的“宿主精确附件清单”，并用文本工具而非 Read 获取内容"
+            "- PDF 上传后已自动拆页；只能逐字使用当前提示中的“宿主精确附件清单”，并用文本工具而非 Read 获取内容",
+            "",
+            "### 附件 Read 失败处理（重要）",
+            "- 如果按照“宿主精确附件清单”中列出的路径 Read 返回空内容或明显不完整：",
+            "  1. 这是阻塞性问题——附件内容缺失意味着需求不完整，无法确认用户请求的具体范围",
+            "  2. 立即停止尝试项目内其他路径或自行搜索同名/相似文件作为替代",
+            "  3. 在 task-planner 的 blocking_unknowns 中写明哪个附件路径返回空、尝试了几次",
+            "  4. 通过 ask_human 说明哪些附件无法读取，请求重新提供",
+            "  5. 绝对不要：使用项目内碰巧存在的 img/、assets/ 等目录下的同名或相似文件作为需求来源"
           ].join("\n"),
       reactGuidance,
       taskTreeGuidance,
@@ -1903,6 +1961,7 @@ export class ClaudeAgentRunner {
             id: z.string().describe("任务唯一标识，如 t1、t2"),
             description: z.string().describe("要完成什么"),
             dependencies: z.array(z.string()).describe("依赖的任务 ID 列表"),
+            acceptance: z.array(z.string()).optional().describe("验收标准：每条可独立核对的断言，task-verifier 据此逐条核对"),
           })).optional().describe("bootstrap 时必填：初始任务列表"),
           goal_restated: z.string().optional().describe("bootstrap 时必填：重述的用户可观测目标"),
           strategy: z.string().optional().describe("bootstrap 时必填：拆分策略说明（如'按模块边界拆分'）"),
@@ -1910,6 +1969,7 @@ export class ClaudeAgentRunner {
             id: z.string().describe("新任务唯一标识"),
             description: z.string().describe("要完成什么"),
             dependencies: z.array(z.string()).describe("依赖的任务 ID"),
+            acceptance: z.array(z.string()).optional().describe("验收标准：每条可独立核对的断言"),
           })).optional().describe("add 时必填：新发现的子任务"),
           add_reason: z.string().optional().describe("add 时必填：为什么此时发现这些任务"),
           task_id: z.string().optional().describe("update_status 时必填：要更新的任务 ID"),
@@ -2463,6 +2523,21 @@ function normalizeToolInputForCache(input: Record<string, unknown>): string {
 }
 
 /**
+ * 检测工具名是否损坏（协议标记泄漏、MCP 前缀截断等）。返回面向模型的纠正提示。
+ * SDK 对未知工具名会直接回 "No such tool available" 并绕过 canUseTool/PreToolUse，
+ * 因此本检测在流处理（profile 查询循环）和参数校验（validateProfileToolInput）两处都调用。
+ */
+export function detectCorruptedToolName(toolName: string): string | null {
+  if (/<\/?parameter\b/i.test(toolName) || /<\|DSML\|/i.test(toolName)) {
+    return `工具名包含损坏的协议标记：${toolName}；请使用工具列表中的精确工具名重新发起`;
+  }
+  if (/update_task_tree/i.test(toolName) && toolName !== "mcp__ai_coder__update_task_tree") {
+    return `任务树工具名损坏：${toolName}；请使用精确工具名 mcp__ai_coder__update_task_tree`;
+  }
+  return null;
+}
+
+/**
  * 在进入 SDK 工具实现前拦住明显损坏的工具协议和 Read 参数。
  * 不猜测或自动修复路径，避免把模型生成错误悄悄改成另一个有效文件。
  */
@@ -2472,12 +2547,8 @@ export async function validateProfileToolInput(
   projectPath?: string,
   attachments: Attachment[] = []
 ): Promise<string | null> {
-  if (/<\/?parameter\b/i.test(toolName)) {
-    return `工具名包含损坏的协议标记：${toolName}`;
-  }
-  if (/update_task_tree/i.test(toolName) && toolName !== "mcp__ai_coder__update_task_tree") {
-    return `任务树工具名损坏：${toolName}；请使用工具列表中的精确工具名 mcp__ai_coder__update_task_tree`;
-  }
+  const nameCorruption = detectCorruptedToolName(toolName);
+  if (nameCorruption) return nameCorruption;
   const resourceError = validateManagedResourceReference(toolName, toolInput, projectPath, attachments);
   if (resourceError) return resourceError;
   if (toolName === "Bash") {
@@ -2916,10 +2987,10 @@ function isMeaningfulSdkProgress(snippet: string): boolean {
 
 interface TaskTreeMutationArgs {
   action: "bootstrap" | "add" | "update_status";
-  tasks?: { id: string; description: string; dependencies: string[] }[];
+  tasks?: { id: string; description: string; dependencies: string[]; acceptance?: string[] }[];
   goal_restated?: string;
   strategy?: string;
-  new_tasks?: { id: string; description: string; dependencies: string[] }[];
+  new_tasks?: { id: string; description: string; dependencies: string[]; acceptance?: string[] }[];
   add_reason?: string;
   task_id?: string;
   new_status?: "in_progress" | "completed" | "blocked" | "skipped";
@@ -2949,7 +3020,7 @@ function extractPlannerTaskTreeMutation(
         tasks,
         goal_restated: optionalString(parsed?.goal_restated) ?? (session.task_prompt.trim() || "完成用户请求"),
         strategy: optionalString(parsed?.strategy) ?? "采用 task-planner 输出的需求契约、影响地图与依赖 DAG",
-        next_focus: tasks[0]?.id,
+        next_focus: pickDefaultFocusTaskId(tasks),
         next_reason: "从第一个依赖就绪的计划节点开始"
       };
     }
@@ -3101,6 +3172,45 @@ function repairIncompleteTaskStatusMutation(
   };
 }
 
+/**
+ * 模型在工具名损坏（如 mcp__ai_c__update_task_tree）或 SDK 拒绝后重试 bootstrap 时，
+ * 常会丢掉 tasks 参数而只重发 action/goal_restated/strategy，导致执行卡在
+ * "bootstrap 需要至少一个任务节点"。前序尝试携带的 tasks 已记录在 session.tool_calls，
+ * 这里复用它们，让重试能真正建立任务树。
+ */
+function reusePriorBootstrapTasks(
+  session: AgentSession,
+  args: TaskTreeMutationArgs,
+  currentToolUseID: string
+): TaskTreeMutationArgs {
+  if (args.action !== "bootstrap") return args;
+  if (args.tasks && args.tasks.length > 0) return args;
+  // 仅在尚未真正 bootstrap（只有 host-goal 占位）时复用，避免覆盖已建立的 DAG。
+  const existingIsHostRoot = session.task_tree?.tasks.length === 1
+    && session.task_tree.tasks[0]?.id === "host-goal";
+  if (session.task_tree && !existingIsHostRoot) return args;
+
+  for (let i = session.tool_calls.length - 1; i >= 0; i -= 1) {
+    const prior = session.tool_calls[i];
+    if (!prior || prior.id === currentToolUseID) continue;
+    // 前序尝试的工具名可能本身已损坏（如 mcp__ai_c__update_task_tree），用宽松匹配。
+    if (!/update_task_tree/i.test(prior.tool)) continue;
+    const priorInput = isPlainObject(prior.input) ? prior.input : null;
+    if (!priorInput || optionalString(priorInput.action) !== "bootstrap") continue;
+    const priorTasks = normalizeTaskItems(priorInput.tasks);
+    if (!priorTasks || priorTasks.length === 0) continue;
+    return {
+      ...args,
+      tasks: priorTasks,
+      goal_restated: args.goal_restated ?? optionalString(priorInput.goal_restated),
+      strategy: args.strategy ?? optionalString(priorInput.strategy),
+      next_focus: args.next_focus ?? optionalString(priorInput.next_focus),
+      next_reason: args.next_reason ?? optionalString(priorInput.next_reason)
+    };
+  }
+  return args;
+}
+
 function taskTreeMutationToToolInput(args: TaskTreeMutationArgs): Record<string, unknown> {
   return Object.fromEntries(
     Object.entries(args).filter(([, value]) => value !== undefined)
@@ -3139,7 +3249,10 @@ function normalizeTaskItems(value: unknown): TaskTreeMutationArgs["tasks"] {
       : typeof item.dependencies === "string" && item.dependencies.trim()
         ? item.dependencies.split(",").map((dependency) => dependency.trim()).filter(Boolean)
         : [];
-    return [{ id, description, dependencies }];
+    const acceptance: string[] | undefined = Array.isArray(item.acceptance)
+      ? item.acceptance.filter((a): a is string => typeof a === "string" && a.trim() !== "").map((a) => a.trim())
+      : undefined;
+    return [{ id, description, dependencies, ...(acceptance && acceptance.length > 0 ? { acceptance } : {}) }];
   });
   return tasks.length > 0 ? tasks : undefined;
 }
@@ -3199,6 +3312,16 @@ function startCurrentProfileTask(session: AgentSession): string | null {
   return `${task.id} → in_progress`;
 }
 
+/**
+ * 选默认 current_focus：优先首个无依赖的入口任务，与 startCurrentProfileTask 的兜底一致。
+ * 不能直接取 tasks[0]--它可能依赖未完成的节点，而 startCurrentProfileTask 的聚焦分支
+ * 不校验依赖，会把带未完成依赖的 tasks[0] 直接标 in_progress，跳过 DAG 顺序。
+ * 合法 DAG 必存在至少一个无依赖节点，故 find 命中；tasks[0] 仅作兜底。
+ */
+function pickDefaultFocusTaskId(tasks: { id: string; dependencies: string[] }[]): string | undefined {
+  return tasks.find((t) => t.dependencies.length === 0)?.id ?? tasks[0]?.id;
+}
+
 function applyTaskTreeMutation(session: AgentSession, args: TaskTreeMutationArgs): string {
   const now = new Date().toISOString();
 
@@ -3209,10 +3332,12 @@ function applyTaskTreeMutation(session: AgentSession, args: TaskTreeMutationArgs
       return formatTaskTreeResponse(session.task_tree, "任务树已存在，忽略重复 bootstrap");
     }
     if (!args.tasks || args.tasks.length === 0) {
-      throw new Error("bootstrap 需要至少一个任务节点");
+      throw new Error(
+        "bootstrap 需要 tasks 参数（至少一个任务节点）；请把 task-planner 刚产出的 DAG 作为 tasks 传入，不要重发空的 bootstrap"
+      );
     }
     if (!args.goal_restated || !args.strategy) {
-      throw new Error("bootstrap 需要 goal_restated 和 strategy");
+      throw new Error("bootstrap 需要 goal_restated 和 strategy；请同时提供这两项与 tasks");
     }
     const seen = new Set(args.tasks.map((t) => t.id));
     if (seen.size !== args.tasks.length) {
@@ -3230,17 +3355,25 @@ function applyTaskTreeMutation(session: AgentSession, args: TaskTreeMutationArgs
       throw new Error("任务依赖存在循环——无法确定执行顺序，请消除循环依赖");
     }
     const plannedTasks = appendFinalAuditTask(args.tasks);
+    // next_focus 必须指向真实任务 id；模型重试时常会写出分支名等非任务标识。
+    const focusIsRealTask = args.next_focus ? seen.has(args.next_focus) : false;
+    const currentFocus = focusIsRealTask ? args.next_focus : pickDefaultFocusTaskId(args.tasks);
+    // focus 被纠正时丢弃模型为原（无效）focus 写的 reason，避免理由与焦点不符。
+    const focusReason = focusIsRealTask
+      ? (args.next_reason ?? "从首个依赖就绪的计划节点开始")
+      : "从首个依赖就绪的计划节点开始";
     session.task_tree = {
       tasks: plannedTasks.map((t) => ({
         id: t.id,
         description: t.description,
         dependencies: t.dependencies,
+        ...(t.acceptance && t.acceptance.length > 0 ? { acceptance: t.acceptance } : {}),
         status: "pending" as const,
       })),
       goal_restated: args.goal_restated,
       strategy: args.strategy,
-      current_focus: args.next_focus,
-      focus_reason: args.next_reason,
+      current_focus: currentFocus,
+      focus_reason: focusReason,
       created_at: now,
       updated_at: now,
     };
@@ -3275,6 +3408,7 @@ function applyTaskTreeMutation(session: AgentSession, args: TaskTreeMutationArgs
         id: t.id,
         description: t.description,
         dependencies: t.dependencies,
+        ...(t.acceptance && t.acceptance.length > 0 ? { acceptance: t.acceptance } : {}),
         status: "pending",
       });
     }
@@ -3440,7 +3574,10 @@ function buildTaskTreePromptSection(tree: TaskTree): string {
     const evidence = t.evidence ? ` [证据: ${t.evidence.slice(0, 120)}]` : "";
     const deps = t.dependencies.length > 0 ? ` (依赖: ${t.dependencies.join(", ")})` : "";
     const reason = t.status_reason ? ` — ${t.status_reason}` : "";
-    lines.push(`  ${icon} ${t.id}: ${t.description}${deps}${evidence}${reason}${focus}`);
+    const acceptance = t.acceptance && t.acceptance.length > 0
+      ? `\n      验收: ${t.acceptance.slice(0, 3).map((a) => a.slice(0, 100)).join(" | ")}${t.acceptance.length > 3 ? ` (+${t.acceptance.length - 3})` : ""}`
+      : "";
+    lines.push(`  ${icon} ${t.id}: ${t.description}${deps}${evidence}${reason}${acceptance}${focus}`);
   }
   if (tree.current_focus && tree.focus_reason) {
     lines.push("", `当前聚焦：${tree.current_focus}——${tree.focus_reason}`);
@@ -3504,7 +3641,8 @@ function formatTaskTreeResponse(tree: TaskTree, header: string): string {
     const focus = t.id === tree.current_focus ? " ← 当前聚焦" : "";
     const evidence = t.evidence ? ` [证据: ${t.evidence.slice(0, 80)}]` : "";
     const deps = t.dependencies.length > 0 ? ` (依赖: ${t.dependencies.join(", ")})` : "";
-    lines.push(`${icon} ${t.id}: ${t.description}${deps}${evidence}${focus}`);
+    const acceptance = t.acceptance && t.acceptance.length > 0 ? ` [验收${t.acceptance.length}条]` : "";
+    lines.push(`${icon} ${t.id}: ${t.description}${deps}${evidence}${acceptance}${focus}`);
   }
   if (tree.current_focus && tree.focus_reason) {
     lines.push(`\n当前聚焦：${tree.current_focus}——${tree.focus_reason}`);

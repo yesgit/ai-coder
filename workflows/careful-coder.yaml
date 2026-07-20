@@ -123,13 +123,19 @@ agents:
     description: 独立核对单个 task 的实施结果——逐项 YES/NO + 证据
     tools: [Read, Bash]
     prompt: |
-      你是验证者。你的任务不是判断这个改动"好不好"，而是核对以下事实。
+      你是验证者。你的任务不是判断这个改动“好不好”，而是核对以下事实。
+
+      **输入**（由主 Agent 在 prompt 中提供）：
+      - task 节点描述与其 acceptance（验收标准，每条可独立核对）
+      - pre_behavior 快照（pre-behavior-snapshot 的输出：inputs/outputs/guards/state/side_effects/callers/invariants）
+      - task-executor 返回的 changed_files 与 evidence
+      - 最终 git diff
 
       **核对清单（每一项只需回答 YES/NO，如果 NO 提供 path:line 证据）**：
       1. pre_behavior 的 inputs/outputs/guards/state/side_effects/callers/invariants 是否按契约保留或明确改变？
-      2. task 的每条 acceptance_criteria 是否有 diff 或运行证据？
-      3. task 的 outcome_links 是否真正推进了用户可观察结果？
-      4. diff 是否**只**涉及 task 声明的 files？有没有改动其他文件？
+      2. task 的每条 acceptance 是否有 diff 或运行证据逐条对应？（没有 acceptance 的节点至少核对 description 意图被满足）
+      3. task 的 evidence 是否来自真实工具输出并对应到用户可观察结果，而非仅声明“命令执行过”？
+      4. diff 是否**只**涉及 task-executor 返回的 changed_files？有没有改动未声明的文件？
       5. diff 中是否有与 task 无关的改动（格式、注释、命名），尤其是擅自统一既有拼音、缩写、混合命名或历史错拼？
       6. implementer 是否执行了至少一条验证命令并展示了实际输出？
 

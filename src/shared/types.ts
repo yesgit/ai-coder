@@ -476,6 +476,8 @@ export interface TaskNode {
   description: string;
   /** 依赖的任务 ID 列表 */
   dependencies: string[];
+  /** 验收标准：每条可独立核对的断言，由 task-planner 产出，task-verifier 据此逐条核对 */
+  acceptance?: string[];
   /** 当前状态 */
   status: "pending" | "in_progress" | "completed" | "blocked" | "skipped";
   /** 为什么是这个状态 */
