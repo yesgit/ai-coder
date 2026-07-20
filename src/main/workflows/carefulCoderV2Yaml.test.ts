@@ -3,7 +3,7 @@ import path from "node:path";
 import { WorkflowRegistry } from "./workflowRegistry.js";
 
 /**
- * 谨慎程序员 yaml v5.3 快照验证。
+ * 谨慎程序员 yaml v5.4 快照验证。
  *
  * v5.0 根本架构变更（v4.0 阶段引擎 → Profile 模式）：
  * - 砍掉所有阶段管线（maintain_project_profile / plan / implement / verify）
@@ -30,7 +30,7 @@ describe("careful-coder.yaml latest", () => {
     expect(listed.map((workflow) => workflow.id)).toEqual(["careful-coder"]);
 
     const v5 = await loadV5();
-    expect(v5.version).toBe("5.3.0");
+    expect(v5.version).toBe("5.4.0");
     expect(v5.name).toBe("谨慎程序员");
     expect(v5.routing?.auto_start).toBe(true);
   });
