@@ -14,6 +14,7 @@ const STATUS_LABELS: Record<string, string> = {
   waiting_approval: "等待审批",
   blocked: "已阻断",
   completed: "已完成",
+  skipped: "已跳过",
   failed: "失败",
   interrupted: "已中断",
   pending: "待处理",

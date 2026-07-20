@@ -432,7 +432,7 @@ export interface ToolCallRecord {
   stage_id: string;
   tool: string;
   input: unknown;
-  status: "requested" | "pending_approval" | "approved" | "denied" | "completed" | "blocked" | "cancelled";
+  status: "requested" | "pending_approval" | "approved" | "denied" | "completed" | "skipped" | "failed" | "blocked" | "cancelled";
   created_at: string;
   resolved_at?: string;
   /** SDK 返回的真实退出码；未知时不伪造。 */

@@ -10,6 +10,7 @@ Build an evidence-backed usage model before editing an existing callable. Treat 
 ## Required workflow
 
 1. Resolve one exact target file and symbol. If the symbol is ambiguous, pass `target_line` to identify its definition before investigating.
+   - When the target came from a Chinese business term or mixed pinyin/abbreviation, first apply the alias-discovery rules in [chinese-naming-discovery.md](../exploring-codebase/references/chinese-naming-discovery.md). Record ambiguous matches instead of silently choosing one.
 2. Call `mcp__ai_coder__analyze_symbol_contract` with `section="contract"`. Record every input, prop and output:
    - meaning and type;
    - required or optional;
@@ -34,6 +35,7 @@ Build an evidence-backed usage model before editing an existing callable. Treat 
 - Never collapse calls merely because they have the same number of arguments; group by parameter presence and behaviorally relevant values.
 - Treat spread props/arguments, callbacks, reflective lookup, event registration, dependency injection, and external consumers as incomplete until followed.
 - Treat zero discovered callers as a finding to investigate, not proof that the symbol is unused.
+- Before accepting zero callers or references, search observed Chinese, pinyin, initial, mixed, English, case, separator, route-key, and dynamically composed aliases. Alias matches still require runtime evidence.
 
 ## Investigation result
 

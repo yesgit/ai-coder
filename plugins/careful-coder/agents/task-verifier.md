@@ -6,7 +6,7 @@
 2. task 的每条 acceptance_criteria 是否有 diff 或运行证据？
 3. task 的 outcome_links 是否真正推进了用户可观察结果？
 4. diff 是否**只**涉及 task 声明的 files？有没有改动其他文件？
-5. diff 中是否有与 task 无关的改动（格式、注释、命名）？
+5. diff 中是否有与 task 无关的改动（格式、注释、命名），尤其是擅自统一既有拼音、缩写、混合命名或历史错拼？
 6. implementer 是否执行了至少一条验证命令并展示了实际输出？
 
 **铁律**：

@@ -15,6 +15,8 @@ import { WorkflowRegistry } from "./workflows/workflowRegistry.js";
 import { WorkflowRouter } from "./workflows/workflowRouter.js";
 import { PtyManager } from "./ptyManager.js";
 
+const backgroundSessionRuns = new Map<string, Promise<void>>();
+
 export function registerIpcHandlers(registry: WorkflowRegistry, sessions: SessionStore, runner: ClaudeAgentRunner): void {
   const authorizedProjects = new AuthorizedProjects();
   const workflowEngine = new WorkflowEngine();
@@ -264,7 +266,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
   });
 
   ipcMain.handle("sessions:reset-context", async (_event, sessionId: string, options?: { includeProjectProfile?: boolean }) => {
-    const session = await sessions.get(sessionId);
+    let session = await sessions.get(sessionId);
     if (!session) {
       throw new Error(`Session not found: ${sessionId}`);
     }
@@ -273,7 +275,8 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     if (!workflow) {
       throw new Error(`Workflow not found: ${session.workflow_id}`);
     }
-    runner.abort(sessionId);
+    await stopBackgroundSession(runner, sessionId, queuedUserMessages);
+    session = (await sessions.get(sessionId)) ?? session;
     workflowEngine.resetSessionContext(session, workflow, resolveStartStageId(workflow, options?.includeProjectProfile));
     if (session.onboarding) {
       session.onboarding.project_profile_enabled = options?.includeProjectProfile !== false;
@@ -468,7 +471,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
       session.progress_events.push({
         id: randomUUID(),
         type: "status",
-        message: "已收到用户消息，将在当前运行结束后继续处理。",
+        message: "已收到用户补充消息，将在当前执行步骤结束后的安全边界接入。",
         visibility: "milestone",
         created_at: new Date().toISOString()
       });
@@ -558,13 +561,20 @@ function runSessionInBackground(
   workflow: NonNullable<Awaited<ReturnType<WorkflowRegistry["get"]>>>,
   queuedUserMessages: Map<string, AgentSession["messages"]>
 ): void {
-  void runner
+  const backgroundRun = runner
     .run({
       session,
       workflow,
       onProgress: async (updated) => {
         await sessions.save(updated);
         broadcastSessionProgress(updated);
+      },
+      takeQueuedUserMessages: () => {
+        const queued = queuedUserMessages.get(session.id) ?? [];
+        if (queued.length > 0) {
+          queuedUserMessages.delete(session.id);
+        }
+        return queued;
       }
     })
     .then(async (updated) => {
@@ -609,6 +619,32 @@ function runSessionInBackground(
       await sessions.save(session);
       broadcastSessionProgress(session);
     });
+  backgroundSessionRuns.set(session.id, backgroundRun);
+  void backgroundRun.finally(() => {
+    if (backgroundSessionRuns.get(session.id) === backgroundRun) {
+      backgroundSessionRuns.delete(session.id);
+    }
+  }).catch(() => {
+    // 主链已经负责记录错误；这里只防止 finally 派生 Promise 产生未处理拒绝。
+  });
+}
+
+async function stopBackgroundSession(
+  runner: ClaudeAgentRunner,
+  sessionId: string,
+  queuedUserMessages: Map<string, AgentSession["messages"]>
+): Promise<void> {
+  while (true) {
+    queuedUserMessages.delete(sessionId);
+    runner.abort(sessionId);
+    const active = backgroundSessionRuns.get(sessionId);
+    if (!active) break;
+    await active;
+    if (backgroundSessionRuns.get(sessionId) === active) {
+      backgroundSessionRuns.delete(sessionId);
+    }
+  }
+  queuedUserMessages.delete(sessionId);
 }
 
 function appendMissingMessages(session: AgentSession, messages: AgentSession["messages"]): void {

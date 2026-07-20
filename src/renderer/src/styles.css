@@ -1461,6 +1461,39 @@ textarea {
   padding-top: 12px;
 }
 
+.execution-history {
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid #d9e2ec;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.execution-history-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid #e4e7ec;
+  background: #f8fafc;
+  padding: 8px 12px;
+}
+
+.execution-history-heading h3 {
+  margin: 0;
+  color: #344054;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.execution-history-scroll {
+  max-height: clamp(320px, 52vh, 680px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0 12px;
+  scrollbar-gutter: stable;
+}
+
 .timeline-item {
   display: grid;
   grid-template-columns: 100px 1fr;

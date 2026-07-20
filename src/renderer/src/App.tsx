@@ -442,26 +442,15 @@ export default function App() {
     }
   }
 
-  async function restartSession(session: AgentSession) {
+  async function restartFromFirstQuestion(session: AgentSession) {
     setBusy(true);
     setError("");
     try {
-      const updated = await window.aiCoder.restartSession(session.id, { includeProjectProfile });
-      upsertSession(updated);
-      await refreshSessions(updated.id);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function resetSessionContext(session: AgentSession) {
-    setBusy(true);
-    setError("");
-    try {
-      setIncludeProjectProfile(true);
-      const updated = await window.aiCoder.resetSessionContext(session.id, { includeProjectProfile: true });
+      const originalProjectProfileSetting = session.onboarding?.project_profile_enabled !== false;
+      setIncludeProjectProfile(originalProjectProfileSetting);
+      const updated = await window.aiCoder.resetSessionContext(session.id, {
+        includeProjectProfile: originalProjectProfileSetting
+      });
       upsertSession(updated);
       await refreshSessions(updated.id);
       setTimelineLimit(50);
@@ -857,7 +846,7 @@ export default function App() {
                   <p>
                     {composerSession
                       ? composerSession.status === "running"
-                        ? "消息会在当前运行结束后继续处理。"
+                        ? "补充消息会在当前执行步骤结束后的安全边界加入本轮任务。"
                         : "发送消息后继续这个会话。"
                       : taskWorkflow
                       ? formatWorkflowDescription(taskWorkflow.id, taskWorkflow.description)
@@ -1006,25 +995,13 @@ export default function App() {
                           className="secondary"
                           disabled={busy}
                           onClick={() => {
-                            if (confirm(`确定要重新开始任务 "${activeSession.task_prompt}" 吗？这将清空当前的执行进度并从第一个阶段重新开始。`)) {
-                              void restartSession(activeSession);
+                            if (confirm(`确定要重新开始 "${activeSession.task_prompt}" 吗？这将从用户首次提问和首次附件开始，清除之后的消息、执行过程、工具记录、审批、返工和任务上下文。`)) {
+                              void restartFromFirstQuestion(activeSession);
                             }
                           }}
-                          title="从工作流的第一个阶段重新开始执行"
+                          title="从用户首次提问和首次附件开始，按全新会话重新执行"
                         >
                           重新开始
-                        </button>
-                        <button
-                          className="secondary"
-                          disabled={busy}
-                          onClick={() => {
-                            if (confirm(`确定要重置当前会话 "${activeSession.task_prompt}" 吗？这将只保留第一条用户消息，清除所有执行过程、工具记录、审批、返工和上下文，然后重新运行。`)) {
-                              void resetSessionContext(activeSession);
-                            }
-                          }}
-                          title="只保留第一条用户消息，清除当前会话的所有执行上下文"
-                        >
-                          重置会话
                         </button>
                       </div>
                     )}
@@ -1329,29 +1306,37 @@ export default function App() {
                   {pendingReworkRequests.length > 0 && (
                     <div className="pending-banner">{pendingReworkRequests.length} 个返工请求等待审批。</div>
                   )}
-                  <div className="timeline">
-                    {timeline.map((event: TimelineEvent) => (
-                      <article key={event.id} className={`timeline-item ${event.type}`}>
-                        <div className="timeline-meta">
-                          <time>{formatTimestamp(event.timestamp)}</time>
-                          {event.status && <span className="timeline-status">{formatStatus(event.status)}</span>}
-                        </div>
-                        <div className="timeline-body">
-                          <strong>{event.title}</strong>
-                          {event.detail && (
-                            <MarkdownContent>{truncateDetail(event.detail)}</MarkdownContent>
-                          )}
-                        </div>
-                      </article>
-                    ))}
-                  </div>
-                  {showMoreTimeline && (
-                    <div className="timeline-more">
-                      <button className="secondary" onClick={() => setTimelineLimit((n) => n + 50)}>
-                        加载更多（显示更多 50 条）
-                      </button>
+                  <section className="execution-history">
+                    <div className="panel-heading execution-history-heading">
+                      <h3>执行过程</h3>
+                      <small>{timelineAll.length} 条记录</small>
                     </div>
-                  )}
+                    <div className="execution-history-scroll">
+                      <div className="timeline">
+                        {timeline.map((event: TimelineEvent) => (
+                          <article key={event.id} className={`timeline-item ${event.type}`}>
+                            <div className="timeline-meta">
+                              <time>{formatTimestamp(event.timestamp)}</time>
+                              {event.status && <span className="timeline-status">{formatStatus(event.status)}</span>}
+                            </div>
+                            <div className="timeline-body">
+                              <strong>{event.title}</strong>
+                              {event.detail && (
+                                <MarkdownContent>{truncateDetail(event.detail)}</MarkdownContent>
+                              )}
+                            </div>
+                          </article>
+                        ))}
+                      </div>
+                      {showMoreTimeline && (
+                        <div className="timeline-more">
+                          <button className="secondary" onClick={() => setTimelineLimit((n) => n + 50)}>
+                            加载更多（显示更多 50 条）
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </section>
               </>
               ) : (
                 <div className="empty-state">

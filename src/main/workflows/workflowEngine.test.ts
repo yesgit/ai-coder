@@ -429,6 +429,76 @@ describe("WorkflowEngine", () => {
     expect(session.task_tree).toBeUndefined();
   });
 
+  it("rebuilds reset context from the first user question and its original attachments", () => {
+    const engine = new WorkflowEngine();
+    const profileWorkflow: WorkflowTemplate = { ...workflow, stages: [] };
+    const session = createSession();
+    const firstQuestion = {
+      role: "user" as const,
+      content: "首次提问",
+      created_at: "2026-07-20T08:00:00.000Z",
+      attachments: [{
+        type: "file_ref" as const,
+        path: ".ai-coder/uploads/spec/page-01.png",
+        display_name: "需求.pdf · 第 1 页"
+      }]
+    };
+    session.initial_user_message = firstQuestion;
+    session.messages = [
+      firstQuestion,
+      { role: "assistant", content: "旧回答", created_at: "2026-07-20T08:01:00.000Z" },
+      { role: "user", content: "后续追问", created_at: "2026-07-20T08:02:00.000Z" }
+    ];
+    session.tool_calls = [{
+      id: "old-tool",
+      stage_id: "profile",
+      tool: "Read",
+      input: { file_path: "/tmp/old" },
+      status: "completed",
+      created_at: "2026-07-20T08:01:00.000Z"
+    }];
+    session.file_changes = [{
+      path: "old.ts",
+      operation: "update",
+      stage_id: "profile",
+      approved: false,
+      created_at: "2026-07-20T08:01:00.000Z"
+    }];
+    session.progress_events = [{
+      id: "old-progress",
+      type: "runner",
+      message: "旧进度",
+      visibility: "milestone",
+      created_at: "2026-07-20T08:01:00.000Z"
+    }];
+    session.pending_human_questions = [{
+      id: "old-question",
+      stage_id: "profile",
+      question: "旧问题",
+      question_type: "text",
+      status: "answered",
+      answer: "旧答案",
+      created_at: "2026-07-20T08:01:00.000Z"
+    }];
+    session.error = "旧错误";
+    session.status = "failed";
+    session.approved_external_paths = ["/tmp/old-external"];
+
+    engine.resetSessionContext(session, profileWorkflow);
+
+    expect(session.messages).toEqual([firstQuestion]);
+    expect(session.initial_user_message).toEqual(firstQuestion);
+    expect(session.task_prompt).toBe("Fix the bug");
+    expect(session.tool_calls).toEqual([]);
+    expect(session.file_changes).toEqual([]);
+    expect(session.progress_events).toEqual([]);
+    expect(session.pending_human_questions).toEqual([]);
+    expect(session.approved_external_paths).toEqual([]);
+    expect(session.task_tree).toBeUndefined();
+    expect(session.error).toBeUndefined();
+    expect(session.status).toBe("running");
+  });
+
   it("keeps repairing critical required output misses before hard blocking", () => {
     const engine = new WorkflowEngine();
     const session = createSession();

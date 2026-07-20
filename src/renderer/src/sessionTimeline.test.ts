@@ -124,6 +124,31 @@ describe("buildSessionTimeline", () => {
     });
   });
 
+  it("shows a failed tool's SDK error separately from its input", () => {
+    const events = buildSessionTimeline({
+      ...session,
+      tool_calls: [{
+        id: "read-failed",
+        stage_id: "execute",
+        tool: "Read",
+        input: { filefile_path: "/homehome/project/page-01.png" },
+        status: "failed",
+        output_summary: "Read 缺少必需的 file_path 参数；收到字段：filefile_path",
+        created_at: "2026-06-03T01:04:00.000Z",
+        resolved_at: "2026-06-03T01:04:01.000Z"
+      }]
+    });
+
+    const failed = events.find((event) => event.id.endsWith(":read-failed:resolved"));
+    expect(failed).toMatchObject({
+      title: "工具失败：Read",
+      status: "failed"
+    });
+    expect(failed?.detail).toContain("filefile_path");
+    expect(failed?.detail).toContain("执行结果：");
+    expect(failed?.detail).toContain("Read 缺少必需的 file_path 参数");
+  });
+
   it("includes stage attempts and rework requests", () => {
     const reworkSession: AgentSession = {
       ...session,

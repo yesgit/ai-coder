@@ -13,6 +13,10 @@ Trace from observable behavior to the code that produces it. Do not stop at a sy
 4. Record evidence as `file → role → observed behavior`; label gaps as unknown rather than filling them with guesswork.
 5. Change the smallest causal point(s). If the request needs multiple layers—metadata, resolver, navigation, component registration, guards—verify each layer has a consumer.
 
+## Chinese and mixed naming
+
+When requirements use Chinese business terms, or the repository contains pinyin or abbreviations, read [chinese-naming-discovery.md](references/chinese-naming-discovery.md). Build a small alias map before declaring a symbol, route, file, or caller absent. Use aliases to widen discovery only; observed runtime evidence decides meaning.
+
 Represent the result as a causal path: `trigger → consumer/processing → guards and state → side effects → observable result`, with a source for every non-obvious claim. For non-runtime artifacts, use the equivalent production path from authoring input to consumed output.
 
 Before declaring the investigation sufficient, answer: “What invokes this code at runtime, and what proves the requested outcome happens after invocation?”

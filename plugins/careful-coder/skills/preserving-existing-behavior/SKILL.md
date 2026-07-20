@@ -25,6 +25,8 @@ While editing:
 
 - Make the smallest change that satisfies the user goal.
 - Do not refactor, rename, or normalize unrelated code.
+- Preserve mixed pinyin, initials, English, and historical misspellings when they participate in routes, APIs, storage, events, native bridges, reflection, or other compatibility contracts.
+- Treat a “cleaner” name as a contract change unless all consumers and migration behavior are proven.
 - If another file becomes necessary, explain the causal link to the requested behavior.
 
 After editing:

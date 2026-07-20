@@ -344,6 +344,7 @@ export class WorkflowEngine {
     session.rework_requests = [];
     session.pending_human_questions = [];
     session.progress_events = [];
+    session.approved_external_paths = [];
     session.task_tree = undefined;
     session.error = undefined;
     session.status = "running";

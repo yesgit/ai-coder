@@ -182,7 +182,7 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
         id: `${session.id}:tool:${toolCall.id}:resolved`,
         type: "tool",
         title: `工具${formatStatus(toolCall.status)}：${toolCall.tool}`,
-        detail: formatJson(toolCall.input),
+        detail: formatToolResultDetail(toolCall),
         timestamp: toolCall.resolved_at,
         status: toolCall.status,
         sort_order: 31,
@@ -288,6 +288,12 @@ export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
 
 function formatJson(value: unknown) {
   return JSON.stringify(value, null, 2);
+}
+
+function formatToolResultDetail(toolCall: ToolCallRecord): string {
+  const input = formatJson(toolCall.input);
+  if (!toolCall.output_summary) return input;
+  return `${input}\n\n执行结果：\n${toolCall.output_summary}`;
 }
 
 /**

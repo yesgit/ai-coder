@@ -34,9 +34,9 @@ export function getProfileAgentStatus(
     }
     return (toolCall.input as Record<string, unknown>).subagent_type === agentName;
   });
-  const latest = calls.at(-1);
+  const latest = [...calls].reverse().find((toolCall) => toolCall.status !== "skipped");
   if (!latest) return "not_started";
   if (latest.status === "completed") return "completed";
-  if (latest.status === "blocked" || latest.status === "denied" || latest.status === "cancelled") return "failed";
+  if (latest.status === "failed" || latest.status === "blocked" || latest.status === "denied" || latest.status === "cancelled") return "failed";
   return "running";
 }

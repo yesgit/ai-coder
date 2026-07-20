@@ -3,7 +3,7 @@ import path from "node:path";
 import { WorkflowRegistry } from "./workflowRegistry.js";
 
 /**
- * 谨慎程序员 yaml v5.2 快照验证。
+ * 谨慎程序员 yaml v5.3 快照验证。
  *
  * v5.0 根本架构变更（v4.0 阶段引擎 → Profile 模式）：
  * - 砍掉所有阶段管线（maintain_project_profile / plan / implement / verify）
@@ -30,7 +30,7 @@ describe("careful-coder.yaml latest", () => {
     expect(listed.map((workflow) => workflow.id)).toEqual(["careful-coder"]);
 
     const v5 = await loadV5();
-    expect(v5.version).toBe("5.2.0");
+    expect(v5.version).toBe("5.3.0");
     expect(v5.name).toBe("谨慎程序员");
     expect(v5.routing?.auto_start).toBe(true);
   });
@@ -65,6 +65,8 @@ describe("careful-coder.yaml latest", () => {
     expect(v5.system_prompt).toContain("EXECUTE_ONE");
     expect(v5.system_prompt).toContain("VERIFY_ONE");
     expect(v5.system_prompt).toContain("FINAL_AUDIT");
+    expect(v5.system_prompt).toContain("全拼/首字母/混合拼音/英文");
+    expect(v5.system_prompt).toContain("别名只扩大检索");
   });
 
   it("has all 10 skills configured", async () => {
@@ -103,6 +105,16 @@ describe("careful-coder.yaml latest", () => {
     expect(v5.agents!["call-contract-investigator"].tools).toContain("mcp__ai_coder__analyze_symbol_contract");
     // task-executor can write
     expect(v5.agents!["task-executor"].tools).toContain("Edit");
+  });
+
+  it("teaches sub-agents to resolve domestic mixed naming without speculative renames", async () => {
+    const v5 = await loadV5();
+    expect(v5.agents!["task-planner"].prompt).toContain("业务术语 → 别名 → path:line");
+    expect(v5.agents!["pre-behavior-snapshot"].prompt).toContain("缩写多义时保留 unknown");
+    expect(v5.agents!["call-contract-investigator"].prompt).toContain("历史错拼别名");
+    expect(v5.agents!["completeness-checker"].prompt).toContain("只搜中文原词不构成完整证据");
+    expect(v5.agents!["task-executor"].prompt).toContain("不得为了统一风格而重命名");
+    expect(v5.agents!["task-verifier"].prompt).toContain("擅自统一既有拼音");
   });
 
   it("shell approval is required (engine-level safety unchanged)", async () => {
