@@ -500,6 +500,26 @@ export interface TaskTree {
   updated_at: string;
 }
 
+export type ExplorationDisposition = "continue" | "verify" | "complete" | "blocked";
+
+/**
+ * Agent 对当前任务的文本化工作记忆。知识内容保持自由文本；其余字段只供宿主
+ * 驱动循环、恢复中断和判断完成声明是否基于最新工具结果。
+ */
+export interface ExplorationCheckpoint {
+  revision: number;
+  text: string;
+  disposition: ExplorationDisposition;
+  next_action?: string;
+  /** host 仅用于旧会话迁移基线；模型写入的 checkpoint 为 agent。 */
+  source?: "host" | "agent";
+  /** 写入本 checkpoint 时已纳入考虑的工具调用数量。 */
+  observed_tool_call_count: number;
+  /** 工具数量不变但 pending→completed 时也能识别 checkpoint 已过期。 */
+  observed_tool_state?: string;
+  created_at: string;
+}
+
 export interface AgentSession {
   id: string;
   project_path: string;
@@ -527,6 +547,8 @@ export interface AgentSession {
   auto_approve?: boolean;
   /** 动态任务树：LLM 通过 update_task_tree MCP 工具维护，贯穿整个执行过程 */
   task_tree?: TaskTree;
+  /** 文本化探索工作记忆；最后一项是当前有效认知，前序项用于恢复与审计。 */
+  exploration_checkpoints?: ExplorationCheckpoint[];
   created_at: string;
   updated_at: string;
   error?: string;

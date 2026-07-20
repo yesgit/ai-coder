@@ -22,6 +22,7 @@ import { buildWorkflowStageDisplays } from "./workflowStageStatus.js";
 import { formatStageRunCardDetail } from "./stageRunPresentation.js";
 import { getProfileAgentStatus, getProfileSkillStatus } from "./profileCapabilityStatus.js";
 import TaskTreePanel from "./TaskTreePanel.js";
+import ExplorationPanel from "./ExplorationPanel.js";
 import {
   formatStageName,
   formatStatus,
@@ -1360,6 +1361,9 @@ export default function App() {
 
           {activeWorkflow && (
             <div className="right-panel">
+              {isProfileMode && (
+                <ExplorationPanel checkpoints={activeSession?.exploration_checkpoints} />
+              )}
               <TaskTreePanel taskTree={activeSession?.task_tree} />
               {isProfileMode ? (
                 <div className="stages-panel">

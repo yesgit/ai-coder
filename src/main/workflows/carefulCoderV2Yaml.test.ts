@@ -67,6 +67,9 @@ describe("careful-coder.yaml latest", () => {
     expect(v5.system_prompt).toContain("FINAL_AUDIT");
     expect(v5.system_prompt).toContain("全拼/首字母/混合拼音/英文");
     expect(v5.system_prompt).toContain("别名只扩大检索");
+    expect(v5.system_prompt).toContain("持续滚动探索工作记忆");
+    expect(v5.system_prompt).toContain("重要工具结果必须通过 checkpoint_exploration 归并");
+    expect(v5.system_prompt).toContain("审查结果必须回流 checkpoint");
   });
 
   it("has all 10 skills configured", async () => {

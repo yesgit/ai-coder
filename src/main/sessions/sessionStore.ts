@@ -237,7 +237,24 @@ export class SessionStore {
   private async writeSessionFile(session: AgentSession): Promise<void> {
     await fs.mkdir(this.storeDir, { recursive: true });
     session.updated_at = new Date().toISOString();
-    await fs.writeFile(this.filePath(session.id), JSON.stringify(session, null, 2), "utf8");
+    const targetPath = this.filePath(session.id);
+    const tempPath = path.join(this.storeDir, `.${session.id}.${randomUUID()}.tmp`);
+    let handle: fs.FileHandle | undefined;
+    try {
+      handle = await fs.open(tempPath, "wx", 0o600);
+      await handle.writeFile(JSON.stringify(session, null, 2), "utf8");
+      await handle.sync();
+      await handle.close();
+      handle = undefined;
+      await fs.rename(tempPath, targetPath);
+    } finally {
+      await handle?.close().catch(() => undefined);
+      await fs.unlink(tempPath).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "ENOENT") {
+          console.warn(`[sessionStore] failed to clean temporary session file ${tempPath}:`, error);
+        }
+      });
+    }
   }
 
   private async enqueueWrite<T>(id: string, operation: () => Promise<T>): Promise<T> {

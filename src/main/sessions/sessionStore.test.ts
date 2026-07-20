@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { SessionStore } from "./sessionStore.js";
 import type { WorkflowTemplate } from "../../shared/types.js";
 
@@ -148,6 +148,54 @@ describe("SessionStore", () => {
     const sessions = await store.list();
 
     expect(sessions).toHaveLength(1);
+  });
+
+  it("atomically persists exploration checkpoints without leaving temporary files", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-sessions-"));
+    const store = new SessionStore(dir);
+    const session = await store.create("/tmp/project", workflow, "Fix bug");
+    session.exploration_checkpoints = [{
+      revision: 1,
+      text: "# Current knowledge\n\nTests still need to run.",
+      disposition: "verify",
+      next_action: "Run the focused tests",
+      observed_tool_call_count: 0,
+      observed_tool_state: "state-1",
+      source: "agent",
+      created_at: new Date().toISOString()
+    }];
+
+    await store.save(session);
+
+    expect((await store.get(session.id))?.exploration_checkpoints).toEqual(session.exploration_checkpoints);
+    expect((await fs.readdir(dir)).filter((entry) => entry.endsWith(".tmp"))).toEqual([]);
+  });
+
+  it("preserves the previous session when the atomic replacement fails", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-sessions-"));
+    const store = new SessionStore(dir);
+    const session = await store.create("/tmp/project", workflow, "Fix bug");
+    session.exploration_checkpoints = [{
+      revision: 1,
+      text: "Uncommitted replacement",
+      disposition: "continue",
+      next_action: "Keep exploring",
+      observed_tool_call_count: 0,
+      source: "agent",
+      created_at: new Date().toISOString()
+    }];
+    const rename = vi.spyOn(fs, "rename").mockRejectedValueOnce(new Error("simulated rename failure"));
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    try {
+      await expect(store.save(session)).rejects.toThrow("simulated rename failure");
+    } finally {
+      rename.mockRestore();
+      consoleError.mockRestore();
+    }
+
+    expect((await store.get(session.id))?.exploration_checkpoints).toBeUndefined();
+    expect((await fs.readdir(dir)).filter((entry) => entry.endsWith(".tmp"))).toEqual([]);
   });
 
   it("approves and denies pending tool calls", async () => {
