@@ -1167,6 +1167,7 @@ textarea {
 
 .tool-approval {
   display: grid;
+  min-width: 0;
   gap: 8px;
   border: 1px solid #f3d18b;
   border-radius: 8px;
@@ -1187,6 +1188,10 @@ textarea {
 }
 
 .tool-approval small {
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   color: #667085;
   font-size: 11px;
 }
@@ -1630,6 +1635,37 @@ textarea {
   border-bottom: 1px solid #d9e2ec;
   background: #f2f4f7;
   font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.activity-heading-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.activity-copy-button {
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  padding: 2px 7px;
+  background: #ffffff;
+  color: #344054;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.activity-copy-button:hover:not(:disabled) {
+  border-color: #98a2b3;
+  background: #f8fafc;
+}
+
+.activity-copy-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
 }
 
 .activity-stream-body {
@@ -1640,11 +1676,15 @@ textarea {
 
 .activity-item {
   display: grid;
-  grid-template-columns: 55px 1fr;
+  grid-template-columns: 55px minmax(0, 1fr);
   gap: 6px;
   font-size: 11px;
   color: #475467;
   padding: 2px 0;
+}
+
+.activity-item > * {
+  min-width: 0;
 }
 
 .activity-item time {
@@ -1652,9 +1692,9 @@ textarea {
 }
 
 .activity-item span.muted {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .activity-item time {
@@ -1681,7 +1721,7 @@ textarea {
   color: #344054;
 }
 .profile-activity .activity-item {
-  grid-template-columns: 55px 70px 1fr;
+  grid-template-columns: 55px 70px minmax(0, 1fr);
   padding: 3px 0;
 }
 .activity-type-badge {
@@ -1728,6 +1768,9 @@ textarea {
 
 .timeline-body {
   min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   border: 1px solid #e1e7ef;
   border-radius: 6px;
   background: #ffffff;
@@ -1982,6 +2025,10 @@ pre {
 
 /* Markdown 内容样式 */
 .markdown-content {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   font-size: 13px;
   line-height: 1.5;
   color: #344054;
@@ -1996,6 +2043,9 @@ pre {
 }
 
 .markdown-content code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   background: rgba(0, 0, 0, 0.06);
   padding: 2px 5px;
   border-radius: 3px;
@@ -2008,11 +2058,18 @@ pre {
   padding: 8px 10px;
   border-radius: 5px;
   background: #f4f5f7;
-  overflow-x: auto;
+  max-width: 100%;
+  overflow-x: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   font-size: 12px;
 }
 
 .markdown-content pre code {
+  white-space: inherit;
+  overflow-wrap: inherit;
+  word-break: inherit;
   background: transparent;
   padding: 0;
 }

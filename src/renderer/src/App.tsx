@@ -21,6 +21,12 @@ import { getVisibleSessions, groupSessionsByProject, resolveActiveSessionId, res
 import { buildWorkflowStageDisplays } from "./workflowStageStatus.js";
 import { formatStageRunCardDetail } from "./stageRunPresentation.js";
 import { getProfileAgentStatus, getProfileSkillStatus } from "./profileCapabilityStatus.js";
+import { formatActivityLog } from "./activityLog.js";
+import {
+  createPastedTextFileName,
+  insertPastedTextAttachmentReference,
+  shouldAttachPastedText
+} from "./pastedTextAttachment.js";
 import TaskTreePanel from "./TaskTreePanel.js";
 import ExplorationPanel from "./ExplorationPanel.js";
 import {
@@ -63,6 +69,7 @@ export default function App() {
   // 单选/多选中选择"其他"时的自定义文本草稿，按 question id 存放
   const [questionOtherTexts, setQuestionOtherTexts] = useState<Record<string, string>>({});
   const [timelineLimit, setTimelineLimit] = useState(50); // 默认只显示最近 50 条事件
+  const [activityCopyState, setActivityCopyState] = useState<"idle" | "copied" | "failed">("idle");
 
   // 切换 session 时清空草稿答案，避免不同 session 间的串味
   useEffect(() => {
@@ -553,7 +560,7 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [showFileMention, fileMentionQuery, projectPath]);
 
-  function handlePaste(e: React.ClipboardEvent, target: "task" | "chat") {
+  function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>, target: "task" | "chat") {
     const items = e.clipboardData.items;
     const imageItems: DataTransferItem[] = [];
     for (let i = 0; i < items.length; i++) {
@@ -561,28 +568,62 @@ export default function App() {
         imageItems.push(items[i]);
       }
     }
-    if (imageItems.length === 0) return;
-    e.preventDefault();
-    const MAX_IMAGE_SIZE = 5 * 1024 * 1024; // 5MB
-    for (const item of imageItems) {
-      const file = item.getAsFile();
-      if (!file) continue;
-      if (file.size > MAX_IMAGE_SIZE) {
-        setError(`图片 ${file.name} 过大（${Math.round(file.size / 1024)}KB），上限 5MB`);
-        continue;
+    if (imageItems.length > 0) {
+      e.preventDefault();
+      const MAX_IMAGE_SIZE = 5 * 1024 * 1024; // 5MB
+      for (const item of imageItems) {
+        const file = item.getAsFile();
+        if (!file) continue;
+        if (file.size > MAX_IMAGE_SIZE) {
+          setError(`图片 ${file.name} 过大（${Math.round(file.size / 1024)}KB），上限 5MB`);
+          continue;
+        }
+        const reader = new FileReader();
+        reader.onload = () => {
+          const dataUrl = reader.result as string;
+          const base64 = dataUrl.split(",")[1];
+          const mediaType = item.type || "image/png";
+          setTaskAttachments((prev) => [
+            ...prev,
+            { type: "image", data_base64: base64, media_type: mediaType, display_name: file.name || "pasted-image.png" }
+          ]);
+        };
+        reader.readAsDataURL(file);
       }
-      const reader = new FileReader();
-      reader.onload = () => {
-        const dataUrl = reader.result as string;
-        const base64 = dataUrl.split(",")[1];
-        const mediaType = item.type || "image/png";
+      return;
+    }
+
+    const pastedText = e.clipboardData.getData("text/plain");
+    if (!shouldAttachPastedText(pastedText)) return;
+
+    e.preventDefault();
+    const fileName = createPastedTextFileName();
+    const file = new File([pastedText], fileName, { type: "text/plain" });
+    if (file.size > MAX_UPLOAD_SIZE) {
+      setError(`粘贴文本过大（${Math.round(file.size / 1024 / 1024)}MB），上限 ${MAX_UPLOAD_SIZE / 1024 / 1024}MB`);
+      return;
+    }
+
+    const selectionStart = e.currentTarget.selectionStart ?? e.currentTarget.value.length;
+    const selectionEnd = e.currentTarget.selectionEnd ?? selectionStart;
+    setTaskPrompt(insertPastedTextAttachmentReference(
+      e.currentTarget.value,
+      selectionStart,
+      selectionEnd,
+      fileName,
+      pastedText.length
+    ));
+    setShowFileMention(false);
+    void readFileAsBase64(file)
+      .then((base64) => {
         setTaskAttachments((prev) => [
           ...prev,
-          { type: "image", data_base64: base64, media_type: mediaType, display_name: file.name || "pasted-image.png" }
+          { type: "file_upload", data_base64: base64, media_type: "text/plain", display_name: fileName }
         ]);
-      };
-      reader.readAsDataURL(file);
-    }
+      })
+      .catch((pasteError) => {
+        setError(`粘贴文本附件生成失败：${pasteError instanceof Error ? pasteError.message : String(pasteError)}`);
+      });
   }
 
   function handleDrop(e: React.DragEvent, target: "task" | "chat") {
@@ -755,7 +796,21 @@ export default function App() {
     const el = activityStreamRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [activityEvents]);
+  useEffect(() => {
+    setActivityCopyState("idle");
+  }, [activeSessionId, activityEvents.length]);
   const latestProgress = activeSession?.progress_events?.at(-1);
+
+  async function copyActivityLog() {
+    if (activityEvents.length === 0) return;
+    try {
+      await window.aiCoder.copyText(formatActivityLog(activityEvents, formatTimestamp));
+      setActivityCopyState("copied");
+    } catch (copyError) {
+      setActivityCopyState("failed");
+      setError(copyError instanceof Error ? copyError.message : "复制实时活动日志失败");
+    }
+  }
 
   return (
     <main className={`app-shell${historyOpen ? " history-open" : ""}`}>
@@ -914,7 +969,7 @@ export default function App() {
                   handleTextareaChange(event.target.value, "task", event.target.selectionStart ?? undefined);
                 }}
                 onPaste={(e) => handlePaste(e, "task")}
-                placeholder={composerSession ? "给当前会话发送消息... (可粘贴图片、拖入文件、@引用项目文件)" : "描述要执行的编码任务... (可粘贴图片、拖入文件、@引用项目文件)"}
+                placeholder={composerSession ? "给当前会话发送消息... (大段文本自动转附件，也可粘贴图片、拖入文件、@引用项目文件)" : "描述要执行的编码任务... (大段文本自动转附件，也可粘贴图片、拖入文件、@引用项目文件)"}
               />
               {showFileMention && mentionTarget === "task" && fileMentionResults.length > 0 && (
                 <div className="file-mention-dropdown">
@@ -1209,7 +1264,17 @@ export default function App() {
                     <section className="activity-stream profile-activity">
                       <div className="panel-heading">
                         <h3>实时活动</h3>
-                        <small>{activityEvents.length} 条记录</small>
+                        <div className="activity-heading-actions">
+                          <small>{activityEvents.length} 条记录</small>
+                          <button
+                            type="button"
+                            className="activity-copy-button"
+                            disabled={activityEvents.length === 0}
+                            onClick={() => void copyActivityLog()}
+                          >
+                            {activityCopyState === "copied" ? "已复制" : activityCopyState === "failed" ? "复制失败" : "复制日志"}
+                          </button>
+                        </div>
                       </div>
                       <div className="activity-stream-body" ref={activityStreamRef}>
                         {activityEvents.length > 0 ? (
@@ -1229,7 +1294,16 @@ export default function App() {
                     <>
                       {activityEvents.length > 0 && (
                         <section className="activity-stream">
-                          <div className="activity-stream-header">实时活动（滚动）</div>
+                          <div className="activity-stream-header">
+                            <span>实时活动（滚动）</span>
+                            <button
+                              type="button"
+                              className="activity-copy-button"
+                              onClick={() => void copyActivityLog()}
+                            >
+                              {activityCopyState === "copied" ? "已复制" : activityCopyState === "failed" ? "复制失败" : "复制日志"}
+                            </button>
+                          </div>
                           <div className="activity-stream-body" ref={activityStreamRef}>
                             {activityEvents.map((p) => (
                               <div key={p.id} className="activity-item">

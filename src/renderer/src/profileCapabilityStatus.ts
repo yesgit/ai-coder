@@ -12,15 +12,16 @@ export function getProfileSkillStatus(
 ): ProfileCapabilityStatus {
   if (!session) return "not_started";
   const expected = normalizedSkillId(skillId);
-  const loadedByHost = (session.progress_events ?? []).some((event) =>
-    event.message.startsWith("宿主强制加载 Skill：")
-    && normalizedSkillId(event.message.slice("宿主强制加载 Skill：".length).trim()) === expected
+  const appliedByDelegation = (session.progress_events ?? []).some((event) =>
+    event.message.startsWith("委托 ")
+    && event.message.includes("落实 Skill：")
+    && event.message.split("落实 Skill：")[1]?.split(",").some((value) => normalizedSkillId(value.trim()) === expected)
   );
   const loadedByTool = session.messages.some((message) =>
     message.kind === "skill_usage"
     && normalizedSkillId(message.content.replace(/`/g, "").trim()).includes(expected)
   );
-  return loadedByHost || loadedByTool ? "completed" : "not_started";
+  return appliedByDelegation || loadedByTool ? "completed" : "not_started";
 }
 
 export function getProfileAgentStatus(

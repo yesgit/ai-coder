@@ -227,6 +227,8 @@ export interface WorkflowTemplate {
   skills?: string[];
   /** v5.0 profile 模式：顶层 sub-agents（无阶段管线时使用） */
   agents?: Record<string, WorkflowStageAgentDefinition>;
+  /** 简洁 Profile 循环：以探索知识为主，不强制 task-planner、任务树或角色流水线。 */
+  simple_profile_loop?: boolean;
 }
 
 export interface WorkflowLoadIssue {
@@ -501,6 +503,7 @@ export interface TaskTree {
 }
 
 export type ExplorationDisposition = "continue" | "verify" | "complete" | "blocked";
+export type ExplorationPhase = "investigate" | "implement" | "verify" | "complete";
 
 /**
  * Agent 对当前任务的文本化工作记忆。知识内容保持自由文本；其余字段只供宿主
@@ -510,6 +513,8 @@ export interface ExplorationCheckpoint {
   revision: number;
   text: string;
   disposition: ExplorationDisposition;
+  /** 当前行动进度标签；用于提示和展示，不作为工具权限门禁。 */
+  phase?: ExplorationPhase;
   next_action?: string;
   /** host 仅用于旧会话迁移基线；模型写入的 checkpoint 为 agent。 */
   source?: "host" | "agent";
@@ -626,6 +631,7 @@ export interface ProjectOnboardingStatus {
 }
 
 export interface AppApi {
+  copyText(text: string): Promise<void>;
   selectProjectDirectory(): Promise<string | null>;
   authorizeSessionProject(projectPath: string): Promise<string>;
   getAgentRuntimeStatus(): Promise<AgentRuntimeStatus>;

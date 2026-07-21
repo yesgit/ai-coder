@@ -216,6 +216,7 @@ const workflowSchema = z.object({
     })
     .default({ enabled: false, auto_start: false, keywords: [], examples: [] }),
   system_prompt: z.string().optional(),
+  simple_profile_loop: z.boolean().optional(),
   skills: stringArraySchema,
   agents: z
     .record(
@@ -306,6 +307,7 @@ function normalizeWorkflow(input: unknown, sourceType: WorkflowSourceType, fileP
     rework: workflow.rework,
     routing: workflow.routing,
     system_prompt: workflow.system_prompt,
+    simple_profile_loop: workflow.simple_profile_loop,
     skills: workflow.skills,
     agents: workflow.agents,
     stages: workflow.stages.map((stage) => ({

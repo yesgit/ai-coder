@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { access, readFile } from "node:fs/promises";
+import { access, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
-import type { AgentMessage, AgentSession, Attachment, ExplorationCheckpoint, ExplorationDisposition, HumanQuestion, HumanQuestionOption, SessionProgressEvent, StageAgentResult, TaskTree, WorkflowStage, WorkflowTemplate } from "../../shared/types.js";
+import type { AgentMessage, AgentSession, Attachment, ExplorationCheckpoint, ExplorationDisposition, ExplorationPhase, HumanQuestion, HumanQuestionOption, SessionProgressEvent, StageAgentResult, TaskTree, WorkflowStage, WorkflowTemplate } from "../../shared/types.js";
 import { isMeaningfulAgentText } from "../../shared/agentMessages.js";
 import { analyzeSymbolContract } from "../analysis/symbolContractAnalyzer.js";
 import {
@@ -62,6 +62,21 @@ function isModelMultimodal(model: string | undefined | null): boolean {
   return !NON_MULTIMODAL_MODEL_PATTERNS.some((p) => lower.includes(p));
 }
 
+function extractSkillCatalogMetadata(content: string, fallbackName: string): { name: string; description: string } {
+  const frontmatter = /^---\s*\r?\n([\s\S]*?)\r?\n---/.exec(content)?.[1] ?? "";
+  const readScalar = (key: string): string | undefined => {
+    const raw = new RegExp(`^${key}:\\s*(.+)$`, "m").exec(frontmatter)?.[1]?.trim();
+    if (!raw) return undefined;
+    const quote = raw[0];
+    return (quote === "\"" || quote === "'") && raw.at(-1) === quote
+      ? raw.slice(1, -1).trim()
+      : raw;
+  };
+  const name = readScalar("name") || fallbackName;
+  const description = readScalar("description") || "按 Skill 的完整说明判断是否适用";
+  return { name, description };
+}
+
 export class ClaudeAgentRunner {
   private readonly workflowEngine = new WorkflowEngine();
   private readonly maxStageIterations = 50;
@@ -70,6 +85,7 @@ export class ClaudeAgentRunner {
   private readonly pendingToolApprovals = new Map<string, Map<string, PendingToolApproval>>();
   private readonly options: ClaudeAgentRunnerOptions;
   private resolvedEffectiveModel: string | null = null;
+  private discoveredSkillCatalog?: Promise<Array<{ id: string; description: string }>>;
 
   constructor(options: ClaudeAgentRunnerOptions | ClaudeQuery = {}) {
     this.options = typeof options === "function" ? { queryOverride: options } : options;
@@ -163,6 +179,7 @@ export class ClaudeAgentRunner {
 
   private async runProfileMode(input: AgentRunInput): Promise<AgentSession> {
     input.session.status = "running";
+    const simpleProfileLoop = input.workflow.simple_profile_loop === true;
     const attachmentErrors = await findUnreadableProfileAttachments(input.session);
     if (attachmentErrors.length > 0) {
       input.session.status = "interrupted";
@@ -174,12 +191,21 @@ export class ClaudeAgentRunner {
       await this.recordProgress(input, "status", input.session.error, "milestone");
       return input.session;
     }
-    const taskTreeBootstrapped = ensureProfileTaskTree(input.session);
     const explorationBootstrapped = ensureExplorationCheckpoint(input.session);
-    const taskTreeRepair = repairConcurrentProfileTasks(input.session);
+    const taskTreeBootstrapped = simpleProfileLoop
+      ? syncPhaseTaskTreeWithCheckpoint(input.session)
+      : ensureProfileTaskTree(input.session);
+    const taskTreeRepair = simpleProfileLoop ? null : repairConcurrentProfileTasks(input.session);
     await input.onProgress?.(input.session);
     if (taskTreeBootstrapped) {
-      await this.recordProgress(input, "status", "宿主已建立 Profile 根任务，等待执行与验证证据。", "milestone");
+      await this.recordProgress(
+        input,
+        "status",
+        simpleProfileLoop
+          ? "宿主已根据知识雪球的 next_action 建立当前阶段任务。"
+          : "宿主已建立 Profile 根任务，等待执行与验证证据。",
+        "milestone"
+      );
     }
     if (taskTreeRepair) {
       await this.recordProgress(input, "status", taskTreeRepair, "milestone");
@@ -190,9 +216,6 @@ export class ClaudeAgentRunner {
 
     const abortController = new AbortController();
     this.abortControllers.set(input.session.id, abortController);
-    const completedToolCache = new Map<string, { outputSummary?: string; exitCode?: number }>();
-    this.saveCompletedToolsToCache(input.session, completedToolCache);
-    const persistedEvidenceCache = new Map(completedToolCache);
     const maxProfileQueries = 24;
     const maxRuntimeFollowUpQueries = 8;
     let profileQueryLimit = maxProfileQueries;
@@ -202,21 +225,14 @@ export class ClaudeAgentRunner {
     let subprocessCrashRetries = 0;
     let consecutiveServiceUnavailableFailures = 0;
     let recentAssistantContext = collectRecentAssistantContext(input.session.messages);
-    let continuationContext = persistedEvidenceCache.size > 0
-      ? buildCompletionContinuationContext(
-          evaluateProfileCompletion(input.session),
-          recentAssistantContext,
-          persistedEvidenceCache,
-          false
-        )
-      : "";
+    let continuationContext = "";
 
     try {
       for (let attempt = 0; attempt < profileQueryLimit; attempt += 1) {
         const queuedBeforeQuery = await this.takeQueuedUserMessages(input);
         if (queuedBeforeQuery.length > 0) {
           continuationContext = [
-            buildQueuedUserMessageContext(queuedBeforeQuery),
+            buildQueuedUserMessageContext(queuedBeforeQuery, input.session.project_path),
             continuationContext
           ].filter(Boolean).join("\n\n");
           await this.recordProgress(
@@ -230,7 +246,6 @@ export class ClaudeAgentRunner {
         const result = await this.runProfileQuery(
           input,
           abortController,
-          completedToolCache,
           attempt > 0 || Boolean(continuationContext),
           continuationContext
         );
@@ -239,10 +254,25 @@ export class ClaudeAgentRunner {
         const transcript = formatClaudeTranscript(result.sdkMessages);
         if (transcript) {
           enrichImageReadEvidence(input.session, result.preQueryTcCount, transcript);
-          this.saveCompletedToolsToCache(input.session, completedToolCache);
           this.appendAssistantMessage(input.session, transcript);
           recentAssistantContext = appendBoundedAssistantContext(recentAssistantContext, transcript);
           await this.recordProgress(input, "runner", transcript, "milestone");
+        }
+
+        if (!result.apiError) {
+          const milestoneCheckpoint = checkpointProfileMilestoneIfNeeded(
+            input.session,
+            transcript
+          );
+          if (milestoneCheckpoint) {
+            if (simpleProfileLoop) syncPhaseTaskTreeWithCheckpoint(input.session);
+            await this.recordProgress(
+              input,
+              "status",
+              milestoneCheckpoint,
+              "milestone"
+            );
+          }
         }
 
         if (result.postResultProcessError) {
@@ -258,7 +288,6 @@ export class ClaudeAgentRunner {
         }
 
         if (result.apiError) {
-          this.saveCompletedToolsToCache(input.session, completedToolCache);
           const errorMessage = result.apiError instanceof Error
             ? result.apiError.message
             : String(result.apiError);
@@ -266,7 +295,19 @@ export class ClaudeAgentRunner {
             ? result.apiError.name
             : typeof result.apiError;
           input.session.messages = input.session.messages.slice(0, result.preQueryMsgCount);
-          input.session.tool_calls = input.session.tool_calls.slice(0, result.preQueryTcCount);
+          const completedDuringInterruptedQuery = retainSettledProfileToolCalls(
+            input.session,
+            result.preQueryTcCount
+          );
+          if (completedDuringInterruptedQuery.length > 0) {
+            checkpointInterruptedProfileProgress(
+              input.session,
+              completedDuringInterruptedQuery,
+              transcript,
+              errorMessage
+            );
+            if (simpleProfileLoop) syncPhaseTaskTreeWithCheckpoint(input.session);
+          }
           input.session.status = "running";
           input.session.error = undefined;
           await this.recordProgress(input, "status", `API 调用失败：${errorMessage.slice(0, 120)}`, "milestone");
@@ -274,7 +315,7 @@ export class ClaudeAgentRunner {
             errorName,
             errorMessage,
             transcript,
-            completedToolCache
+            completedDuringInterruptedQuery
           );
           if (isSubprocessCrashError(result.apiError)) {
             subprocessCrashRetries += 1;
@@ -345,8 +386,7 @@ export class ClaudeAgentRunner {
 
         const queuedAfterQuery = await this.takeQueuedUserMessages(input);
         if (queuedAfterQuery.length > 0) {
-          this.saveCompletedToolsToCache(input.session, completedToolCache);
-          continuationContext = buildQueuedUserMessageContext(queuedAfterQuery);
+          continuationContext = buildQueuedUserMessageContext(queuedAfterQuery, input.session.project_path);
           stalledQueries = 0;
           input.session.status = "running";
           if (
@@ -364,6 +404,7 @@ export class ClaudeAgentRunner {
           continue;
         }
 
+        if (simpleProfileLoop) syncPhaseTaskTreeWithCheckpoint(input.session);
         const latestCheckpoint = getLatestExplorationCheckpoint(input.session);
         if (latestCheckpoint?.source === "agent" && latestCheckpoint.disposition === "blocked") {
           input.session.status = "blocked";
@@ -374,7 +415,7 @@ export class ClaudeAgentRunner {
           return input.session;
         }
 
-        const incompleteReasons = evaluateProfileCompletion(input.session);
+        const incompleteReasons = evaluateProfileCompletion(input.session, !simpleProfileLoop);
         if (incompleteReasons.length === 0) {
           input.session.status = "completed";
           input.session.error = undefined;
@@ -382,11 +423,9 @@ export class ClaudeAgentRunner {
           return input.session;
         }
 
-        this.saveCompletedToolsToCache(input.session, completedToolCache);
         continuationContext = buildCompletionContinuationContext(
           incompleteReasons,
           recentAssistantContext,
-          completedToolCache,
           Boolean(result.postResultProcessError)
         );
         const progressAfterQuery = buildProfileProgressFingerprint(input.session);
@@ -397,7 +436,7 @@ export class ClaudeAgentRunner {
           await this.recordProgress(
             input,
             "status",
-            `连续 ${maxStalledQueries} 轮没有任务状态、非重复工具证据或文件改动，已暂停以避免空转。可使用断点恢复继续。`,
+            `连续 ${maxStalledQueries} 轮没有任务状态、知识或文件改动，已暂停以避免空转。可使用断点恢复继续。`,
             "milestone"
           );
           return input.session;
@@ -411,7 +450,7 @@ export class ClaudeAgentRunner {
         );
       }
 
-      const incompleteReasons = evaluateProfileCompletion(input.session);
+      const incompleteReasons = evaluateProfileCompletion(input.session, !simpleProfileLoop);
       input.session.status = "interrupted";
       input.session.error = `完成闸门未通过：${incompleteReasons.join("；")}`;
       await this.recordProgress(input, "status", "达到 Profile 工作轮次安全上限，任务未完成。可使用断点恢复继续。", "milestone");
@@ -447,15 +486,11 @@ export class ClaudeAgentRunner {
   private async runProfileQuery(
     input: AgentRunInput,
     abortController: AbortController,
-    completedToolCache: Map<string, { outputSummary?: string; exitCode?: number }>,
     isLlmRetry: boolean,
     llmDecisionContext: string
   ): Promise<ProfileQueryResult> {
     const sdkMessages: unknown[] = [];
     const rewrittenToolInputs = new Map<string, Record<string, unknown>>();
-    // 只把前序 query 的成功结果视为跨轮缓存；本轮刚完成的同名操作仍可能是合法复核。
-    // 本轮并发重复由 inFlightToolKeys 单独拦截。
-    const priorQueryToolKeys = new Set(completedToolCache.keys());
     const preQueryMsgCount = input.session.messages.length;
     const preQueryTcCount = input.session.tool_calls.length;
     // 运行时解析的有效模型只来自 SDK init；宿主不指定或切换模型。
@@ -466,14 +501,28 @@ export class ClaudeAgentRunner {
       const mcpServer = await this.resolveMcpServer(input);
 
       const skillIds = input.workflow.skills ?? [];
-      const profileSkills = await this.loadProfileSkills(skillIds);
+      const allProfileSkills = await this.loadProfileSkills(skillIds);
+      const profileSkills = selectProfileSkillsForPhase(
+        allProfileSkills,
+        getLatestExplorationCheckpoint(input.session)?.phase ?? "investigate"
+      );
+      const capabilityCatalog = await this.buildProfileCapabilityCatalog(input.workflow, Boolean(mcpServer));
       if (!isLlmRetry) {
-        for (const skill of profileSkills) {
-          await this.recordProgress(input, "runner", `宿主强制加载 Skill：${skill.id}`, "milestone");
-        }
+        await this.recordProgress(
+          input,
+          "runner",
+          `宿主已按当前阶段注入 ${profileSkills.length} 个 Skill 执行契约：${profileSkills.map((skill) => skill.id).join(", ") || "无"}`,
+          "milestone"
+        );
       }
 
-      const carefulCoderInstructions = this.buildProfileSystemPrompt(profileSkills, input.workflow.system_prompt, isLlmRetry ? effectiveModel : undefined);
+      const simpleProfileLoop = input.workflow.simple_profile_loop === true;
+      const carefulCoderInstructions = this.buildProfileSystemPrompt(
+        profileSkills,
+        input.workflow.system_prompt,
+        isLlmRetry ? effectiveModel : undefined,
+        simpleProfileLoop
+      );
 
       const taskPrompt = input.session.task_prompt ?? "";
       const humanQaHistory = (input.session.pending_human_questions ?? [])
@@ -483,21 +532,22 @@ export class ClaudeAgentRunner {
 
       const initialMessage = input.session.initial_user_message ?? input.session.messages.find((m) => m.role === "user");
       const sessionAttachments = collectSessionAttachments(input.session);
-      const attachmentList = formatProfileAttachmentList(sessionAttachments);
+      const attachmentList = formatProfileAttachmentList(sessionAttachments, input.session.project_path);
 
-      let instructions = [
-        taskPrompt || "（无任务描述）",
-        attachmentList ? `\n附件：\n${attachmentList}` : "",
-        humanQaHistory ? `\n人类问答历史：\n${humanQaHistory}` : "",
+      const instructions = [
+        `## 用户原始目标与输入\n${taskPrompt || "（无任务描述）"}`,
+        attachmentList ? `### 附件\n${attachmentList}` : "",
+        humanQaHistory ? `### 人类问答历史\n${humanQaHistory}` : "",
+        buildExplorationPromptSection(input.session),
         input.session.task_tree
-          ? buildTaskTreePromptSection(input.session.task_tree)
+          ? simpleProfileLoop
+            ? buildPhaseTaskTreePromptSection(input.session.task_tree)
+            : buildTaskTreePromptSection(input.session.task_tree)
           : "",
-        buildExplorationPromptSection(input.session)
+        buildExecutionProgressPromptSection(input.session),
+        isLlmRetry && llmDecisionContext ? llmDecisionContext : "",
+        capabilityCatalog
       ].filter(Boolean).join("\n\n");
-
-      if (isLlmRetry && llmDecisionContext) {
-        instructions = llmDecisionContext + "\n\n" + instructions;
-      }
 
       await this.recordProgress(input, "runner", isLlmRetry ? "LLM 判断后继续执行（Profile 模式）" : "开始执行（Profile 模式）", "milestone");
       const nodeInfo = await resolveNodeExecutable();
@@ -514,98 +564,18 @@ export class ClaudeAgentRunner {
         };
       }
       const activeProfileSubagents = new Set<string>();
-      const inFlightToolKeys = new Map<string, string>();
-      const duplicateRequestsByKey = new Map<string, number>();
-      const countedDuplicateToolUses = new Set<string>();
-      let duplicateRequestTotal = 0;
-      let duplicateVolumeWarned = false;
-      const noteDuplicateRequest = async (
-        cacheKey: string,
-        toolUseID: string,
-        reason: string
-      ): Promise<string> => {
-        const duplicateIdentity = toolUseID ? `${cacheKey}::${toolUseID}` : "";
-        if (duplicateIdentity && countedDuplicateToolUses.has(duplicateIdentity)) return reason;
-        if (duplicateIdentity) countedDuplicateToolUses.add(duplicateIdentity);
-        const duplicateCount = (duplicateRequestsByKey.get(cacheKey) ?? 0) + 1;
-        duplicateRequestsByKey.set(cacheKey, duplicateCount);
-        duplicateRequestTotal += 1;
-        if (duplicateRequestTotal >= 10 && !duplicateVolumeWarned) {
-          duplicateVolumeWarned = true;
-          const message = `本轮累计命中 ${duplicateRequestTotal} 个已完成工具；这些调用已逐项跳过，但不会暂停会话。`;
-          await this.recordProgress(input, "status", message, "milestone");
-          return `${reason} ${message}`;
-        }
-        if (duplicateCount === 3) {
-          const message = `同一操作重复 ${duplicateCount} 次，本轮累计重复 ${duplicateRequestTotal} 次；本轮禁止再次调用，请使用已返回的结果或改做下一个任务。`;
-          await this.recordProgress(input, "status", message, "milestone");
-          return `${reason} ${message}`;
-        }
-        if (duplicateCount > 3) {
-          return `${reason} 此操作本轮已被软熔断，禁止再次调用；请继续其他工作。`;
-        }
-        return reason;
-      };
       const inspectToolUse = async (
         toolName: string,
         toolInput: Record<string, unknown>,
-        toolUseID: string
+        _toolUseID: string
       ): Promise<string | null> => {
-        const cacheKey = makeToolCacheKey(toolName, toolInput);
-        const canReuseCurrentQueryResult = ["Read", "Grep", "Glob", "LS"].includes(toolName);
-        const cached = (
-          priorQueryToolKeys.has(cacheKey)
-          || (canReuseCurrentQueryResult && completedToolCache.has(cacheKey))
-        )
-          ? completedToolCache.get(cacheKey)
-          : undefined;
-        if (cached) {
-          const safeSummary = safeCachedToolOutput(cached.outputSummary);
-          const resultHint = safeSummary
-            ? `前序结果：${safeSummary.slice(0, 1_200)}`
-            : ["Read", "Glob", "Grep", "LS"].includes(toolName)
-              ? "前序读取已成功；二进制或超大内容未重新注入"
-              : `退出码：${cached.exitCode ?? 0}`;
-          return noteDuplicateRequest(
-            cacheKey,
-            toolUseID,
-            `此操作已在本会话中成功完成，无需重复执行。${resultHint}。请基于该结果继续。`
-          );
-        }
-        const inFlightToolUseID = inFlightToolKeys.get(cacheKey);
-        if (inFlightToolUseID && inFlightToolUseID !== toolUseID) {
-          return noteDuplicateRequest(
-            cacheKey,
-            toolUseID,
-            "相同工具调用仍在执行中，已跳过重复请求。请等待现有调用结果。"
-          );
-        }
-        // 必须在第一个异步校验前原子占位，否则同一批并发 hook 会一起穿过检查。
-        if (toolUseID) {
-          inFlightToolKeys.set(cacheKey, toolUseID);
-        }
-        const validationError = await validateProfileToolInput(
+        return validateProfileToolInput(
           toolName,
           toolInput,
           input.session.project_path,
-          sessionAttachments
+          sessionAttachments,
+          getLatestExplorationCheckpoint(input.session)?.phase
         );
-        if (validationError) {
-          if (inFlightToolKeys.get(cacheKey) === toolUseID) {
-            inFlightToolKeys.delete(cacheKey);
-          }
-          return validationError;
-        }
-        return null;
-      };
-      const reserveToolUse = (
-        toolName: string,
-        toolInput: Record<string, unknown>,
-        toolUseID: string
-      ): void => {
-        if (toolUseID) {
-          inFlightToolKeys.set(makeToolCacheKey(toolName, toolInput), toolUseID);
-        }
       };
       const redirectTaskToPlanner = async (
         toolInput: Record<string, unknown>,
@@ -679,7 +649,46 @@ export class ClaudeAgentRunner {
                 const hookToolInput = isPlainObject(hookInput.tool_input) ? hookInput.tool_input : {};
                 const hookToolUseID = optionalString(hookInput.tool_use_id) ?? "";
                 const hookAgentID = optionalString(hookInput.agent_id);
-                const repeatsCompletedPlanner = hookToolName === "Task"
+                const plannerGuard = simpleProfileLoop && !hookAgentID
+                  ? getSimplePlannerGuardError(input.session, sessionAttachments, hookToolName, hookToolInput)
+                  : null;
+                if (plannerGuard) {
+                  return {
+                    continue: true,
+                    hookSpecificOutput: {
+                      hookEventName: "PreToolUse",
+                      permissionDecision: "deny",
+                      permissionDecisionReason: plannerGuard
+                    }
+                  };
+                }
+                const executorPrerequisiteGuard = simpleProfileLoop && !hookAgentID
+                  ? getSimpleExecutorPrerequisiteGuardError(input.session, hookToolName, hookToolInput)
+                  : null;
+                if (executorPrerequisiteGuard) {
+                  return {
+                    continue: true,
+                    hookSpecificOutput: {
+                      hookEventName: "PreToolUse",
+                      permissionDecision: "deny",
+                      permissionDecisionReason: executorPrerequisiteGuard
+                    }
+                  };
+                }
+                const delegationGuard = simpleProfileLoop && !hookAgentID
+                  ? getSimpleDelegationGuardError(hookToolName, hookToolInput)
+                  : null;
+                if (delegationGuard) {
+                  return {
+                    continue: true,
+                    hookSpecificOutput: {
+                      hookEventName: "PreToolUse",
+                      permissionDecision: "deny",
+                      permissionDecisionReason: delegationGuard
+                    }
+                  };
+                }
+                const repeatsCompletedPlanner = !simpleProfileLoop && hookToolName === "Task"
                   && optionalString(hookToolInput.subagent_type) === "task-planner"
                   && !profileNeedsPlanning(input.session)
                   && hasCompletedSubagent(input.session, "task-planner");
@@ -695,7 +704,9 @@ export class ClaudeAgentRunner {
                 }
                 const explorationGuard = hookAgentID || activeProfileSubagents.size > 0
                   ? null
-                  : getExplorationActionGuardError(input.session, hookToolName, hookToolInput, hookToolUseID);
+                  : simpleProfileLoop
+                    ? getSimpleKnowledgeBoundaryGuardError(input.session, hookToolName, hookToolInput, hookToolUseID)
+                    : getExplorationActionGuardError(input.session, hookToolName, hookToolInput, hookToolUseID);
                 if (explorationGuard) {
                   return {
                     continue: true,
@@ -706,7 +717,7 @@ export class ClaudeAgentRunner {
                     }
                   };
                 }
-                if (activeProfileSubagents.size > 0 || !profileNeedsPlanning(input.session)) {
+                if (simpleProfileLoop || activeProfileSubagents.size > 0 || !profileNeedsPlanning(input.session)) {
                   const guardError = await inspectToolUse(hookToolName, hookToolInput, hookToolUseID);
                   if (guardError) {
                     return {
@@ -718,7 +729,6 @@ export class ClaudeAgentRunner {
                       }
                     };
                   }
-                  reserveToolUse(hookToolName, hookToolInput, hookToolUseID);
                   return { continue: true };
                 }
                 const plannerCompleted = hasCompletedSubagent(input.session, "task-planner");
@@ -726,7 +736,6 @@ export class ClaudeAgentRunner {
                   const subagentType = optionalString(hookToolInput.subagent_type);
                   if (subagentType !== "task-planner") {
                     const updatedInput = await redirectTaskToPlanner(hookToolInput, hookToolUseID);
-                    reserveToolUse(hookToolName, updatedInput, hookToolUseID);
                     return {
                       continue: true,
                       hookSpecificOutput: {
@@ -736,7 +745,6 @@ export class ClaudeAgentRunner {
                       }
                     };
                   }
-                  reserveToolUse(hookToolName, hookToolInput, hookToolUseID);
                   return { continue: true };
                 }
                 if (
@@ -744,7 +752,6 @@ export class ClaudeAgentRunner {
                   || hookToolName === "mcp__ai_coder__checkpoint_exploration"
                   || (plannerCompleted && hookToolName === "mcp__ai_coder__update_task_tree")
                 ) {
-                  reserveToolUse(hookToolName, hookToolInput, hookToolUseID);
                   return { continue: true };
                 }
                 return {
@@ -771,7 +778,14 @@ export class ClaudeAgentRunner {
               this.appendAssistantMessage(input.session, `正在加载 Skill：\`${skillName}\``, "skill_usage");
               await this.recordProgress(input, "runner", `加载 Skill：${skillName}`, "milestone");
             }
-            const rootNeedsTaskDag = !options.agentID && profileNeedsPlanning(input.session);
+            const plannerGuard = simpleProfileLoop && !options.agentID
+              ? getSimplePlannerGuardError(input.session, sessionAttachments, toolName, toolInput)
+              : null;
+            if (plannerGuard) {
+              await this.recordProgress(input, "tool_policy", plannerGuard, "milestone");
+              return { behavior: "deny", message: plannerGuard, interrupt: false };
+            }
+            const rootNeedsTaskDag = !simpleProfileLoop && !options.agentID && profileNeedsPlanning(input.session);
             const plannerCompleted = hasCompletedSubagent(input.session, "task-planner");
             if (
               rootNeedsTaskDag
@@ -793,6 +807,7 @@ export class ClaudeAgentRunner {
             if (
               toolName === "Task"
               && optionalString(toolInput.subagent_type) === "task-planner"
+              && !simpleProfileLoop
               && !profileNeedsPlanning(input.session)
               && hasCompletedSubagent(input.session, "task-planner")
             ) {
@@ -804,10 +819,19 @@ export class ClaudeAgentRunner {
             }
             const explorationGuard = options.agentID
               ? null
-              : getExplorationActionGuardError(input.session, toolName, toolInput, options.toolUseID);
+              : simpleProfileLoop
+                ? getSimpleKnowledgeBoundaryGuardError(input.session, toolName, toolInput, options.toolUseID)
+                : getExplorationActionGuardError(input.session, toolName, toolInput, options.toolUseID);
             if (explorationGuard) {
               await this.recordProgress(input, "tool_policy", explorationGuard, "milestone");
               return { behavior: "deny", message: explorationGuard, interrupt: false };
+            }
+            const delegationGuard = simpleProfileLoop && !options.agentID
+              ? getSimpleDelegationGuardError(toolName, toolInput)
+              : null;
+            if (delegationGuard) {
+              await this.recordProgress(input, "tool_policy", delegationGuard, "milestone");
+              return { behavior: "deny", message: delegationGuard, interrupt: false };
             }
             const guardError = await inspectToolUse(toolName, toolInput, options.toolUseID);
             if (guardError) {
@@ -823,8 +847,10 @@ export class ClaudeAgentRunner {
                   (toolCall) => toolCall.id === options.toolUseID
                 );
                 if (recordedToolCall) recordedToolCall.input = auditInput;
-                reserveToolUse(toolName, toolInput, options.toolUseID);
-                return { behavior: "allow" };
+                // The SDK's PermissionResult allow branch requires updatedInput.
+                // Keep the full checkpoint payload here so the MCP handler receives
+                // `memory`; only the separately rewritten audit record is redacted.
+                return { behavior: "allow", updatedInput: toolInput };
               } catch (error) {
                 const message = `探索 checkpoint 参数无效，已拒绝执行：${error instanceof Error ? error.message : String(error)}`;
                 await this.recordProgress(input, "tool_policy", message, "milestone");
@@ -878,7 +904,6 @@ export class ClaudeAgentRunner {
                 );
                 return { behavior: "deny", message, interrupt: false };
               }
-              reserveToolUse(toolName, effectiveInput, options.toolUseID);
               return { behavior: "allow", updatedInput: effectiveInput };
             }
             if (toolName === "Task") {
@@ -895,7 +920,7 @@ export class ClaudeAgentRunner {
                   interrupt: false
                 };
               }
-              if (profileNeedsPlanning(input.session) && !plannerCompleted) {
+              if (!simpleProfileLoop && profileNeedsPlanning(input.session) && !plannerCompleted) {
                 if (!allowedSubagents.has("task-planner")) {
                   return {
                     behavior: "deny",
@@ -905,7 +930,6 @@ export class ClaudeAgentRunner {
                 }
                 if (subagentType !== "task-planner") {
                   const updatedInput = await redirectTaskToPlanner(toolInput, options.toolUseID);
-                  reserveToolUse(toolName, updatedInput, options.toolUseID);
                   return { behavior: "allow", updatedInput };
                 }
               }
@@ -916,10 +940,31 @@ export class ClaudeAgentRunner {
                   interrupt: false
                 };
               }
+              if (
+                simpleProfileLoop
+                && subagentType === "task-executor"
+                && !hasMergedCallContractPrerequisite(input.session)
+              ) {
+                return {
+                  behavior: "deny",
+                  message: getSimpleExecutorPrerequisiteGuardError(input.session, toolName, toolInput) ?? "task-executor 前置门禁未通过",
+                  interrupt: false
+                };
+              }
               const effectiveTaskInput = augmentTaskInputWithExplorationMemory(
                 augmentTaskInputWithAttachmentManifest(toolInput, input.session),
-                input.session
+                input.session,
+                capabilityCatalog
               );
+              const requiredSkills = requiredSkillsForSubagent(subagentType);
+              if (requiredSkills.length > 0) {
+                await this.recordProgress(
+                  input,
+                  "runner",
+                  `委托 ${subagentType} 落实 Skill：${requiredSkills.join(", ")}`,
+                  "milestone"
+                );
+              }
               if (effectiveTaskInput !== toolInput) {
                 rewrittenToolInputs.set(options.toolUseID, effectiveTaskInput);
                 const recordedToolCall = input.session.tool_calls.find(
@@ -931,7 +976,6 @@ export class ClaudeAgentRunner {
               if (startedTask) {
                 await this.recordProgress(input, "runner", `${startedTask}（宿主兜底）`, "milestone");
               }
-              reserveToolUse(toolName, effectiveTaskInput, options.toolUseID);
               return { behavior: "allow", updatedInput: effectiveTaskInput };
             }
             if (
@@ -940,17 +984,16 @@ export class ClaudeAgentRunner {
               toolName === "mcp__ai_coder__checkpoint_exploration" ||
               toolName === "mcp__ai_coder__analyze_symbol_contract"
             ) {
-              reserveToolUse(toolName, toolInput, options.toolUseID);
-              return { behavior: "allow" };
+              return { behavior: "allow", updatedInput: toolInput };
             }
-            if (profileNeedsPlanning(input.session) && ["Edit", "Write", "NotebookEdit"].includes(toolName)) {
+            if (!simpleProfileLoop && profileNeedsPlanning(input.session) && ["Edit", "Write", "NotebookEdit"].includes(toolName)) {
               return {
                 behavior: "deny",
                 message: "宿主仍处于 PLAN 阶段：task-planner 尚未产出详细任务 DAG，禁止修改文件。",
                 interrupt: false
               };
             }
-            if (profileNeedsPlanning(input.session) && toolName === "Bash" && isMutatingShellCommand(toolInput.command)) {
+            if (!simpleProfileLoop && profileNeedsPlanning(input.session) && toolName === "Bash" && isMutatingShellCommand(toolInput.command)) {
               return {
                 behavior: "deny",
                 message: "宿主仍处于 PLAN 阶段：禁止通过 Bash 修改工作区、分支、索引或提交历史。先完成 task-planner 并由宿主建立详细任务 DAG。",
@@ -976,7 +1019,6 @@ export class ClaudeAgentRunner {
               decision.allow ? "transient" : "milestone"
             );
             if (decision.allow) {
-              reserveToolUse(toolName, decision.updatedInput, options.toolUseID);
               return { behavior: "allow", updatedInput: decision.updatedInput };
             }
             if (this.hasPendingToolCall(input.session, options.toolUseID)) {
@@ -1001,7 +1043,6 @@ export class ClaudeAgentRunner {
                 );
                 if (approvedDecision.allow) {
                   input.session.status = "running";
-                  reserveToolUse(toolName, approvedDecision.updatedInput, options.toolUseID);
                   return { behavior: "allow", updatedInput: approvedDecision.updatedInput };
                 }
                 return { behavior: "deny", message: approvedDecision.message, interrupt: approvedDecision.interrupt };
@@ -1051,10 +1092,12 @@ export class ClaudeAgentRunner {
           if (toolUse.tool === "Task") {
             const subagentType = optionalString(toolUse.input.subagent_type);
             if (!subagentType) {
-              const needsPlanner = profileNeedsPlanning(input.session);
+              const needsPlanner = simpleProfileLoop
+                ? requiresPlannerInSimpleProfile(input.session, sessionAttachments)
+                : profileNeedsPlanning(input.session);
               const allowed = Object.keys(input.workflow.agents ?? {});
               const hint = needsPlanner && allowed.includes("task-planner")
-                ? "当前处于 PLAN 阶段，请使用 subagent_type=task-planner"
+                ? "当前请求需要规划，请使用 Task({ subagent_type: \"task-planner\", description: \"拆分需求\", prompt: \"...\" })"
                 : `请提供有效的 subagent_type（可用：${allowed.join(", ") || "无"}）`;
               await this.recordProgress(
                 input,
@@ -1075,12 +1118,19 @@ export class ClaudeAgentRunner {
           }
         }
         this.recordToolExecutionResult(input.session, message);
-        this.saveCompletedToolsToCache(input.session, completedToolCache);
-        for (const [cacheKey, toolUseID] of inFlightToolKeys) {
-          const recordedToolCall = input.session.tool_calls.find((toolCall) => toolCall.id === toolUseID);
-          if (recordedToolCall?.resolved_at) {
-            inFlightToolKeys.delete(cacheKey);
-          }
+        const streamedTranscript = formatClaudeTranscript([message]);
+        const streamedMilestoneCheckpoint = checkpointProfileMilestoneIfNeeded(
+          input.session,
+          streamedTranscript
+        );
+        if (streamedMilestoneCheckpoint) {
+          if (simpleProfileLoop) syncPhaseTaskTreeWithCheckpoint(input.session);
+          await this.recordProgress(
+            input,
+            "status",
+            streamedMilestoneCheckpoint,
+            "milestone"
+          );
         }
         const snippet = describeSdkMessageSnippet(message);
         if (isMeaningfulSdkProgress(snippet)) {
@@ -1129,30 +1179,12 @@ export class ClaudeAgentRunner {
     }
   }
 
-  /** 将已成功执行的工具保存到跨重试缓存中 */
-  private saveCompletedToolsToCache(
-    session: AgentSession,
-    cache: Map<string, { outputSummary?: string; exitCode?: number }>
-  ): void {
-    for (const tc of session.tool_calls) {
-      if (isExplorationControlTool(tc.tool)) continue;
-      if (tc.status === "completed" || (tc.exit_code === 0 && tc.status === "approved")) {
-        const key = makeToolCacheKey(tc.tool, tc.input);
-        const existing = cache.get(key);
-        const existingSafeSummary = safeCachedToolOutput(existing?.outputSummary);
-        const nextSafeSummary = safeCachedToolOutput(tc.output_summary);
-        if (!existing || (nextSafeSummary && !existingSafeSummary)) {
-          cache.set(key, { outputSummary: tc.output_summary, exitCode: tc.exit_code });
-        }
-      }
-    }
-  }
-
 /** 构建 Profile 模式的系统提示词 */
   private buildProfileSystemPrompt(
     profileSkills: Array<{ id: string; content: string }>,
     workflowSystemPrompt?: string,
-    effectiveModel?: string
+    effectiveModel?: string,
+    simpleProfileLoop = false
   ): string {
     const modelSupportsImages = isModelMultimodal(effectiveModel ?? null);
     const languageGuidance = [
@@ -1162,6 +1194,32 @@ export class ClaudeAgentRunner {
       "代码、命令、文件名等技术内容保持原文不变。",
       "违反此规则将导致任务失败。"
     ].join("\n");
+    const loadedSkillsSection = profileSkills.length > 0
+      ? [
+          "## 宿主按当前阶段注入的 Skills（执行契约）",
+          "以下内容不是可选参考。先用这些契约判断当前缺口和行动方式；无需再次调用 Skill 工具加载同名 Skill，但必须在实际委托、执行和证据中体现契约。",
+          ...profileSkills.map((skill) => `\n### ${skill.id}\n${skill.content}`)
+        ].join("\n")
+      : "";
+
+    if (simpleProfileLoop) {
+      const simpleFileGuidance = modelSupportsImages
+        ? "附件只使用宿主精确清单中的路径；按当前缺失信息读取必要页面，不猜路径、不找替代副本。"
+        : `当前模型（${effectiveModel || "默认"}）不支持图片输入；附件只使用宿主精确清单中的路径，并选择合适的文本提取工具。`;
+      return [
+        languageGuidance,
+        workflowSystemPrompt ?? "",
+        loadedSkillsSection,
+        simpleFileGuidance,
+        "提示词装配顺序：系统层持续提供谨慎程序员人设与完整 Skill 契约；每次主线程查询按“用户原始目标与输入 → 当前知识雪球 → 当前阶段任务 → 当前执行观察 → Skills/Sub-agents/Tools 能力目录”读取；每次 Task 委托也按“委托目标 → 知识雪球 → 阶段任务 → 执行观察 → 能力目录”读取。后面的执行观察只能校正知识，不能越过知识雪球直接改变目标。",
+        "每轮先结合知识雪球中的缺口与当前能力目录，明确选择：已加载 Skill 契约、一个匹配的 Sub-agent，或直接工具。跨多文件追踪、独立验证或完整性审查与已注册 Sub-agent 职责匹配时优先委托；简单单点事实才直接用工具。把选择及理由归并进知识雪球。",
+        "复杂入口硬规则：多附件、多需求点、跨文件或指定基线的请求在进入实现前必须委托 task-planner。planner 尚未成功启动时，根 Agent 可以做最小只读取证以解除阻塞，但不得一次性读取全部附件或重复撞同一门禁。根 Agent 只负责编排和知识归并，任何工作区修改必须委托 task-executor，并在完成后委托 task-verifier。",
+        "Task 调用必须显式填写 subagent_type。复杂入口的正确格式是 `Task({ subagent_type: \"task-planner\", description: \"拆分需求\", prompt: \"只读分析并返回 R-ID 与证据\" })`；不要省略 subagent_type，也不要用 Skill 调用替代 Task。",
+        "当前阶段已经注入的核心 Skill 不得再次调用 Skill 工具；应直接落实其契约。只有能力目录里未注入且确实需要的额外 Skill 才调用 Skill 工具。",
+        "调用契约硬规则：拟议实现只要会调用、复用或修改已有函数、方法、Hook 或组件，第一次相关修改前必须通过 Task 使用 call-contract-investigator，并把结果归并进知识雪球；主线程自行 Read/Grep/Bash 不能替代。只有纯文案、静态数据或样式且不涉及任何既有函数/组件时才可判定不适用，并记录依据。",
+        "只调用工具列表中展示的精确工具名，并使用标准 tool_use 格式。"
+      ].filter(Boolean).join("\n\n");
+    }
 
     const reactGuidance = [
       "## 工具使用指引（探索循环）",
@@ -1170,7 +1228,7 @@ export class ClaudeAgentRunner {
       "1. **认知**：先读当前探索工作记忆，找出最重要的未知、矛盾或未验证结论",
       "2. **行动**：只调用能够缩小该未知或验证该结论的最小工具（Read、Bash、Task、Skill 等）",
       "3. **观察**：区分原始工具事实、可支持的结论和仍然存在的未知",
-      "4. **归并**：在重要证据、实现、验证或审查后，用 checkpoint_exploration 重写当前有效认知",
+      "4. **归并**：在重要证据、实现、验证或审查后，用 checkpoint_exploration 更新当前有效认知；已确认知识像雪球一样持续累积",
       "5. **继续**：从更新后的工作记忆选择下一步；没有阻塞未知且最终审查通过后才能结束",
       "",
       "关键规则：",
@@ -1212,8 +1270,9 @@ export class ClaudeAgentRunner {
       "## 探索工作记忆（最高优先级的认知雪球）",
       "",
       "`checkpoint_exploration` 中的一整段 Markdown 是你跨轮工作的首要认知来源。任务树、消息历史和工具日志为它提供执行状态与原始依据，但不能代替它。不要把工作记忆写成工具流水账。",
-      "在取得会改变判断的证据、完成一组相关搜索、修改代码、完成验证或审查、改变行动方向，以及准备结束前，调用一次 `checkpoint_exploration` 整段重写工作记忆。",
-      "每次重写都要吸收最新结果：保留有依据的确认项，修正失效判断，移除无价值过程，写明尚待探索的问题及下一步。",
+      "在取得会改变判断的证据、完成一组相关搜索、修改代码、完成验证或审查、改变行动方向，以及准备结束前，调用一次 `checkpoint_exploration` 更新工作记忆。",
+      "每次更新都要吸收最新结果。`## 已确认` 下的既有条目必须继续保留；宿主会自动补回遗漏项，让知识像雪球一样只增不丢。过程信息可以压缩，但确认知识不可以。",
+      "发现旧结论有误时，不删除旧条目，新增一条带证据的“校正：旧结论 → 新结论”，让后续工作以校正后的结论为准。",
       "事实尽量附用户原话、path:line、命令输出或 sub-agent 结果；猜测必须留在待确认项，不能写成已确认事实。",
       "文件、分支或依赖发生变化后，主动检查哪些旧结论和验证已经过期，并在工作记忆中重新打开必要问题。",
       "disposition 用法：continue=继续探索或实施；verify=进入最终验证/审查；complete=最终审查通过且任务树全部关闭；blocked=缺少外部信息或无法安全继续。",
@@ -1226,7 +1285,7 @@ export class ClaudeAgentRunner {
         ? [
             "## 文件读取规则",
             "- 读取 PDF 时优先使用已拆页 PNG，避免 PDF base64 过大导致 API 400；必要时仍可自行选择其他工具",
-            "- PDF 上传后已自动拆页；只能逐字使用当前提示中的“宿主精确附件清单”，不得推导目录、页码或替代路径",
+            "- 对宿主登记的输入及其派生资源，只能逐字使用当前提示中的“宿主精确附件清单”，不得推导目录或替代路径",
             "- 每次只读取当前需要的页面，不要一次性读取所有页面",
             "- 图片已经可以直接用 Read 查看；禁止为了查看尺寸、base64 或图片文本再编写 Python/PIL 临时脚本",
             "",
@@ -1236,13 +1295,13 @@ export class ClaudeAgentRunner {
             "  2. 立即停止尝试项目内其他路径或自行搜索同名/相似文件作为替代",
             "  3. 在 task-planner 的 blocking_unknowns 中写明哪个附件路径返回空、尝试了几次",
             "  4. 通过 ask_human 说明哪些附件无法读取，请求重新提供",
-            "  5. 绝对不要：使用项目内碰巧存在的 img/、assets/ 等目录下的同名或相似文件作为需求来源"
+            "  5. 绝对不要：使用项目内碰巧存在的同名、相似或同类型文件作为输入资源的替代来源"
           ].join("\n")
         : [
             "## 文件读取规则",
             "- 读取 PDF 时优先使用文本提取工具，避免 PDF base64 过大导致 API 400；必要时仍可自行选择其他工具",
             `- **当前模型（${effectiveModel || "默认"}）不支持图片输入**：请使用命令行文本工具提取 PDF 内容，例如 ` + "`pdftotext <pdf路径> -` 或 `python3 -c \"import PyPDF2; ...\"`",
-            "- PDF 上传后已自动拆页；只能逐字使用当前提示中的“宿主精确附件清单”，并用文本工具而非 Read 获取内容",
+            "- 对宿主登记的输入及其派生资源，只能逐字使用当前提示中的“宿主精确附件清单”，并根据当前模型能力选择读取工具",
             "",
             "### 附件 Read 失败处理（重要）",
             "- 如果按照“宿主精确附件清单”中列出的路径 Read 返回空内容或明显不完整：",
@@ -1250,19 +1309,13 @@ export class ClaudeAgentRunner {
             "  2. 立即停止尝试项目内其他路径或自行搜索同名/相似文件作为替代",
             "  3. 在 task-planner 的 blocking_unknowns 中写明哪个附件路径返回空、尝试了几次",
             "  4. 通过 ask_human 说明哪些附件无法读取，请求重新提供",
-            "  5. 绝对不要：使用项目内碰巧存在的 img/、assets/ 等目录下的同名或相似文件作为需求来源"
+            "  5. 绝对不要：使用项目内碰巧存在的同名、相似或同类型文件作为输入资源的替代来源"
           ].join("\n"),
       explorationGuidance,
       reactGuidance,
-      taskTreeGuidance,
+      simpleProfileLoop ? "" : taskTreeGuidance,
       workflowSystemPrompt ?? "",
-      profileSkills.length > 0
-        ? [
-            "## 宿主强制加载的 Skills（执行契约）",
-            "以下内容不是可选参考。必须在计划、任务状态、实现和验证证据中体现；无需再次调用 Skill 工具。",
-            ...profileSkills.map((skill) => `\n### ${skill.id}\n${skill.content}`)
-          ].join("\n")
-        : ""
+      loadedSkillsSection
     ].filter(Boolean).join("\n\n");
   }
 
@@ -1304,23 +1357,8 @@ export class ClaudeAgentRunner {
     const MAX_API_RETRIES = 3;
     let lastError: unknown = null;
 
-    // 跨重试的已完成工具结果缓存：key = `${toolName}::${normalizedInput}`
-    const completedToolCache = new Map<string, { outputSummary?: string; exitCode?: number }>();
-
     for (let attempt = 0; attempt <= MAX_API_RETRIES; attempt++) {
       if (attempt > 0) {
-        // 回滚前保存本轮已成功完成的工具结果到缓存
-        for (const tc of input.session.tool_calls) {
-          if (tc.status === "completed" || (tc.exit_code === 0 && tc.status === "approved")) {
-            const cacheKey = makeToolCacheKey(tc.tool, tc.input);
-            if (!completedToolCache.has(cacheKey)) {
-              completedToolCache.set(cacheKey, {
-                outputSummary: tc.output_summary,
-                exitCode: tc.exit_code
-              });
-            }
-          }
-        }
         // 回滚会话状态到查询前
         sdkMessages.length = 0;
         input.session.messages = input.session.messages.slice(0, preQueryMsgCount);
@@ -1401,19 +1439,7 @@ export class ClaudeAgentRunner {
               toolName === "mcp__ai_coder__ask_human" ||
               toolName === "mcp__ai_coder__update_task_tree"
             ) {
-              return { behavior: "allow" };
-            }
-            const cached = completedToolCache.get(makeToolCacheKey(toolName, toolInput));
-            if (cached) {
-              const resultHint = cached.outputSummary
-                ? `结果摘要：${cached.outputSummary.slice(0, 500)}`
-                : `退出码：${cached.exitCode ?? 0}`;
-              await this.recordProgress(input, "tool_policy", `跳过重复工具（已缓存）：${toolName}`, "transient");
-              return {
-                behavior: "deny",
-                message: `此操作已在前序尝试中成功完成，无需重复执行。${resultHint}。请基于该结果继续。`,
-                interrupt: false
-              };
+              return { behavior: "allow", updatedInput: toolInput };
             }
             const safety = checkCommandSafety(currentStage.id, toolName, toolInput);
             if (!safety.allow) {
@@ -1897,6 +1923,83 @@ export class ClaudeAgentRunner {
     return loaded;
   }
 
+  private async discoverProfileSkills(): Promise<Array<{ id: string; description: string }>> {
+    if (!this.options.pluginPaths?.length) return [];
+    const discovered: Array<{ id: string; description: string }> = [];
+    for (const pluginPath of this.options.pluginPaths) {
+      const namespace = path.basename(pluginPath);
+      let entries: import("node:fs").Dirent[];
+      try {
+        entries = await readdir(path.join(pluginPath, "skills"), { withFileTypes: true });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        try {
+          const content = await readFile(path.join(pluginPath, "skills", entry.name, "SKILL.md"), "utf8");
+          const metadata = extractSkillCatalogMetadata(content, entry.name);
+          discovered.push({
+            id: `${namespace}:${metadata.name}`,
+            description: metadata.description
+          });
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+      }
+    }
+    return discovered.sort((left, right) => left.id.localeCompare(right.id));
+  }
+
+  private async buildProfileCapabilityCatalog(workflow: WorkflowTemplate, hasMcpServer: boolean): Promise<string> {
+    this.discoveredSkillCatalog ??= this.discoverProfileSkills();
+    const skills = await this.discoveredSkillCatalog;
+    const agents = Object.entries(workflow.agents ?? {}).sort(([left], [right]) => left.localeCompare(right));
+    const tools = buildAllowedClaudeTools(workflow);
+    const toolDescriptions: Record<string, string> = {
+      Read: "读取已知文件或图片",
+      Grep: "按内容搜索",
+      Glob: "按路径模式查找文件",
+      LS: "查看已知目录",
+      Skill: "按当前缺失信息加载专项方法",
+      Edit: "精确修改现有文件",
+      MultiEdit: "批量精确修改",
+      Write: "创建或重写文件",
+      Bash: "执行检查、测试或命令",
+      Task: "按需委托给下列 Sub-agent"
+    };
+    const mcpTools = hasMcpServer
+      ? [
+          ["mcp__ai_coder__checkpoint_exploration", "归并知识、声明 phase 与 next_action"],
+          ["mcp__ai_coder__update_task_tree", "维护传统全局任务树；简单模式通常无需调用"],
+          ["mcp__ai_coder__analyze_symbol_contract", "只读分析函数/组件及静态调用契约"],
+          ["mcp__ai_coder__ask_human", "仅在外部信息确实阻塞时询问用户"]
+        ] as const
+      : [];
+    return [
+      "## 当前可用能力（与知识雪球、阶段任务同时生效）",
+      "先根据当前缺失信息明确选择 Skill、Sub-agent 或直接工具，并把选择理由写回知识雪球。跨多文件追踪、独立验证或完整性审查与某个 Sub-agent 职责匹配时优先委托；简单单点事实直接用工具。只选能推进当前阶段任务的最小能力。",
+      "硬规则：凡拟议实现会调用、复用或修改已有函数、方法、Hook 或组件，第一次相关修改前必须通过 Task 使用 call-contract-investigator；主线程搜索不能替代。纯文案、静态数据或样式且不涉及既有函数/组件时才可记录依据后判定不适用。",
+      "",
+      "### Skills（工作流核心项已由宿主加载；目录中的其他项可用 Skill 加载）",
+      ...(skills.length > 0
+        ? skills.map((skill) => `- ${skill.id}: ${skill.description}`)
+        : ["- 当前没有宿主可枚举的 Skill；仍以 SDK 实际展示的 Skill 工具结果为准。"]),
+      "",
+      "### Sub-agents（通过 Task 调用）",
+      ...(agents.length > 0
+        ? agents.map(([name, definition]) => `- ${name}: ${definition.description}`)
+        : ["- 当前工作流没有注册 Sub-agent。"]),
+      "",
+      "### Tools（必须使用精确名称）",
+      ...tools.map((name) => `- ${name}: ${toolDescriptions[name] ?? "按工具说明使用"}`),
+      ...mcpTools.map(([name, description]) => `- ${name}: ${description}`),
+      "",
+      "phase 只是进度标签，不限制工具；仍需遵守项目权限和危险操作审批。"
+    ].join("\n");
+  }
+
   private async recordDiscoveredSkills(input: AgentRunInput, message: unknown): Promise<void> {
     if (!isPlainObject(message) || message.type !== "system" || message.subtype !== "init") return;
     const data = isPlainObject(message.data) ? message.data : {};
@@ -1982,6 +2085,9 @@ export class ClaudeAgentRunner {
         recordedToolCall.input = summarizeExplorationCheckpointToolInput(normalizedCheckpoint);
       }
       const result = applyExplorationCheckpoint(input.session, normalizedCheckpoint);
+      if (input.workflow.simple_profile_loop === true) {
+        syncPhaseTaskTreeWithCheckpoint(input.session);
+      }
       if (recordedToolCall) {
         recordedToolCall.status = "completed";
         recordedToolCall.output_summary = result;
@@ -2018,7 +2124,6 @@ export class ClaudeAgentRunner {
         || isNegativeReviewTaskResult(toolCall, result.outputSummary)
         || isNegativeReviewTaskMessage(toolCall, message)
       );
-    const duplicateWasSkipped = isSkippedDuplicateToolResult(result.outputSummary);
     if (result.exitCode !== undefined) {
       toolCall.exit_code = result.exitCode;
     } else if (toolCall.tool === "Bash" && result.executionSucceeded === true) {
@@ -2039,10 +2144,7 @@ export class ClaudeAgentRunner {
       return;
     }
     if (result.outputSummary) toolCall.output_summary = result.outputSummary;
-    if (duplicateWasSkipped) {
-      toolCall.status = "skipped";
-      toolCall.resolved_at = new Date().toISOString();
-    } else if (result.executionSucceeded === false || taskFailedSemantically) {
+    if (result.executionSucceeded === false || taskFailedSemantically) {
       // SDK 执行失败（参数校验、ENOENT、子代理 API 错误等）不是宿主安全策略阻断。
       // blocked 只保留给 projectPolicy 等宿主策略拒绝，避免 UI 隐藏真实故障性质。
       toolCall.status = "failed";
@@ -2175,17 +2277,32 @@ export class ClaudeAgentRunner {
         handler: (...args: unknown[]) => Promise<unknown>
       ) => unknown)(
         "checkpoint_exploration",
-        "整段重写当前探索工作记忆。知识内容保持 Markdown 文本；在重要证据、实现、验证、审查或方向变化后调用，用于跨轮续跑、中断恢复和完成门禁。",
+        "更新当前探索工作记忆。Markdown 中既有的“## 已确认”条目会由宿主自动带入，形成只增不丢的知识雪球；错误结论用带证据的校正说明覆盖语义。",
         {
-          memory: z.string().min(40).max(30_000).describe("完整的最新工作记忆 Markdown；不是增量补丁或工具流水账"),
-          disposition: z.enum(["continue", "verify", "complete", "blocked"]).describe("下一阶段意图"),
-          next_action: z.string().max(2_000).optional().describe("continue/verify 时准备执行的下一项具体行动")
+          memory: z.string().max(30_000).optional().describe("最新工作记忆；省略或只提供简短补充时由宿主与上一版合并"),
+          disposition: z.enum(["continue", "verify", "complete", "blocked"]).optional().describe("下一阶段意图；省略时按 continue 处理"),
+          phase: z.enum(["investigate", "implement", "verify", "complete"]).optional()
+            .describe("进度标签，仅用于表达当前工作状态，不限制工具"),
+          next_action: z.string().max(2_000).optional().describe("准备执行的下一项具体行动；省略时继承上一版")
         },
         async (args) => {
           try {
             const result = applyExplorationCheckpoint(input.session, normalizeExplorationCheckpointArgs(args));
+            if (input.workflow.simple_profile_loop === true) {
+              syncPhaseTaskTreeWithCheckpoint(input.session);
+            }
             await this.recordProgress(input, "runner", result, "milestone");
-            return { content: [{ type: "text", text: result }] };
+            const immediateContext = input.workflow.simple_profile_loop === true && input.session.task_tree
+              ? [
+                  result,
+                  buildExplorationPromptSection(input.session),
+                  buildPhaseTaskTreePromptSection(input.session.task_tree),
+                  buildExecutionProgressPromptSection(input.session),
+                  await this.buildProfileCapabilityCatalog(input.workflow, true),
+                  "下一轮开始时宿主还会再次注入完整知识雪球和阶段任务。"
+                ].join("\n\n")
+              : result;
+            return { content: [{ type: "text", text: immediateContext }] };
           } catch (error) {
             return {
               content: [{
@@ -2277,12 +2394,11 @@ export function evaluateHumanQuestionRequest(toolInput: Record<string, unknown>)
   return null;
 }
 
-/** 将已成功执行的工具保存到跨重试缓存中 */
 function buildLlmDecisionContext(
   errorName: string,
   errorMessage: string,
   partialTranscript: string,
-  completedToolCache: Map<string, { outputSummary?: string; exitCode?: number }>
+  completedToolCalls: AgentSession["tool_calls"] = []
 ): string {
   const parts: string[] = [];
 
@@ -2290,21 +2406,19 @@ function buildLlmDecisionContext(
   parts.push(`上一次执行因 API 错误中断：**${errorName}**`);
   parts.push(`\`\`\`\n${errorMessage.slice(0, 500)}\n\`\`\``);
 
-  if (completedToolCache.size > 0) {
-    parts.push("## 已成功完成的工具（禁止重复执行）");
-    for (const [key, result] of completedToolCache.entries()) {
-      const [toolName, inputSnippet] = key.split("::", 2);
-      const safeSummary = safeCachedToolOutput(result.outputSummary);
-      const outputInfo = safeSummary
-        ? ` → ${safeSummary.slice(0, 1_200)}`
-        : (result.exitCode === 0 ? " → 执行成功" : "");
-      parts.push(`- **${toolName}**(\`${inputSnippet.slice(0, 150)}\`)${outputInfo}`);
-    }
-  }
-
   if (partialTranscript) {
     parts.push("## 中断前的对话摘要");
     parts.push(partialTranscript.slice(0, 6000));
+  }
+
+  if (completedToolCalls.length > 0) {
+    parts.push("## 中断前已成功完成的工具调用");
+    parts.push(...completedToolCalls.map((toolCall) => {
+      const input = isPlainObject(toolCall.input) ? toolCall.input : {};
+      const summary = sanitizeToolOutputSummary(toolCall.output_summary)?.slice(0, 240);
+      return `- ${describeToolAttempt(toolCall.tool, input)}${summary ? `：${summary}` : ""}`;
+    }));
+    parts.push("这些调用已经成功，不要重复调用；先核对并把可确认结论归并进 checkpoint_exploration。");
   }
 
   parts.push("## 你的决策");
@@ -2317,29 +2431,158 @@ function buildLlmDecisionContext(
   return parts.join("\n\n");
 }
 
-export function evaluateProfileCompletion(session: AgentSession): string[] {
+function retainSettledProfileToolCalls(
+  session: AgentSession,
+  firstToolCallIndex: number
+): AgentSession["tool_calls"] {
+  const beforeQuery = session.tool_calls.slice(0, firstToolCallIndex);
+  const settled = session.tool_calls.slice(firstToolCallIndex).filter((toolCall) =>
+    toolCall.status === "completed"
+    || toolCall.status === "failed"
+    || toolCall.status === "blocked"
+    || toolCall.exit_code !== undefined
+  );
+  session.tool_calls = [...beforeQuery, ...settled];
+  return settled;
+}
+
+function checkpointInterruptedProfileProgress(
+  session: AgentSession,
+  completedToolCalls: AgentSession["tool_calls"],
+  partialTranscript: string,
+  errorMessage: string
+): void {
+  const latest = getLatestExplorationCheckpoint(session);
+  const observations = completedToolCalls.map((toolCall) => {
+    const input = isPlainObject(toolCall.input) ? toolCall.input : {};
+    const summary = sanitizeToolOutputSummary(toolCall.output_summary)?.slice(0, 240);
+    return `- ${describeToolAttempt(toolCall.tool, input)} → ${toolCall.status}${summary ? ` / ${summary}` : ""}`;
+  });
+  const transcript = partialTranscript.replace(/\s+/g, " ").trim().slice(-3_000);
+  const recoverySection = [
+    "## SDK 中断恢复观察（宿主自动保全，待模型核对）",
+    `- 中断原因：${errorMessage.replace(/\s+/g, " ").slice(0, 240)}`,
+    ...(observations.length > 0 ? ["- 中断前已完成的工具调用：", ...observations] : []),
+    ...(transcript ? ["- 中断前助手结论：", `  ${transcript}`] : []),
+    "- 上述成功调用不得重复；下一步先核对这些观察并归并可确认事实。"
+  ].join("\n");
+  const memory = [latest?.text?.trim(), recoverySection].filter(Boolean).join("\n\n");
+  applyExplorationCheckpoint(session, {
+    memory,
+    disposition: "continue",
+    phase: latest?.phase ?? "investigate",
+    next_action: "核对并归并 SDK 中断前已完成的工具结果，不重复调用已经成功的相同工具"
+  });
+}
+
+function checkpointProfileMilestoneIfNeeded(
+  session: AgentSession,
+  transcript: string
+): string | null {
+  const latest = getLatestExplorationCheckpoint(session);
+  if (!latest || !isCheckpointWorthyProfileTranscript(transcript)) return null;
+
+  const completedToolCalls = session.tool_calls
+    .slice(Math.min(latest.observed_tool_call_count, session.tool_calls.length))
+    .filter((toolCall) =>
+      !isExplorationControlTool(toolCall.tool)
+      && (
+        toolCall.status === "completed"
+        || toolCall.status === "failed"
+        || toolCall.status === "blocked"
+        || toolCall.exit_code !== undefined
+      )
+    );
+  if (completedToolCalls.length === 0) return null;
+
+  const callObservations = completedToolCalls
+    .slice(-8)
+    .map((toolCall) => {
+      const input = isPlainObject(toolCall.input) ? toolCall.input : {};
+      const summary = sanitizeToolOutputSummary(toolCall.output_summary)?.slice(0, 240);
+      return `- ${describeToolAttempt(toolCall.tool, input)} → ${toolCall.status}${summary ? ` / ${summary}` : ""}`;
+    })
+    .filter((observation) => !latest.text.includes(observation));
+  const compactTranscript = transcript.replace(/\s+/g, " ").trim().slice(-2_000);
+  const transcriptAlreadyCaptured = compactTranscript.length > 0
+    && latest.text.includes(compactTranscript.slice(-Math.min(800, compactTranscript.length)));
+  const additions = [
+    ...(callObservations.length > 0 ? ["- 本轮已完成的工具观察：", ...callObservations] : []),
+    ...(!transcriptAlreadyCaptured && compactTranscript
+      ? ["- 本轮助手关键发现（宿主原样保全，待下一步核对）：", `  ${compactTranscript}`]
+      : [])
+  ];
+  const memory = additions.length > 0
+    ? [
+        latest.text.trim(),
+        "## 最新关键观察（宿主自动保全）",
+        ...additions,
+        "- 下一步先核对这些观察，把确认项归入已有知识；不得重新获取已经成功取得的相同证据。"
+      ].join("\n")
+    : latest.text;
+  const priorNextAction = latest.next_action && !latest.next_action.startsWith("核对并归并宿主保全的关键观察")
+    ? latest.next_action
+    : undefined;
+  const checkpointResult = applyExplorationCheckpoint(session, {
+    memory,
+    disposition: "continue",
+    phase: latest.phase ?? "investigate",
+    next_action: [
+      "核对并归并宿主保全的关键观察，不重复调用已经成功的相同工具",
+      priorNextAction ? `随后继续：${priorNextAction}` : ""
+    ].filter(Boolean).join("；")
+  });
+  return `${checkpointResult}；宿主已保全本轮结论及最近 ${Math.min(completedToolCalls.length, 8)} 个证据来源`;
+}
+
+export function isCheckpointWorthyProfileTranscript(transcript: string): boolean {
+  if (!transcript.trim()) return false;
+  const compact = transcript.replace(/\s+/g, " ").trim();
+  const hasStrongConclusion = /(?:根因|调用契约|差异|校正|验证通过|测试通过|构建通过|审查通过|部分实现|尚缺|缺少|不一致|冲突|映射为|对应到|确定为|最后一项)/i.test(compact);
+  const hasEvidenceBackedFinding = /(?:已经|已)(?:找到|发现|确认|完成|实现|验证|通过)|(?:结论|定义|结果)/i.test(compact)
+    && /(?:[A-Za-z0-9_.-]+\/(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+|\b[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+\b|第\s*\d+\s*页|\d+\s*(?:个|项|条|页|处)|：|:)/.test(compact);
+  if (!hasStrongConclusion && !hasEvidenceBackedFinding) return false;
+  const onlyProgressNarration = /^(?:我需要|让我|接下来|继续|现在我(?:需要|将)|已经读取|已读取)/.test(compact)
+    && !hasStrongConclusion;
+  return !onlyProgressNarration;
+}
+
+export function evaluateProfileCompletion(session: AgentSession, requireTaskTree = true): string[] {
   const tree = session.task_tree;
-  if (!tree || tree.tasks.length === 0) {
+  if (requireTaskTree && (!tree || tree.tasks.length === 0)) {
     return ["尚未建立任务树"];
   }
 
   const reasons: string[] = [];
-  const unfinished = tree.tasks.filter((task) => task.status !== "completed" && task.status !== "skipped");
-  if (unfinished.length > 0) {
-    reasons.push(`仍有未完成任务：${unfinished.map((task) => `${task.id}(${task.status})`).join(", ")}`);
+  if (!requireTaskTree && hasCodeChangeActivity(session)) {
+    if (!hasMergedTaskVerifierAfterLastCodeChange(session)) {
+      reasons.push("代码已修改，但修改后尚未由 task-verifier 独立核对，或 verifier 结果尚未归并进知识雪球");
+    }
+    if (!hasSuccessfulValidationAfterLastCodeChange(session)) {
+      reasons.push("代码已修改，但修改后没有成功的测试、构建、类型检查、lint、语法检查或 git diff --check 证据");
+    }
+    if (!hasFinalAuditAfterLastCodeChange(session)) {
+      reasons.push("代码已修改，但修改后尚未由 completeness-checker 独立核对原始需求、输入依据、指定基线、最终 diff 和验证结果");
+    }
   }
-  const completedWithoutEvidence = tree.tasks.filter(
-    (task) => task.status === "completed" && !task.evidence?.trim()
-  );
-  if (completedWithoutEvidence.length > 0) {
-    reasons.push(`完成节点缺少证据：${completedWithoutEvidence.map((task) => task.id).join(", ")}`);
+  if (requireTaskTree && tree) {
+    const unfinished = tree.tasks.filter((task) => task.status !== "completed" && task.status !== "skipped");
+    if (unfinished.length > 0) {
+      reasons.push(`仍有未完成任务：${unfinished.map((task) => `${task.id}(${task.status})`).join(", ")}`);
+    }
+    const completedWithoutEvidence = tree.tasks.filter(
+      (task) => task.status === "completed" && !task.evidence?.trim()
+    );
+    if (completedWithoutEvidence.length > 0) {
+      reasons.push(`完成节点缺少证据：${completedWithoutEvidence.map((task) => task.id).join(", ")}`);
+    }
   }
   const checkpoint = getLatestExplorationCheckpoint(session);
   if (!checkpoint) {
     reasons.push("尚未建立探索工作记忆 checkpoint");
   } else {
     const isHostBaseline = checkpoint.source === "host";
-    if (!isHostBaseline && checkpoint.disposition !== "complete") {
+    if (checkpoint.disposition !== "complete" && (!isHostBaseline || !requireTaskTree)) {
       reasons.push(`探索工作记忆尚未声明完成：revision ${checkpoint.revision} 为 ${checkpoint.disposition}`);
     }
     if (!isExplorationCheckpointFresh(session, checkpoint)) {
@@ -2351,17 +2594,94 @@ export function evaluateProfileCompletion(session: AgentSession): string[] {
   return reasons;
 }
 
+function hasCodeChangeActivity(session: AgentSession): boolean {
+  return (session.file_changes?.length ?? 0) > 0 || (session.tool_calls ?? []).some(isCodeChangingToolCall);
+}
+
+function isCodeChangingToolCall(toolCall: AgentSession["tool_calls"][number]): boolean {
+  if (["Edit", "MultiEdit", "Write", "NotebookEdit"].includes(toolCall.tool)) return true;
+  return toolCall.tool === "Task"
+    && isPlainObject(toolCall.input)
+    && toolCall.input.subagent_type === "task-executor"
+    && toolCall.status === "completed";
+}
+
+function lastCodeChangeToolIndex(session: AgentSession): number {
+  let lastIndex = -1;
+  (session.tool_calls ?? []).forEach((toolCall, index) => {
+    if (isCodeChangingToolCall(toolCall)) lastIndex = index;
+  });
+  return lastIndex;
+}
+
+function hasSuccessfulValidationAfterLastCodeChange(session: AgentSession): boolean {
+  return lastSuccessfulValidationIndexAfterLastCodeChange(session) >= 0;
+}
+
+function hasMergedTaskVerifierAfterLastCodeChange(session: AgentSession): boolean {
+  const checkpoint = getLatestExplorationCheckpoint(session);
+  if (!checkpoint) return false;
+  const hasVerifierConclusionInMemory = /(?:task-verifier|独立验证|独立核对)[\s\S]{0,800}(?:PASS|通过|证据|命令|路径|path:line|无回归)/i.test(checkpoint.text);
+  if (!hasVerifierConclusionInMemory) return false;
+  const lastChange = lastCodeChangeToolIndex(session);
+  return (session.tool_calls ?? []).some((toolCall, index) =>
+    index > lastChange
+    && index < checkpoint.observed_tool_call_count
+    && toolCall.tool === "Task"
+    && toolCall.status === "completed"
+    && isPlainObject(toolCall.input)
+    && toolCall.input.subagent_type === "task-verifier"
+    && Boolean(toolCall.output_summary?.trim())
+  );
+}
+
+function lastSuccessfulValidationIndexAfterLastCodeChange(session: AgentSession): number {
+  const lastChange = lastCodeChangeToolIndex(session);
+  let lastValidation = -1;
+  (session.tool_calls ?? []).forEach((toolCall, index) => {
+    if (index <= lastChange || toolCall.tool !== "Bash" || toolCall.status !== "completed" || toolCall.exit_code !== 0) {
+      return;
+    }
+    const command = isPlainObject(toolCall.input) ? optionalString(toolCall.input.command) ?? "" : "";
+    if (/(?:^|\s)(?:test|check|lint|typecheck|build)(?:\s|$)|\b(?:vitest|jest|pytest|mocha|eslint|tsc|cargo\s+test|go\s+test|gradle\w*\s+test|mvn\s+test|node\s+--check)\b|git\s+diff\s+--check/i.test(command)) {
+      lastValidation = index;
+    }
+  });
+  return lastValidation;
+}
+
+function hasFinalAuditAfterLastCodeChange(session: AgentSession): boolean {
+  const lastValidation = lastSuccessfulValidationIndexAfterLastCodeChange(session);
+  if (lastValidation < 0) return false;
+  return (session.tool_calls ?? []).some((toolCall, index) =>
+    index > lastValidation
+    && toolCall.tool === "Task"
+    && toolCall.status === "completed"
+    && isPlainObject(toolCall.input)
+    && toolCall.input.subagent_type === "completeness-checker"
+  );
+}
+
 const MAX_EXPLORATION_CHECKPOINTS = 40;
 
 export interface ExplorationCheckpointArgs {
   memory: string;
   disposition: ExplorationDisposition;
+  phase?: ExplorationPhase;
   next_action?: string;
 }
 
 export function ensureExplorationCheckpoint(session: AgentSession): boolean {
   if (getLatestExplorationCheckpoint(session)) return false;
   const goal = session.task_prompt.trim() || "完成用户请求";
+  const attachmentManifest = formatProfileAttachmentList(collectSessionAttachments(session), session.project_path);
+  const confirmed = [
+    "- 用户原始目标（保持范围与措辞）：",
+    ...goal.split(/\r?\n/).map((line) => `  ${line}`),
+    ...(attachmentManifest
+      ? ["- 宿主精确附件清单（后续必须复用，不得猜测或寻找替代副本）：", ...attachmentManifest.split(/\r?\n/).map((line) => `  ${line}`)]
+      : ["- 当前没有宿主附件。"])
+  ];
   session.exploration_checkpoints = [{
     revision: 1,
     text: [
@@ -2369,19 +2689,25 @@ export function ensureExplorationCheckpoint(session: AgentSession): boolean {
       goal,
       "",
       "## 已确认",
-      "- 尚未开始取证。",
+      ...confirmed,
       "",
-      "## 仍需探索",
-      "- 核对原始请求、附件、有效基线、相关代码和验证入口。",
+      "## 仍缺少",
+      "- 尚未确认最相似既有实现、有效基线、相关代码、实现状态和验证入口。",
+      "",
+      "## 最相似既有实现",
+      "- 位置：待确认",
+      "- 可复用模式：待确认",
+      "- 与本需求的差异：待确认",
       "",
       "## 当前判断",
       "任务尚未完成。",
       "",
       "## 下一步",
-      "调用 task-planner 建立需求证据和可执行计划。"
+      "第一优先级：在指定基线中寻找最相似功能的既有实现，记录位置、可复用模式和差异。若任务从某个序号、版本或步骤继续，先检查边界前最近的已完成项，再按需向前追踪；确实没有时记录搜索范围。"
     ].join("\n"),
     disposition: "continue",
-    next_action: "调用 task-planner 建立需求证据和可执行计划",
+    phase: "investigate",
+    next_action: "在指定基线中寻找最相似功能的既有实现；连续序列优先检查边界前最近的已完成项，记录位置、模式和差异",
     source: "host",
     observed_tool_call_count: session.tool_calls.length,
     observed_tool_state: buildExplorationToolStateFingerprint(session),
@@ -2392,24 +2718,17 @@ export function ensureExplorationCheckpoint(session: AgentSession): boolean {
 
 function normalizeExplorationCheckpointArgs(value: unknown): ExplorationCheckpointArgs {
   if (!isPlainObject(value)) throw new Error("checkpoint 参数必须是对象");
-  const memory = optionalString(value.memory);
-  if (!memory || memory.length < 40) {
-    throw new Error("memory 必须是至少 40 个字符的完整工作记忆，不能只写一句结论");
-  }
+  const memory = optionalString(value.memory) ?? "";
   if (memory.length > 30_000) {
     throw new Error("memory 超过 30000 字符；请压缩过程信息，只保留当前有效认知");
   }
-  const disposition = value.disposition;
-  if (!isExplorationDisposition(disposition)) {
-    throw new Error(`未知 disposition: ${String(disposition)}`);
-  }
+  const disposition = isExplorationDisposition(value.disposition) ? value.disposition : "continue";
   const nextAction = optionalString(value.next_action);
-  if ((disposition === "continue" || disposition === "verify") && !nextAction) {
-    throw new Error(`${disposition} checkpoint 必须提供 next_action`);
-  }
+  const phase = value.phase;
   return {
     memory,
     disposition,
+    ...(isExplorationPhase(phase) ? { phase } : {}),
     next_action: nextAction
   };
 }
@@ -2420,11 +2739,33 @@ export function applyExplorationCheckpoint(
 ): string {
   const checkpoints = session.exploration_checkpoints ?? [];
   const latest = checkpoints.at(-1);
+  const phase = args.disposition === "verify" || args.disposition === "complete"
+    ? phaseFromDisposition(args.disposition)
+    : args.phase ?? latest?.phase ?? phaseFromDisposition(args.disposition);
+  const proposedMemory = args.memory.trim()
+    ? latest && args.memory.trim().length < 40
+      ? `${latest.text.trimEnd()}\n\n## 最新补充\n${args.memory.trim()}`
+      : args.memory
+    : latest?.text ?? "## 已确认\n- 尚未开始取证。";
+  const nextAction = args.next_action
+    ?? extractNextActionFromMemory(proposedMemory)
+    ?? (args.disposition === "blocked" ? "需要外部信息或状态变化" : undefined)
+    ?? (args.disposition === "complete" ? "任务已完成" : undefined)
+    ?? latest?.next_action
+    ?? "继续根据当前知识雪球推进";
+  const reconciled = preserveConfirmedKnowledge(
+    latest?.text,
+    proposedMemory
+  );
+  if (reconciled.memory.length > 30_000) {
+    throw new Error("保全既有已确认知识后 memory 超过 30000 字符；请压缩过程信息，不能删除确认项");
+  }
   if (
     latest
-    && latest.text === args.memory
+    && latest.text === reconciled.memory
     && latest.disposition === args.disposition
-    && latest.next_action === args.next_action
+    && latest.phase === phase
+    && latest.next_action === nextAction
   ) {
     latest.source = "agent";
     latest.observed_tool_call_count = session.tool_calls.length;
@@ -2433,16 +2774,72 @@ export function applyExplorationCheckpoint(
   }
   const checkpoint: ExplorationCheckpoint = {
     revision: (latest?.revision ?? 0) + 1,
-    text: args.memory,
+    text: reconciled.memory,
     disposition: args.disposition,
-    ...(args.next_action ? { next_action: args.next_action } : {}),
+    phase,
+    next_action: nextAction,
     source: "agent",
     observed_tool_call_count: session.tool_calls.length,
     observed_tool_state: buildExplorationToolStateFingerprint(session),
     created_at: new Date().toISOString()
   };
   session.exploration_checkpoints = [...checkpoints, checkpoint].slice(-MAX_EXPLORATION_CHECKPOINTS);
-  return `探索工作记忆已更新至 revision ${checkpoint.revision}（${checkpoint.disposition}）`;
+  const preservationNote = reconciled.restoredCount > 0
+    ? `；宿主补回 ${reconciled.restoredCount} 条遗漏的已确认知识`
+    : "";
+  return `探索工作记忆已更新至 revision ${checkpoint.revision}（${checkpoint.disposition}${preservationNote}）`;
+}
+
+function extractNextActionFromMemory(memory: string): string | undefined {
+  const lines = memory.split(/\r?\n/);
+  const headingIndex = lines.findIndex((line) => /^#{1,6}\s+(?:下一步|next[_ ]?action)\s*>?\s*$/i.test(line.trim()));
+  if (headingIndex < 0) return undefined;
+  return lines.slice(headingIndex + 1).find((line) => line.trim() && !/^#{1,6}\s+/.test(line.trim()))?.trim();
+}
+
+const TRANSIENT_CONFIRMED_PLACEHOLDERS = new Set(["- 尚未开始取证。", "尚未开始取证。"]);
+
+function isConfirmedHeading(line: string): boolean {
+  return /^#{1,6}\s+已确认(?:事实|内容)?\s*$/.test(line.trim());
+}
+
+function extractConfirmedEntries(memory: string | undefined): string[] {
+  if (!memory) return [];
+  const lines = memory.split(/\r?\n/);
+  const headingIndex = lines.findIndex(isConfirmedHeading);
+  if (headingIndex < 0) return [];
+  const entries: string[] = [];
+  for (let index = headingIndex + 1; index < lines.length; index += 1) {
+    const line = lines[index]!.trim();
+    if (/^#{1,6}\s+/.test(line)) break;
+    if (line && !TRANSIENT_CONFIRMED_PLACEHOLDERS.has(line)) entries.push(line);
+  }
+  return [...new Set(entries)];
+}
+
+function insertConfirmedEntries(memory: string, entries: string[]): string {
+  if (entries.length === 0) return memory;
+  const lines = memory.split(/\r?\n/);
+  const headingIndex = lines.findIndex(isConfirmedHeading);
+  if (headingIndex < 0) {
+    return `${memory.trimEnd()}\n\n## 已确认\n${entries.join("\n")}`;
+  }
+  lines.splice(headingIndex + 1, 0, ...entries);
+  return lines.join("\n");
+}
+
+function preserveConfirmedKnowledge(
+  previousMemory: string | undefined,
+  proposedMemory: string
+): { memory: string; restoredCount: number } {
+  const previousEntries = extractConfirmedEntries(previousMemory);
+  if (previousEntries.length === 0) return { memory: proposedMemory, restoredCount: 0 };
+  const proposedEntries = new Set(extractConfirmedEntries(proposedMemory));
+  const missingEntries = previousEntries.filter((entry) => !proposedEntries.has(entry));
+  return {
+    memory: insertConfirmedEntries(proposedMemory, missingEntries),
+    restoredCount: missingEntries.length
+  };
 }
 
 function summarizeExplorationCheckpointToolInput(
@@ -2450,6 +2847,7 @@ function summarizeExplorationCheckpointToolInput(
 ): Record<string, unknown> {
   return {
     disposition: args.disposition,
+    ...(args.phase ? { phase: args.phase } : {}),
     ...(args.next_action ? { next_action: args.next_action } : {}),
     memory_chars: args.memory.length
   };
@@ -2461,6 +2859,16 @@ function getLatestExplorationCheckpoint(session: AgentSession): ExplorationCheck
 
 function isExplorationDisposition(value: unknown): value is ExplorationDisposition {
   return value === "continue" || value === "verify" || value === "complete" || value === "blocked";
+}
+
+function isExplorationPhase(value: unknown): value is ExplorationPhase {
+  return value === "investigate" || value === "implement" || value === "verify" || value === "complete";
+}
+
+function phaseFromDisposition(disposition: ExplorationDisposition): ExplorationPhase {
+  if (disposition === "verify") return "verify";
+  if (disposition === "complete") return "complete";
+  return "investigate";
 }
 
 export function getExplorationActionGuardError(
@@ -2477,6 +2885,118 @@ export function getExplorationActionGuardError(
     "请先调用 mcp__ai_coder__checkpoint_exploration，把新证据、被修正的结论、新问题和下一步归并进完整工作记忆；",
     "然后重新发起当前行动。不要用普通回复代替 checkpoint。"
   ].join("");
+}
+
+/**
+ * Simple-profile mode has one deliberately narrow knowledge boundary:
+ * after new evidence is gathered, it must be folded into the snowball before
+ * the first mutation. Once an implementation edit has actually completed,
+ * subsequent edits belong to the same batch and are not interrupted.
+ */
+export function getSimpleKnowledgeBoundaryGuardError(
+  session: AgentSession,
+  toolName: string,
+  toolInput: Record<string, unknown>,
+  currentToolUseID?: string
+): string | null {
+  if (!isKnowledgeBoundaryMutation(toolName, toolInput)) return null;
+
+  const checkpoint = getLatestExplorationCheckpoint(session);
+  if (checkpoint && isExplorationCheckpointFresh(session, checkpoint, currentToolUseID)) return null;
+
+  if (checkpoint) {
+    const callsAfterCheckpoint = session.tool_calls.slice(
+      Math.min(checkpoint.observed_tool_call_count, session.tool_calls.length)
+    );
+    const implementationBatchStarted = callsAfterCheckpoint.some((toolCall) =>
+      toolCall.id !== currentToolUseID
+      && toolCall.status === "completed"
+      && isCodeChangingToolCall(toolCall)
+    );
+    if (implementationBatchStarted) return null;
+  }
+
+  return [
+    "最新读取或调查结果尚未归并进知识雪球。",
+    "开始修改前先调用 mcp__ai_coder__checkpoint_exploration，更新已确认事实、仍缺少内容和下一步；",
+    "phase 与 Markdown 格式不作限制。"
+  ].join("");
+}
+
+/**
+ * 简洁 Profile 中根 Agent 只负责编排和归并认知。真正的工作区修改必须由
+ * task-executor 完成，避免“提示词要求委托、实际却由根线程直接 Edit”的旁路。
+ */
+export function getSimpleDelegationGuardError(
+  toolName: string,
+  toolInput: Record<string, unknown>
+): string | null {
+  const isDirectMutation = ["Edit", "MultiEdit", "Write", "NotebookEdit"].includes(toolName)
+    || (toolName === "Bash" && isMutatingShellCommand(optionalString(toolInput.command) ?? ""));
+  if (!isDirectMutation) return null;
+  return [
+    "简洁 Profile 的根 Agent 只负责编排、知识归并与结果交付，禁止直接修改工作区。",
+    "请把当前单个独立需求点通过 Task 委托给 task-executor；executor 完成后再委托 task-verifier 独立核对。"
+  ].join("");
+}
+
+function requiresPlannerInSimpleProfile(session: AgentSession, attachments: Attachment[]): boolean {
+  if (hasCompletedSubagent(session, "task-planner")) return false;
+  const prompt = session.task_prompt ?? "";
+  return attachments.length > 1
+    || /(?:多个|几个|所有|全部|分别|逐个|从.+开始|重新从.+分支|跨文件|附件)/i.test(prompt);
+}
+
+export function getSimplePlannerGuardError(
+  session: AgentSession,
+  attachments: Attachment[],
+  toolName: string,
+  toolInput: Record<string, unknown>
+): string | null {
+  if (!requiresPlannerInSimpleProfile(session, attachments)) return null;
+  if (toolName === "Task" && optionalString(toolInput.subagent_type) === "task-planner") return null;
+  if (toolName === "Task" && optionalString(toolInput.subagent_type) === "task-executor") {
+    return "当前请求包含多附件、多需求点、跨文件或指定基线。进入实现前必须先委托 task-planner 提取需求、拆分独立 R-ID 并给出证据；根 Agent 仍可做最小只读取证。";
+  }
+  return null;
+}
+
+function hasMergedCallContractPrerequisite(session: AgentSession): boolean {
+  const checkpoint = getLatestExplorationCheckpoint(session);
+  if (!checkpoint) return false;
+  if (/调用契约不适用[\s\S]{0,240}(?:纯文案|静态数据|纯样式|不调用|不复用|不修改)/i.test(checkpoint.text)) {
+    return true;
+  }
+  const hasContractConclusionInMemory = /(?:调用契约|契约调查)[\s\S]{0,800}(?:证据|文件|路径|组件|函数|方法|参数|调用方|返回值|副作用|path:line)/i.test(checkpoint.text);
+  if (!hasContractConclusionInMemory) return false;
+  return session.tool_calls.some((toolCall, index) =>
+    index < checkpoint.observed_tool_call_count
+    && toolCall.tool === "Task"
+    && isPlainObject(toolCall.input)
+    && optionalString(toolCall.input.subagent_type) === "call-contract-investigator"
+    && toolCall.status === "completed"
+    && Boolean(toolCall.output_summary?.trim())
+  );
+}
+
+export function getSimpleExecutorPrerequisiteGuardError(
+  session: AgentSession,
+  toolName: string,
+  toolInput: Record<string, unknown>
+): string | null {
+  if (toolName !== "Task" || optionalString(toolInput.subagent_type) !== "task-executor") return null;
+  if (hasMergedCallContractPrerequisite(session)) return null;
+  return [
+    "task-executor 前置门禁未通过：当前知识雪球中没有已归并且带证据的 call-contract-investigator 独立调查结果。",
+    "调查 Task 必须 completed 且返回非空结论，随后 checkpoint 必须实际写入调用契约证据。",
+    "若任务确实只涉及纯文案、静态数据或纯样式，请先在 checkpoint 中记录“调用契约不适用”及具体依据。"
+  ].join("");
+}
+
+function isKnowledgeBoundaryMutation(toolName: string, toolInput: Record<string, unknown>): boolean {
+  if (["Edit", "MultiEdit", "Write", "NotebookEdit"].includes(toolName)) return true;
+  if (toolName === "Task") return optionalString(toolInput.subagent_type) === "task-executor";
+  return toolName === "Bash" && isMutatingShellCommand(optionalString(toolInput.command) ?? "");
 }
 
 function requiresFreshExplorationCheckpoint(
@@ -2571,6 +3091,54 @@ export function ensureProfileTaskTree(session: AgentSession): boolean {
   return true;
 }
 
+const PHASE_TASK_TREE_STRATEGY = "阶段性任务树：只落实当前知识雪球的 next_action；checkpoint 更新后由宿主自动替换。";
+
+/** 简洁 Profile 模式只保留当前知识雪球下一步，不建立覆盖整个目标的全局 DAG。 */
+export function syncPhaseTaskTreeWithCheckpoint(session: AgentSession): boolean {
+  const checkpoint = getLatestExplorationCheckpoint(session);
+  if (!checkpoint) return false;
+  const taskId = `knowledge-r${checkpoint.revision}`;
+  const phase = checkpoint.phase ?? phaseFromDisposition(checkpoint.disposition);
+  const description = checkpoint.next_action
+    ?? (checkpoint.disposition === "complete" ? "汇总已完成目标与验证证据" : "根据当前知识雪球决定下一步");
+  const status = checkpoint.disposition === "complete"
+    ? "completed"
+    : checkpoint.disposition === "blocked"
+      ? "blocked"
+      : "in_progress";
+  const existing = session.task_tree;
+  const current = existing?.tasks[0];
+  if (
+    existing?.strategy === PHASE_TASK_TREE_STRATEGY
+    && existing.tasks.length === 1
+    && current?.id === taskId
+    && current.description === description
+    && current.status === status
+  ) {
+    return false;
+  }
+  const now = new Date().toISOString();
+  session.task_tree = {
+    goal_restated: session.task_prompt.trim() || "完成用户请求",
+    strategy: PHASE_TASK_TREE_STRATEGY,
+    ...(status === "completed" ? {} : { current_focus: taskId }),
+    ...(status === "completed" ? {} : { focus_reason: "落实知识雪球中当前最重要的下一步" }),
+    tasks: [{
+      id: taskId,
+      description,
+      dependencies: [],
+      status,
+      status_reason: `由 checkpoint revision ${checkpoint.revision} / ${checkpoint.disposition} / ${phase} 自动生成`,
+      ...(status === "completed"
+        ? { evidence: `checkpoint revision ${checkpoint.revision} 已归并最终实现与验证结论` }
+        : {})
+    }],
+    created_at: now,
+    updated_at: now
+  };
+  return true;
+}
+
 function profileNeedsPlanning(session: AgentSession): boolean {
   return !session.task_tree
     || (session.task_tree.tasks.length === 1 && session.task_tree.tasks[0]?.id === "host-goal");
@@ -2583,11 +3151,11 @@ export function buildProfileProgressFingerprint(session: AgentSession): string {
     evidence: task.evidence ?? "",
     reason: task.status_reason ?? ""
   }));
-  const completedTools = [...new Set(
-    session.tool_calls
-      .filter((toolCall) => toolCall.status === "completed" || toolCall.exit_code === 0)
-      .map((toolCall) => makeToolCacheKey(toolCall.tool, toolCall.input))
-  )].sort();
+  const toolState = session.tool_calls.map((toolCall) => ({
+    id: toolCall.id,
+    status: toolCall.status,
+    exitCode: toolCall.exit_code
+  }));
   const fileChanges = [...new Set(
     session.file_changes.map((change) => `${change.operation}:${change.path}`)
   )].sort();
@@ -2596,18 +3164,22 @@ export function buildProfileProgressFingerprint(session: AgentSession): string {
     ? {
         revision: checkpoint.revision,
         disposition: checkpoint.disposition,
+        phase: checkpoint.phase ?? "",
         text: checkpoint.text,
         nextAction: checkpoint.next_action ?? ""
       }
     : null;
-  return JSON.stringify({ taskState, completedTools, fileChanges, explorationState });
+  return JSON.stringify({ taskState, toolState, fileChanges, explorationState });
 }
 
-export function formatProfileAttachmentList(attachments: Attachment[]): string {
+export function formatProfileAttachmentList(attachments: Attachment[], projectPath?: string): string {
   if (attachments.length === 0) return "";
   const entries = attachments.map((attachment) => {
     if (attachment.type === "file_ref") {
-      return `- [可读取文件] ${attachment.path}（显示名: ${attachment.display_name}）`;
+      const exactPath = projectPath
+        ? path.normalize(path.isAbsolute(attachment.path) ? attachment.path : path.resolve(projectPath, attachment.path))
+        : attachment.path;
+      return `- [可读取文件] ${exactPath}（显示名: ${attachment.display_name}）`;
     }
     if (attachment.type === "image") {
       return `- [内联图片] ${attachment.display_name}（没有磁盘路径）`;
@@ -2624,7 +3196,7 @@ export function formatProfileAttachmentList(attachments: Attachment[]): string {
 function collectSessionAttachments(session: AgentSession): Attachment[] {
   const collected = [
     ...(session.initial_user_message?.attachments ?? []),
-    ...session.messages.flatMap((message) => message.attachments ?? [])
+    ...(session.messages ?? []).flatMap((message) => message.attachments ?? [])
   ];
   const seen = new Set<string>();
   return collected.filter((attachment) => {
@@ -2642,52 +3214,112 @@ function augmentTaskInputWithAttachmentManifest(
   session: AgentSession
 ): Record<string, unknown> {
   const attachments = collectSessionAttachments(session);
-  const manifest = formatProfileAttachmentList(attachments);
+  const manifest = formatProfileAttachmentList(attachments, session.project_path);
   const marker = "## 宿主精确附件清单";
-  const evidenceMarker = "## 宿主可复用证据";
   const existingPrompt = optionalString(toolInput.prompt) ?? optionalString(toolInput.description) ?? "";
-  const evidence = formatReusableAgentEvidence(session, attachments);
-  if (
-    (!manifest || existingPrompt.includes(marker))
-    && (!evidence || existingPrompt.includes(evidenceMarker))
-  ) {
+  if (!manifest || existingPrompt.includes(marker)) {
     return toolInput;
   }
   return {
     ...toolInput,
     prompt: [
       existingPrompt,
-      manifest && !existingPrompt.includes(marker) ? `${marker}\n${manifest}` : "",
-      evidence && !existingPrompt.includes(evidenceMarker) ? `${evidenceMarker}\n${evidence}` : ""
+      `${marker}\n${manifest}`
     ].filter(Boolean).join("\n\n")
   };
 }
 
 export function augmentTaskInputWithExplorationMemory(
   toolInput: Record<string, unknown>,
-  session: AgentSession
+  session: AgentSession,
+  capabilityCatalog = ""
 ): Record<string, unknown> {
-  if (optionalString(toolInput.subagent_type) === "task-planner") return toolInput;
   const checkpoint = getLatestExplorationCheckpoint(session);
-  if (!checkpoint) return toolInput;
-  const marker = `## 宿主当前探索工作记忆（revision ${checkpoint.revision}）`;
+  const subagentType = optionalString(toolInput.subagent_type);
+  const requiredSkills = requiredSkillsForSubagent(subagentType);
+  const skillMarker = "## 本次委托必须落实的 Skill";
+  const marker = checkpoint ? `## 宿主当前探索工作记忆（revision ${checkpoint.revision}）` : "";
   const existingPrompt = optionalString(toolInput.prompt) ?? optionalString(toolInput.description) ?? "";
-  if (existingPrompt.includes(marker)) return toolInput;
-  const memory = boundExplorationMemoryForHandoff(checkpoint.text);
+  if ((marker && existingPrompt.includes(marker)) || existingPrompt.includes(skillMarker)) return toolInput;
+  const memory = checkpoint ? boundExplorationMemoryForHandoff(checkpoint.text) : "";
   return {
     ...toolInput,
     prompt: [
       existingPrompt,
+      requiredSkills.length > 0
+        ? `${skillMarker}\n${requiredSkills.map((skill) => `- ${skill}`).join("\n")}\n必须在执行和返回证据中体现这些契约，而不是只声称“已加载”。`
+        : "",
       marker,
-      `状态：${checkpoint.disposition}`,
-      checkpoint.next_action ? `主线程记录的下一步：${checkpoint.next_action}` : "",
+      checkpoint ? `状态：${checkpoint.disposition}` : "",
+      checkpoint ? `阶段：${checkpoint.phase ?? phaseFromDisposition(checkpoint.disposition)}` : "",
+      checkpoint?.next_action ? `主线程记录的下一步：${checkpoint.next_action}` : "",
       memory,
+      session.task_tree
+        ? session.task_tree.strategy === PHASE_TASK_TREE_STRATEGY
+          ? buildPhaseTaskTreePromptSection(session.task_tree)
+          : buildTaskTreePromptSection(session.task_tree)
+        : "",
+      buildExecutionProgressPromptSection(session),
+      capabilityCatalog,
       [
         "把以上文本当作当前有效认知，而不是绝对真理；用你的独立工具结果核对它。",
         "如果发现冲突、失效结论、新未知或验证失败，必须在返回中明确写出，供主 Agent 回流到下一版 checkpoint。"
       ].join("\n")
     ].filter(Boolean).join("\n\n")
   };
+}
+
+function requiredSkillsForSubagent(subagentType?: string): string[] {
+  const mapping: Record<string, string[]> = {
+    "task-planner": [
+      "careful-coder:exploring-codebase",
+      "careful-coder:planning-complex-changes",
+      "careful-coder:task-decomposition"
+    ],
+    "call-contract-investigator": [
+      "careful-coder:cautious-calling",
+      "careful-coder:investigating-call-contracts"
+    ],
+    "task-executor": [
+      "careful-coder:preserving-existing-behavior",
+      "careful-coder:safe-git-operations",
+      "careful-coder:task-decomposition"
+    ],
+    "task-verifier": ["careful-coder:verification-before-completion"],
+    "completeness-checker": ["careful-coder:verification-before-completion"]
+  };
+  return subagentType ? (mapping[subagentType] ?? []) : [];
+}
+
+function selectProfileSkillsForPhase<T extends { id: string }>(
+  skills: T[],
+  phase: ExplorationPhase
+): T[] {
+  const suffixesByPhase: Record<ExplorationPhase, string[]> = {
+    investigate: [
+      "clarifying-requirements",
+      "exploring-codebase",
+      "planning-complex-changes",
+      "task-decomposition",
+      "cautious-calling",
+      "investigating-call-contracts"
+    ],
+    implement: [
+      "preserving-existing-behavior",
+      "safe-git-operations",
+      "task-decomposition",
+      "cautious-calling",
+      "investigating-call-contracts"
+    ],
+    verify: ["verification-before-completion", "systematic-debugging"],
+    complete: ["verification-before-completion"]
+  };
+  const suffixes = suffixesByPhase[phase] ?? suffixesByPhase.investigate;
+  const knownSuffixes = new Set(Object.values(suffixesByPhase).flat());
+  return skills.filter((skill) => {
+    const shortId = skill.id.includes(":") ? skill.id.slice(skill.id.lastIndexOf(":") + 1) : skill.id;
+    return !knownSuffixes.has(shortId) || suffixes.includes(shortId);
+  });
 }
 
 function boundExplorationMemoryForHandoff(memory: string): string {
@@ -2699,45 +3331,9 @@ function boundExplorationMemoryForHandoff(memory: string): string {
   ].join("");
 }
 
-/**
- * 给新 Agent 的通用证据胶囊。只移交安全的文字结论，不转发二进制/base64；
- * 若资源只被读取但尚无文字语义，明确要求重读原始注册路径，避免寻找替代副本。
- */
-function formatReusableAgentEvidence(session: AgentSession, attachments: Attachment[]): string {
-  const registeredPaths = resolveRegisteredResourcePaths(session.project_path, attachments);
-  const entries: string[] = [];
-  for (const toolCall of session.tool_calls) {
-    if (toolCall.status !== "completed" && toolCall.exit_code !== 0) continue;
-    if (toolCall.tool === "Task") {
-      const summary = safeCachedToolOutput(toolCall.output_summary);
-      if (summary) {
-        const subagentType = isPlainObject(toolCall.input)
-          ? optionalString(toolCall.input.subagent_type)
-          : undefined;
-        entries.push(`- Agent ${subagentType ?? "任务"}：${summary.slice(0, 1_500)}`);
-      }
-      continue;
-    }
-    if (toolCall.tool !== "Read" || !isPlainObject(toolCall.input)) continue;
-    const filePath = optionalString(toolCall.input.file_path);
-    if (!filePath) continue;
-    const resolvedPath = path.resolve(session.project_path, filePath);
-    if (!registeredPaths.has(path.normalize(resolvedPath))) continue;
-    const summary = safeCachedToolOutput(toolCall.output_summary);
-    entries.push(summary
-      ? `- 注册资源 ${filePath}：${summary.slice(0, 1_500)}`
-      : `- 注册资源 ${filePath} 已读取，但尚无可移交的文字语义；如确需内容，只能重读该原始注册路径，不得猜测、搜索或创建替代副本。`);
-  }
-  if (entries.length === 0) return "";
-  return [
-    "以下是前序工具或 Agent 已取得的证据。先复用，再做最小必要验证；不得把“读取成功”冒充为已理解内容。",
-    ...entries.slice(-20)
-  ].join("\n").slice(-10_000);
-}
-
-export function buildQueuedUserMessageContext(messages: AgentMessage[]): string {
+export function buildQueuedUserMessageContext(messages: AgentMessage[], projectPath?: string): string {
   const entries = messages.map((message, index) => {
-    const attachments = formatProfileAttachmentList(message.attachments ?? []);
+    const attachments = formatProfileAttachmentList(message.attachments ?? [], projectPath);
     return [
       `### 补充消息 ${index + 1}（${message.created_at}）`,
       "<user-follow-up>",
@@ -2792,56 +3388,66 @@ function appendBoundedAssistantContext(current: string, next: string): string {
 export function buildCompletionContinuationContext(
   incompleteReasons: string[],
   partialTranscript: string,
-  completedToolCache: Map<string, { outputSummary?: string; exitCode?: number }> = new Map(),
   recoveredFromPostResultCrash = false
 ): string {
-  const completedEvidence = formatCompletedToolEvidence(completedToolCache);
   return [
     "## 这是同一任务的续跑，不是新任务",
     recoveredFromPostResultCrash
       ? "上一轮 SDK 已经返回 success，只是在清理子进程时崩溃；上一轮分析、工具结果、任务树和探索工作记忆全部有效。"
       : "上一轮已经完成的分析、工具结果、任务树和探索工作记忆全部有效。",
-    "不得重新规划，不得从第一页或项目根目录重新勘察，不得换一个 preview/original 路径重复读取同一附件内容。",
+    "以当前知识雪球为准，不要把本轮当成新任务。",
     "续跑时以当前探索工作记忆为首要认知，不以最后一段助手回复或任务树标签代替它：",
-    "1. 先对照 checkpoint、下方跨轮工具证据和当前工作区，识别 checkpoint 之后的新事实或状态变化；",
+    "1. 先对照 checkpoint 和当前工作区，识别 checkpoint 之后的新事实或状态变化；",
     "2. 若存在新结果，先调用 checkpoint_exploration 归并，再启动 Task/Bash/修改/任务状态推进；",
     "3. 从工作记忆中最重要的未解决问题选择下一步，再映射到第一个 dependency-ready 节点；",
-    "4. 已有证据足够时，把工作记忆和证据直接交给 task-executor/task-verifier，不要重读同一文件；",
-    "5. 只有缺少关闭当前未知所必需的具体证据时，才执行一个最小化的新工具调用；禁止再次调用 task-planner。",
+    "4. 根据当前缺失信息选择一个最小行动；需要工具时正常调用，不需要时不要调用。",
     "",
     "## 宿主完成闸门未通过",
     ...incompleteReasons.map((reason) => `- ${reason}`),
-    "",
-    completedEvidence ? `## 已完成的跨轮工具证据（禁止重复勘察）\n${completedEvidence}` : "",
     "",
     partialTranscript ? `## 上一轮结论（作为续跑输入，不要重新获取）\n${partialTranscript.slice(-6000)}` : "",
     "",
     "当前回复不能作为任务完成。请立即继续执行剩余工作：维护 update_task_tree 和 checkpoint_exploration，完成实现与验证，",
     "并确保每个 completed 节点都包含真实工具输出或文件位置作为 evidence；最终审查通过后写入 disposition=complete 的 checkpoint。",
-    "不要重复已经完成的勘察，不要只输出下一步计划。"
+    "不要只输出下一步计划。"
   ].filter(Boolean).join("\n");
 }
 
-function formatCompletedToolEvidence(
-  completedToolCache: Map<string, { outputSummary?: string; exitCode?: number }>
-): string {
-  const entries = [...completedToolCache.entries()].slice(-60);
-  if (entries.length === 0) return "";
-  return entries.map(([key, result]) => {
-    const separator = key.indexOf("::");
-    const toolName = separator >= 0 ? key.slice(0, separator) : key;
-    const input = separator >= 0 ? key.slice(separator + 2) : "";
-    const safeSummary = safeCachedToolOutput(result.outputSummary);
-    const output = safeSummary
-      ? ` → ${safeSummary.slice(0, 1_200)}`
-      : result.exitCode === 0
-        ? " → 成功"
-        : "";
-    return `- ${toolName} ${input.slice(0, 240)}${output}`;
-  }).join("\n");
+/**
+ * A bounded observation window for a fresh SDK query or a sub-agent handoff.
+ * It is intentionally placed after knowledge/task context: observations may
+ * correct the snowball, but must not silently replace confirmed knowledge.
+ */
+export function buildExecutionProgressPromptSection(session: AgentSession): string {
+  const checkpoint = getLatestExplorationCheckpoint(session);
+  const start = checkpoint
+    ? Math.min(checkpoint.observed_tool_call_count, session.tool_calls.length)
+    : Math.max(0, session.tool_calls.length - 12);
+  const calls = session.tool_calls
+    .slice(start)
+    .filter((toolCall) => !isExplorationControlTool(toolCall.tool))
+    .slice(-12);
+  const changes = (session.file_changes ?? []).slice(-12);
+  if (calls.length === 0 && changes.length === 0) {
+    return [
+      "## 当前执行观察",
+      "- 暂无尚待核对的工具执行或文件变更。"
+    ].join("\n");
+  }
+  return [
+    "## 当前执行观察（原始状态，不代替知识雪球）",
+    `- 会话状态：${session.status ?? "unknown"}；当前阶段：${session.current_stage ?? "unknown"}`,
+    ...calls.map((toolCall) => {
+      const summary = sanitizeToolOutputSummary(toolCall.output_summary)?.slice(0, 300);
+      const input = isPlainObject(toolCall.input) ? toolCall.input : {};
+      return `- 工具 ${describeToolAttempt(toolCall.tool, input)} → ${toolCall.status}${toolCall.exit_code !== undefined ? ` / exit ${toolCall.exit_code}` : ""}${summary ? ` / ${summary}` : ""}`;
+    }),
+    ...changes.map((change) => `- 文件 ${change.operation}: ${change.path}`),
+    "完成一个可独立认定的工作单元后，立即核对目标、实际结果、验证证据和新未知；核对结论写入 checkpoint 后才能推进下一项。"
+  ].join("\n");
 }
 
-function safeCachedToolOutput(outputSummary: string | undefined): string | undefined {
+function sanitizeToolOutputSummary(outputSummary: string | undefined): string | undefined {
   if (!outputSummary) return undefined;
   if (
     /"type"\s*:\s*"image"|"base64"\s*:|data:image\/|iVBORw0KGgo|\/9j\/|JVBERi0/i.test(outputSummary)
@@ -2868,7 +3474,7 @@ function enrichImageReadEvidence(
     if (toolCall.tool !== "Read" || toolCall.status !== "completed" || !isPlainObject(toolCall.input)) continue;
     const filePath = optionalString(toolCall.input.file_path);
     if (!filePath || !/\.(?:png|jpe?g|webp|gif|bmp)$/i.test(filePath)) continue;
-    if (toolCall.output_summary && safeCachedToolOutput(toolCall.output_summary)) continue;
+    if (toolCall.output_summary && sanitizeToolOutputSummary(toolCall.output_summary)) continue;
     toolCall.output_summary = `图片已成功读取；同轮助手结论（可能涵盖同批附件）：${conclusion}`;
   }
 }
@@ -2964,26 +3570,6 @@ function hasDsmlContent(message: unknown): boolean {
   return false;
 }
 
-/** 将工具名和输入规范化为缓存键，用于跨重试的去重。 */
-function makeToolCacheKey(toolName: string, toolInput: unknown): string {
-  const normalized = isPlainObject(toolInput) ? normalizeToolInputForCache(toolInput) : JSON.stringify(toolInput);
-  return `${toolName}::${normalized}`;
-}
-
-/** 从工具输入中提取稳定、有序的规范化字符串。忽略无关字段如 description。 */
-function normalizeToolInputForCache(input: Record<string, unknown>): string {
-  const relevant = Object.entries(input)
-    .filter(([key]) => !["description", "timeout", "run_in_background", "dangerouslyDisableSandbox", "toolUseID"].includes(key))
-    .map(([key, value]) => [
-      key,
-      key === "file_path" && typeof value === "string"
-        ? path.normalize(value)
-        : value
-    ] as const)
-    .sort(([a], [b]) => a.localeCompare(b));
-  return JSON.stringify(relevant);
-}
-
 /**
  * 检测工具名是否损坏（协议标记泄漏、MCP 前缀截断等）。返回面向模型的纠正提示。
  * SDK 对未知工具名会直接回 "No such tool available" 并绕过 canUseTool/PreToolUse，
@@ -3010,12 +3596,11 @@ export async function validateProfileToolInput(
   toolName: string,
   toolInput: Record<string, unknown>,
   projectPath?: string,
-  attachments: Attachment[] = []
+  attachments: Attachment[] = [],
+  _phase?: ExplorationPhase
 ): Promise<string | null> {
   const nameCorruption = detectCorruptedToolName(toolName);
   if (nameCorruption) return nameCorruption;
-  const resourceError = validateManagedResourceReference(toolName, toolInput, projectPath, attachments);
-  if (resourceError) return resourceError;
   if (toolName === "Bash") {
     const command = toolInput.command;
     if (typeof command !== "string" || !command.trim()) {
@@ -3047,71 +3632,29 @@ export async function validateProfileToolInput(
     const resolvedPath = path.isAbsolute(filePath)
       ? filePath
       : path.resolve(projectPath ?? process.cwd(), filePath);
+    const normalizedPath = path.normalize(resolvedPath);
+    if (normalizedPath.includes(`${path.sep}.ai-coder${path.sep}uploads${path.sep}`)) {
+      const allowedAttachmentPaths = attachments.flatMap((attachment) => {
+        if (attachment.type !== "file_ref" || !attachment.path) return [];
+        return [path.normalize(
+          path.isAbsolute(attachment.path)
+            ? attachment.path
+            : path.resolve(projectPath ?? process.cwd(), attachment.path)
+        )];
+      });
+      if (allowedAttachmentPaths.length > 0 && !allowedAttachmentPaths.includes(normalizedPath)) {
+        return [
+          `Read 附件路径不在宿主精确清单：${filePath}。`,
+          "禁止猜测 UUID、目录或页码；必须逐字复制以下路径之一：",
+          ...allowedAttachmentPaths.map((allowedPath) => `- ${allowedPath}`)
+        ].join("\n");
+      }
+    }
     await access(resolvedPath);
     return null;
   } catch {
     return `Read 目标文件不存在或不可访问：${filePath}`;
   }
-}
-
-function resolveRegisteredResourcePaths(projectPath: string, attachments: Attachment[]): Set<string> {
-  return new Set(attachments
-    .filter((attachment): attachment is Extract<Attachment, { type: "file_ref" }> =>
-      attachment.type === "file_ref"
-    )
-    .map((attachment) => path.normalize(path.isAbsolute(attachment.path)
-      ? attachment.path
-      : path.resolve(projectPath, attachment.path))));
-}
-
-/**
- * `.ai-coder/uploads` 是宿主管理的资源命名空间，不是可供 Agent 枚举或猜测的普通源码目录。
- * 工作区其他目录仍按 coding agent 的常规探索规则处理。
- */
-function validateManagedResourceReference(
-  toolName: string,
-  toolInput: Record<string, unknown>,
-  projectPath: string | undefined,
-  attachments: Attachment[]
-): string | null {
-  if (!projectPath) return null;
-  const managedRoot = path.normalize(path.resolve(projectPath, ".ai-coder", "uploads"));
-  const registeredPaths = resolveRegisteredResourcePaths(projectPath, attachments);
-  const isManaged = (candidate: string): boolean => {
-    const normalized = path.normalize(path.isAbsolute(candidate)
-      ? candidate
-      : path.resolve(projectPath, candidate));
-    return normalized === managedRoot || normalized.startsWith(`${managedRoot}${path.sep}`);
-  };
-  const isRegistered = (candidate: string): boolean => {
-    const normalized = path.normalize(path.isAbsolute(candidate)
-      ? candidate
-      : path.resolve(projectPath, candidate));
-    return registeredPaths.has(normalized);
-  };
-  const reject = (candidate: string): string =>
-    `工具引用了不属于当前会话的已注册资源：${candidate}。宿主管理目录不可枚举、猜测或使用替代副本；请逐字使用“宿主精确附件清单”中的完整路径。`;
-
-  if (["Read", "Grep", "Glob", "LS"].includes(toolName)) {
-    for (const key of ["file_path", "path"]) {
-      const candidate = optionalString(toolInput[key]);
-      if (candidate && isManaged(candidate) && !isRegistered(candidate)) return reject(candidate);
-    }
-  }
-  if (toolName !== "Bash") return null;
-  const command = optionalString(toolInput.command);
-  if (!command || !/(?:^|[\\/])\.ai-coder[\\/]uploads(?:[\\/]|$)/.test(command)) return null;
-  const references = command.match(/(?:[A-Za-z]:)?[^\s"'`|;&<>]*[\\/]\.ai-coder[\\/]uploads[\\/][^\s"'`|;&<>]+/g)
-    ?? command.match(/\.ai-coder[\\/]uploads[\\/][^\s"'`|;&<>]+/g)
-    ?? [];
-  if (references.length === 0) {
-    return reject(".ai-coder/uploads");
-  }
-  for (const reference of references) {
-    const cleaned = reference.replace(/[),\]}]+$/g, "");
-    if (isManaged(cleaned) && !isRegistered(cleaned)) return reject(cleaned);
-  }
-  return null;
 }
 
 function isSubprocessCrashError(error: unknown): boolean {
@@ -3163,8 +3706,7 @@ function isRetriableApiError(error: unknown): boolean {
   if (/\b5\d{2}\b/.test(message)) return true;
   if (/rate.?limit|overloaded|too many requests/i.test(message)) return true;
   if (/timeout|timed.?out|ECONNRESET|ETIMEDOUT|ENOTFOUND|ECONNREFUSED|network|fetch failed/i.test(message)) return true;
-  // 兼容第三方 Anthropic Provider/模型在流式 JSON 行中途断开。此类错误通常保留了
-  // 已完成工具结果；Profile 循环会回滚本轮记录、缓存成功工具并用新进程续跑。
+  // 兼容第三方 Anthropic Provider/模型在流式 JSON 行中途断开；Profile 循环会用新进程有限重试。
   if (
     /Unterminated string in JSON/i.test(message)
     || /Unexpected end of JSON input/i.test(message)
@@ -3341,13 +3883,6 @@ function isSemanticallyFailedTaskMessage(message: unknown): boolean {
   return isSemanticallyFailedTaskResult(toolResultText);
 }
 
-function isSkippedDuplicateToolResult(outputSummary: string | undefined): boolean {
-  if (!outputSummary) return false;
-  return /此操作已在本会话中成功完成，无需重复执行|相同工具调用仍在执行中，已跳过重复请求/.test(
-    outputSummary
-  );
-}
-
 function isMutatingShellCommand(value: unknown): boolean {
   if (typeof value !== "string") return false;
   const command = value
@@ -3358,7 +3893,7 @@ function isMutatingShellCommand(value: unknown): boolean {
   return [
     /(?:^|[;&|]\s*)git(?:\s+(?:-[cC]\s+\S+|--(?:git-dir|work-tree)=\S+))*\s+(?:add|am|apply|branch\s+(?:-[dDmM]|--delete|--move)|checkout|cherry-pick|clean|commit|merge|mv|pull|push|rebase|reset|restore|revert|rm|stash|switch|tag)\b/i,
     /(?:^|[;&|]\s*)(?:rm|mv|cp|install|mkdir|rmdir|touch|truncate|tee|patch)\b/i,
-    /(?:^|[;&|]\s*)(?:sed|perl)\s+[^;&|]*\s-i(?:\s|$)/i,
+    /(?:^|[;&|]\s*)(?:sed|perl)\b[^;&|]*(?:\s-i(?:\s|$)|\s--in-place(?:[=\s]|$))/i,
     /(?:^|[;&|]\s*)(?:npm|pnpm|yarn|bun)\s+(?:add|install|remove|uninstall|update|upgrade)\b/i,
     /(?:^|[;&|]\s*)(?:cargo\s+(?:add|remove)|go\s+mod\s+(?:edit|tidy)|pip(?:3)?\s+install)\b/i,
     /(^|[^<])>>?(?![>&])/,
@@ -4107,18 +4642,34 @@ function buildTaskTreePromptSection(tree: TaskTree): string {
   return lines.join("\n");
 }
 
+function buildPhaseTaskTreePromptSection(tree: TaskTree): string {
+  const task = tree.tasks[0];
+  if (!task) return "";
+  return [
+    "## 当前阶段任务（知识雪球的执行投影）",
+    `- ${task.id}: ${task.description}`,
+    `- 状态：${task.status}`,
+    "这不是全局计划。只落实这一项；获得结果后更新 checkpoint_exploration，宿主会按新的 next_action 自动替换阶段任务。",
+    "完成这一项后先核对：目标是否满足、证据是否对应、验证是否通过、是否产生新未知。未完成核对不得更换 next_action 或开始下一项。",
+    "不要为维护任务树本身调用 update_task_tree。"
+  ].join("\n");
+}
+
 export function buildExplorationPromptSection(session: AgentSession): string {
   const checkpoint = getLatestExplorationCheckpoint(session);
   if (!checkpoint) return "";
   return [
     `## 当前探索工作记忆（revision ${checkpoint.revision} / ${checkpoint.disposition}）`,
+    `进度标签：${checkpoint.phase ?? phaseFromDisposition(checkpoint.disposition)}（仅描述状态，不限制工具）`,
     "",
     checkpoint.text,
     "",
     checkpoint.next_action ? `记录的下一步：${checkpoint.next_action}` : "",
     "",
-    "这是一份可重写的当前有效认知，不是不可变日志。请先吸收它和本轮新证据，再行动。",
-    "取得重要证据、完成实现或验证、审查产生新问题、改变方向或准备结束时，调用 checkpoint_exploration 整段更新。",
+    "这是一份持续滚动的知识雪球。`## 已确认` 中的既有条目会自动继承，禁止静默删除；发现错误时新增带证据的“校正：旧结论 → 新结论”。",
+    "知识雪球至少维护：用户目标与范围、宿主精确输入资源路径及派生关系、最相似既有实现（位置、可复用模式、与本需求的差异）、仓库/分支/基线、带证据的代码事实、已做改动、验证结果、校正记录、仍缺少的信息和唯一下一步。无同类参照时必须记录搜索范围。不要记录无结论的工具流水账。",
+    "每完成一个调查结论、实现单元、独立需求点或验证动作，立即做四项核对：原目标、实际结果、验证证据、新未知。只有核对通过并写入本知识雪球，才把该项标为已完成并推进 next_action。",
+    "取得重要证据、完成实现或验证、审查产生新问题、改变方向或准备结束时，调用 checkpoint_exploration 更新；过程可压缩，确认项不可丢失。",
     "不要仅在回复文本中声称已更新；只有 checkpoint_exploration 成功写入才会进入恢复状态和完成门禁。"
   ].filter(Boolean).join("\n");
 }

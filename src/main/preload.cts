@@ -3,6 +3,7 @@ import type { IpcRendererEvent } from "electron";
 import type { AgentSession, AppApi, Attachment, ResolveWorkflowInput, StartSessionInput } from "../shared/types.js";
 
 const api: AppApi = {
+  copyText: (text: string) => ipcRenderer.invoke("app:copy-text", text),
   selectProjectDirectory: () => ipcRenderer.invoke("project:select"),
   authorizeSessionProject: (projectPath: string) => ipcRenderer.invoke("project:authorize-session-project", projectPath),
   getAgentRuntimeStatus: () => ipcRenderer.invoke("agent:get-status"),

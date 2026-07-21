@@ -391,7 +391,7 @@ describe("WorkflowEngine", () => {
     expect(session.stage_runs?.[0]).toMatchObject({ stage_id: "understand", stage_name: "Understand" });
   });
 
-  it("clears the task tree when restarting or resetting Profile mode", () => {
+  it("clears the task tree and exploration memory when restarting or resetting Profile mode", () => {
     const engine = new WorkflowEngine();
     const profileWorkflow: WorkflowTemplate = { ...workflow, stages: [] };
     const session = createSession();
@@ -409,9 +409,19 @@ describe("WorkflowEngine", () => {
         evidence: "旧证据"
       }]
     };
+    session.exploration_checkpoints = [{
+      revision: 8,
+      text: "## 已确认\n- 这是旧任务的知识。",
+      disposition: "continue",
+      next_action: "继续旧任务",
+      observed_tool_call_count: 3,
+      source: "agent",
+      created_at: "old"
+    }];
 
     engine.restartFromBeginning(session, profileWorkflow);
     expect(session.task_tree).toBeUndefined();
+    expect(session.exploration_checkpoints).toBeUndefined();
 
     session.task_tree = {
       goal_restated: "另一旧目标",
@@ -425,8 +435,18 @@ describe("WorkflowEngine", () => {
         status: "pending"
       }]
     };
+    session.exploration_checkpoints = [{
+      revision: 3,
+      text: "## 已确认\n- 这是另一份旧知识。",
+      disposition: "verify",
+      next_action: "验证旧任务",
+      observed_tool_call_count: 1,
+      source: "agent",
+      created_at: "old"
+    }];
     engine.resetSessionContext(session, profileWorkflow);
     expect(session.task_tree).toBeUndefined();
+    expect(session.exploration_checkpoints).toBeUndefined();
   });
 
   it("rebuilds reset context from the first user question and its original attachments", () => {

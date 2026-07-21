@@ -2,7 +2,7 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { applyExplorationCheckpoint, augmentTaskInputWithExplorationMemory, buildClaudeSdkEnv, buildCompletionContinuationContext, buildExplorationPromptSection, ClaudeAgentRunner, describeSdkMessageSnippet, describeToolAttempt, detectCorruptedToolName, ensureExplorationCheckpoint, evaluateHumanQuestionRequest, evaluateProfileCompletion, extractSdkTerminalError, extractSdkToolUses, extractToolExecutionResult, formatProfileAttachmentList, getExplorationActionGuardError, hasSuccessfulSdkTerminalResult, parseBestStageAgentResult, validateProfileToolInput } from "./claudeAgentRunner.js";
+import { applyExplorationCheckpoint, augmentTaskInputWithExplorationMemory, buildClaudeSdkEnv, buildCompletionContinuationContext, buildExecutionProgressPromptSection, buildExplorationPromptSection, ClaudeAgentRunner, describeSdkMessageSnippet, describeToolAttempt, detectCorruptedToolName, ensureExplorationCheckpoint, evaluateHumanQuestionRequest, evaluateProfileCompletion, extractSdkTerminalError, extractSdkToolUses, extractToolExecutionResult, formatProfileAttachmentList, getExplorationActionGuardError, getSimpleDelegationGuardError, getSimpleExecutorPrerequisiteGuardError, getSimpleKnowledgeBoundaryGuardError, getSimplePlannerGuardError, hasSuccessfulSdkTerminalResult, isCheckpointWorthyProfileTranscript, parseBestStageAgentResult, syncPhaseTaskTreeWithCheckpoint, validateProfileToolInput } from "./claudeAgentRunner.js";
 import type { AgentSession, WorkflowTemplate } from "../../shared/types.js";
 
 const workflow: WorkflowTemplate = {
@@ -141,6 +141,184 @@ describe("ClaudeAgentRunner", () => {
     expect(attempt).toBe(2);
     expect(updated.status, updated.error).toBe("completed");
     expect(updated.messages.at(-1)?.content).toBe("Recovered");
+  });
+
+  it("preserves completed tool observations in the knowledge snowball before retrying a crashed Profile query", async () => {
+    const profileWorkflow: WorkflowTemplate = {
+      ...workflow,
+      id: "profile-workflow",
+      stages: [],
+      simple_profile_loop: true
+    };
+    const prompts: string[] = [];
+    let attempt = 0;
+    let session!: AgentSession;
+    async function* query(params: unknown) {
+      attempt += 1;
+      prompts.push(String((params as { prompt?: unknown }).prompt ?? ""));
+      if (attempt === 1) {
+        yield {
+          type: "assistant",
+          message: {
+            content: [{
+              type: "tool_use",
+              id: "read-page-21-before-crash",
+              name: "Read",
+              input: { file_path: "/tmp/uploads/page-21.png" }
+            }]
+          }
+        };
+        yield {
+          type: "user",
+          message: {
+            content: [{
+              type: "tool_result",
+              tool_use_id: "read-page-21-before-crash",
+              content: "image inspected",
+              is_error: false
+            }]
+          }
+        };
+        yield {
+          type: "assistant",
+          message: { content: [{ type: "text", text: "已经读取第 21 页并确认这是需求末页。" }] }
+        };
+        throw new Error("Claude Code process terminated by signal SIGSEGV");
+      }
+      const latest = session.exploration_checkpoints!.at(-1)!;
+      applyExplorationCheckpoint(session, {
+        memory: `${latest.text}\n\n## 已确认\n- 第 21 页已经读取，无需重复。`,
+        disposition: "complete",
+        phase: "complete",
+        next_action: "任务已完成"
+      });
+      yield { type: "result", subtype: "success", is_error: false, result: "Recovered without rereading" };
+    }
+    session = {
+      id: "profile-crash-preserves-tools",
+      project_path: "/tmp/project",
+      workflow_id: profileWorkflow.id,
+      task_prompt: "Inspect attachments",
+      status: "running",
+      current_stage: "profile",
+      messages: [],
+      tool_calls: [],
+      file_changes: [],
+      approvals: [],
+      stage_runs: [],
+      rework_requests: [],
+      progress_events: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    } as AgentSession;
+
+    const updated = await new ClaudeAgentRunner(query).run({ session, workflow: profileWorkflow });
+
+    expect(attempt).toBe(2);
+    expect(updated.status, updated.error).toBe("completed");
+    expect(updated.tool_calls).toHaveLength(1);
+    expect(updated.tool_calls[0]).toMatchObject({
+      id: "read-page-21-before-crash",
+      status: "completed"
+    });
+    expect(prompts[1]).toContain("/tmp/uploads/page-21.png");
+    expect(prompts[1]).toContain("上述成功调用不得重复");
+    expect(updated.exploration_checkpoints?.some((checkpoint) =>
+      checkpoint.text.includes("SDK 中断恢复观察")
+      && checkpoint.text.includes("/tmp/uploads/page-21.png")
+    )).toBe(true);
+  });
+
+  it("actively checkpoints key discoveries after a successful query when the model omitted the checkpoint", async () => {
+    const profileWorkflow: WorkflowTemplate = {
+      ...workflow,
+      id: "profile-workflow",
+      stages: [],
+      simple_profile_loop: true
+    };
+    const prompts: string[] = [];
+    let attempt = 0;
+    let checkpointedBeforeTerminalResult = false;
+    let session!: AgentSession;
+    async function* query(params: unknown) {
+      attempt += 1;
+      prompts.push(String((params as { prompt?: unknown }).prompt ?? ""));
+      if (attempt === 1) {
+        yield {
+          type: "assistant",
+          message: {
+            content: [{
+              type: "tool_use",
+              id: "read-routing-definition",
+              name: "Read",
+              input: { file_path: "/tmp/project/spec/page-21.png" }
+            }]
+          }
+        };
+        yield {
+          type: "user",
+          message: {
+            content: [{
+              type: "tool_result",
+              tool_use_id: "read-routing-definition",
+              content: "image inspected",
+              is_error: false
+            }]
+          }
+        };
+        yield {
+          type: "assistant",
+          message: {
+            content: [{
+              type: "text",
+              text: "已经确认第 21 页包含账户安全 ACCTSEC，这是附件最后一项。"
+            }]
+          }
+        };
+        checkpointedBeforeTerminalResult = session.exploration_checkpoints?.some((checkpoint) =>
+          checkpoint.text.includes("ACCTSEC")
+          && checkpoint.text.includes("最新关键观察")
+        ) === true;
+        yield { type: "result", subtype: "success", is_error: false, result: "Continue" };
+        return;
+      }
+      const latest = session.exploration_checkpoints!.at(-1)!;
+      applyExplorationCheckpoint(session, {
+        memory: `${latest.text}\n\n## 已确认\n- ACCTSEC 是附件最后一项。`,
+        disposition: "complete",
+        phase: "complete",
+        next_action: "任务已完成"
+      });
+      yield { type: "result", subtype: "success", is_error: false, result: "Done" };
+    }
+    session = {
+      id: "profile-auto-milestone-checkpoint",
+      project_path: "/tmp/project",
+      workflow_id: profileWorkflow.id,
+      task_prompt: "Inspect routing definitions",
+      status: "running",
+      current_stage: "profile",
+      messages: [],
+      tool_calls: [],
+      file_changes: [],
+      approvals: [],
+      stage_runs: [],
+      rework_requests: [],
+      progress_events: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    } as AgentSession;
+
+    const updated = await new ClaudeAgentRunner(query).run({ session, workflow: profileWorkflow });
+
+    expect(updated.status, updated.error).toBe("completed");
+    expect(attempt).toBe(2);
+    expect(checkpointedBeforeTerminalResult).toBe(true);
+    expect(prompts[1]).toContain("ACCTSEC");
+    expect(prompts[1]).toContain("不得重新获取已经成功取得的相同证据");
+    expect(updated.progress_events?.some((event) =>
+      event.message.includes("宿主已保全本轮结论及最近 1 个证据来源")
+    )).toBe(true);
   });
 
   it("stops retrying after two repeated Profile subprocess crashes", async () => {
@@ -468,7 +646,7 @@ describe("ClaudeAgentRunner", () => {
     })).resolves.toContain("损坏的工具协议尾标");
   });
 
-  it("treats the managed upload directory as an exact per-session resource registry", async () => {
+  it("requires exact host paths for uploaded attachments without restricting ordinary project resources", async () => {
     const projectPath = await mkdtemp(path.join(tmpdir(), "ai-coder-resource-registry-"));
     const registeredPath = path.join(projectPath, ".ai-coder", "uploads", "spec", "asset.bin");
     const stalePath = path.join(projectPath, ".ai-coder", "uploads", "stale", "asset.bin");
@@ -493,13 +671,13 @@ describe("ClaudeAgentRunner", () => {
       { file_path: stalePath },
       projectPath,
       attachments
-    )).resolves.toContain("不属于当前会话的已注册资源");
+    )).resolves.toContain("附件路径不在宿主精确清单");
     await expect(validateProfileToolInput(
       "Bash",
       { command: `file ${stalePath}` },
       projectPath,
       attachments
-    )).resolves.toContain("不属于当前会话的已注册资源");
+    )).resolves.toBeNull();
     await expect(validateProfileToolInput(
       "Bash",
       { command: `file ${registeredPath}` },
@@ -518,7 +696,186 @@ describe("ClaudeAgentRunner", () => {
     )).resolves.toBeNull();
   });
 
-  it("denies an identical tool request while the first request is still in flight", async () => {
+  it("keeps routine progress out of the knowledge snowball and accepts evidence-backed conclusions", () => {
+    expect(isCheckpointWorthyProfileTranscript("已经读取三个文件，让我继续读取剩余页面")).toBe(false);
+    expect(isCheckpointWorthyProfileTranscript("确认 lib/router.ts:42 的 routeMap 将 LQBInvest 映射为零钱宝组件")).toBe(true);
+    expect(isCheckpointWorthyProfileTranscript("根因：simple_profile_loop 允许根线程直接 Edit，绕过 task-executor")).toBe(true);
+  });
+
+  it("forces simple-profile workspace mutations through task-executor", () => {
+    expect(getSimpleDelegationGuardError("Edit", { file_path: "src/a.ts" })).toContain("task-executor");
+    expect(getSimpleDelegationGuardError("Write", { file_path: "src/a.ts" })).toContain("禁止直接修改");
+    expect(getSimpleDelegationGuardError("Bash", { command: "git checkout -b feature/test" })).toContain("task-executor");
+    expect(getSimpleDelegationGuardError("Read", { file_path: "src/a.ts" })).toBeNull();
+    expect(getSimpleDelegationGuardError("Task", { subagent_type: "task-executor" })).toBeNull();
+  });
+
+  it("allows minimal root evidence reads before planner but blocks entering execution", () => {
+    const session = {
+      task_prompt: "读取多个附件并实现所有页面跳转",
+      tool_calls: []
+    } as unknown as AgentSession;
+    const attachments = [
+      { type: "file_ref" as const, path: ".ai-coder/uploads/id/page-01.png", display_name: "第 1 页" },
+      { type: "file_ref" as const, path: ".ai-coder/uploads/id/page-02.png", display_name: "第 2 页" }
+    ];
+
+    expect(getSimplePlannerGuardError(
+      session,
+      attachments,
+      "Read",
+      { file_path: attachments[0]!.path }
+    )).toBeNull();
+    expect(getSimplePlannerGuardError(
+      session,
+      attachments,
+      "Bash",
+      { command: "git status" }
+    )).toBeNull();
+    expect(getSimplePlannerGuardError(
+      session,
+      attachments,
+      "Task",
+      { subagent_type: "task-executor" }
+    )).toContain("进入实现前必须先委托 task-planner");
+    expect(getSimplePlannerGuardError(
+      session,
+      attachments,
+      "Task",
+      { subagent_type: "task-planner" }
+    )).toBeNull();
+  });
+
+  it("requires a non-empty call-contract result to be merged before task-executor", () => {
+    const session = {
+      task_prompt: "复用已有组件",
+      tool_calls: [{
+        id: "contract",
+        stage_id: "profile",
+        tool: "Task",
+        input: { subagent_type: "call-contract-investigator" },
+        status: "completed",
+        output_summary: "确认 src/Panel.tsx:42 的 Panel 组件要求传入 navigator 参数",
+        created_at: "t"
+      }],
+      exploration_checkpoints: [{
+        revision: 1,
+        text: "## 已确认\n- 仍需调查调用方式。",
+        disposition: "continue",
+        phase: "investigate",
+        observed_tool_call_count: 1,
+        source: "agent",
+        created_at: "t"
+      }]
+    } as unknown as AgentSession;
+
+    expect(getSimpleExecutorPrerequisiteGuardError(
+      session,
+      "Task",
+      { subagent_type: "task-executor" }
+    )).toContain("checkpoint 必须实际写入调用契约证据");
+
+    session.exploration_checkpoints![0]!.text = "## 已确认\n- 调用契约证据：src/Panel.tsx:42 的 Panel 组件要求 navigator 参数。";
+    expect(getSimpleExecutorPrerequisiteGuardError(
+      session,
+      "Task",
+      { subagent_type: "task-executor" }
+    )).toBeNull();
+  });
+
+  it("enforces the executor prerequisite in PreToolUse even before canUseTool", async () => {
+    let preToolDecision: unknown;
+    let session!: AgentSession;
+    async function* query(params: unknown) {
+      const preToolUse = (params as {
+        options: { hooks: { PreToolUse: Array<{ hooks: Array<(input: Record<string, unknown>) => Promise<unknown>> }> } }
+      }).options.hooks.PreToolUse[0]!.hooks[0]!;
+      preToolDecision = await preToolUse({
+        tool_name: "Task",
+        tool_input: { subagent_type: "task-executor", description: "实现单点修改" },
+        tool_use_id: "executor-before-contract"
+      });
+      applyExplorationCheckpoint(session, {
+        memory: "## 已确认\n- 已验证 executor 前置门禁。",
+        disposition: "complete",
+        phase: "complete",
+        next_action: "完成"
+      });
+      yield { type: "result", subtype: "success", is_error: false, result: "done" };
+    }
+    const profileWorkflow: WorkflowTemplate = {
+      ...workflow,
+      id: "simple-executor-hook-guard",
+      stages: [],
+      simple_profile_loop: true,
+      agents: { "task-executor": { description: "execute", prompt: "execute" } }
+    };
+    session = {
+      id: "simple-executor-hook-guard",
+      project_path: "/tmp/project",
+      workflow_id: profileWorkflow.id,
+      task_prompt: "实现单点修改",
+      status: "running",
+      current_stage: "profile",
+      messages: [], tool_calls: [], file_changes: [], approvals: [],
+      created_at: "t", updated_at: "t"
+    } as AgentSession;
+
+    const updated = await new ClaudeAgentRunner(query).run({ session, workflow: profileWorkflow });
+    expect(updated.status, updated.error).toBe("completed");
+    expect(preToolDecision).toMatchObject({
+      hookSpecificOutput: {
+        permissionDecision: "deny",
+        permissionDecisionReason: expect.stringContaining("call-contract-investigator")
+      }
+    });
+  });
+
+  it("uses normal file accessibility checks without phase-specific input restrictions", async () => {
+    const projectPath = await mkdtemp(path.join(tmpdir(), "ai-coder-input-registry-"));
+    const registeredPath = path.join(projectPath, ".ai-coder", "uploads", "input-id", "source.png");
+    const peerPath = path.join(projectPath, "workspace-assets", "other.png");
+    await mkdir(path.dirname(registeredPath), { recursive: true });
+    await mkdir(path.dirname(peerPath), { recursive: true });
+    await writeFile(registeredPath, "registered input");
+    await writeFile(peerPath, "unregistered input");
+    const attachments = [{
+      type: "file_ref" as const,
+      path: ".ai-coder/uploads/input-id/source.png",
+      display_name: "uploaded reference"
+    }];
+
+    await expect(validateProfileToolInput(
+      "Read",
+      { file_path: registeredPath },
+      projectPath,
+      attachments,
+      "investigate"
+    )).resolves.toBeNull();
+    await expect(validateProfileToolInput(
+      "Read",
+      { file_path: registeredPath.replace(path.basename(projectPath), `${path.basename(projectPath)}-typo`) },
+      projectPath,
+      attachments,
+      "investigate"
+    )).resolves.toContain("附件路径不在宿主精确清单");
+    await expect(validateProfileToolInput(
+      "Read",
+      { file_path: peerPath },
+      projectPath,
+      attachments,
+      "investigate"
+    )).resolves.toBeNull();
+    await expect(validateProfileToolInput(
+      "Bash",
+      { command: `file ${peerPath}` },
+      projectPath,
+      attachments,
+      "investigate"
+    )).resolves.toBeNull();
+  });
+
+  it("does not add a host dedupe layer for identical tool requests", async () => {
     const projectPath = await mkdtemp(path.join(tmpdir(), "ai-coder-tool-dedupe-"));
     const pagePath = path.join(projectPath, "page-01.png");
     await writeFile(pagePath, "fixture");
@@ -561,13 +918,10 @@ describe("ClaudeAgentRunner", () => {
     await new ClaudeAgentRunner(query).run({ session, workflow: profileWorkflow });
 
     expect(decisions[0]).toEqual({ continue: true });
-    expect(decisions[1]).toMatchObject({
-      hookSpecificOutput: { permissionDecision: "deny" }
-    });
-    expect(JSON.stringify(decisions[1])).toContain("相同工具调用仍在执行中");
+    expect(decisions[1]).toEqual({ continue: true });
   });
 
-  it("soft-blocks one repeated operation without interrupting the whole Profile query", async () => {
+  it("does not count or soft-block repeated operations", async () => {
     const projectPath = await mkdtemp(path.join(tmpdir(), "ai-coder-tool-loop-"));
     const pagePath = path.join(projectPath, "page-01.png");
     await writeFile(pagePath, "fixture");
@@ -602,12 +956,10 @@ describe("ClaudeAgentRunner", () => {
     const updated = await new ClaudeAgentRunner(query).run({ session, workflow: profileWorkflow });
 
     expect(updated.status, updated.error).toBe("completed");
-    expect(updated.progress_events?.some((event) =>
-      event.message.includes("同一操作重复 3 次") && event.message.includes("本轮禁止再次调用")
-    )).toBe(true);
+    expect(updated.progress_events?.some((event) => event.message.includes("同一操作重复"))).toBe(false);
   });
 
-  it("counts one duplicate tool use only once across PreToolUse and canUseTool", async () => {
+  it("does not count duplicate tool uses across hooks", async () => {
     const projectPath = await mkdtemp(path.join(tmpdir(), "ai-coder-tool-hook-count-"));
     const pagePath = path.join(projectPath, "page-01.txt");
     await writeFile(pagePath, "cached text");
@@ -632,6 +984,10 @@ describe("ClaudeAgentRunner", () => {
         await preToolUse({ tool_name: "Read", tool_input: toolInput, tool_use_id: toolUseID });
         await typed.options.canUseTool("Read", toolInput, { toolUseID });
       }
+      applyExplorationCheckpoint(session, {
+        memory: "## 已确认\n- 重复工具请求未被宿主缓存或计数。\n## 仍缺少\n- 无。",
+        disposition: "complete"
+      });
       yield { type: "result", subtype: "success", is_error: false, result: "Continued" };
     }
     const session = {
@@ -659,12 +1015,10 @@ describe("ClaudeAgentRunner", () => {
     const updated = await new ClaudeAgentRunner(query).run({ session, workflow: profileWorkflow });
 
     expect(updated.status, updated.error).toBe("completed");
-    const softBreak = updated.progress_events?.find((event) => event.message.includes("同一操作重复 3 次"));
-    expect(softBreak?.message).toContain("本轮累计重复 3 次");
-    expect(softBreak?.message).not.toContain("累计重复 6 次");
+    expect(updated.progress_events?.some((event) => event.message.includes("累计重复"))).toBe(false);
   });
 
-  it("does not interrupt when ten different cached pages are revisited once", async () => {
+  it("does not maintain counters for previously visited pages", async () => {
     const profileWorkflow: WorkflowTemplate = { ...workflow, id: "profile-workflow", stages: [] };
     const pagePaths = Array.from(
       { length: 10 },
@@ -717,12 +1071,10 @@ describe("ClaudeAgentRunner", () => {
     const updated = await new ClaudeAgentRunner(query).run({ session, workflow: profileWorkflow });
 
     expect(updated.status, updated.error).toBe("completed");
-    expect(updated.progress_events?.some((event) =>
-      event.message.includes("累计命中 10 个已完成工具") && event.message.includes("不会暂停会话")
-    )).toBe(true);
+    expect(updated.progress_events?.some((event) => event.message.includes("累计命中"))).toBe(false);
   });
 
-  it("reuses a prior image conclusion for a lexically equivalent Read path", async () => {
+  it("allows a later Read without replaying a cached conclusion", async () => {
     const projectPath = await mkdtemp(path.join(tmpdir(), "ai-coder-image-evidence-"));
     const imageDir = path.join(projectPath, "pages");
     const imagePath = path.join(imageDir, "page-17.png");
@@ -796,9 +1148,9 @@ describe("ClaudeAgentRunner", () => {
       );
       session.task_tree!.tasks[0]!.status = "completed";
       session.task_tree!.tasks[0]!.evidence = "test cleanup";
-      yield { type: "result", subtype: "success", is_error: false, result: "Used cached conclusion" };
+      yield { type: "result", subtype: "success", is_error: false, result: "Read again when needed" };
       applyExplorationCheckpoint(session, {
-        memory: "## 已确认\n已复用第 17 页的既有图片结论完成当前任务，未重复读取等价路径，现有证据足够。",
+        memory: "## 已确认\n已根据当前知识与必要读取完成任务，现有证据足够。",
         disposition: "complete"
       });
     }
@@ -817,65 +1169,34 @@ describe("ClaudeAgentRunner", () => {
     const updated = await new ClaudeAgentRunner(query).run({ session, workflow: profileWorkflow });
 
     expect(attempts).toBe(2);
-    expect(sameQueryDecision).toMatchObject({ behavior: "deny", interrupt: false });
-    expect(duplicateDecision).toMatchObject({ behavior: "deny", interrupt: false });
-    expect(JSON.stringify(duplicateDecision)).toContain("第 17 页包含序号 33 到 36");
+    expect(sameQueryDecision).toMatchObject({ behavior: "allow" });
+    expect(duplicateDecision).toMatchObject({ behavior: "allow" });
     expect(updated.tool_calls.find((toolCall) => toolCall.id === "read-image-once")?.output_summary)
       .toContain("同轮助手结论");
     expect(updated.status, updated.error).toBe("completed");
   });
 
-  it("carries prior evidence into an incomplete Profile continuation after a post-result crash", () => {
-    const cache = new Map([
-      [
-        'Read::[["file_path","/tmp/uploads/page-17.png"]]',
-        { outputSummary: "image payload omitted" }
-      ],
-      [
-        'Bash::[["command","grep -r pageSwitch lib"]]',
-        { outputSummary: "lib/router.js:42: pageSwitch(target)", exitCode: 0 }
-      ]
-    ]);
-
+  it("continues from the knowledge context after a post-result crash", () => {
     const context = buildCompletionContinuationContext(
       ["仍有未完成任务：t1(pending)"],
       "已经确认序号 33-44 的页面和 pageName。",
-      cache,
       true
     );
 
     expect(context).toContain("这是同一任务的续跑，不是新任务");
     expect(context).toContain("上一轮 SDK 已经返回 success");
-    expect(context).toContain("不得重新规划");
-    expect(context).toContain("禁止再次调用 task-planner");
-    expect(context).toContain("/tmp/uploads/page-17.png");
-    expect(context).toContain("lib/router.js:42");
+    expect(context).toContain("当前知识雪球");
     expect(context).toContain("已经确认序号 33-44");
   });
 
-  it("carries bounded text Read content across queries while suppressing image payloads", () => {
-    const cache = new Map([
-      [
-        'Read::[["file_path","/tmp/lib/Const/index.js"]]',
-        { outputSummary: JSON.stringify({ type: "text", file: { content: "export const routeName = 'Setting';" } }) }
-      ],
-      [
-        'Read::[["file_path","/tmp/page-17.png"]]',
-        { outputSummary: '{"type":"image","file":{"base64":"iVBORw0KGgoAAAANSUhEUgAA' + "A".repeat(500) + '"}}' }
-      ]
-    ]);
-
+  it("does not inject prior tool payloads into continuation context", () => {
     const context = buildCompletionContinuationContext(
       ["仍有未完成任务：t1(in_progress)"],
-      "继续实现",
-      cache
+      "继续实现"
     );
 
-    expect(context).toContain("export const routeName");
-    expect(context).toContain("Setting");
-    expect(context).toContain("/tmp/page-17.png");
+    expect(context).not.toContain("已完成的跨轮工具证据");
     expect(context).not.toContain("iVBORw0KGgo");
-    expect(context).not.toContain("A".repeat(100));
   });
 
   it("denies restarting task-planner after a detailed task tree already exists", async () => {
@@ -929,7 +1250,7 @@ describe("ClaudeAgentRunner", () => {
     expect(JSON.stringify(plannerDecision)).toContain("不得重新规划");
   });
 
-  it("injects persisted evidence on the first query when resuming an existing Profile session", async () => {
+  it("injects persisted knowledge rather than replaying tool cache on resume", async () => {
     let receivedPrompt = "";
     const profileWorkflow: WorkflowTemplate = { ...workflow, id: "profile-workflow", stages: [] };
     async function* query(params: unknown) {
@@ -960,12 +1281,22 @@ describe("ClaudeAgentRunner", () => {
         tasks: [{ id: "t1", description: "实现", dependencies: [], status: "completed", evidence: "done" }],
         created_at: new Date().toISOString(), updated_at: new Date().toISOString()
       },
+      exploration_checkpoints: [{
+        revision: 2,
+        text: "## 已确认\n- 附件路径：/tmp/uploads/page-17.png。\n- 上一轮已经确认序号 33-44 的页面映射。\n## 仍缺少\n- 继续实现。",
+        disposition: "continue",
+        phase: "implement",
+        next_action: "继续实现",
+        source: "agent",
+        observed_tool_call_count: 1,
+        created_at: new Date().toISOString()
+      }],
       created_at: new Date().toISOString(), updated_at: new Date().toISOString()
     } as AgentSession;
 
     await new ClaudeAgentRunner(query).run({ session, workflow: profileWorkflow });
 
-    expect(receivedPrompt).toContain("这是同一任务的续跑，不是新任务");
+    expect(receivedPrompt).toContain("当前探索工作记忆");
     expect(receivedPrompt).toContain("/tmp/uploads/page-17.png");
     expect(receivedPrompt).toContain("上一轮已经确认序号 33-44");
   });
@@ -1227,12 +1558,16 @@ describe("ClaudeAgentRunner", () => {
     const updated = await new ClaudeAgentRunner(query).run({ session, workflow: profileWorkflow });
 
     expect(updated.status, updated.error).toBe("completed");
-    expect(decision).toMatchObject({ behavior: "allow" });
+    expect(decision).toEqual({
+      behavior: "allow",
+      updatedInput: { memory, disposition: "complete" }
+    });
     expect(updated.tool_calls.find((toolCall) => toolCall.id === "checkpoint-final")?.input).toEqual({
       disposition: "complete",
       memory_chars: memory.length
     });
-    expect(updated.exploration_checkpoints?.at(-1)?.text).toBe(memory);
+    expect(updated.exploration_checkpoints?.at(-1)?.text).toContain("实现、验证和最终审查均已完成");
+    expect(updated.exploration_checkpoints?.at(-1)?.text).toContain("用户原始目标");
   });
 
   it("stops the Profile loop when an agent checkpoint explicitly reports a blocker", async () => {
@@ -2291,7 +2626,7 @@ describe("ClaudeAgentRunner", () => {
     expect(session.tool_calls.map((toolCall) => toolCall.status)).toEqual(["failed", "failed"]);
   });
 
-  it("marks host-denied duplicate tool results as skipped rather than failed", () => {
+  it("records an errored tool result as failed without duplicate-specific status", () => {
     const runner = new ClaudeAgentRunner(async function* () {});
     const session = {
       id: "duplicate-skipped", project_path: "/tmp/project", workflow_id: workflow.id, task_prompt: "inspect",
@@ -2319,7 +2654,7 @@ describe("ClaudeAgentRunner", () => {
         }
       });
 
-    expect(session.tool_calls[0]).toMatchObject({ status: "skipped" });
+    expect(session.tool_calls[0]).toMatchObject({ status: "failed" });
   });
 
   it("turns a successful task-planner JSON result into the host task DAG", () => {
@@ -2458,7 +2793,7 @@ describe("ClaudeAgentRunner", () => {
     )).toBe(true);
   });
 
-  it("injects the exact attachment manifest into task-planner assignments", async () => {
+  it("injects the exact attachment manifest into task-planner assignments without replaying tool outputs", async () => {
     const projectPath = await mkdtemp(path.join(tmpdir(), "ai-coder-planner-attachments-"));
     const relativePagePath = ".ai-coder/uploads/spec/page-01.png";
     const followUpPath = ".ai-coder/uploads/follow-up/contract.txt";
@@ -2565,9 +2900,8 @@ describe("ClaudeAgentRunner", () => {
     });
     expect(JSON.stringify(decision)).toContain("只能逐字复制");
     expect(JSON.stringify(decision)).toContain(followUpPath);
-    expect(JSON.stringify(decision)).toContain("宿主可复用证据");
-    expect(JSON.stringify(decision)).toContain("公开调用契约必须保持兼容");
-    expect(JSON.stringify(decision)).toContain("尚无可移交的文字语义");
+    expect(JSON.stringify(decision)).not.toContain("宿主可复用证据");
+    expect(JSON.stringify(decision)).not.toContain("公开调用契约必须保持兼容");
     expect(updated.status, updated.error).toBe("completed");
   });
 
@@ -2837,10 +3171,11 @@ describe("ClaudeAgentRunner", () => {
     }).run({ session, workflow: profileWorkflow });
 
     expect(updated.status).toBe("completed");
-    expect(systemAppend).toContain("宿主强制加载的 Skills");
+    expect(systemAppend).toContain("宿主按当前阶段注入的 Skills");
     expect(systemAppend).toContain("FULL_CONTRACT_SENTINEL");
     expect(updated.progress_events?.some((event) =>
-      event.message === "宿主强制加载 Skill：careful-coder:profile-contract"
+      event.message.includes("宿主已按当前阶段注入")
+      && event.message.includes("careful-coder:profile-contract")
     )).toBe(true);
   });
 
@@ -3568,6 +3903,74 @@ describe("ClaudeAgentRunner", () => {
     expect(updated.messages).toHaveLength(1);
     expect(updated.messages[0].content).toBe("Repeated   answer");
   });
+
+  it("runs the simple profile loop with a checkpoint-derived phase task tree", async () => {
+    const profileWorkflow: WorkflowTemplate = {
+      ...workflow,
+      id: "simple-profile-workflow",
+      stages: [],
+      simple_profile_loop: true,
+      skills: ["exploring-codebase"],
+      agents: {
+        "task-verifier": { description: "独立验证当前阶段结果", prompt: "只读验证" }
+      }
+    };
+    let injectedPrompt = "";
+    let systemAppend = "";
+    async function* query(params: unknown) {
+      const typed = params as { prompt?: string; options?: { systemPrompt?: { append?: unknown } } };
+      injectedPrompt = String(typed.prompt ?? "");
+      systemAppend = String(typed.options?.systemPrompt?.append ?? "");
+      applyExplorationCheckpoint(session, {
+        memory: "## 已确认\n- 用户目标已经实现。\n- 相关验证已经通过。\n## 仍缺少\n- 无。",
+        disposition: "complete",
+        phase: "complete"
+      });
+      yield { type: "result", subtype: "success", is_error: false, result: "Done" };
+    }
+    const session = {
+      id: "simple-profile-session",
+      project_path: "/tmp/project",
+      workflow_id: profileWorkflow.id,
+      task_prompt: "完成一个简单任务",
+      status: "running",
+      current_stage: "profile",
+      messages: [],
+      tool_calls: [],
+      file_changes: [],
+      approvals: [],
+      stage_runs: [],
+      rework_requests: [],
+      progress_events: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    } as AgentSession;
+
+    const updated = await new ClaudeAgentRunner({
+      queryOverride: query,
+      pluginPaths: [path.resolve(__dirname, "../../../plugins/careful-coder")]
+    }).run({ session, workflow: profileWorkflow });
+
+    expect(updated.status, updated.error).toBe("completed");
+    expect(updated.task_tree?.strategy).toContain("阶段性任务树");
+    expect(updated.task_tree?.tasks).toHaveLength(1);
+    expect(updated.task_tree?.tasks[0]?.status).toBe("completed");
+    expect(updated.exploration_checkpoints?.at(-1)?.disposition).toBe("complete");
+    expect(injectedPrompt).toContain("当前可用能力");
+    expect(injectedPrompt).toContain("careful-coder:exploring-codebase");
+    expect(injectedPrompt).toContain("task-verifier");
+    expect(injectedPrompt).toContain("Edit: 精确修改现有文件");
+    expect(injectedPrompt).toContain("把选择理由写回知识雪球");
+    expect(injectedPrompt.indexOf("用户原始目标与输入")).toBeLessThan(injectedPrompt.indexOf("当前探索工作记忆"));
+    expect(injectedPrompt.indexOf("当前探索工作记忆")).toBeLessThan(injectedPrompt.indexOf("当前阶段任务"));
+    expect(injectedPrompt.indexOf("当前阶段任务")).toBeLessThan(injectedPrompt.indexOf("当前执行观察"));
+    expect(injectedPrompt.indexOf("当前执行观察")).toBeLessThan(injectedPrompt.indexOf("当前可用能力"));
+    expect(systemAppend).toContain("宿主按当前阶段注入的 Skills");
+    expect(systemAppend).toContain("What invokes this code at runtime");
+    expect(systemAppend).toContain("优先委托");
+    expect(systemAppend).toContain("第一次相关修改前必须通过 Task 使用 call-contract-investigator");
+    expect(systemAppend).toContain("提示词装配顺序");
+  });
 });
 
 describe("describeSdkMessageSnippet", () => {
@@ -3629,6 +4032,75 @@ describe("describeSdkMessageSnippet", () => {
 describe("evaluateProfileCompletion", () => {
   it("rejects a natural SDK stop before a task tree exists", () => {
     expect(evaluateProfileCompletion({ task_tree: undefined } as AgentSession)).toContain("尚未建立任务树");
+  });
+
+  it("simple profile mode ignores task trees but still requires an agent-complete checkpoint", () => {
+    const session = {
+      tool_calls: [],
+      exploration_checkpoints: [{
+        revision: 1,
+        text: "## 当前目标\n完成用户请求。\n## 已确认\n- 尚未开始取证。",
+        disposition: "continue",
+        next_action: "查看缺失信息",
+        source: "host",
+        observed_tool_call_count: 0,
+        created_at: "t"
+      }]
+    } as unknown as AgentSession;
+
+    expect(evaluateProfileCompletion(session, false)).toEqual([
+      "探索工作记忆尚未声明完成：revision 1 为 continue"
+    ]);
+    session.exploration_checkpoints![0]!.source = "agent";
+    session.exploration_checkpoints![0]!.disposition = "complete";
+    expect(evaluateProfileCompletion(session, false)).toEqual([]);
+  });
+
+  it("requires real validation and an independent final audit before completing code changes", () => {
+    const session = {
+      tool_calls: [{
+        id: "edit-1", stage_id: "profile", tool: "Edit", input: { file_path: "src/a.ts" },
+        status: "completed", created_at: "t"
+      }],
+      file_changes: [{ path: "src/a.ts", operation: "modified" }],
+      exploration_checkpoints: [{
+        revision: 2,
+        text: "## 已确认\n- 模型声明实现完成。",
+        disposition: "complete",
+        phase: "complete",
+        source: "agent",
+        observed_tool_call_count: 1,
+        created_at: "t"
+      }]
+    } as unknown as AgentSession;
+
+    expect(evaluateProfileCompletion(session, false)).toEqual(expect.arrayContaining([
+      expect.stringContaining("没有成功的测试"),
+      expect.stringContaining("completeness-checker")
+    ]));
+
+    session.tool_calls.push({
+      id: "verify-1", stage_id: "profile", tool: "Task",
+      input: { subagent_type: "task-verifier", prompt: "独立核对改动" },
+      status: "completed", output_summary: '{"status":"PASS"}', created_at: "t"
+    }, {
+      id: "test-1", stage_id: "profile", tool: "Bash", input: { command: "npm test" },
+      status: "completed", exit_code: 0, created_at: "t"
+    }, {
+      id: "audit-1", stage_id: "profile", tool: "Task",
+      input: { subagent_type: "completeness-checker", prompt: "核对原始需求和最终 diff" },
+      status: "completed", output_summary: '{"summary":{"covered":1,"uncovered":0,"unclear":0}}', created_at: "t"
+    });
+    session.exploration_checkpoints![0]!.observed_tool_call_count = 4;
+    expect(evaluateProfileCompletion(session, false)).toContain(
+      "代码已修改，但修改后尚未由 task-verifier 独立核对，或 verifier 结果尚未归并进知识雪球"
+    );
+    session.exploration_checkpoints![0]!.text = [
+      "## 已确认",
+      "- task-verifier 独立核对 PASS；证据：npm test 通过，未发现回归。",
+      "- completeness-checker 已覆盖原始需求和最终 diff。"
+    ].join("\n");
+    expect(evaluateProfileCompletion(session, false)).toEqual([]);
   });
 
   it("rejects unfinished nodes and completed nodes without evidence", () => {
@@ -3740,6 +4212,80 @@ describe("exploration checkpoints", () => {
     expect(session.exploration_checkpoints![0]!.source).toBe("agent");
   });
 
+  it("injects bounded execution observations after knowledge without treating them as confirmed facts", () => {
+    const session = {
+      status: "running",
+      current_stage: "profile",
+      tool_calls: [{
+        id: "read-after-checkpoint",
+        stage_id: "profile",
+        tool: "Read",
+        input: { file_path: "src/router.ts" },
+        status: "completed",
+        output_summary: "发现一个新的调用方",
+        created_at: "t"
+      }],
+      file_changes: [{ path: "src/router.ts", operation: "update", approved: true, created_at: "t" }],
+      exploration_checkpoints: [{
+        revision: 1,
+        text: "## 已确认\n- 当前目标是修复路由。",
+        disposition: "continue",
+        observed_tool_call_count: 0,
+        created_at: "t"
+      }]
+    } as unknown as AgentSession;
+
+    const section = buildExecutionProgressPromptSection(session);
+    expect(section).toContain("原始状态，不代替知识雪球");
+    expect(section).toContain("Read: src/router.ts → completed");
+    expect(section).toContain("发现一个新的调用方");
+    expect(section).toContain("核对目标、实际结果、验证证据和新未知");
+  });
+
+  it("seeds exact attachment paths into confirmed knowledge and projects one phase task", () => {
+    const session = {
+      task_prompt: "按附件实现页面跳转",
+      tool_calls: [],
+      messages: [{
+        role: "user",
+        content: "见附件",
+        created_at: "t",
+        attachments: [{
+          type: "file_ref",
+          path: "/tmp/uploads/run-1/page-14.png",
+          display_name: "page-14.png"
+        }]
+      }]
+    } as unknown as AgentSession;
+
+    ensureExplorationCheckpoint(session);
+    expect(session.exploration_checkpoints?.[0]?.text).toContain("/tmp/uploads/run-1/page-14.png");
+    expect(session.exploration_checkpoints?.[0]?.text).toContain("## 最相似既有实现");
+    expect(session.exploration_checkpoints?.[0]?.next_action).toContain("寻找最相似功能的既有实现");
+    expect(session.exploration_checkpoints?.[0]?.phase).toBe("investigate");
+    expect(syncPhaseTaskTreeWithCheckpoint(session)).toBe(true);
+    expect(session.task_tree?.strategy).toContain("阶段性任务树");
+    expect(session.task_tree?.tasks).toHaveLength(1);
+    expect(session.task_tree?.tasks[0]?.id).toBe("knowledge-r1");
+  });
+
+  it("treats phase as an advisory progress label and accepts concise checkpoint updates", () => {
+    const session = {
+      task_prompt: "调查后修复",
+      tool_calls: []
+    } as unknown as AgentSession;
+    ensureExplorationCheckpoint(session);
+
+    expect(() => applyExplorationCheckpoint(session, {
+      memory: "已找到根因，继续实现。",
+      disposition: "continue",
+      phase: "implement",
+    })).not.toThrow();
+    expect(session.exploration_checkpoints?.at(-1)?.phase).toBe("implement");
+    expect(session.exploration_checkpoints?.at(-1)?.text).toContain("## 最新补充");
+    expect(session.exploration_checkpoints?.at(-1)?.next_action).toBeTruthy();
+  });
+
   it("keeps the text free-form while versioning control metadata", () => {
     const session = {
       tool_calls: [
@@ -3787,6 +4333,140 @@ describe("exploration checkpoints", () => {
     })).toContain("刷新工具观察边界");
     expect(session.exploration_checkpoints).toHaveLength(1);
     expect(session.exploration_checkpoints?.[0]?.observed_tool_call_count).toBe(2);
+  });
+
+  it("automatically restores confirmed knowledge omitted by a later checkpoint", () => {
+    const session = {
+      tool_calls: [],
+      exploration_checkpoints: [{
+        revision: 1,
+        text: [
+          "## 已确认",
+          "- 序号 33 对应 /example/list。",
+          "- 路由入口位于 src/router.ts:42。",
+          "## 仍需探索",
+          "- 核对详情页。"
+        ].join("\n"),
+        disposition: "continue",
+        next_action: "核对详情页",
+        source: "agent",
+        observed_tool_call_count: 0,
+        created_at: "t"
+      }]
+    } as unknown as AgentSession;
+
+    const result = applyExplorationCheckpoint(session, {
+      memory: [
+        "## 已确认",
+        "- 路由入口位于 src/router.ts:42。",
+        "- 详情页复用统一入口。",
+        "## 下一步",
+        "- 运行测试。"
+      ].join("\n"),
+      disposition: "verify",
+      next_action: "运行测试"
+    });
+
+    expect(result).toContain("补回 1 条");
+    expect(session.exploration_checkpoints?.at(-1)?.text).toContain("- 序号 33 对应 /example/list。");
+    expect(session.exploration_checkpoints?.at(-1)?.text).toContain("- 详情页复用统一入口。");
+  });
+
+  it("keeps the old fact when a later checkpoint adds an evidenced correction", () => {
+    const session = {
+      tool_calls: [],
+      exploration_checkpoints: [{
+        revision: 1,
+        text: "## 已确认\n- 序号 33 对应 /old/list。\n## 下一步\n- 核对附件。",
+        disposition: "continue",
+        next_action: "核对附件",
+        source: "agent",
+        observed_tool_call_count: 0,
+        created_at: "t"
+      }]
+    } as unknown as AgentSession;
+    applyExplorationCheckpoint(session, {
+      memory: [
+        "## 已确认",
+        "- 校正：序号 33 对应 /old/list → /example/list；证据：需求附件第 19 页与 src/router.ts:42。",
+        "## 下一步",
+        "- 运行测试。"
+      ].join("\n"),
+      disposition: "verify",
+      next_action: "运行测试"
+    });
+
+    const latest = session.exploration_checkpoints?.at(-1);
+    expect(latest?.text).toContain("- 序号 33 对应 /old/list。");
+    expect(latest?.text).toContain("- 校正：序号 33 对应 /old/list → /example/list");
+  });
+
+  it("requires knowledge reconciliation before the first mutation but not between edits in one batch", () => {
+    const session = {
+      task_prompt: "读取附件后实现路由",
+      tool_calls: []
+    } as unknown as AgentSession;
+    ensureExplorationCheckpoint(session);
+    session.tool_calls.push({
+      id: "read-requirement",
+      stage_id: "profile",
+      tool: "Read",
+      input: { file_path: "/tmp/page-19.png" },
+      status: "completed",
+      output_summary: "确认序号 33 的定义",
+      created_at: "t"
+    });
+
+    expect(getSimpleKnowledgeBoundaryGuardError(
+      session,
+      "Edit",
+      { file_path: "src/router.ts" }
+    )).toContain("尚未归并进知识雪球");
+    expect(getSimpleKnowledgeBoundaryGuardError(
+      session,
+      "Bash",
+      { command: "git checkout -b feature/example" }
+    )).toContain("checkpoint_exploration");
+    expect(getSimpleKnowledgeBoundaryGuardError(
+      session,
+      "Bash",
+      { command: "git status" }
+    )).toBeNull();
+
+    applyExplorationCheckpoint(session, {
+      memory: "## 已确认\n- 附件第 19 页确认了序号 33 的页面定义。\n## 仍缺少\n- 实现后验证。",
+      disposition: "continue",
+      next_action: "按既有路由模式实现序号 33"
+    });
+    expect(getSimpleKnowledgeBoundaryGuardError(
+      session,
+      "Edit",
+      { file_path: "src/router.ts" }
+    )).toBeNull();
+
+    session.tool_calls.push({
+      id: "first-edit",
+      stage_id: "profile",
+      tool: "Edit",
+      input: { file_path: "src/router.ts" },
+      status: "completed",
+      output_summary: "加入路由映射",
+      created_at: "t"
+    });
+    session.tool_calls.push({
+      id: "read-after-edit",
+      stage_id: "profile",
+      tool: "Read",
+      input: { file_path: "src/router.ts" },
+      status: "completed",
+      output_summary: "检查刚完成的编辑",
+      created_at: "t"
+    });
+    expect(getSimpleKnowledgeBoundaryGuardError(
+      session,
+      "Edit",
+      { file_path: "src/router.ts" }
+    )).toBeNull();
   });
 
   it("requires stale knowledge to be reconciled before the next high-level action", () => {
@@ -3889,50 +4569,34 @@ describe("exploration checkpoints", () => {
         source: "agent",
         observed_tool_call_count: 0,
         created_at: "t"
-      }]
+      }],
+      task_tree: {
+        goal_restated: "验证详情页入口",
+        strategy: "阶段性任务树：只落实当前知识雪球的 next_action；checkpoint 更新后由宿主自动替换。",
+        tasks: [{ id: "knowledge-r4", description: "验证详情页入口", dependencies: [], status: "in_progress" }],
+        created_at: "t",
+        updated_at: "t"
+      }
     } as unknown as AgentSession;
 
     const verifierInput = augmentTaskInputWithExplorationMemory({
       subagent_type: "task-verifier",
       prompt: "验证 t1"
-    }, session);
+    }, session, "## 当前可用能力\n- task-verifier");
     expect(verifierInput.prompt).toContain("revision 4");
+    expect(verifierInput.prompt).toContain("careful-coder:verification-before-completion");
     expect(verifierInput.prompt).toContain("序号 33 对应 /example/list");
     expect(verifierInput.prompt).toContain("发现冲突、失效结论、新未知或验证失败");
+    const verifierPrompt = String(verifierInput.prompt);
+    expect(verifierPrompt.indexOf("宿主当前探索工作记忆")).toBeLessThan(verifierPrompt.indexOf("当前阶段任务"));
+    expect(verifierPrompt.indexOf("当前阶段任务")).toBeLessThan(verifierPrompt.indexOf("当前执行观察"));
+    expect(verifierPrompt.indexOf("当前执行观察")).toBeLessThan(verifierPrompt.indexOf("当前可用能力"));
 
     const plannerInput = { subagent_type: "task-planner", prompt: "规划" };
-    expect(augmentTaskInputWithExplorationMemory(plannerInput, session)).toBe(plannerInput);
+    expect(augmentTaskInputWithExplorationMemory(plannerInput, session).prompt).toContain("revision 4");
+    expect(augmentTaskInputWithExplorationMemory(plannerInput, session).prompt).toContain("careful-coder:task-decomposition");
   });
 
-  it("does not put checkpoint or task-tree control signals into duplicate tool cache", () => {
-    const session = {
-      tool_calls: [
-        {
-          id: "checkpoint", stage_id: "profile", tool: "mcp__ai_coder__checkpoint_exploration",
-          input: { disposition: "continue", memory_chars: 120 }, status: "completed", created_at: "t"
-        },
-        {
-          id: "tree", stage_id: "profile", tool: "mcp__ai_coder__update_task_tree",
-          input: { action: "update_status", task_id: "t1" }, status: "completed", created_at: "t"
-        },
-        {
-          id: "read", stage_id: "profile", tool: "Read",
-          input: { file_path: "src/a.ts" }, status: "completed", created_at: "t"
-        }
-      ]
-    } as unknown as AgentSession;
-    const cache = new Map<string, { outputSummary?: string; exitCode?: number }>();
-
-    (new ClaudeAgentRunner(async function* () {}) as unknown as {
-      saveCompletedToolsToCache(
-        session: AgentSession,
-        cache: Map<string, { outputSummary?: string; exitCode?: number }>
-      ): void
-    }).saveCompletedToolsToCache(session, cache);
-
-    expect([...cache.keys()]).toHaveLength(1);
-    expect([...cache.keys()][0]).toContain("Read");
-  });
 });
 
 describe("formatProfileAttachmentList", () => {
@@ -3945,6 +4609,16 @@ describe("formatProfileAttachmentList", () => {
     expect(manifest).toContain(".ai-coder/uploads/id/page-21.png");
     expect(manifest).toContain("只能逐字复制");
     expect(manifest).toContain("禁止猜测、缩写");
+  });
+
+  it("resolves attachment paths against the exact project root before injection", () => {
+    const manifest = formatProfileAttachmentList([{
+      type: "file_ref",
+      path: ".ai-coder/uploads/id/page-01.png",
+      display_name: "uploaded reference"
+    }], "/workspace/project");
+
+    expect(manifest).toContain("/workspace/project/.ai-coder/uploads/id/page-01.png");
   });
 });
 

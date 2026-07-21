@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
 import path from "node:path";
+import { readFile } from "node:fs/promises";
 import { WorkflowRegistry } from "./workflowRegistry.js";
 
 /**
- * 谨慎程序员 yaml v5.4 快照验证。
+ * 谨慎程序员 yaml v5.8 快照验证。
  *
  * v5.0 根本架构变更（v4.0 阶段引擎 → Profile 模式）：
  * - 砍掉所有阶段管线（maintain_project_profile / plan / implement / verify）
@@ -30,7 +31,7 @@ describe("careful-coder.yaml latest", () => {
     expect(listed.map((workflow) => workflow.id)).toEqual(["careful-coder"]);
 
     const v5 = await loadV5();
-    expect(v5.version).toBe("5.4.0");
+    expect(v5.version).toBe("5.8.0");
     expect(v5.name).toBe("谨慎程序员");
     expect(v5.routing?.auto_start).toBe(true);
   });
@@ -44,35 +45,28 @@ describe("careful-coder.yaml latest", () => {
     expect(v5.description).toContain("不确定性诚实");
   });
 
-  it("v5.0 has no stages — profile mode with system_prompt + skills + agents", async () => {
+  it("uses the simple knowledge-snowball profile loop", async () => {
     const v5 = await loadV5();
     expect(v5.stages).toEqual([]);
+    expect(v5.simple_profile_loop).toBe(true);
     expect(v5.system_prompt).toBeDefined();
     expect(v5.system_prompt).toContain("谨慎程序员");
-    expect(v5.system_prompt).toContain("先读代码取证");
-    expect(v5.system_prompt).toContain("最小改动");
-    expect(v5.system_prompt).toContain("pre_behavior");
-    expect(v5.system_prompt).toContain("git diff 逐行核对");
-    expect(v5.system_prompt).toContain("验证命令");
-    expect(v5.system_prompt).toContain("unknown");
-    expect(v5.system_prompt).toContain("重新阅读用户原始请求");
-    expect(v5.system_prompt).toContain("investigating-call-contracts");
-    expect(v5.system_prompt).toContain("未完成调查不得编辑目标");
-    expect(v5.system_prompt).toContain("稳定 R-ID");
-    expect(v5.system_prompt).toContain("影响地图");
-    expect(v5.system_prompt).toContain("验证矩阵");
-    expect(v5.system_prompt).toContain("PLAN");
-    expect(v5.system_prompt).toContain("EXECUTE_ONE");
-    expect(v5.system_prompt).toContain("VERIFY_ONE");
-    expect(v5.system_prompt).toContain("FINAL_AUDIT");
-    expect(v5.system_prompt).toContain("全拼/首字母/混合拼音/英文");
-    expect(v5.system_prompt).toContain("别名只扩大检索");
-    expect(v5.system_prompt).toContain("持续滚动探索工作记忆");
-    expect(v5.system_prompt).toContain("重要工具结果必须通过 checkpoint_exploration 归并");
-    expect(v5.system_prompt).toContain("审查结果必须回流 checkpoint");
+    expect(v5.system_prompt).toContain("已经确认了什么");
+    expect(v5.system_prompt).toContain("第一优先级是找到仓库中最相似功能的实现");
+    expect(v5.system_prompt).toContain("边界前最近的已完成项");
+    expect(v5.system_prompt).toContain("最相似既有实现（位置、可复用模式、与本需求的差异）");
+    expect(v5.system_prompt).toContain("Skill 或工具");
+    expect(v5.system_prompt).toContain("核心 Skills 由宿主按知识雪球的当前阶段选择");
+    expect(v5.system_prompt).toContain("checkpoint_exploration");
+    expect(v5.system_prompt).toContain("单节点阶段任务树");
+    expect(v5.system_prompt).toContain("phase 只是");
+    expect(v5.system_prompt).toContain("输入资源路径及派生关系");
+    expect(v5.system_prompt).toContain("尊重既有系统");
+    expect(v5.system_prompt).toContain("最小实现并验证");
+    expect(v5.system_prompt).not.toContain("EXECUTE_ONE");
   });
 
-  it("has all 10 skills configured", async () => {
+  it("loads the core careful-coder skills as execution contracts", async () => {
     const v5 = await loadV5();
     expect(v5.skills).toEqual([
       "clarifying-requirements",
@@ -86,6 +80,19 @@ describe("careful-coder.yaml latest", () => {
       "cautious-calling",
       "investigating-call-contracts"
     ]);
+  });
+
+  it("teaches the relevant skills to split and close independent requirements sequentially", async () => {
+    const skillRoot = path.resolve(__dirname, "../../../plugins/careful-coder/skills");
+    const [decomposition, planning, verification] = await Promise.all([
+      readFile(path.join(skillRoot, "task-decomposition/SKILL.md"), "utf8"),
+      readFile(path.join(skillRoot, "planning-complex-changes/SKILL.md"), "utf8"),
+      readFile(path.join(skillRoot, "verification-before-completion/SKILL.md"), "utf8")
+    ]);
+    expect(decomposition).toContain("一次只把一个 dependency-ready 节点");
+    expect(decomposition).toContain("实现 → 验证 → 证据归并 → completed");
+    expect(planning).toContain("Execute the steps sequentially");
+    expect(verification).toContain("separate implementation result, verification oracle, and evidence row");
   });
 
   it("registers the planner/executor/verifier/auditor roles and contract investigator", async () => {
@@ -110,11 +117,31 @@ describe("careful-coder.yaml latest", () => {
     expect(v5.agents!["task-executor"].tools).toContain("Edit");
   });
 
+  it("requires independent requirement points to be implemented and verified one by one", async () => {
+    const v5 = await loadV5();
+    expect(v5.system_prompt).toContain("独立需求逐项闭环");
+    expect(v5.system_prompt).toContain("一次只推进一个");
+    expect(v5.system_prompt).toContain("next_action` 只能指向其中一个需求点");
+    expect(v5.system_prompt).toContain("完成即核对");
+    expect(v5.system_prompt).toContain("用户原始目标与输入 → 当前知识雪球 → 当前阶段任务 → 当前执行观察");
+    expect(v5.agents!["task-planner"].prompt).toContain("独立 task");
+    expect(v5.agents!["task-executor"].prompt).toContain("一个 R-ID / 一个独立需求点");
+    expect(v5.agents!["task-executor"].prompt).toContain("返回 completed 前执行完成核对");
+    expect(v5.agents!["task-verifier"].prompt).toContain("一次只验证一个独立需求点");
+    expect(v5.agents!["task-verifier"].prompt).toContain("原目标、实际结果、验证证据和新未知");
+    expect(v5.agents!["completeness-checker"].prompt).toContain("独立实现、独立验证和知识归并");
+  });
+
   it("teaches sub-agents to resolve domestic mixed naming without speculative renames", async () => {
     const v5 = await loadV5();
     expect(v5.agents!["task-planner"].prompt).toContain("业务术语 → 别名 → path:line");
     expect(v5.agents!["pre-behavior-snapshot"].prompt).toContain("缩写多义时保留 unknown");
     expect(v5.agents!["call-contract-investigator"].prompt).toContain("历史错拼别名");
+    expect(v5.system_prompt).toContain("调用契约硬规则");
+    expect(v5.system_prompt).toContain("第一次相关修改前");
+    expect(v5.agents!["call-contract-investigator"].description).toContain("必须用于任何会调用");
+    expect(v5.agents!["task-executor"].prompt).toContain("没有就返回 blocked");
+    expect(v5.agents!["completeness-checker"].prompt).toContain("缺少时对应需求标记 NO");
     expect(v5.agents!["completeness-checker"].prompt).toContain("只搜中文原词不构成完整证据");
     expect(v5.agents!["task-executor"].prompt).toContain("不得为了统一风格而重命名");
     expect(v5.agents!["task-verifier"].prompt).toContain("擅自统一既有拼音");

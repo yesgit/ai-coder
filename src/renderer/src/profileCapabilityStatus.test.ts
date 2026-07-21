@@ -21,18 +21,28 @@ function session(overrides: Partial<AgentSession> = {}): AgentSession {
 }
 
 describe("profile capability status", () => {
-  it("shows a host-injected Skill as completed", () => {
+  it("only shows a Skill as completed after it is applied by a delegation", () => {
     const current = session({
-      progress_events: [{
-        id: "p1",
-        type: "runner",
-        message: "宿主强制加载 Skill：careful-coder:clarifying-requirements",
-        visibility: "milestone",
-        created_at: "2026-01-01T00:00:01.000Z"
-      }]
+      progress_events: [
+        {
+          id: "p1",
+          type: "runner",
+          message: "宿主已按当前阶段注入 2 个 Skill 执行契约：careful-coder:clarifying-requirements, careful-coder:exploring-codebase",
+          visibility: "milestone",
+          created_at: "2026-01-01T00:00:01.000Z"
+        },
+        {
+          id: "p2",
+          type: "runner",
+          message: "委托 task-planner 落实 Skill：careful-coder:exploring-codebase, careful-coder:planning-complex-changes",
+          visibility: "milestone",
+          created_at: "2026-01-01T00:00:02.000Z"
+        }
+      ]
     });
 
-    expect(getProfileSkillStatus(current, "clarifying-requirements")).toBe("completed");
+    expect(getProfileSkillStatus(current, "clarifying-requirements")).toBe("not_started");
+    expect(getProfileSkillStatus(current, "exploring-codebase")).toBe("completed");
   });
 
   it("maps the latest Task result to the corresponding Agent state", () => {

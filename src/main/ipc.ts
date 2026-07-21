@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readdir, readFile, mkdir, writeFile, stat, realpath, unlink } from "node:fs/promises";
 import { join, resolve, relative, extname, basename, sep } from "node:path";
 import { pdfToImages } from "./pdfToImages.js";
-import { BrowserWindow, dialog, ipcMain } from "electron";
+import { BrowserWindow, clipboard, dialog, ipcMain } from "electron";
 import type { OpenDialogOptions } from "electron";
 import type { AgentSession, Attachment, ProjectOnboardingStatus, ResolveWorkflowInput, SessionOnboardingSnapshot, SessionRoutingSnapshot, StartSessionInput } from "../shared/types.js";
 import { ClaudeAgentRunner } from "./agent/claudeAgentRunner.js";
@@ -24,6 +24,11 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
   const workflowRouter = new WorkflowRouter();
   const ptyManager = new PtyManager();
   const queuedUserMessages = new Map<string, AgentSession["messages"]>();
+
+  ipcMain.handle("app:copy-text", async (_event, text: string) => {
+    if (typeof text !== "string") throw new Error("Clipboard content must be text.");
+    clipboard.writeText(text);
+  });
 
   // 应用启动时，从会话历史中恢复已授权的项目路径
   // 这样加载历史会话时不需要重新授权，除非项目路径已变化
@@ -786,8 +791,11 @@ async function saveBinaryAttachments(attachments: Attachment[], projectPath: str
       }
 
       const id = randomUUID();
-      const rawExt = att.media_type.split("/")[1]?.split("+")[0] || (att.type === "image" ? "png" : "bin");
-      const ext = /^[a-z0-9]+$/i.test(rawExt) ? rawExt.toLowerCase() : (att.type === "image" ? "png" : "bin");
+      const displayExt = extname(safeDisplayName).slice(1);
+      const rawExt = att.type === "file_upload" && /^[a-z0-9]{1,12}$/i.test(displayExt)
+        ? displayExt
+        : att.media_type.split("/")[1]?.split("+")[0] || (att.type === "image" ? "png" : "bin");
+      const ext = /^[a-z0-9]{1,12}$/i.test(rawExt) ? rawExt.toLowerCase() : (att.type === "image" ? "png" : "bin");
       const fileName = `${id}.${ext}`;
       const filePath = join(uploadsDir, fileName);
       await writeFile(filePath, buffer);

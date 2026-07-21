@@ -7,6 +7,8 @@ description: Verify work before claiming a coding task is complete. Use whenever
 
 Treat the requirement contract and subsequent user answers as the acceptance source. Do not accept an implementation plan, a configuration diff, or a command invocation as proof by itself.
 
+Apply this discipline after every independently completable investigation, implementation unit, requirement point, and validation action—not only once at final delivery. Before advancing, confirm four things: the original target, the actual result, the verification evidence, and any newly discovered unknown. If any remains open, keep the current item active or blocked.
+
 Build a verification matrix before claiming completion:
 
 | Requirement/invariant | Representative condition | Expected oracle | Evidence | Result |
@@ -14,13 +16,14 @@ Build a verification matrix before claiming completion:
 | R1 or I1 | success/failure/boundary combination | independently observable result | command + key output | pass/fail/not run |
 
 1. Include every requirement ID and every intentionally preserved invariant.
-2. Cover the changed success path, closest failure/rejection path, boundary/default case, and affected caller or parameter combinations. Risk, not test count, determines breadth.
-3. Prefer an independent oracle: assert public output or state, not the same helper implementation used by the change.
-4. When practical, prove the regression test fails against pre-fix behavior and passes after the fix.
-5. Inspect the final diff and confirm every changed file has a causal link to a requirement.
-6. Run the strongest relevant focused tests, then the broader build/type/static checks required by the affected surface.
-7. Read exit codes and key output. Detect skipped tests, swallowed failures, stale artifacts, wrong architecture, and commands that exercised a different path.
-8. Record checks that could not run and the residual risk they leave. A clean unrelated test is not substitute evidence.
+2. For strongly independent requirement points, require a separate implementation result, verification oracle, and evidence row for each ID. Verify them one at a time; never let one broad test or an overall statement stand in for several independent outcomes.
+3. Cover the changed success path, closest failure/rejection path, boundary/default case, and affected caller or parameter combinations. Risk, not test count, determines breadth.
+4. Prefer an independent oracle: assert public output or state, not the same helper implementation used by the change.
+5. When practical, prove the regression test fails against pre-fix behavior and passes after the fix.
+6. Inspect the final diff and confirm every changed file has a causal link to a requirement.
+7. Run the strongest relevant focused tests, then the broader build/type/static checks required by the affected surface.
+8. Read exit codes and key output. Detect skipped tests, swallowed failures, stale artifacts, wrong architecture, and commands that exercised a different path.
+9. Record checks that could not run and the residual risk they leave. A clean unrelated test is not substitute evidence.
 
 Report one of:
 

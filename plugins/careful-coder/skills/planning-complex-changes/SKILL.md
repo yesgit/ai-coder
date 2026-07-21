@@ -23,4 +23,6 @@ Create a short plan organized by observable behavior. Each step must include:
 - verification oracle, including a negative or regression path where relevant;
 - migration, rollout, and rollback action when contracts or stored state can outlive one process.
 
+When the request contains multiple strongly independent outcomes, assign each a stable requirement ID and a separate implementation step. Execute the steps sequentially: implement and verify one requirement, record its evidence, then start the next. Sharing a file, helper, release, or theme is not a reason to merge independent outcomes. Represent genuine data or contract dependencies explicitly; extract shared prerequisite work only when it is causally required by more than one outcome.
+
 No high-risk or `unknown` impact may be hidden inside an implementation step. Investigate it, split a reversible seam, or obtain the missing decision first. Do not turn a simple task into a ceremonial plan.
