@@ -217,6 +217,11 @@ export interface WorkflowTemplate {
   version: string;
   description: string;
   source: WorkflowSource;
+  /**
+   * 执行控制模型。legacy_stage/profile 兼容既有会话；hierarchical 由宿主维护
+   * Goal → Requirement → Phase 分层循环，模型不能用自由文本改写控制状态。
+   */
+  execution_mode?: "legacy_stage" | "profile" | "hierarchical";
   permissions: WorkflowPermissions;
   rework: WorkflowReworkPolicy;
   routing?: WorkflowRoutingConfig;
@@ -502,6 +507,209 @@ export interface TaskTree {
   updated_at: string;
 }
 
+export type HierarchicalMacroPhase = "align" | "deliver" | "integrate" | "complete";
+export type HierarchicalWorkPhase = "investigate" | "prepare" | "implement" | "verify" | "close";
+
+export interface GoalContract {
+  id: string;
+  statement: string;
+  source_refs: string[];
+  definition_of_done: string[];
+  revision: number;
+}
+
+export interface RequirementAcceptance {
+  id: string;
+  criterion: string;
+  status: "pending" | "pass" | "fail";
+  evidence_refs: string[];
+}
+
+export interface HierarchicalRequirement {
+  id: string;
+  source_anchor: string;
+  observable_result: string;
+  acceptance: RequirementAcceptance[];
+  dependencies: string[];
+  status: "pending" | "active" | "completed" | "blocked" | "skipped";
+  current_phase?: HierarchicalWorkPhase;
+  evidence_refs: string[];
+  status_reason?: string;
+}
+
+export interface HierarchicalWorkUnit {
+  id: string;
+  requirement_id: string;
+  phase: HierarchicalWorkPhase;
+  status: "ready" | "running" | "passed" | "failed" | "blocked";
+  assigned_role: string;
+  attempt: number;
+  baseline_knowledge_revision: number;
+  allowed_files: string[];
+  started_at?: string;
+  completed_at?: string;
+  failure_reason?: string;
+}
+
+export interface HierarchicalPhaseRun {
+  id: string;
+  work_unit_id: string;
+  requirement_id: string;
+  phase: HierarchicalWorkPhase;
+  role: string;
+  attempt: number;
+  status: "running" | "passed" | "failed" | "interrupted" | "superseded";
+  evidence_refs: string[];
+  error_fingerprint?: string;
+  started_at: string;
+  completed_at?: string;
+  /** 本次通过后形成的、可直接交给下一阶段的结构化产物。 */
+  artifact_id?: string;
+}
+
+export interface HierarchicalPhaseArtifact {
+  id: string;
+  work_unit_id: string;
+  requirement_id: string;
+  phase: Exclude<HierarchicalWorkPhase, "close">;
+  attempt: number;
+  summary: string;
+  /** 按阶段启动前声明的契约提交，不是事后从自由文本猜出的摘要。 */
+  handoff: Record<string, unknown>;
+  evidence_refs: string[];
+  knowledge_revision: number;
+  /** 只有与当前 workspace_revision 相同时，才能当作当前代码观察直接复用。 */
+  workspace_revision: number;
+  created_at: string;
+}
+
+export interface HierarchicalWorkspaceContract {
+  project_path: string;
+  /** 工作区建立属于 Goal 级动作；叶子角色只能读取，不能重新 checkout/stash/reset。 */
+  owner: "host";
+  locked: true;
+  branch?: string;
+  head_sha?: string;
+  initialized_at: string;
+}
+
+export interface HierarchicalAlignmentFinding {
+  source_anchor: string;
+  observable_result: string;
+  acceptance: string[];
+}
+
+/**
+ * align 宏阶段下由宿主持有的附件摄取内循环。每个批次只读取少量精确路径，
+ * 摘要落盘后最终 planner 只消费摘要，不再把全部多模态附件塞进单次查询。
+ */
+export interface HierarchicalAlignmentBatch {
+  id: string;
+  source_refs: string[];
+  status: "pending" | "running" | "completed" | "blocked";
+  attempt: number;
+  consecutive_failure_count: number;
+  summary?: string;
+  findings: HierarchicalAlignmentFinding[];
+  evidence_refs: string[];
+  failure_reason?: string;
+  error_fingerprint?: string;
+}
+
+export interface KnowledgeScope {
+  goal_id: string;
+  requirement_id?: string;
+  work_unit_id?: string;
+}
+
+export interface KnowledgeFact {
+  id: string;
+  scope: KnowledgeScope;
+  claim: string;
+  status: "active" | "superseded" | "disputed";
+  evidence_refs: string[];
+  superseded_by?: string;
+  created_at: string;
+}
+
+export interface KnowledgeUnknown {
+  id: string;
+  scope: KnowledgeScope;
+  question: string;
+  status: "open" | "resolved";
+  blocks_phase?: HierarchicalWorkPhase;
+  resolution_fact_ids: string[];
+  created_at: string;
+  resolved_at?: string;
+}
+
+export interface StructuredKnowledgeState {
+  revision: number;
+  facts: KnowledgeFact[];
+  unknowns: KnowledgeUnknown[];
+}
+
+export type HierarchicalBlockerKind =
+  | "user_decision"
+  | "external_resource_missing"
+  | "safety_approval"
+  | "evidence_blocked"
+  | "verification_failed"
+  | "agent_failed"
+  | "orchestration_fault"
+  | "service_interrupted";
+
+export interface HierarchicalBlocker {
+  id: string;
+  kind: HierarchicalBlockerKind;
+  owner: "user" | "host" | "agent" | "external";
+  message: string;
+  status: "open" | "resolved";
+  retryable: boolean;
+  user_input_required: boolean;
+  alignment_batch_id?: string;
+  requirement_id?: string;
+  work_unit_id?: string;
+  error_fingerprint?: string;
+  created_at: string;
+  resolved_at?: string;
+}
+
+export interface HierarchicalExecutionState {
+  version: 1;
+  goal: GoalContract;
+  macro_phase: HierarchicalMacroPhase;
+  alignment_batches: HierarchicalAlignmentBatch[];
+  /** planner 输出被宿主契约拒绝后，供下一次尝试定向修复的持久化上下文。 */
+  planner_retry?: {
+    attempt: number;
+    failure_reason: string;
+    error_fingerprint?: string;
+    consecutive_failure_count: number;
+  };
+  requirements: HierarchicalRequirement[];
+  active_requirement_id?: string;
+  active_work_unit?: HierarchicalWorkUnit;
+  workspace_contract?: HierarchicalWorkspaceContract;
+  knowledge: StructuredKnowledgeState;
+  blockers: HierarchicalBlocker[];
+  phase_runs: HierarchicalPhaseRun[];
+  phase_artifacts: HierarchicalPhaseArtifact[];
+  /** 每次 implement 成功提交后递增；用于判定只读观察是否仍然新鲜。 */
+  workspace_revision: number;
+  integration_status: "pending" | "running" | "passed" | "failed";
+  integration_evidence_refs: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface HierarchicalLoopFrame {
+  kind: "goal" | "requirement" | "phase" | "action";
+  id: string;
+  objective: string;
+  status: string;
+}
+
 export type ExplorationDisposition = "continue" | "verify" | "complete" | "blocked";
 export type ExplorationPhase = "investigate" | "implement" | "verify" | "complete";
 
@@ -531,6 +739,8 @@ export interface AgentSession {
   workflow_id: string;
   title?: string;
   task_prompt: string;
+  /** 新分层循环模式的一等控制状态；旧 Profile/Stage 会话可缺省。 */
+  hierarchical_state?: HierarchicalExecutionState;
   initial_user_message?: AgentMessage;
   status: SessionStatus;
   current_stage: string;

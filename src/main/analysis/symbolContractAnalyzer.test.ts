@@ -105,4 +105,24 @@ describe("analyzeSymbolContract", () => {
       symbol: "outside"
     })).toThrow("目标文件必须位于项目目录内");
   });
+
+  it("falls back to syntax analysis when the project tsconfig is invalid", async () => {
+    const root = await createFixture();
+    await writeFile(path.join(root, "tsconfig.json"), JSON.stringify({
+      compilerOptions: {
+        module: "DefinitelyNotATypeScriptModuleKind"
+      }
+    }));
+
+    const result = analyzeSymbolContract({
+      projectPath: root,
+      targetFile: "target.tsx",
+      symbol: "Action"
+    });
+
+    expect(result.coverage.analysis_mode).toBe("syntax-fallback");
+    expect(result.coverage.configuration_warnings.length).toBeGreaterThan(0);
+    expect(result.target).toMatchObject({ symbol: "Action", file: "target.tsx" });
+    expect(result.coverage.total_call_sites).toBe(2);
+  });
 });

@@ -1039,6 +1039,95 @@ textarea {
   font-size: 0.82em;
 }
 
+/* ── Host-owned hierarchical loops ── */
+
+.hierarchical-loop-panel {
+  min-width: 0;
+}
+
+.hierarchical-goal {
+  display: grid;
+  gap: 4px;
+  margin-top: 12px;
+  border-left: 3px solid #146c5f;
+  padding-left: 9px;
+}
+
+.hierarchical-goal small,
+.hierarchical-knowledge small,
+.hierarchical-blockers small {
+  color: #667085;
+}
+
+.hierarchical-goal strong {
+  color: #1d2939;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.hierarchical-stack {
+  display: grid;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.hierarchical-stack > div {
+  display: grid;
+  grid-template-columns: 70px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  border: 1px solid #dce8e3;
+  border-radius: 6px;
+  background: #f6fbf8;
+  padding: 6px 8px;
+}
+
+.hierarchical-stack small {
+  color: #47705f;
+  font-weight: 600;
+}
+
+.hierarchical-stack span {
+  min-width: 0;
+  color: #253b32;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.hierarchical-knowledge {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 10px;
+  border-radius: 6px;
+  background: #f8fafc;
+  padding: 7px 8px;
+  font-size: 11px;
+}
+
+.hierarchical-requirements {
+  margin-top: 12px;
+}
+
+.hierarchical-requirements .stage small {
+  display: block;
+}
+
+.hierarchical-blockers {
+  display: grid;
+  gap: 4px;
+  margin-top: 12px;
+  border-left: 3px solid #b42318;
+  background: #fef3f2;
+  padding: 7px 9px;
+}
+
+.hierarchical-blockers span {
+  color: #912018;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
 @media (max-width: 900px) {
   .right-panel {
     position: static;

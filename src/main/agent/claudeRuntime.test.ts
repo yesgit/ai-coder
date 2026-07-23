@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { getClaudeRuntimeStatus, shouldUseClaudeSdk } from "./claudeRuntime.js";
+import { access } from "node:fs/promises";
+import { getClaudeRuntimeStatus, resolveBundledClaudeCodeExecutable, shouldUseClaudeSdk } from "./claudeRuntime.js";
 
 describe("claude runtime", () => {
   it("detects the installed Claude Agent SDK", async () => {
@@ -12,5 +13,12 @@ describe("claude runtime", () => {
     expect(status.sdk_available).toBe(true);
     expect(status.mode).toBe("live");
     expect(status.diagnostics).toEqual(expect.any(Array));
+  });
+
+  it("resolves the platform-native Claude Code executable", async () => {
+    const executable = resolveBundledClaudeCodeExecutable();
+
+    expect(executable).toMatch(/claude(?:\.exe)?$/);
+    await expect(access(executable!)).resolves.toBeUndefined();
   });
 });

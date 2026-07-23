@@ -4,6 +4,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AgentSession, Attachment, SessionOnboardingSnapshot, SessionRoutingSnapshot, WorkflowTemplate } from "../../shared/types.js";
 import { summarizeSessionTitle } from "../../shared/sessionTitle.js";
+import { createHierarchicalExecutionState } from "../workflows/hierarchicalWorkflowEngine.js";
 import { WorkflowEngine } from "../workflows/workflowEngine.js";
 
 export class SessionStore {
@@ -26,7 +27,9 @@ export class SessionStore {
     routing?: SessionRoutingSnapshot
   ): Promise<AgentSession> {
     const now = new Date().toISOString();
-    const firstStage = workflow.stages[0]?.id ?? "start";
+    const firstStage = workflow.execution_mode === "hierarchical"
+      ? "align"
+      : workflow.stages[0]?.id ?? "start";
     const initialUserMessage = { role: "user" as const, content: taskPrompt, created_at: now, attachments };
     const session: AgentSession = {
       id: randomUUID(),
@@ -34,6 +37,14 @@ export class SessionStore {
       workflow_id: workflow.id,
       title: summarizeSessionTitle(taskPrompt),
       task_prompt: taskPrompt,
+      ...(workflow.execution_mode === "hierarchical"
+        ? {
+            hierarchical_state: createHierarchicalExecutionState(taskPrompt, {
+              now,
+              source_refs: ["initial_user_message"]
+            })
+          }
+        : {}),
       initial_user_message: initialUserMessage,
       status: "created",
       current_stage: firstStage,

@@ -4,13 +4,13 @@ import { readFile } from "node:fs/promises";
 import { WorkflowRegistry } from "./workflowRegistry.js";
 
 /**
- * 谨慎程序员 yaml v5.8 快照验证。
+ * 谨慎程序员 yaml v6.0 快照验证。
  *
- * v5.0 根本架构变更（v4.0 阶段引擎 → Profile 模式）：
- * - 砍掉所有阶段管线（maintain_project_profile / plan / implement / verify）
- * - 改为 system_prompt（人设注入）+ skills（技能摘要）+ agents（sub-agent 注册）
- * - 外层循环完全交给 SDK 原生推理线程
- * - 心智落地靠：Prompt（塑造思维）+ Sub-agent（独立核对）+ Engine（硬约束）
+ * v6.0 根本架构变更（自由 Profile 循环 → 宿主分层循环）：
+ * - Goal / Requirement / Phase / Action 分层持久化
+ * - 宿主直接启动当前叶子角色，不再让根 Agent 自行反复 Task 委托
+ * - 知识雪球是带作用域、证据和替代关系的认知状态，不再充当任务 ID
+ * - 心智落地靠：宿主状态机 + 阶段角色 + 强制 Skill 契约 + 完成闸门
  */
 describe("careful-coder.yaml latest", () => {
   const workflowsDir = path.resolve(__dirname, "../../../workflows");
@@ -31,7 +31,7 @@ describe("careful-coder.yaml latest", () => {
     expect(listed.map((workflow) => workflow.id)).toEqual(["careful-coder"]);
 
     const v5 = await loadV5();
-    expect(v5.version).toBe("5.8.0");
+    expect(v5.version).toBe("6.0.0");
     expect(v5.name).toBe("谨慎程序员");
     expect(v5.routing?.auto_start).toBe(true);
   });
@@ -45,10 +45,11 @@ describe("careful-coder.yaml latest", () => {
     expect(v5.description).toContain("不确定性诚实");
   });
 
-  it("uses the simple knowledge-snowball profile loop", async () => {
+  it("uses the host-owned hierarchical loop while retaining the cautious persona", async () => {
     const v5 = await loadV5();
     expect(v5.stages).toEqual([]);
-    expect(v5.simple_profile_loop).toBe(true);
+    expect(v5.execution_mode).toBe("hierarchical");
+    expect(v5.simple_profile_loop).toBe(false);
     expect(v5.system_prompt).toBeDefined();
     expect(v5.system_prompt).toContain("谨慎程序员");
     expect(v5.system_prompt).toContain("已经确认了什么");

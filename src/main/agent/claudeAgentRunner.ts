@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { access, readFile, readdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { access, chmod, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { AgentMessage, AgentSession, Attachment, ExplorationCheckpoint, ExplorationDisposition, ExplorationPhase, HumanQuestion, HumanQuestionOption, SessionProgressEvent, StageAgentResult, TaskTree, WorkflowStage, WorkflowTemplate } from "../../shared/types.js";
+import type { AgentMessage, AgentSession, Attachment, ExplorationCheckpoint, ExplorationDisposition, ExplorationPhase, HierarchicalBlockerKind, HierarchicalExecutionState, HierarchicalWorkPhase, HumanQuestion, HumanQuestionOption, SessionProgressEvent, StageAgentResult, TaskTree, WorkflowStage, WorkflowTemplate } from "../../shared/types.js";
 import { isMeaningfulAgentText } from "../../shared/agentMessages.js";
 import { analyzeSymbolContract } from "../analysis/symbolContractAnalyzer.js";
 import {
@@ -11,12 +12,29 @@ import {
   buildDisallowedClaudeTools
 } from "../security/projectPolicy.js";
 import { WorkflowEngine } from "../workflows/workflowEngine.js";
+import {
+  applyHierarchicalEvent,
+  createHierarchicalExecutionState,
+  deriveHierarchicalNextOperation,
+  evaluateHierarchicalCompletion,
+  mayAskHumanForBlocker,
+  type HierarchicalEvent,
+  type HierarchicalNextOperation
+} from "../workflows/hierarchicalWorkflowEngine.js";
+import {
+  buildHierarchicalPlannerCoverageContract,
+  extractBusinessSequenceNumbers
+} from "../workflows/hierarchicalPlannerCoverage.js";
 import { buildStageInstructions } from "./workflowPrompt.js";
 import { buildStageOutputFormat } from "./stageOutputFormat.js";
 import { evaluateHook, checkCommandSafety } from "./stageHookEnforcer.js";
 import { buildStageAgentInput, createMockStageAgentResult, parseStageAgentResult } from "./stageAgentProtocol.js";
 import { extractClaudeStageOutput, formatClaudeTranscript } from "./claudeMessageAdapter.js";
-import { resolveNodeExecutable, shouldUseClaudeSdk } from "./claudeRuntime.js";
+import { resolveBundledClaudeCodeExecutable, shouldUseClaudeSdk } from "./claudeRuntime.js";
+import {
+  buildHierarchicalRoleSpec,
+  parseHierarchicalRoleResult
+} from "./hierarchicalRoleProtocol.js";
 
 export interface AgentRunInput {
   session: AgentSession;
@@ -46,6 +64,21 @@ interface ProfileQueryResult {
   postResultProcessError?: unknown;
   finalSession?: AgentSession;
   effectiveModel?: string;
+}
+
+interface HierarchicalRoleQueryResult {
+  events: HierarchicalEvent[];
+  transcript: string;
+}
+
+interface HierarchicalWorkUnitSnapshot {
+  work_unit_id: string;
+  files: Array<{
+    path: string;
+    existed: boolean;
+    content?: Uint8Array;
+    mode?: number;
+  }>;
 }
 
 interface PendingToolApproval {
@@ -83,6 +116,7 @@ export class ClaudeAgentRunner {
   private readonly abortControllers = new Map<string, AbortController>();
   private readonly activeRuns = new Map<string, Promise<AgentSession>>();
   private readonly pendingToolApprovals = new Map<string, Map<string, PendingToolApproval>>();
+  private readonly mcpServerCache = new WeakMap<AgentRunInput, { server: unknown | null }>();
   private readonly options: ClaudeAgentRunnerOptions;
   private resolvedEffectiveModel: string | null = null;
   private discoveredSkillCatalog?: Promise<Array<{ id: string; description: string }>>;
@@ -155,8 +189,12 @@ export class ClaudeAgentRunner {
       return input.session;
     }
 
-    // Profile 模式：workflow 无阶段管线，单次 query() 完成整个 session
-    if (input.workflow.stages.length === 0) {
+    if (input.workflow.execution_mode === "hierarchical") {
+      return this.runHierarchicalMode(input);
+    }
+
+    // Profile 模式：可显式声明；旧配置仍以无阶段管线作为兼容判据。
+    if (input.workflow.execution_mode === "profile" || input.workflow.stages.length === 0) {
       return this.runProfileMode(input);
     }
 
@@ -175,6 +213,622 @@ export class ClaudeAgentRunner {
     input.session.error = `Workflow exceeded ${this.maxStageIterations} automatic stage iterations.`;
     await this.recordProgress(input, "status", input.session.error, "milestone");
     return input.session;
+  }
+
+  /**
+   * 分层循环模式：宿主拥有 Goal/Requirement/Phase 的控制权，模型只执行当前叶子角色。
+   * 稳定需求 ID 与阶段出口由状态机维护，不再依赖模型在自由文本中自报 next_action。
+   */
+  private async runHierarchicalMode(input: AgentRunInput): Promise<AgentSession> {
+    input.session.status = "running";
+    input.session.error = undefined;
+    input.session.hierarchical_state ??= createHierarchicalExecutionState(input.session.task_prompt, {
+      source_refs: ["initial_user_message"]
+    });
+    migrateHierarchicalAlignmentState(input.session.hierarchical_state, input.session.project_path);
+
+    const attachmentErrors = await findUnreadableProfileAttachments(input.session);
+    if (attachmentErrors.length > 0) {
+      input.session.status = "interrupted";
+      input.session.error = ["附件完整性检查失败，分层循环尚未启动。", ...attachmentErrors].join("\n");
+      await this.recordProgress(input, "status", input.session.error, "milestone");
+      return input.session;
+    }
+
+    const registeredAlignmentBatches = this.ensureHierarchicalAlignmentBatches(input.session);
+    if (registeredAlignmentBatches > 0) {
+      const sourceCount = input.session.hierarchical_state?.alignment_batches
+        .slice(-registeredAlignmentBatches)
+        .reduce((total, batch) => total + batch.source_refs.length, 0) ?? 0;
+      await this.recordProgress(
+        input,
+        "runner",
+        `宿主将 ${sourceCount} 个附件拆成 ${registeredAlignmentBatches} 个只读摄取批次。`,
+        "milestone"
+      );
+    }
+
+    this.resolveAnsweredHierarchicalBlockers(input.session);
+    const abortController = new AbortController();
+    this.abortControllers.set(input.session.id, abortController);
+    const nonPhaseFailures = new Map<string, { fingerprint: string; count: number }>();
+    const maxHierarchicalTransitions = 2_000;
+
+    try {
+      for (let iteration = 0; iteration < maxHierarchicalTransitions; iteration += 1) {
+        const state = input.session.hierarchical_state;
+        if (!state) throw new Error("分层循环状态意外丢失");
+
+        let operation: HierarchicalNextOperation;
+        try {
+          operation = deriveHierarchicalNextOperation(state);
+        } catch (error) {
+          this.raiseHierarchicalHostBlocker(input.session, "orchestration_fault", error);
+          operation = deriveHierarchicalNextOperation(input.session.hierarchical_state!);
+        }
+
+        if (operation.kind === "activate_requirement") {
+          this.applyHierarchicalEvents(input.session, [{
+            type: "requirement_activated",
+            requirement_id: operation.requirement_id
+          }]);
+          input.session.current_stage = `${operation.requirement_id}/investigate`;
+          await this.recordProgress(input, "runner", `进入需求 ${operation.requirement_id}：investigate`, "milestone");
+          continue;
+        }
+
+        if (operation.kind === "close_requirement") {
+          this.applyHierarchicalEvents(input.session, [{
+            type: "requirement_closed",
+            requirement_id: operation.requirement_id
+          }]);
+          await this.recordProgress(input, "runner", `需求 ${operation.requirement_id} 已由逐项验收证据关闭。`, "milestone");
+          continue;
+        }
+
+        if (operation.kind === "wait_for_user") {
+          const blocker = state.blockers.find((item) => item.id === operation.blocker_id);
+          if (!blocker || !mayAskHumanForBlocker(blocker)) {
+            this.raiseHierarchicalHostBlocker(input.session, "orchestration_fault", new Error("非法的人类提问路由"));
+            continue;
+          }
+          this.ensureHierarchicalHumanQuestion(input.session, blocker.id, blocker.message);
+          input.session.status = "waiting_approval";
+          input.session.error = undefined;
+          await this.recordProgress(input, "status", `等待用户解决业务阻塞：${blocker.message}`, "milestone");
+          return input.session;
+        }
+
+        if (operation.kind === "system_fault") {
+          const blocker = state.blockers.find((item) => item.id === operation.blocker_id);
+          input.session.status = "interrupted";
+          input.session.error = blocker?.message ?? "分层循环发生宿主故障";
+          await this.recordProgress(
+            input,
+            "status",
+            `系统故障已停止自动循环，不会转嫁为人类业务问题：${input.session.error}`,
+            "milestone"
+          );
+          return input.session;
+        }
+
+        if (operation.kind === "blocked") {
+          const blocker = state.blockers.find((item) => item.id === operation.blocker_id);
+          input.session.status = "blocked";
+          input.session.error = blocker?.message ?? "当前阶段存在未解决的内部阻塞";
+          await this.recordProgress(
+            input,
+            "status",
+            `分层循环已停在内部阻塞，不会向用户伪装成业务提问：${input.session.error}`,
+            "milestone"
+          );
+          return input.session;
+        }
+
+        if (operation.kind === "complete") {
+          const incomplete = evaluateHierarchicalCompletion(state);
+          if (incomplete.length > 0) {
+            this.raiseHierarchicalHostBlocker(
+              input.session,
+              "orchestration_fault",
+              new Error(`状态机错误地请求完成：${incomplete.join("；")}`)
+            );
+            continue;
+          }
+          input.session.status = "completed";
+          input.session.current_stage = "complete";
+          await this.recordProgress(input, "status", "分层循环完成：所有需求、逐项验收与全局审计均已通过。", "milestone");
+          return input.session;
+        }
+
+        const roleOperation = operation;
+        if (roleOperation.kind === "run_alignment_batch") {
+          input.session.current_stage = `align/${roleOperation.batch_id}`;
+          const batch = state.alignment_batches.find((item) => item.id === roleOperation.batch_id);
+          if (batch?.status !== "running") {
+            this.applyHierarchicalEvents(input.session, [{
+              type: "alignment_batch_started",
+              batch_id: roleOperation.batch_id
+            }]);
+          }
+        } else if (roleOperation.kind === "run_phase") {
+          input.session.current_stage = `${roleOperation.requirement_id}/${roleOperation.phase}`;
+          this.applyHierarchicalEvents(input.session, [{
+            type: "phase_started",
+            work_unit_id: roleOperation.work_unit_id
+          }]);
+        } else if (roleOperation.kind === "run_integrator") {
+          input.session.current_stage = "integrate";
+          if (state.integration_status !== "running") {
+            this.applyHierarchicalEvents(input.session, [{ type: "integration_started" }]);
+          }
+        } else {
+          input.session.current_stage = "align";
+        }
+
+        const label = roleOperation.kind === "run_alignment_batch"
+          ? `align/${roleOperation.batch_id}`
+          : roleOperation.kind === "run_phase"
+            ? `${roleOperation.requirement_id}/${roleOperation.phase}`
+            : roleOperation.kind === "run_planner" ? "align" : "integrate";
+        await this.recordProgress(input, "runner", `宿主启动专职角色：${label}`, "milestone");
+
+        let workUnitSnapshot: HierarchicalWorkUnitSnapshot | undefined;
+        let workUnitSnapshotRestored = false;
+        try {
+          if (roleOperation.kind === "run_phase" && roleOperation.phase === "implement") {
+            workUnitSnapshot = await captureHierarchicalWorkUnitSnapshot(input.session);
+          }
+          const result = await this.runHierarchicalRoleQuery(input, roleOperation, abortController);
+          if (result.transcript) this.appendAssistantMessage(input.session, result.transcript);
+          if (workUnitSnapshot && result.events.some((event) => event.type === "phase_failed")) {
+            await restoreHierarchicalWorkUnitSnapshot(input.session.project_path, workUnitSnapshot);
+            workUnitSnapshotRestored = true;
+            await this.recordProgress(
+              input,
+              "status",
+              `当前 implement 未通过；宿主已恢复 ${workUnitSnapshot.files.length} 个租约文件到本次工作单元开始前，并保留此前 R-ID 的累计修改。`,
+              "milestone"
+            );
+          } else if (workUnitSnapshot) {
+            await assertHierarchicalWorkUnitIntegrity(workUnitSnapshot);
+          }
+          this.applyHierarchicalEvents(input.session, result.events);
+          nonPhaseFailures.delete(label);
+          await this.recordProgress(input, "runner", `专职角色完成并提交结构化状态事件：${label}`, "milestone");
+        } catch (error) {
+          if (workUnitSnapshot && !workUnitSnapshotRestored) {
+            await restoreHierarchicalWorkUnitSnapshot(input.session.project_path, workUnitSnapshot);
+            workUnitSnapshotRestored = true;
+            await this.recordProgress(
+              input,
+              "status",
+              `当前 implement 异常退出；宿主已自愈恢复 ${workUnitSnapshot.files.length} 个租约文件，仅重试当前工作单元。`,
+              "milestone"
+            );
+          }
+          if (abortController.signal.aborted) {
+            input.session.status = this.hasPendingToolCall(input.session) ? "waiting_approval" : "interrupted";
+            input.session.error = input.session.status === "interrupted" ? "用户停止了分层循环" : undefined;
+            await this.recordProgress(input, "status", input.session.error ?? "等待工具审批", "milestone");
+            return input.session;
+          }
+          const message = error instanceof Error ? error.message : String(error);
+          const fingerprint = hierarchicalErrorFingerprint(label, message);
+          if (roleOperation.kind === "run_alignment_batch") {
+            this.applyHierarchicalEvents(input.session, [{
+              type: "alignment_batch_failed",
+              batch_id: roleOperation.batch_id,
+              reason: message,
+              route: "retry",
+              error_fingerprint: fingerprint
+            }]);
+            const failedBatch = input.session.hierarchical_state?.alignment_batches.find(
+              (item) => item.id === roleOperation.batch_id
+            );
+            const repeats = failedBatch?.consecutive_failure_count ?? 1;
+            await this.recordProgress(
+              input,
+              "status",
+              `附件摄取批次 ${roleOperation.batch_id} 失败，仅重试本批（${repeats}/3）：${message}`,
+              "milestone"
+            );
+            if (repeats >= 3) {
+              this.raiseHierarchicalHostBlocker(input.session, "agent_failed", error, { fingerprint });
+            }
+          } else if (roleOperation.kind === "run_phase") {
+            const previousRepeats = countConsecutiveHierarchicalPhaseFailures(
+              input.session,
+              roleOperation.work_unit_id,
+              fingerprint
+            );
+            const repeats = previousRepeats + 1;
+            const recoveryRoute = repeats >= 3
+              ? hierarchicalPhaseSelfHealRoute(roleOperation.phase)
+              : "retry";
+            this.applyHierarchicalEvents(input.session, [{
+              type: "phase_failed",
+              work_unit_id: roleOperation.work_unit_id,
+              reason: message,
+              route: recoveryRoute,
+              error_fingerprint: fingerprint
+            }]);
+            if (repeats >= 3 && recoveryRoute !== "retry") {
+              await this.recordProgress(
+                input,
+                "status",
+                `当前 ${roleOperation.phase} 连续 ${repeats} 次遇到同类问题；宿主保持 Goal 运行并退回 ${recoveryRoute} 自愈：${message}`,
+                "milestone"
+              );
+            } else {
+              await this.recordProgress(
+                input,
+                "status",
+                `阶段角色失败，宿主仅重试当前工作单元（${repeats}/6）：${message}`,
+                "milestone"
+              );
+            }
+            // investigate 已经是最内层取证阶段，没有更早阶段可退。给带失败上下文的
+            // 自愈重试更大窗口；只有六次完全相同的失败才升级为宿主故障。
+            if (repeats >= 6 && recoveryRoute === "retry") {
+              this.raiseHierarchicalHostBlocker(input.session, "agent_failed", error, {
+                requirementId: roleOperation.requirement_id,
+                workUnitId: roleOperation.work_unit_id,
+                fingerprint
+              });
+            }
+          } else {
+            if (roleOperation.kind === "run_planner") {
+              this.applyHierarchicalEvents(input.session, [{
+                type: "planner_failed",
+                reason: message,
+                error_fingerprint: fingerprint
+              }]);
+              const retry = input.session.hierarchical_state?.planner_retry;
+              const repeats = retry?.consecutive_failure_count ?? 1;
+              await this.recordProgress(
+                input,
+                "status",
+                `align 角色失败，宿主已将拒绝原因写入第 ${retry?.attempt ?? repeats + 1} 次 planner 输出契约（${repeats}/3）：${message}`,
+                "milestone"
+              );
+              if (repeats >= 3) {
+                this.raiseHierarchicalHostBlocker(input.session, "agent_failed", error, { fingerprint });
+              }
+              continue;
+            }
+            if (roleOperation.kind === "run_integrator") {
+              this.applyHierarchicalEvents(input.session, [{ type: "integration_failed", reason: message }]);
+            }
+            const previous = nonPhaseFailures.get(label);
+            const repeats = previous?.fingerprint === fingerprint ? previous.count + 1 : 1;
+            nonPhaseFailures.set(label, { fingerprint, count: repeats });
+            await this.recordProgress(input, "status", `${label} 角色失败，宿主将恢复重试（${repeats}/3）：${message}`, "milestone");
+            if (repeats >= 3) {
+              this.raiseHierarchicalHostBlocker(input.session, "agent_failed", error, { fingerprint });
+            }
+          }
+        }
+      }
+
+      this.raiseHierarchicalHostBlocker(
+        input.session,
+        "orchestration_fault",
+        new Error(`分层循环超过 ${maxHierarchicalTransitions} 次宿主状态迁移安全上限`)
+      );
+      input.session.status = "interrupted";
+      input.session.error = `分层循环超过 ${maxHierarchicalTransitions} 次宿主状态迁移安全上限`;
+      await this.recordProgress(input, "status", input.session.error, "milestone");
+      return input.session;
+    } finally {
+      if (this.abortControllers.get(input.session.id) === abortController) {
+        this.abortControllers.delete(input.session.id);
+      }
+    }
+  }
+
+  private async runHierarchicalRoleQuery(
+    input: AgentRunInput,
+    operation: Extract<HierarchicalNextOperation, {
+      kind: "run_alignment_batch" | "run_planner" | "run_phase" | "run_integrator"
+    }>,
+    abortController: AbortController
+  ): Promise<HierarchicalRoleQueryResult> {
+    const spec = buildHierarchicalRoleSpec(input.session, input.workflow, operation);
+    const skillStage: WorkflowStage = {
+      id: `hierarchical-${spec.phaseLabel}`,
+      name: spec.phaseLabel,
+      required_skills: spec.requiredSkills
+    };
+    const loadedSkills = await this.loadRequiredSkills(skillStage);
+    const skillContracts = loadedSkills.length > 0
+      ? [
+          "## 宿主强制加载的 Skill 契约",
+          "这些是当前角色的执行契约，必须在行动与证据中落实。",
+          ...loadedSkills.map((skill) => `### ${skill.id}\n${skill.content}`)
+        ].join("\n\n")
+      : "";
+    const prompt = [spec.prompt, skillContracts].filter(Boolean).join("\n\n");
+    const query = await this.resolveQuery();
+    const needsContractAnalyzer = spec.tools.includes("mcp__ai_coder__analyze_symbol_contract");
+    const mcpServer = needsContractAnalyzer ? await this.resolveMcpServer(input) : null;
+    if (needsContractAnalyzer && !mcpServer) {
+      throw new Error("当前阶段要求完整调查目标函数/组件，但符号契约分析工具初始化失败");
+    }
+    const claudeCodeExecutable = resolveBundledClaudeCodeExecutable();
+    const sdkMessages: unknown[] = [];
+    const sdkStderr: string[] = [];
+    const policyDenials = new Map<string, number>();
+    const stageId = `hierarchical:${spec.phaseLabel}`;
+
+    const recoverableDenial = async (category: string, message: string) => {
+      const count = (policyDenials.get(category) ?? 0) + 1;
+      policyDenials.set(category, count);
+      const recovery = count >= 2
+        ? `${message} 同类动作已被宿主纠正 ${count} 次；不要继续改写命令规避策略，保留当前进度并执行阶段契约中的下一项合法动作。`
+        : message;
+      await this.recordProgress(input, "tool_policy", recovery, "milestone");
+      return { behavior: "deny" as const, message: recovery, interrupt: false };
+    };
+
+    const queryInstance = query({
+      prompt,
+      options: {
+        cwd: input.session.project_path,
+        ...(claudeCodeExecutable ? { pathToClaudeCodeExecutable: claudeCodeExecutable } : {}),
+        env: buildClaudeSdkEnv(),
+        stderr: (chunk: string) => captureBoundedSdkStderr(sdkStderr, chunk),
+        abortController,
+        mcpServers: mcpServer ? { ai_coder: mcpServer } : undefined,
+        ...(this.options.pluginPaths?.length
+          ? { plugins: this.options.pluginPaths.map((pluginPath) => ({ type: "local" as const, path: pluginPath })) }
+          : {}),
+        tools: spec.tools,
+        disallowedTools: buildDisallowedClaudeTools(input.workflow),
+        permissionMode: "default",
+        settingSources: [],
+        outputFormat: spec.outputFormat,
+        canUseTool: async (
+          toolName: string,
+          toolInput: Record<string, unknown>,
+          options: { toolUseID: string }
+        ) => {
+          const projectPathError = operation.kind === "run_alignment_batch"
+            ? null
+            : getHierarchicalProjectPathError(input.session, toolName, toolInput);
+          if (projectPathError) {
+            return recoverableDenial("project-path", projectPathError);
+          }
+          const attachmentReadError = getHierarchicalAttachmentReadError(
+            input.session,
+            operation,
+            toolName,
+            toolInput
+          );
+          if (attachmentReadError) {
+            return recoverableDenial("attachment-boundary", attachmentReadError);
+          }
+          const malformed = await validateProfileToolInput(
+            toolName,
+            toolInput,
+            input.session.project_path,
+            collectSessionAttachments(input.session)
+          );
+          if (malformed) {
+            return recoverableDenial("malformed-tool-input", `分层角色工具参数无效：${malformed}`);
+          }
+          if (toolName === "Bash" && isMutatingShellCommand(String(toolInput.command ?? ""))) {
+            const message = [
+              "分层角色的 Bash 仅用于读取和验证；代码修改必须通过受租约约束的 Edit。",
+              "分支、stash、reset、restore 属于已锁定的 Goal 工作区契约，当前叶子角色不得重做；请保留已完成 R-ID 的累计修改并继续当前需求。"
+            ].join(" ");
+            return recoverableDenial("mutating-shell", message);
+          }
+          const writeSafetyError = await getHierarchicalWriteSafetyError(
+            input.session,
+            toolName,
+            toolInput
+          );
+          if (writeSafetyError) {
+            return recoverableDenial("overwrite-existing-file", writeSafetyError);
+          }
+          const leaseError = getHierarchicalCapabilityLeaseError(input.session, toolName, toolInput);
+          if (leaseError) {
+            return recoverableDenial("file-lease", leaseError);
+          }
+          const safety = checkCommandSafety(stageId, toolName, toolInput);
+          if (!safety.allow) {
+            await this.recordProgress(input, "tool_policy", `安全拦截：${safety.message}`, "milestone");
+            return { behavior: "deny", message: safety.message, interrupt: false };
+          }
+          const decision = await approveOrDenyToolUse(
+            input.session,
+            input.workflow,
+            toolName,
+            toolInput,
+            options.toolUseID
+          );
+          if (decision.allow) return { behavior: "allow", updatedInput: decision.updatedInput };
+          if (this.hasPendingToolCall(input.session, options.toolUseID)) {
+            const resolved = await this.waitForToolApproval(input.session, options.toolUseID, abortController.signal);
+            if (resolved === "approved") {
+              const approved = await approveOrDenyToolUse(
+                input.session,
+                input.workflow,
+                toolName,
+                toolInput,
+                options.toolUseID
+              );
+              if (approved.allow) {
+                input.session.status = "running";
+                return { behavior: "allow", updatedInput: approved.updatedInput };
+              }
+              return { behavior: "deny", message: approved.message, interrupt: approved.interrupt };
+            }
+            input.session.status = "running";
+            return { behavior: "deny", message: "用户拒绝了工具调用，请在当前权限边界内继续。", interrupt: false };
+          }
+          return { behavior: "deny", message: decision.message, interrupt: decision.interrupt };
+        }
+      }
+    } as never);
+
+    let postResultProcessError: unknown;
+    try {
+      for await (const message of queryInstance) {
+        sdkMessages.push(message);
+        this.recordSdkToolUses(input.session, stageId, message);
+        this.recordToolExecutionResult(input.session, message);
+        await this.recordDiscoveredSkills(input, message);
+        const snippet = this.describeSdkMessage(message);
+        if (isMeaningfulSdkProgress(snippet)) {
+          await this.recordProgress(input, "sdk_message", snippet, "transient");
+        }
+      }
+    } catch (error) {
+      if (abortController.signal.aborted || !hasSuccessfulSdkTerminalResult(sdkMessages)) {
+        throw enrichClaudeSdkProcessError(error, sdkStderr);
+      }
+      postResultProcessError = error;
+    }
+
+    if (abortController.signal.aborted) throw new Error("分层角色查询被中止");
+    const output = extractClaudeStageOutput(sdkMessages);
+    if (output.error) throw new Error(output.error);
+    const transcript = formatClaudeTranscript(sdkMessages) || formatStructuredOutput(output.structuredOutput);
+    const structured = output.structuredOutput !== undefined
+      ? output.structuredOutput
+      : output.resultText || output.assistantText;
+    validateHierarchicalPlannerEnumeratedCoverage(input.session, operation, structured);
+    const events = parseHierarchicalRoleResult(operation, structured);
+    validateHierarchicalContractToolEvidence(input.session, operation, events, stageId);
+    validateHierarchicalBehaviorObligationContinuity(input.session, operation, events);
+    for (const event of events) {
+      if (event.type !== "phase_passed" || !event.allowed_files) continue;
+      const normalizedAllowedFiles: string[] = [];
+      for (const filePath of event.allowed_files) {
+        const normalized = normalizeHierarchicalLeasePath(input.session.project_path, filePath);
+        if (normalized !== filePath) {
+          await this.recordProgress(
+            input,
+            "tool_policy",
+            `宿主已将 allowed_files 中的格式噪声规范化：${filePath} → ${normalized}`,
+            "milestone"
+          );
+        }
+        normalizedAllowedFiles.push(normalized);
+      }
+      event.allowed_files = [...new Set(normalizedAllowedFiles)];
+      for (const filePath of event.allowed_files) {
+        await assertPathInsideProject(input.session.project_path, filePath);
+      }
+    }
+    if (postResultProcessError) {
+      const warning = postResultProcessError instanceof Error
+        ? postResultProcessError.message
+        : String(postResultProcessError);
+      await this.recordProgress(
+        input,
+        "status",
+        `SDK 已返回成功结构化结果；子进程随后异常退出，${spec.phaseLabel} 结果已保留：${warning.slice(0, 120)}${formatSdkStderrSuffix(sdkStderr)}`,
+        "milestone"
+      );
+    }
+    return {
+      events,
+      transcript
+    };
+  }
+
+  private applyHierarchicalEvents(session: AgentSession, events: HierarchicalEvent[]): void {
+    let state = session.hierarchical_state;
+    if (!state) throw new Error("会话尚未建立分层循环状态");
+    for (const event of events) state = applyHierarchicalEvent(state, event);
+    session.hierarchical_state = state;
+  }
+
+  private ensureHierarchicalAlignmentBatches(session: AgentSession): number {
+    const state = session.hierarchical_state;
+    if (!state || state.requirements.length > 0 || state.macro_phase !== "align") return 0;
+    const registered = new Set(state.alignment_batches.flatMap((batch) =>
+      batch.source_refs.map((source) => path.normalize(source))
+    ));
+    const candidateSources = collectSessionAttachments(session).flatMap((attachment) => {
+      if (attachment.type !== "file_ref" || !attachment.path) return [];
+      const exactPath = path.normalize(path.isAbsolute(attachment.path)
+        ? attachment.path
+        : path.resolve(session.project_path, attachment.path));
+      return registered.has(exactPath) ? [] : [exactPath];
+    });
+    const newSources = [...new Set(candidateSources)];
+    if (newSources.length === 0) return 0;
+    const batches: Array<{ id: string; source_refs: string[] }> = [];
+    let nextId = state.alignment_batches.reduce((largest, batch) => {
+      const numeric = /^A(\d+)$/.exec(batch.id)?.[1];
+      return Math.max(largest, numeric ? Number(numeric) : 0);
+    }, 0) + 1;
+    for (let index = 0; index < newSources.length; index += 3) {
+      batches.push({ id: `A${nextId}`, source_refs: newSources.slice(index, index + 3) });
+      nextId += 1;
+    }
+    this.applyHierarchicalEvents(session, [{ type: "alignment_sources_registered", batches }]);
+    return batches.length;
+  }
+
+  private resolveAnsweredHierarchicalBlockers(session: AgentSession): void {
+    const state = session.hierarchical_state;
+    if (!state) return;
+    const events: HierarchicalEvent[] = [];
+    for (const blocker of state.blockers) {
+      if (blocker.status !== "open" || !mayAskHumanForBlocker(blocker)) continue;
+      const question = (session.pending_human_questions ?? []).find((item) =>
+        item.id === `hierarchical:${blocker.id}` && item.status === "answered"
+      );
+      if (question) events.push({ type: "blocker_resolved", blocker_id: blocker.id });
+    }
+    if (events.length > 0) this.applyHierarchicalEvents(session, events);
+  }
+
+  private ensureHierarchicalHumanQuestion(session: AgentSession, blockerId: string, message: string): void {
+    const id = `hierarchical:${blockerId}`;
+    if ((session.pending_human_questions ?? []).some((question) => question.id === id)) return;
+    session.pending_human_questions = [...(session.pending_human_questions ?? []), {
+      id,
+      stage_id: session.current_stage,
+      question: message,
+      question_type: "text",
+      status: "pending",
+      created_at: new Date().toISOString()
+    }];
+  }
+
+  private raiseHierarchicalHostBlocker(
+    session: AgentSession,
+    kind: Extract<HierarchicalBlockerKind, "orchestration_fault" | "agent_failed" | "service_interrupted">,
+    error: unknown,
+    context: { requirementId?: string; workUnitId?: string; fingerprint?: string } = {}
+  ): void {
+    const message = error instanceof Error ? error.message : String(error);
+    const fingerprint = context.fingerprint ?? hierarchicalErrorFingerprint(session.current_stage, message);
+    const state = session.hierarchical_state;
+    if (!state) throw new Error(message);
+    if (state.blockers.some((blocker) => blocker.status === "open" && blocker.error_fingerprint === fingerprint)) return;
+    this.applyHierarchicalEvents(session, [{
+      type: "blocker_raised",
+      blocker: {
+        id: `host-${kind}-${fingerprint}`,
+        kind,
+        owner: "host",
+        message,
+        status: "open",
+        retryable: true,
+        user_input_required: false,
+        ...(context.requirementId ? { requirement_id: context.requirementId } : {}),
+        ...(context.workUnitId ? { work_unit_id: context.workUnitId } : {}),
+        error_fingerprint: fingerprint,
+        created_at: new Date().toISOString()
+      }
+    }]);
   }
 
   private async runProfileMode(input: AgentRunInput): Promise<AgentSession> {
@@ -550,8 +1204,8 @@ export class ClaudeAgentRunner {
       ].filter(Boolean).join("\n\n");
 
       await this.recordProgress(input, "runner", isLlmRetry ? "LLM 判断后继续执行（Profile 模式）" : "开始执行（Profile 模式）", "milestone");
-      const nodeInfo = await resolveNodeExecutable();
-      const sdkEnv = buildClaudeSdkEnv(nodeInfo?.env);
+      const claudeCodeExecutable = resolveBundledClaudeCodeExecutable();
+      const sdkEnv = buildClaudeSdkEnv();
 
       const sdkAgents: Record<string, { description: string; tools?: string[]; prompt: string; model?: string }> = {};
       const workflowAgents = input.workflow.agents ?? {};
@@ -614,7 +1268,7 @@ export class ClaudeAgentRunner {
             append: carefulCoderInstructions
           },
           cwd: input.session.project_path,
-          executable: nodeInfo?.command ?? undefined,
+          ...(claudeCodeExecutable ? { pathToClaudeCodeExecutable: claudeCodeExecutable } : {}),
           env: sdkEnv,
           abortController,
           mcpServers: mcpServer ? { ai_coder: mcpServer } : undefined,
@@ -1393,8 +2047,8 @@ export class ClaudeAgentRunner {
             : ""
         ].filter(Boolean).join("\n\n");
         await this.recordProgress(input, "runner", attempt > 0 ? `开始重试阶段：${currentStage.name || currentStage.id}（第 ${attempt} 次）` : `开始执行阶段：${currentStage.name || currentStage.id}`, "milestone");
-      const nodeInfo = await resolveNodeExecutable();
-      const sdkEnv = buildClaudeSdkEnv(nodeInfo?.env);
+      const claudeCodeExecutable = resolveBundledClaudeCodeExecutable();
+      const sdkEnv = buildClaudeSdkEnv();
 
       // 构建 SDK agents 配置：将 YAML 中定义的 sub-agent 映射为 SDK AgentDefinition
       const sdkAgents: Record<string, { description: string; tools?: string[]; prompt: string; model?: string }> = {};
@@ -1413,7 +2067,7 @@ export class ClaudeAgentRunner {
         prompt: instructions,
         options: {
           cwd: input.session.project_path,
-          executable: nodeInfo?.command ?? undefined,
+          ...(claudeCodeExecutable ? { pathToClaudeCodeExecutable: claudeCodeExecutable } : {}),
           env: sdkEnv,
           abortController,
           mcpServers: mcpServer ? { ai_coder: mcpServer } : undefined,
@@ -2009,7 +2663,7 @@ export class ClaudeAgentRunner {
     await this.recordProgress(
       input,
       "runner",
-      `SDK 已发现 Plugins：${plugins.join(", ") || "无"}；Skills：${skills.join(", ") || "无"}`,
+      `SDK 已发现 Plugins：${plugins.map(formatSdkCatalogItem).join(", ") || "无"}；Skills：${skills.map(formatSdkCatalogItem).join(", ") || "无"}`,
       "milestone"
     );
   }
@@ -2172,6 +2826,8 @@ export class ClaudeAgentRunner {
   }
 
   private async resolveMcpServer(input: AgentRunInput): Promise<unknown | null> {
+    const cached = this.mcpServerCache.get(input);
+    if (cached) return cached.server;
     try {
       const sdk = await import("@anthropic-ai/claude-agent-sdk");
       const createSdkMcpServer = (sdk as { createSdkMcpServer?: unknown }).createSdkMcpServer;
@@ -2363,11 +3019,14 @@ export class ClaudeAgentRunner {
           }
         }
       );
-      return (createSdkMcpServer as (opts: { name: string; tools: unknown[] }) => unknown)({
+      const server = (createSdkMcpServer as (opts: { name: string; tools: unknown[] }) => unknown)({
         name: "ai_coder",
         tools: [askHumanTool, taskTreeTool, explorationCheckpointTool, analyzeSymbolContractTool]
       });
+      this.mcpServerCache.set(input, { server });
+      return server;
     } catch {
+      this.mcpServerCache.set(input, { server: null });
       return null;
     }
   }
@@ -2392,6 +3051,569 @@ export function evaluateHumanQuestionRequest(toolInput: Record<string, unknown>)
   if (numberedPrompts.length > 1) return `一次只能询问一个决策，当前包含 ${numberedPrompts.length} 个编号议题`;
 
   return null;
+}
+
+export function validateHierarchicalContractToolEvidence(
+  session: AgentSession,
+  operation: Extract<HierarchicalNextOperation, { kind: "run_phase" | "run_alignment_batch" | "run_planner" | "run_integrator" }>,
+  events: HierarchicalEvent[],
+  stageId: string
+): void {
+  if (operation.kind !== "run_phase" || operation.phase !== "prepare") return;
+  const passed = events.find((event): event is Extract<HierarchicalEvent, { type: "phase_passed" }> => (
+    event.type === "phase_passed"
+  ));
+  if (!passed) return;
+  const callContract = isPlainObject(passed.handoff?.call_contract) ? passed.handoff.call_contract : undefined;
+  const targets = Array.isArray(callContract?.analyzed_targets) ? callContract.analyzed_targets : [];
+  for (const rawTarget of targets) {
+    if (!isPlainObject(rawTarget)) continue;
+    const targetFile = optionalString(rawTarget.target_file);
+    const symbol = optionalString(rawTarget.symbol);
+    const method = optionalString(rawTarget.analysis_method);
+    if (!targetFile || !symbol) continue;
+
+    if (method === "manual-static-analysis") {
+      const absoluteTarget = path.resolve(session.project_path, targetFile);
+      if (!existsSync(absoluteTarget)) {
+        throw new Error(`手工静态分析目标不存在：${targetFile}#${symbol}`);
+      }
+      if (!/\.[cm]?[jt]sx?$/i.test(absoluteTarget)) continue;
+      try {
+        analyzeSymbolContract({
+          projectPath: session.project_path,
+          targetFile,
+          symbol,
+          section: "contract"
+        });
+      } catch {
+        continue;
+      }
+      throw new Error(
+        `目标 ${targetFile}#${symbol} 可由符号契约分析器解析，不得用 manual-static-analysis 绕过完整调用点调查`
+      );
+    }
+    if (method !== "symbol-analyzer") continue;
+
+    const targetPath = path.resolve(session.project_path, targetFile);
+    const calls = session.tool_calls.filter((call) => {
+      if (call.stage_id !== stageId || call.tool !== "mcp__ai_coder__analyze_symbol_contract") return false;
+      if (call.status !== "completed" || !isPlainObject(call.input)) return false;
+      const calledFile = optionalString(call.input.target_file);
+      return Boolean(
+        calledFile
+        && path.resolve(session.project_path, calledFile) === targetPath
+        && optionalString(call.input.symbol) === symbol
+      );
+    });
+    const contractCalled = calls.some((call) => (
+      isPlainObject(call.input) && optionalString(call.input.section) === "contract"
+    ));
+    if (!contractCalled) {
+      throw new Error(`目标 ${targetFile}#${symbol} 未实际执行 contract 符号契约分析`);
+    }
+
+    const actual = analyzeSymbolContract({
+      projectPath: session.project_path,
+      targetFile,
+      symbol,
+      section: "all"
+    });
+    const totals: Record<"calls" | "wrappers" | "references", number> = {
+      calls: actual.coverage.total_call_sites,
+      wrappers: actual.coverage.total_public_wrappers,
+      references: actual.coverage.total_non_call_references
+    };
+    for (const section of ["calls", "wrappers", "references"] as const) {
+      const pages = calls
+        .filter((call) => isPlainObject(call.input) && optionalString(call.input.section) === section)
+        .map((call) => {
+          const input = call.input as Record<string, unknown>;
+          const offset = typeof input.offset === "number" ? Math.max(0, input.offset) : 0;
+          const limit = typeof input.limit === "number" ? Math.min(100, Math.max(1, input.limit)) : 50;
+          return { offset, limit };
+        });
+      if (!coversPaginatedContractSection(totals[section], pages)) {
+        throw new Error(
+          `目标 ${targetFile}#${symbol} 的 ${section} 调查未覆盖全部分页（总数 ${totals[section]}）`
+        );
+      }
+    }
+  }
+}
+
+export function validateHierarchicalBehaviorObligationContinuity(
+  session: AgentSession,
+  operation: Extract<HierarchicalNextOperation, {
+    kind: "run_phase" | "run_alignment_batch" | "run_planner" | "run_integrator"
+  }>,
+  events: HierarchicalEvent[]
+): void {
+  const state = session.hierarchical_state;
+  if (!state) return;
+
+  if (operation.kind === "run_integrator") {
+    const passedIntegration = events.find((event): event is Extract<HierarchicalEvent, {
+      type: "integration_passed"
+    }> => event.type === "integration_passed");
+    if (!passedIntegration) return;
+    for (const requirement of state.requirements) {
+      const prepare = latestHierarchicalArtifact(state, requirement.id, "prepare");
+      const verify = latestHierarchicalArtifact(state, requirement.id, "verify");
+      if (!prepare || !verify) {
+        throw new Error(`全局审计缺少 ${requirement.id} 的 prepare 行为契约或 verify 契约结果`);
+      }
+      assertObligationResultClosure(
+        prepare.handoff.behavior_obligations,
+        passedIntegration.contract_results.filter((result) => result.requirement_id === requirement.id),
+        `${requirement.id}/integrate-final-workspace`,
+        ["pass"]
+      );
+    }
+    return;
+  }
+
+  if (operation.kind !== "run_phase") return;
+  const passed = events.find((event): event is Extract<HierarchicalEvent, { type: "phase_passed" }> => (
+    event.type === "phase_passed"
+  ));
+  if (!passed) return;
+
+  if (operation.phase === "prepare") {
+    const investigate = latestHierarchicalArtifact(state, operation.requirement_id, "investigate");
+    if (!investigate) throw new Error("prepare 缺少 investigate 同功能入口交接物");
+    const referenceAnalysis = isPlainObject(investigate.handoff.reference_analysis)
+      ? investigate.handoff.reference_analysis
+      : undefined;
+    const selectedLocation = optionalString(referenceAnalysis?.selected_location);
+    const noReferenceReason = optionalString(referenceAnalysis?.no_reference_reason);
+    if (!selectedLocation && !noReferenceReason) {
+      throw new Error("prepare 前必须由 investigate 选定同一业务功能的既有入口");
+    }
+    const selectedFile = selectedLocation
+      ? evidenceLocationFile(selectedLocation, session.project_path)
+      : null;
+    const selectedAnchor = selectedLocation
+      ? evidenceLocationAnchor(selectedLocation, session.project_path)
+      : null;
+    const callContract = isPlainObject(passed.handoff?.call_contract)
+      ? passed.handoff.call_contract
+      : undefined;
+    const targets = Array.isArray(callContract?.analyzed_targets)
+      ? callContract.analyzed_targets.filter(isPlainObject)
+      : [];
+    const analyzedFiles = new Set(targets
+      .map((target) => optionalString(target.target_file))
+      .filter((value): value is string => Boolean(value))
+      .map((value) => path.resolve(session.project_path, value)));
+    if (selectedFile && !analyzedFiles.has(selectedFile)) {
+      throw new Error(
+        `prepare 必须分析 investigate 选中的同功能入口文件：${selectedLocation}`
+      );
+    }
+    const codeAllowedFiles = (passed.allowed_files ?? [])
+      .filter((filePath) => /\.[cm]?[jt]sx?$/i.test(filePath))
+      .map((filePath) => path.resolve(
+        session.project_path,
+        normalizeHierarchicalLeasePath(session.project_path, filePath)
+      ));
+    const missingChangeFiles = codeAllowedFiles.filter((filePath) => !analyzedFiles.has(filePath));
+    if (missingChangeFiles.length > 0) {
+      throw new Error(
+        `prepare 的 analyzed_targets 未覆盖实际代码修改文件：${missingChangeFiles
+          .map((filePath) => path.relative(session.project_path, filePath))
+          .join(", ")}`
+      );
+    }
+    const obligations = Array.isArray(passed.handoff?.behavior_obligations)
+      ? passed.handoff.behavior_obligations.filter(isPlainObject)
+      : [];
+    if (selectedFile) {
+      for (const obligation of obligations) {
+        const evidence = Array.isArray(obligation.evidence_refs)
+          ? obligation.evidence_refs.filter((item): item is string => typeof item === "string")
+          : [];
+        if (!evidence.some((item) => evidenceLocationFile(item, session.project_path) === selectedFile)) {
+          throw new Error(
+            `行为义务 ${optionalString(obligation.id) ?? "<unknown>"} 未引用选定同功能入口 ${selectedLocation}`
+          );
+        }
+        if (
+          selectedAnchor
+          && !evidence.some((item) => {
+            const anchor = evidenceLocationAnchor(item, session.project_path);
+            return Boolean(anchor && anchor !== selectedAnchor);
+          })
+        ) {
+          throw new Error(
+            `行为义务 ${optionalString(obligation.id) ?? "<unknown>"} 缺少当前目标代码的独立 path:line 证据`
+          );
+        }
+      }
+    }
+    if (passed.handoff?.change_disposition === "already_satisfied") {
+      const satisfaction = Array.isArray(passed.handoff.satisfaction_evidence)
+        ? passed.handoff.satisfaction_evidence.filter((item): item is string => typeof item === "string")
+        : [];
+      if (satisfaction.length < obligations.length) {
+        throw new Error("already_satisfied 必须为每条行为义务提供独立 satisfaction_evidence");
+      }
+    }
+    return;
+  }
+
+  if (operation.phase === "investigate") return;
+  const prepare = latestHierarchicalArtifact(state, operation.requirement_id, "prepare");
+  if (!prepare) throw new Error(`${operation.phase} 缺少 prepare 冻结行为契约`);
+  if (operation.phase === "implement") {
+    assertObligationResultClosure(
+      prepare.handoff.behavior_obligations,
+      passed.handoff?.obligation_results,
+      `${operation.requirement_id}/implement`,
+      ["applied", "already-satisfied"]
+    );
+  } else if (operation.phase === "verify") {
+    assertObligationResultClosure(
+      prepare.handoff.behavior_obligations,
+      passed.handoff?.contract_results,
+      `${operation.requirement_id}/verify`,
+      ["pass"]
+    );
+  }
+}
+
+function latestHierarchicalArtifact(
+  state: HierarchicalExecutionState,
+  requirementId: string,
+  phase: "investigate" | "prepare" | "implement" | "verify"
+): HierarchicalExecutionState["phase_artifacts"][number] | undefined {
+  return [...state.phase_artifacts].reverse().find((artifact) =>
+    artifact.requirement_id === requirementId && artifact.phase === phase
+  );
+}
+
+function assertObligationResultClosure(
+  rawObligations: unknown,
+  rawResults: unknown,
+  label: string,
+  passingStatuses: string[]
+): void {
+  const obligations = Array.isArray(rawObligations) ? rawObligations.filter(isPlainObject) : [];
+  const expected = obligations
+    .map((obligation) => optionalString(obligation.id))
+    .filter((id): id is string => Boolean(id));
+  const requiredBehaviorById = new Map(obligations.map((obligation) => [
+    optionalString(obligation.id) ?? "",
+    optionalString(obligation.required_behavior) ?? ""
+  ]));
+  if (expected.length === 0) throw new Error(`${label} 缺少 prepare behavior_obligations`);
+  const results = Array.isArray(rawResults) ? rawResults.filter(isPlainObject) : [];
+  const actual = results
+    .map((result) => optionalString(result.obligation_id))
+    .filter((id): id is string => Boolean(id));
+  const missing = expected.filter((id) => !actual.includes(id));
+  const unexpected = actual.filter((id) => !expected.includes(id));
+  if (missing.length > 0 || unexpected.length > 0 || new Set(actual).size !== actual.length) {
+    throw new Error(
+      `${label} 行为义务 ID 未闭环；missing=${missing.join(",") || "none"}；unexpected=${unexpected.join(",") || "none"}`
+    );
+  }
+  for (const result of results) {
+    const status = optionalString(result.status) ?? "";
+    const obligationId = optionalString(result.obligation_id) ?? "";
+    if (!passingStatuses.includes(status)) {
+      throw new Error(`${label} 行为义务 ${obligationId || "<unknown>"} 未通过：${status}`);
+    }
+    const requiredBehavior = normalizeBehaviorStatement(requiredBehaviorById.get(obligationId) ?? "");
+    const observedBehavior = normalizeBehaviorStatement(optionalString(result.observed_behavior) ?? "");
+    if (!requiredBehavior || observedBehavior !== requiredBehavior) {
+      throw new Error(
+        `${label} 行为义务 ${obligationId || "<unknown>"} 的最终观察与冻结契约不一致`
+      );
+    }
+  }
+}
+
+function normalizeBehaviorStatement(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function evidenceLocationFile(value: string, projectPath: string): string | null {
+  const trimmed = value.trim().replace(/^["'`(]+|["'`),.;]+$/g, "");
+  const match = /^(.*\.[A-Za-z0-9]+):\d+(?::\d+)?(?:\b|$)/.exec(trimmed);
+  if (!match?.[1]) return null;
+  return path.resolve(projectPath, match[1]);
+}
+
+function evidenceLocationAnchor(value: string, projectPath: string): string | null {
+  const trimmed = value.trim().replace(/^["'`(]+|["'`),.;]+$/g, "");
+  const match = /^(.*\.[A-Za-z0-9]+):(\d+)(?::\d+)?(?:\b|$)/.exec(trimmed);
+  if (!match?.[1] || !match[2]) return null;
+  return `${path.resolve(projectPath, match[1])}:${Number(match[2])}`;
+}
+
+export function validateHierarchicalPlannerEnumeratedCoverage(
+  session: AgentSession,
+  operation: Extract<HierarchicalNextOperation, { kind: "run_phase" | "run_alignment_batch" | "run_planner" | "run_integrator" }>,
+  structured: unknown
+): void {
+  if (operation.kind !== "run_planner") return;
+  if (!isPlainObject(structured) || !session.hierarchical_state) return;
+  const coverageContract = buildHierarchicalPlannerCoverageContract(
+    session.task_prompt,
+    session.hierarchical_state
+  );
+  if (!coverageContract) return;
+  const covered = new Set<number>();
+  const requirements = Array.isArray(structured.requirements) ? structured.requirements : [];
+  for (const rawRequirement of requirements) {
+    if (!isPlainObject(rawRequirement)) continue;
+    const id = optionalString(rawRequirement.id) ?? "";
+    const numericId = /^R0*(\d+)$/i.exec(id)?.[1];
+    if (numericId) covered.add(Number(numericId));
+    const evidenceText = [
+      optionalString(rawRequirement.source_anchor),
+      optionalString(rawRequirement.observable_result)
+    ].filter(Boolean).join("\n");
+    for (const sequence of extractBusinessSequenceNumbers(evidenceText)) covered.add(sequence);
+  }
+  const missing = coverageContract.required_sequences
+    .filter((sequence) => !covered.has(sequence));
+  if (missing.length > 0) {
+    throw new Error(`planner 需求账本遗漏用户范围内业务序号：${missing.join(", ")}`);
+  }
+}
+
+function coversPaginatedContractSection(
+  total: number,
+  pages: Array<{ offset: number; limit: number }>
+): boolean {
+  if (pages.length === 0) return false;
+  if (total === 0) return pages.some((page) => page.offset === 0);
+  const sorted = [...pages].sort((left, right) => left.offset - right.offset);
+  let coveredUntil = 0;
+  for (const page of sorted) {
+    if (page.offset > coveredUntil) return false;
+    coveredUntil = Math.max(coveredUntil, page.offset + page.limit);
+    if (coveredUntil >= total) return true;
+  }
+  return false;
+}
+
+function hierarchicalErrorFingerprint(scope: string, message: string): string {
+  return createHash("sha256")
+    .update(`${scope}\n${message.replace(/\s+/g, " ").trim()}`)
+    .digest("hex")
+    .slice(0, 16);
+}
+
+function countConsecutiveHierarchicalPhaseFailures(
+  session: AgentSession,
+  workUnitId: string,
+  fingerprint: string
+): number {
+  let count = 0;
+  for (let index = (session.hierarchical_state?.phase_runs.length ?? 0) - 1; index >= 0; index -= 1) {
+    const run = session.hierarchical_state?.phase_runs[index];
+    if (!run || run.work_unit_id !== workUnitId) continue;
+    if (run.status === "running") continue;
+    if (run.status !== "failed" || run.error_fingerprint !== fingerprint) break;
+    count += 1;
+  }
+  return count;
+}
+
+function hierarchicalPhaseSelfHealRoute(
+  phase: Exclude<HierarchicalWorkPhase, "close">
+): "retry" | "investigate" | "prepare" | "implement" {
+  if (phase === "prepare") return "investigate";
+  if (phase === "implement") return "prepare";
+  if (phase === "verify") return "implement";
+  return "retry";
+}
+
+async function captureHierarchicalWorkUnitSnapshot(
+  session: AgentSession
+): Promise<HierarchicalWorkUnitSnapshot> {
+  const workUnit = session.hierarchical_state?.active_work_unit;
+  if (!workUnit || workUnit.phase !== "implement" || workUnit.status !== "running") {
+    throw new Error("无法为非运行中的 implement 工作单元建立恢复快照");
+  }
+  const files: HierarchicalWorkUnitSnapshot["files"] = [];
+  for (const rawPath of workUnit.allowed_files) {
+    const relativePath = normalizeHierarchicalLeasePath(session.project_path, rawPath);
+    const absolutePath = path.resolve(session.project_path, relativePath);
+    await assertPathInsideProject(session.project_path, absolutePath);
+    try {
+      const [content, fileStat] = await Promise.all([readFile(absolutePath), stat(absolutePath)]);
+      files.push({ path: absolutePath, existed: true, content, mode: fileStat.mode });
+    } catch (error) {
+      const code = isPlainObject(error) && typeof error.code === "string" ? error.code : "";
+      if (code !== "ENOENT") throw error;
+      files.push({ path: absolutePath, existed: false });
+    }
+  }
+  return { work_unit_id: workUnit.id, files };
+}
+
+async function restoreHierarchicalWorkUnitSnapshot(
+  projectPath: string,
+  snapshot: HierarchicalWorkUnitSnapshot
+): Promise<void> {
+  for (const file of snapshot.files) {
+    await assertPathInsideProject(projectPath, file.path);
+    if (file.existed) {
+      await writeFile(file.path, file.content ?? new Uint8Array());
+      if (file.mode !== undefined) await chmod(file.path, file.mode);
+      continue;
+    }
+    try {
+      await unlink(file.path);
+    } catch (error) {
+      const code = isPlainObject(error) && typeof error.code === "string" ? error.code : "";
+      if (code !== "ENOENT") throw error;
+    }
+  }
+}
+
+async function assertHierarchicalWorkUnitIntegrity(snapshot: HierarchicalWorkUnitSnapshot): Promise<void> {
+  for (const file of snapshot.files) {
+    if (!file.existed) continue;
+    let current: Uint8Array;
+    try {
+      current = await readFile(file.path);
+    } catch {
+      throw new Error(`implement 删除或破坏了既有租约文件：${file.path}`);
+    }
+    const previousSize = file.content?.byteLength ?? 0;
+    if (previousSize >= 1_024 && current.byteLength < previousSize * 0.5) {
+      throw new Error(
+        `implement 导致既有文件异常缩减：${file.path}（${previousSize} → ${current.byteLength} bytes）`
+      );
+    }
+  }
+}
+
+function getHierarchicalCapabilityLeaseError(
+  session: AgentSession,
+  toolName: string,
+  toolInput: Record<string, unknown>
+): string | null {
+  if (toolName !== "Edit" && toolName !== "Write" && toolName !== "NotebookEdit") return null;
+  const workUnit = session.hierarchical_state?.active_work_unit;
+  if (!workUnit || workUnit.phase !== "implement" || workUnit.status !== "running") {
+    return `当前分层阶段没有 ${toolName} 写权限租约。`;
+  }
+  const suppliedPath = optionalString(toolInput.file_path ?? toolInput.notebook_path);
+  if (!suppliedPath) return `${toolName} 缺少文件路径，无法核对阶段写权限租约。`;
+  const normalizeLeasePath = (value: string): string => path.normalize(
+    path.isAbsolute(value) ? value : path.resolve(session.project_path, value)
+  );
+  const target = normalizeLeasePath(suppliedPath);
+  const allowed = workUnit.allowed_files.map(normalizeLeasePath);
+  if (allowed.length === 0 || !allowed.includes(target)) {
+    return [
+      `当前工作单元 ${workUnit.id} 不允许修改 ${suppliedPath}。`,
+      `允许文件：${workUnit.allowed_files.join(", ") || "无（必须退回 prepare 建立文件边界）"}`
+    ].join(" ");
+  }
+  return null;
+}
+
+async function getHierarchicalWriteSafetyError(
+  session: AgentSession,
+  toolName: string,
+  toolInput: Record<string, unknown>
+): Promise<string | null> {
+  if (toolName !== "Write") return null;
+  const suppliedPath = optionalString(toolInput.file_path);
+  if (!suppliedPath) return null;
+  const target = path.isAbsolute(suppliedPath)
+    ? path.normalize(suppliedPath)
+    : path.resolve(session.project_path, suppliedPath);
+  try {
+    await access(target);
+    return [
+      `禁止使用 Write 覆盖现有文件：${suppliedPath}。`,
+      "请保留现有内容并使用 Edit 做最小局部修改；宿主不会把整文件重写当作自愈手段。"
+    ].join(" ");
+  } catch (error) {
+    const code = isPlainObject(error) && typeof error.code === "string" ? error.code : "";
+    return code === "ENOENT"
+      ? null
+      : `宿主无法确认 Write 目标是否为新文件：${suppliedPath}；为避免覆盖现有内容，请改用 Edit 或先修复路径。`;
+  }
+}
+
+export function normalizeHierarchicalLeasePath(projectPath: string, value: string): string {
+  let normalized = value.trim();
+  normalized = normalized
+    .replace(/^\s*(?:[-*]|\d+[.)、])\s+/, "")
+    .replace(/^[`'\"“”‘’*]+|[`'\"“”‘’*]+$/g, "")
+    .replace(/[“”‘’`]/g, "")
+    .trim();
+  if (!normalized || /[\r\n]/.test(normalized)) {
+    throw new Error(`allowed_files 包含无法安全规范化的路径：${value}`);
+  }
+  const absolute = path.isAbsolute(normalized)
+    ? path.normalize(normalized)
+    : path.resolve(projectPath, normalized);
+  const projectRoot = path.resolve(projectPath);
+  if (!isPathInsideRoot(projectRoot, absolute)) {
+    throw new Error(`allowed_files 路径越出当前项目：${value}`);
+  }
+  return path.relative(projectRoot, absolute) || ".";
+}
+
+/**
+ * 分层角色必须围绕会话登记的唯一项目根目录工作。SDK 的 cwd 已经正确设置，但模型仍
+ * 可能沿用训练语料中的 /workspace 或 /home/user/workspace。这里在工具执行前明确拒绝
+ * 越界路径，并把真实根目录回传给同一角色纠正，避免无意义地访问/修改另一个位置。
+ */
+export function getHierarchicalProjectPathError(
+  session: AgentSession,
+  toolName: string,
+  toolInput: Record<string, unknown>
+): string | null {
+  const projectRoot = path.resolve(session.project_path);
+  if (toolName === "Bash") {
+    const command = optionalString(toolInput.command);
+    if (!command) return null;
+    const cdPattern = /(?:^|[;&|]\s*)cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/g;
+    for (const match of command.matchAll(cdPattern)) {
+      const destination = match[1] ?? match[2] ?? match[3];
+      if (!destination || !path.isAbsolute(destination)) continue;
+      if (!isPathInsideRoot(projectRoot, path.resolve(destination))) {
+        return hierarchicalProjectPathMessage("Bash cd", destination, projectRoot);
+      }
+    }
+    return null;
+  }
+  const pathField = toolName === "NotebookEdit"
+    ? "notebook_path"
+    : toolName === "Read" || toolName === "Edit" || toolName === "Write"
+      ? "file_path"
+      : null;
+  if (!pathField) return null;
+  const suppliedPath = optionalString(toolInput[pathField]);
+  if (!suppliedPath) return null;
+
+  const target = path.resolve(projectRoot, suppliedPath);
+  if (isPathInsideRoot(projectRoot, target)) return null;
+  return hierarchicalProjectPathMessage(toolName, suppliedPath, projectRoot);
+}
+
+function isPathInsideRoot(root: string, target: string): boolean {
+  const relative = path.relative(root, target);
+  return relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+function hierarchicalProjectPathMessage(toolName: string, suppliedPath: string, projectRoot: string): string {
+  return [
+    `${toolName} 路径越出当前项目：${suppliedPath}。`,
+    `唯一项目根目录是 ${projectRoot}；请使用该目录下的项目相对路径，或以该目录逐字开头的绝对路径。`,
+    "不得改用 /workspace、/home/user/workspace 或省略项目目录的路径。"
+  ].join(" ");
 }
 
 function buildLlmDecisionContext(
@@ -3209,6 +4431,65 @@ function collectSessionAttachments(session: AgentSession): Attachment[] {
   });
 }
 
+function migrateHierarchicalAlignmentState(state: HierarchicalExecutionState, projectPath: string): void {
+  const migratable = state as HierarchicalExecutionState & {
+    alignment_batches?: HierarchicalExecutionState["alignment_batches"];
+    phase_artifacts?: HierarchicalExecutionState["phase_artifacts"];
+    workspace_revision?: number;
+  };
+  migratable.alignment_batches ??= [];
+  migratable.phase_artifacts ??= [];
+  migratable.workspace_revision ??= 0;
+  for (const artifact of migratable.phase_artifacts) {
+    artifact.workspace_revision ??= 0;
+  }
+  migratable.workspace_contract ??= {
+    project_path: path.resolve(projectPath),
+    owner: "host",
+    locked: true,
+    initialized_at: new Date().toISOString()
+  };
+  for (const batch of migratable.alignment_batches) {
+    batch.consecutive_failure_count ??= 0;
+  }
+}
+
+function getHierarchicalAttachmentReadError(
+  session: AgentSession,
+  operation: Extract<HierarchicalNextOperation, {
+    kind: "run_alignment_batch" | "run_planner" | "run_phase" | "run_integrator"
+  }>,
+  toolName: string,
+  toolInput: Record<string, unknown>
+): string | null {
+  if (operation.kind === "run_alignment_batch") {
+    if (toolName !== "Read" || typeof toolInput.file_path !== "string") return null;
+    if (operation.source_refs.includes(toolInput.file_path)) return null;
+    return [
+      `附件摄取批次 ${operation.batch_id} 只能读取本批次的精确路径：${toolInput.file_path}`,
+      ...operation.source_refs.map((source) => `- ${source}`),
+      "请逐字复制其中一个路径；不得读取代码、搜索附件或猜测替代路径。"
+    ].join("\n");
+  }
+  const registeredSources = session.hierarchical_state?.alignment_batches
+    .flatMap((batch) => batch.source_refs) ?? [];
+  if (registeredSources.length === 0) return null;
+  const serializedInput = JSON.stringify(toolInput).replace(/\\\\/g, "/");
+  const mentionsRegisteredSource = registeredSources.some((source) =>
+    serializedInput.includes(source.replace(/\\/g, "/"))
+    || serializedInput.includes(path.basename(source))
+  );
+  const mentionsUploadArea = /\.?ai-coder\/uploads(?:\/|\*|\b)/.test(serializedInput);
+  const searchesAttachmentFormats = operation.kind === "run_planner" && (
+    (toolName === "Glob" && /\.(?:png|jpe?g|webp|pdf)\b/i.test(serializedInput))
+    || (toolName === "Bash" && /\bfind\b[\s\S]*\.(?:png|jpe?g|webp|pdf)\b/i.test(serializedInput))
+  );
+  if (mentionsRegisteredSource || mentionsUploadArea || searchesAttachmentFormats) {
+    return "原始附件已由宿主分批摄取；当前角色必须使用持久化摘要，禁止再次 Read 或猜测附件路径。";
+  }
+  return null;
+}
+
 function augmentTaskInputWithAttachmentManifest(
   toolInput: Record<string, unknown>,
   session: AgentSession
@@ -3662,6 +4943,30 @@ function isSubprocessCrashError(error: unknown): boolean {
   return /terminated by signal SIG(?:SEGV|ABRT|BUS|ILL)|signal SIG(?:SEGV|ABRT|BUS|ILL)/i.test(message);
 }
 
+function captureBoundedSdkStderr(target: string[], chunk: string): void {
+  const sanitized = chunk
+    .replace(/\u001b\[[0-9;]*m/g, "")
+    .replace(/\bsk-ant-[A-Za-z0-9_-]+\b/g, "[REDACTED]")
+    .replace(/((?:ANTHROPIC_(?:API_KEY|AUTH_TOKEN)|CLAUDE_CODE_OAUTH_TOKEN)\s*[=:]\s*)\S+/gi, "$1[REDACTED]")
+    .trim();
+  if (!sanitized) return;
+  target.push(sanitized);
+  while (target.join("\n").length > 8_000 && target.length > 1) target.shift();
+}
+
+function formatSdkStderrSuffix(stderr: string[]): string {
+  if (stderr.length === 0) return "";
+  const tail = stderr.join("\n").replace(/\s+/g, " ").trim().slice(-600);
+  return tail ? `；CLI stderr：${tail}` : "";
+}
+
+function enrichClaudeSdkProcessError(error: unknown, stderr: string[]): Error {
+  const base = error instanceof Error ? error : new Error(String(error));
+  const enriched = new Error(`${base.message}${formatSdkStderrSuffix(stderr)}`);
+  enriched.name = base.name;
+  return enriched;
+}
+
 function isServiceUnavailableError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /\b503\b|no available workers|service temporarily unavailable/i.test(message);
@@ -3984,7 +5289,7 @@ export function describeSdkMessageSnippet(message: unknown): string {
       if (!isPlainObject(block)) continue;
       if (block.type === "text" && typeof block.text === "string") {
         const snippet = block.text.replace(/\s+/g, " ").trim().slice(0, 500);
-        if (snippet) parts.push(snippet);
+        if (snippet && !/^\(no content\)$/i.test(snippet)) parts.push(snippet);
       } else if (block.type === "tool_use") {
         const name = String(block.name ?? "unknown");
         parts.push(`请求 ${name}${describeToolInputSnippet(block.input)}`);
@@ -3992,6 +5297,9 @@ export function describeSdkMessageSnippet(message: unknown): string {
     }
     return parts.length > 0 ? parts.join(" | ") : "助手消息（无文本）";
   }
+  // Claude SDK 把每次工具返回包装为 user 消息；工具请求/结果已由专用审计流记录，
+  // 再显示 SDK:user 只会制造几十条没有语义的活动噪声。
+  if (type === "user") return "";
   if (type === "tool_result") return "工具结果";
   if (type === "result") {
     const subtype = typeof msg.subtype === "string" ? msg.subtype : "unknown";
@@ -3999,6 +5307,20 @@ export function describeSdkMessageSnippet(message: unknown): string {
     return `SDK 查询结束：${subtype}${suffix}`;
   }
   return type ? `SDK:${type}` : "收到 Claude SDK 消息。";
+}
+
+export function formatSdkCatalogItem(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (!isPlainObject(value)) return String(value);
+  for (const key of ["name", "id", "path", "type"] as const) {
+    const candidate = value[key];
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return "未知";
+  }
 }
 
 function describeToolInputSnippet(input: unknown): string {

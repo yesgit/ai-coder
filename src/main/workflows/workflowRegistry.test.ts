@@ -49,6 +49,46 @@ describe("WorkflowRegistry", () => {
     expect(loaded.routing).toEqual({ enabled: true, auto_start: true, keywords: ["review"], examples: ["review this diff"] });
   });
 
+  it("loads an explicit hierarchical execution mode without requiring legacy stages", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-workflows-"));
+    await fs.writeFile(
+      path.join(dir, "hierarchical.yaml"),
+      [
+        "id: hierarchical",
+        "name: Hierarchical",
+        "version: 1.0.0",
+        "execution_mode: hierarchical",
+        "stages: []"
+      ].join("\n")
+    );
+
+    const [loaded] = await new WorkflowRegistry(dir).list();
+    expect(loaded.execution_mode).toBe("hierarchical");
+    expect(loaded.stages).toEqual([]);
+  });
+
+  it("rejects execution modes whose static stage shape contradicts the mode", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-workflows-"));
+    await fs.writeFile(
+      path.join(dir, "bad.yaml"),
+      [
+        "id: bad",
+        "name: Bad",
+        "version: 1.0.0",
+        "execution_mode: hierarchical",
+        "stages:",
+        "  - id: implement",
+        "    name: Implement"
+      ].join("\n"),
+      "utf8"
+    );
+
+    const result = await new WorkflowRegistry(dir).listWithIssues();
+
+    expect(result.workflows).toEqual([]);
+    expect(result.issues[0]?.message).toContain("cannot declare a legacy stage pipeline");
+  });
+
   it("lets project workflows override builtin workflows by id", async () => {
     const builtinDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-builtin-"));
     const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-project-"));

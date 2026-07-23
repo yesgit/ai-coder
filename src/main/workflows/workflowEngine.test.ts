@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { WorkflowEngine } from "./workflowEngine.js";
+import { applyHierarchicalEvent } from "./hierarchicalWorkflowEngine.js";
 import type { AgentSession, WorkflowTemplate } from "../../shared/types.js";
 
 const workflow: WorkflowTemplate = {
@@ -279,6 +280,57 @@ describe("WorkflowEngine", () => {
       status: "running",
       input_summary: "Explain the result"
     });
+  });
+
+  it("starts a hierarchical follow-up as a fresh goal loop", () => {
+    const engine = new WorkflowEngine();
+    const hierarchicalWorkflow: WorkflowTemplate = {
+      ...workflow,
+      execution_mode: "hierarchical",
+      stages: []
+    };
+    const session = createSession();
+    session.status = "completed";
+    engine.ensureState(session, hierarchicalWorkflow);
+    const previousState = session.hierarchical_state;
+
+    engine.startFollowUp(session, hierarchicalWorkflow, "补充实现第二个入口");
+
+    expect(session.status).toBe("running");
+    expect(session.current_stage).toBe("align");
+    expect(session.hierarchical_state).not.toBe(previousState);
+    expect(session.hierarchical_state?.goal.statement).toBe("补充实现第二个入口");
+    expect(session.hierarchical_state?.requirements).toEqual([]);
+  });
+
+  it("clears retryable hierarchical host blockers on explicit resume", () => {
+    const engine = new WorkflowEngine();
+    const hierarchicalWorkflow: WorkflowTemplate = {
+      ...workflow,
+      execution_mode: "hierarchical",
+      stages: []
+    };
+    const session = createSession();
+    engine.ensureState(session, hierarchicalWorkflow);
+    session.hierarchical_state = applyHierarchicalEvent(session.hierarchical_state!, {
+      type: "blocker_raised",
+      blocker: {
+        id: "host-agent-failed",
+        kind: "agent_failed",
+        owner: "host",
+        message: "角色协议连续失败",
+        status: "open",
+        retryable: true,
+        user_input_required: false,
+        created_at: new Date().toISOString()
+      }
+    });
+    session.status = "interrupted";
+
+    engine.resumeFromFailedStage(session, hierarchicalWorkflow);
+
+    expect(session.status).toBe("running");
+    expect(session.hierarchical_state?.blockers[0]?.status).toBe("resolved");
   });
 
   it("auto-retries when missing required outputs and attempt count is below limit", () => {

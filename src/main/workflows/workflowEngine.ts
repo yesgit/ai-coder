@@ -9,6 +9,10 @@ import type {
   WorkflowStage,
   WorkflowTemplate
 } from "../../shared/types.js";
+import {
+  applyHierarchicalEvent,
+  createHierarchicalExecutionState
+} from "./hierarchicalWorkflowEngine.js";
 
 const OUTPUT_CONTRACT_REPAIR_RETRY_LIMIT = 5;
 
@@ -16,6 +20,14 @@ export class WorkflowEngine {
   ensureState(session: AgentSession, workflow: WorkflowTemplate): AgentSession {
     session.stage_runs ??= [];
     session.rework_requests ??= [];
+
+    if (workflow.execution_mode === "hierarchical") {
+      session.hierarchical_state ??= createHierarchicalExecutionState(session.task_prompt, {
+        source_refs: ["initial_user_message"]
+      });
+      session.current_stage = session.current_stage || "align";
+      return session;
+    }
 
     if (session.stage_runs.length === 0) {
       const firstStage = workflow.stages[0];
@@ -275,6 +287,19 @@ export class WorkflowEngine {
   resumeFromFailedStage(session: AgentSession, workflow: WorkflowTemplate): AgentSession {
     this.ensureState(session, workflow);
 
+    if (workflow.execution_mode === "hierarchical" && session.hierarchical_state) {
+      let state = session.hierarchical_state;
+      for (const blocker of state.blockers) {
+        if (blocker.status === "open" && blocker.retryable && !blocker.user_input_required) {
+          state = applyHierarchicalEvent(state, { type: "blocker_resolved", blocker_id: blocker.id });
+        }
+      }
+      session.hierarchical_state = state;
+      session.error = undefined;
+      session.status = "running";
+      return session;
+    }
+
     // Profile 模式：无阶段管线，只需重置状态让 runner 的自然循环接管
     if (workflow.stages.length === 0) {
       session.error = undefined;
@@ -316,11 +341,18 @@ export class WorkflowEngine {
     session.approvals = [];
     session.task_tree = undefined;
     session.exploration_checkpoints = undefined;
+    session.hierarchical_state = undefined;
     session.error = undefined;
     session.status = "running";
 
     // Profile 模式：无阶段管线，只需重置状态让 runner 的自然循环接管
     if (workflow.stages.length === 0) {
+      if (workflow.execution_mode === "hierarchical") {
+        session.hierarchical_state = createHierarchicalExecutionState(session.task_prompt, {
+          source_refs: ["initial_user_message"]
+        });
+        session.current_stage = "align";
+      }
       return session;
     }
 
@@ -348,11 +380,18 @@ export class WorkflowEngine {
     session.approved_external_paths = [];
     session.task_tree = undefined;
     session.exploration_checkpoints = undefined;
+    session.hierarchical_state = undefined;
     session.error = undefined;
     session.status = "running";
 
     // Profile 模式：无阶段管线，只需重置状态让 runner 的自然循环接管
     if (workflow.stages.length === 0) {
+      if (workflow.execution_mode === "hierarchical") {
+        session.hierarchical_state = createHierarchicalExecutionState(session.task_prompt, {
+          source_refs: ["initial_user_message"]
+        });
+        session.current_stage = "align";
+      }
       return session;
     }
 
@@ -368,6 +407,15 @@ export class WorkflowEngine {
 
   startFollowUp(session: AgentSession, workflow: WorkflowTemplate, inputSummary: string): AgentSession {
     if (this.getActiveStageRun(session)) {
+      return session;
+    }
+    if (workflow.execution_mode === "hierarchical") {
+      session.hierarchical_state = createHierarchicalExecutionState(inputSummary, {
+        source_refs: ["latest_user_message"]
+      });
+      session.current_stage = "align";
+      session.error = undefined;
+      session.status = "running";
       return session;
     }
     const firstStage = workflow.stages.find((stage) => !isProjectProfileStage(stage.id)) ?? workflow.stages[0];

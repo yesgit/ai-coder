@@ -2,7 +2,7 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { applyExplorationCheckpoint, augmentTaskInputWithExplorationMemory, buildClaudeSdkEnv, buildCompletionContinuationContext, buildExecutionProgressPromptSection, buildExplorationPromptSection, ClaudeAgentRunner, describeSdkMessageSnippet, describeToolAttempt, detectCorruptedToolName, ensureExplorationCheckpoint, evaluateHumanQuestionRequest, evaluateProfileCompletion, extractSdkTerminalError, extractSdkToolUses, extractToolExecutionResult, formatProfileAttachmentList, getExplorationActionGuardError, getSimpleDelegationGuardError, getSimpleExecutorPrerequisiteGuardError, getSimpleKnowledgeBoundaryGuardError, getSimplePlannerGuardError, hasSuccessfulSdkTerminalResult, isCheckpointWorthyProfileTranscript, parseBestStageAgentResult, syncPhaseTaskTreeWithCheckpoint, validateProfileToolInput } from "./claudeAgentRunner.js";
+import { applyExplorationCheckpoint, augmentTaskInputWithExplorationMemory, buildClaudeSdkEnv, buildCompletionContinuationContext, buildExecutionProgressPromptSection, buildExplorationPromptSection, ClaudeAgentRunner, describeSdkMessageSnippet, describeToolAttempt, detectCorruptedToolName, ensureExplorationCheckpoint, evaluateHumanQuestionRequest, evaluateProfileCompletion, extractSdkTerminalError, extractSdkToolUses, extractToolExecutionResult, formatProfileAttachmentList, formatSdkCatalogItem, getExplorationActionGuardError, getHierarchicalProjectPathError, getSimpleDelegationGuardError, getSimpleExecutorPrerequisiteGuardError, getSimpleKnowledgeBoundaryGuardError, getSimplePlannerGuardError, hasSuccessfulSdkTerminalResult, isCheckpointWorthyProfileTranscript, normalizeHierarchicalLeasePath, parseBestStageAgentResult, syncPhaseTaskTreeWithCheckpoint, validateProfileToolInput } from "./claudeAgentRunner.js";
 import type { AgentSession, WorkflowTemplate } from "../../shared/types.js";
 
 const workflow: WorkflowTemplate = {
@@ -644,6 +644,46 @@ describe("ClaudeAgentRunner", () => {
     await expect(validateProfileToolInput("Bash", {
       command: "find /tmp/project -type f\n</"
     })).resolves.toContain("损坏的工具协议尾标");
+  });
+
+  it("rejects guessed hierarchical project roots with the exact registered root", () => {
+    const session = {
+      id: "hierarchical-path-root",
+      project_path: "/home/user/projects/huaxiafortune",
+      workflow_id: "hierarchical",
+      task_prompt: "实现页面跳转",
+      status: "running",
+      current_stage: "R1/implement",
+      messages: [],
+      tool_calls: [],
+      file_changes: [],
+      approvals: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    } as AgentSession;
+
+    expect(getHierarchicalProjectPathError(session, "Read", {
+      file_path: "lib/views/homepage/utils/homepageRedirection.js"
+    })).toBeNull();
+    expect(getHierarchicalProjectPathError(session, "Edit", {
+      file_path: "/home/user/projects/huaxiafortune/lib/views/homepage/utils/homepageRedirection.js"
+    })).toBeNull();
+    expect(getHierarchicalProjectPathError(session, "Edit", {
+      file_path: "/workspace/lib/views/homepage/utils/homepageRedirection.js"
+    })).toContain("唯一项目根目录是 /home/user/projects/huaxiafortune");
+    expect(getHierarchicalProjectPathError(session, "Read", {
+      file_path: "../../lib/views/homepage/utils/homepageRedirection.js"
+    })).toContain("路径越出当前项目");
+    expect(getHierarchicalProjectPathError(session, "Bash", {
+      command: "cd /workspace && git status"
+    })).toContain("Bash cd 路径越出当前项目");
+    expect(getHierarchicalProjectPathError(session, "Bash", {
+      command: "git status"
+    })).toBeNull();
+    expect(normalizeHierarchicalLeasePath(
+      session.project_path,
+      "“lib/Const/RouterDisplayName.js”"
+    )).toBe("lib/Const/RouterDisplayName.js");
   });
 
   it("requires exact host paths for uploaded attachments without restricting ordinary project resources", async () => {
@@ -4019,6 +4059,10 @@ describe("describeSdkMessageSnippet", () => {
 
   it("assistant 无 content", () => {
     expect(describeSdkMessageSnippet({ type: "assistant", message: { content: [] } })).toBe("助手消息（无文本）");
+    expect(describeSdkMessageSnippet({
+      type: "assistant",
+      message: { content: [{ type: "text", text: "(no content)" }] }
+    })).toBe("助手消息（无文本）");
   });
 
   it("result / tool_result / 其他类型", () => {
@@ -4026,6 +4070,11 @@ describe("describeSdkMessageSnippet", () => {
     expect(describeSdkMessageSnippet({ type: "result", subtype: "error_max_turns", is_error: true })).toBe("SDK 查询结束：error_max_turns，错误");
     expect(describeSdkMessageSnippet({ type: "tool_result" })).toBe("工具结果");
     expect(describeSdkMessageSnippet({ type: "system" })).toBe("SDK:system");
+  });
+
+  it("filters SDK user tool-result envelopes and formats plugin objects", () => {
+    expect(describeSdkMessageSnippet({ type: "user", message: { content: [] } })).toBe("");
+    expect(formatSdkCatalogItem({ type: "local", path: "/plugins/careful-coder" })).toBe("/plugins/careful-coder");
   });
 });
 

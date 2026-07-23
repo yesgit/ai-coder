@@ -169,6 +169,7 @@ const workflowSchema = z.object({
   name: z.string().min(1),
   version: z.string().min(1),
   description: z.string().default(""),
+  execution_mode: z.enum(["legacy_stage", "profile", "hierarchical"]).optional(),
   source: z
     .object({
       id: z.string().min(1).optional(),
@@ -281,6 +282,21 @@ const workflowSchema = z.object({
       })
     )
     .default([])
+}).superRefine((workflow, ctx) => {
+  if ((workflow.execution_mode === "profile" || workflow.execution_mode === "hierarchical") && workflow.stages.length > 0) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["stages"],
+      message: `${workflow.execution_mode} execution_mode cannot declare a legacy stage pipeline`
+    });
+  }
+  if (workflow.execution_mode === "legacy_stage" && workflow.stages.length === 0) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["stages"],
+      message: "legacy_stage execution_mode requires at least one stage"
+    });
+  }
 });
 
 function normalizeWorkflow(input: unknown, sourceType: WorkflowSourceType, filePath: string): WorkflowTemplate {
@@ -297,6 +313,7 @@ function normalizeWorkflow(input: unknown, sourceType: WorkflowSourceType, fileP
     name: workflow.name,
     version: workflow.version,
     description: workflow.description,
+    execution_mode: workflow.execution_mode,
     source: {
       type: sourceType,
       id: workflow.source?.id ?? workflow.id,

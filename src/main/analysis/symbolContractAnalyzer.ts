@@ -71,6 +71,8 @@ export interface SymbolContractAnalysis {
   };
   coverage: {
     language: "typescript-javascript";
+    analysis_mode: "project-config" | "syntax-fallback";
+    configuration_warnings: string[];
     files_scanned: number;
     total_call_sites: number;
     total_public_wrappers: number;
@@ -127,7 +129,8 @@ export function analyzeSymbolContract(input: AnalyzeSymbolContractInput): Symbol
     : path.resolve(projectPath, input.targetFile);
   assertInsideProject(projectPath, targetFile);
 
-  const program = createProgram(projectPath, targetFile);
+  const programBuild = createProgram(projectPath, targetFile);
+  const program = programBuild.program;
   const checker = program.getTypeChecker();
   const sourceFile = program.getSourceFile(targetFile);
   if (!sourceFile) {
@@ -205,6 +208,8 @@ export function analyzeSymbolContract(input: AnalyzeSymbolContractInput): Symbol
     },
     coverage: {
       language: "typescript-javascript",
+      analysis_mode: programBuild.mode,
+      configuration_warnings: programBuild.warnings,
       files_scanned: projectSources.length,
       total_call_sites: callSites.length,
       total_public_wrappers: wrappers.length,
@@ -252,48 +257,83 @@ export function analyzeSymbolContract(input: AnalyzeSymbolContractInput): Symbol
   return result;
 }
 
-function createProgram(projectPath: string, targetFile: string): ts.Program {
+function createProgram(
+  projectPath: string,
+  targetFile: string
+): {
+  program: ts.Program;
+  mode: "project-config" | "syntax-fallback";
+  warnings: string[];
+} {
   const configPath = ts.findConfigFile(projectPath, ts.sys.fileExists, "tsconfig.json");
   if (configPath) {
     const config = ts.readConfigFile(configPath, ts.sys.readFile);
-    if (config.error) {
-      throw new Error(formatDiagnostic(config.error));
+    if (!config.error) {
+      const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, path.dirname(configPath), {
+        noEmit: true,
+        allowJs: true
+      }, configPath);
+      if (parsed.errors.length === 0) {
+        const allProjectFiles = discoverProjectSources(projectPath);
+        const rootNames = [...new Set([...parsed.fileNames, ...allProjectFiles, targetFile])];
+        return {
+          program: ts.createProgram({ rootNames, options: parsed.options }),
+          mode: "project-config",
+          warnings: []
+        };
+      }
+      return createFallbackProgram(
+        projectPath,
+        targetFile,
+        parsed.errors.map(formatDiagnostic)
+      );
     }
-    const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, path.dirname(configPath), {
-      noEmit: true,
-      allowJs: true
-    }, configPath);
-    if (parsed.errors.length > 0) {
-      throw new Error(parsed.errors.map(formatDiagnostic).join("\n"));
-    }
-    const allProjectFiles = ts.sys.readDirectory(
+    return createFallbackProgram(
       projectPath,
-      [".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"],
-      ["**/node_modules/**", "**/dist/**", "**/build/**", "**/release/**", "**/.git/**"]
+      targetFile,
+      [formatDiagnostic(config.error)]
     );
-    const rootNames = [...new Set([...parsed.fileNames, ...allProjectFiles, targetFile])];
-    return ts.createProgram({ rootNames, options: parsed.options });
   }
 
-  const rootNames = ts.sys.readDirectory(
+  return createFallbackProgram(projectPath, targetFile, []);
+}
+
+function createFallbackProgram(
+  projectPath: string,
+  targetFile: string,
+  warnings: string[]
+): {
+  program: ts.Program;
+  mode: "syntax-fallback";
+  warnings: string[];
+} {
+  const rootNames = discoverProjectSources(projectPath);
+  if (!rootNames.includes(targetFile)) rootNames.push(targetFile);
+  return {
+    program: ts.createProgram({
+      rootNames,
+      options: {
+        allowJs: true,
+        checkJs: false,
+        jsx: ts.JsxEmit.ReactJSX,
+        module: ts.ModuleKind.NodeNext,
+        moduleResolution: ts.ModuleResolutionKind.NodeNext,
+        noEmit: true,
+        skipLibCheck: true,
+        target: ts.ScriptTarget.ES2022
+      }
+    }),
+    mode: "syntax-fallback",
+    warnings
+  };
+}
+
+function discoverProjectSources(projectPath: string): string[] {
+  return ts.sys.readDirectory(
     projectPath,
     [".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"],
-    ["node_modules", "dist", "build", "release", ".git"]
+    ["**/node_modules/**", "**/dist/**", "**/build/**", "**/release/**", "**/.git/**"]
   );
-  if (!rootNames.includes(targetFile)) rootNames.push(targetFile);
-  return ts.createProgram({
-    rootNames,
-    options: {
-      allowJs: true,
-      checkJs: false,
-      jsx: ts.JsxEmit.ReactJSX,
-      module: ts.ModuleKind.NodeNext,
-      moduleResolution: ts.ModuleResolutionKind.NodeNext,
-      noEmit: true,
-      skipLibCheck: true,
-      target: ts.ScriptTarget.ES2022
-    }
-  });
 }
 
 function resolveTargetSymbol(

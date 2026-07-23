@@ -29,6 +29,7 @@ import {
 } from "./pastedTextAttachment.js";
 import TaskTreePanel from "./TaskTreePanel.js";
 import ExplorationPanel from "./ExplorationPanel.js";
+import HierarchicalLoopPanel from "./HierarchicalLoopPanel.js";
 import {
   formatStageName,
   formatStatus,
@@ -784,7 +785,9 @@ export default function App() {
   );
   const timeline = useMemo(() => timelineAll.slice(0, timelineLimit), [timelineAll, timelineLimit]);
   const showMoreTimeline = timelineAll.length > timelineLimit;
+  const isHierarchicalMode = activeWorkflow?.execution_mode === "hierarchical" || Boolean(activeSession?.hierarchical_state);
   const isProfileMode = (activeWorkflow?.stages.length ?? 0) === 0;
+  const isLegacyProfileMode = isProfileMode && !isHierarchicalMode;
   const activityEvents = useMemo(
     () => (activeSession?.progress_events ?? [])
       .filter((p) => isProfileMode || p.visibility === "transient")
@@ -1435,11 +1438,13 @@ export default function App() {
 
           {activeWorkflow && (
             <div className="right-panel">
-              {isProfileMode && (
+              {isHierarchicalMode ? (
+                <HierarchicalLoopPanel state={activeSession?.hierarchical_state} />
+              ) : isLegacyProfileMode ? (
                 <ExplorationPanel checkpoints={activeSession?.exploration_checkpoints} />
-              )}
-              <TaskTreePanel taskTree={activeSession?.task_tree} />
-              {isProfileMode ? (
+              ) : null}
+              {!isHierarchicalMode && <TaskTreePanel taskTree={activeSession?.task_tree} />}
+              {isHierarchicalMode ? null : isLegacyProfileMode ? (
                 <div className="stages-panel">
                   <h3>{activeWorkflow.name}</h3>
                   <p className="muted" style={{ fontSize: "0.85em", marginBottom: "12px" }}>

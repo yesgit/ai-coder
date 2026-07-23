@@ -36,6 +36,28 @@ describe("SessionStore", () => {
     expect(session.stage_runs?.[0]).toMatchObject({ stage_id: "plan", attempt: 1, status: "running" });
   });
 
+  it("bootstraps hierarchical sessions with a goal loop instead of a legacy stage run", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-sessions-"));
+    const store = new SessionStore(dir);
+    const hierarchicalWorkflow: WorkflowTemplate = {
+      ...workflow,
+      id: "hierarchical",
+      execution_mode: "hierarchical",
+      stages: []
+    };
+
+    const session = await store.create("/tmp/project", hierarchicalWorkflow, "实现第 33 页开始的所有跳转");
+
+    expect(session.current_stage).toBe("align");
+    expect(session.hierarchical_state).toMatchObject({
+      version: 1,
+      macro_phase: "align",
+      goal: { id: "G1", statement: "实现第 33 页开始的所有跳转" },
+      requirements: []
+    });
+    expect(session.stage_runs).toEqual([]);
+  });
+
   it("records onboarding admission snapshots", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ai-coder-sessions-"));
     const store = new SessionStore(dir);

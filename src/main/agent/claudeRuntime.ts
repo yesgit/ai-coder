@@ -1,12 +1,14 @@
 import { execFile } from "node:child_process";
 import { access, readFile, stat } from "node:fs/promises";
 import { existsSync, readdirSync } from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import os from "node:os";
 import { promisify } from "node:util";
 import type { AgentRuntimeStatus } from "../../shared/types.js";
 
 const execFileAsync = promisify(execFile);
+const require = createRequire(import.meta.url);
 
 let nodeExecutablePromise: Promise<NodeExecutableInfo | null> | undefined;
 
@@ -49,6 +51,7 @@ export function selectClaudeProviderEnvironment(
 }
 
 export async function getClaudeRuntimeStatus(): Promise<AgentRuntimeStatus> {
+  const nativeClaudeCode = resolveBundledClaudeCodeExecutable();
   const [sdkAvailable, nodeInfo, authAvailable] = await Promise.all([
     isClaudeSdkAvailable(),
     resolveNodeExecutable(),
@@ -59,9 +62,11 @@ export async function getClaudeRuntimeStatus(): Promise<AgentRuntimeStatus> {
   if (!sdkAvailable) {
     diagnostics.push("Claude Agent SDK package is not available.");
   }
-  if (!nodeInfo) {
+  if (!nodeInfo && !nativeClaudeCode) {
     diagnostics.push("No Node.js runtime could be located (system node missing and Electron fallback failed).");
-  } else if (nodeInfo.source === "electron") {
+  } else if (nativeClaudeCode) {
+    diagnostics.push("Using bundled native Claude Code runtime.");
+  } else if (nodeInfo?.source === "electron") {
     diagnostics.push("Using bundled Electron as Node runtime (ELECTRON_RUN_AS_NODE).");
   }
   if (!authAvailable) {
@@ -71,10 +76,43 @@ export async function getClaudeRuntimeStatus(): Promise<AgentRuntimeStatus> {
   return {
     mode: sdkAvailable ? "live" : "mock",
     sdk_available: sdkAvailable,
-    node_runtime_available: Boolean(nodeInfo),
+    node_runtime_available: Boolean(nodeInfo || nativeClaudeCode),
     auth_env_available: authAvailable,
     diagnostics
   };
+}
+
+/**
+ * SDK 0.3+ ships Claude Code as a platform-native executable. Electron cannot execute a
+ * binary directly from app.asar, so packaging places it in app.asar.unpacked and this
+ * resolver rewrites the virtual path to the real filesystem path.
+ */
+export function resolveBundledClaudeCodeExecutable(): string | undefined {
+  const packageName = claudeCodePlatformPackage();
+  if (!packageName) return undefined;
+  try {
+    const resolved = require.resolve(`${packageName}/claude${process.platform === "win32" ? ".exe" : ""}`);
+    const unpacked = resolved.replace(
+      `${path.sep}app.asar${path.sep}`,
+      `${path.sep}app.asar.unpacked${path.sep}`
+    );
+    return unpacked !== resolved && existsSync(unpacked) ? unpacked : resolved;
+  } catch {
+    return undefined;
+  }
+}
+
+function claudeCodePlatformPackage(): string | undefined {
+  const arch = process.arch === "x64" || process.arch === "arm64" ? process.arch : undefined;
+  if (!arch) return undefined;
+  if (process.platform === "darwin") return `@anthropic-ai/claude-agent-sdk-darwin-${arch}`;
+  if (process.platform === "win32") return `@anthropic-ai/claude-agent-sdk-win32-${arch}`;
+  if (process.platform !== "linux") return undefined;
+  const report = (typeof process.report?.getReport === "function"
+    ? process.report.getReport()
+    : undefined) as { header?: { glibcVersionRuntime?: string } } | undefined;
+  const isMusl = Boolean(report && !report.header?.glibcVersionRuntime);
+  return `@anthropic-ai/claude-agent-sdk-linux-${arch}${isMusl ? "-musl" : ""}`;
 }
 
 export async function shouldUseClaudeSdk(): Promise<boolean> {
