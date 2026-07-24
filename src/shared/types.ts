@@ -549,6 +549,14 @@ export interface HierarchicalWorkUnit {
   started_at?: string;
   completed_at?: string;
   failure_reason?: string;
+  /**
+   * Host-side validation failures accumulated for the current leaf retry.
+   * Keeping more than the latest error prevents alternating validators from
+   * sending a fresh role back and forth between two incompatible drafts.
+   */
+  correction_history?: string[];
+  /** Bounded rejected draft that the next attempt should repair in place. */
+  last_rejected_output?: string;
 }
 
 export interface HierarchicalPhaseRun {
@@ -561,6 +569,7 @@ export interface HierarchicalPhaseRun {
   status: "running" | "passed" | "failed" | "interrupted" | "superseded";
   evidence_refs: string[];
   error_fingerprint?: string;
+  failure_reason?: string;
   started_at: string;
   completed_at?: string;
   /** 本次通过后形成的、可直接交给下一阶段的结构化产物。 */

@@ -222,6 +222,11 @@ function buildPhaseSpec(
     artifact.requirement_id === requirement.id
   );
   const phaseSpecific = phaseInstructions(operation.phase, requirement, workUnit.allowed_files);
+  const correctionHistory = workUnit.correction_history ?? [];
+  const hasCorrectionContext = workUnit.attempt > 1
+    || Boolean(workUnit.failure_reason)
+    || correctionHistory.length > 0
+    || Boolean(workUnit.last_rejected_output);
   return {
     role: operation.role,
     phaseLabel: `${requirement.id}/${operation.phase}`,
@@ -232,11 +237,23 @@ function buildPhaseSpec(
       `## 谨慎程序员心智\n${workflow.description}`,
       "## 当前循环栈",
       `${state.goal.id} > ${requirement.id} > ${operation.phase} > ${workUnit.id}`,
-      ...(workUnit.attempt > 1
+      ...(hasCorrectionContext
         ? [
             "## 当前阶段自愈重试",
             `这是 attempt ${workUnit.attempt}；上次未通过原因：${workUnit.failure_reason ?? "阶段交接契约未满足"}`,
-            "只修复该失败点并复用下方仍为 fresh 的交接物；不要从头重读、不要改写 Goal、不要回退此前 R-ID。"
+            ...(correctionHistory.length > 0
+              ? [
+                  "宿主已累计的拒绝原因（后一次修正不能重新引入前一次错误）：",
+                  ...correctionHistory.map((reason, index) => `${index + 1}. ${reason}`)
+                ]
+              : []),
+            ...(workUnit.last_rejected_output
+              ? [
+                  "上次被拒绝的结构化草稿如下；复制后只修正被指出的字段，不要丢弃已完成调查：",
+                  workUnit.last_rejected_output
+                ]
+              : []),
+            "同一阶段已成功完成的只读工具证据仍由宿主保留。只修复列出的失败点；不要从头重读、不要提前实现、不要向用户申请阶段工具。"
           ]
         : []),
       "## 当前需求",
@@ -797,10 +814,12 @@ function phaseInstructions(
       return [
         "只读取证：建立调用契约、pre-behavior、修改处置和验证入口。需要修改时必须返回非空 allowed_files；完整契约已满足时走有证据的 no-op。",
         "对每个将调用、复用或修改的既有函数/组件，优先使用 analyze_symbol_contract，并完整覆盖 contract、calls、wrappers、references 及全部分页。",
-        "如果目标不受分析器支持，必须改为 manual-static-analysis，说明原因并用 path:line 补齐同样的调用契约维度。",
+        "analyzed_targets 只登记函数、方法、类或组件等真实调用契约目标；常量表、路由配置对象、静态数据和样式文件即使列入 allowed_files，也不要为了凑文件覆盖伪造符号契约目标。",
+        "如果真实调用契约目标不受分析器支持，才改为 manual-static-analysis，说明原因并用 path:line 补齐同样的契约维度。纯静态配置改动直接写入 patch_plan、pre_behavior 和 allowed_files。",
         "必须把 investigate 选中的同功能入口落实为 reference_application，并生成恰好六类稳定 behavior_obligations：destination、invocation、arguments、preconditions、context、side_effects。",
         "默认逐维度复用同功能入口。任何 intentional-difference 都必须引用用户要求或既有架构证据；不能以‘当前代码已经这样写’作为差异依据。",
-        "若六类义务已全部满足，返回 change_disposition=already_satisfied、空 allowed_files 和逐项 satisfaction_evidence，宿主将跳过 implement 直接独立验证；否则返回 changes_required 和非空 allowed_files。"
+        "若六类义务已全部满足，返回 change_disposition=already_satisfied、空 allowed_files 和逐项 satisfaction_evidence，宿主将跳过 implement 直接独立验证；否则返回 changes_required 和非空 allowed_files。",
+        "prepare 是只读阶段，不需要 Edit。提交合格 handoff 后宿主会自动进入 implement 并授予 allowed_files 的 Edit 权限；不得改用 Bash 写文件，也不得要求用户启用内部工具。"
       ].join("\n");
     case "implement":
       return [

@@ -118,6 +118,7 @@ export type HierarchicalEvent =
       reason: string;
       route: "retry" | "investigate" | "prepare" | "implement" | "blocked";
       error_fingerprint?: string;
+      rejected_output?: string;
       occurred_at?: string;
     }
   | { type: "requirement_closed"; requirement_id: string; occurred_at?: string }
@@ -775,7 +776,12 @@ function failPhase(
   workUnit.status = event.route === "blocked" ? "blocked" : "failed";
   workUnit.completed_at = now;
   workUnit.failure_reason = event.reason;
-  settleCurrentPhaseRun(state, workUnit.id, "failed", now, [], event.error_fingerprint);
+  workUnit.correction_history = unique([
+    ...(workUnit.correction_history ?? []),
+    event.reason
+  ]).slice(-4);
+  if (event.rejected_output) workUnit.last_rejected_output = event.rejected_output;
+  settleCurrentPhaseRun(state, workUnit.id, "failed", now, [], event.error_fingerprint, event.reason);
 
   if (event.route === "blocked") {
     requirement.status = "blocked";
@@ -794,13 +800,17 @@ function failPhase(
     }
   }
   requirement.current_phase = event.route;
-  state.active_work_unit = createWorkUnit(
+  const recoveryWorkUnit = createWorkUnit(
     state,
     requirement.id,
     event.route,
     1,
     event.route === "implement" ? workUnit.allowed_files : []
   );
+  recoveryWorkUnit.failure_reason = `下游 ${workUnit.phase} 未通过：${event.reason}`;
+  recoveryWorkUnit.correction_history = [...(workUnit.correction_history ?? [])];
+  recoveryWorkUnit.last_rejected_output = workUnit.last_rejected_output;
+  state.active_work_unit = recoveryWorkUnit;
 }
 
 function closeRequirement(state: HierarchicalExecutionState, requirementId: string): void {
@@ -1021,7 +1031,8 @@ function settleCurrentPhaseRun(
   status: "passed" | "failed",
   now: string,
   evidenceRefs: string[],
-  errorFingerprint?: string
+  errorFingerprint?: string,
+  failureReason?: string
 ): void {
   const run = [...state.phase_runs].reverse().find((item) =>
     item.work_unit_id === workUnitId && item.status === "running"
@@ -1031,6 +1042,7 @@ function settleCurrentPhaseRun(
   run.completed_at = now;
   run.evidence_refs = unique(evidenceRefs);
   if (errorFingerprint) run.error_fingerprint = errorFingerprint;
+  if (failureReason) run.failure_reason = failureReason;
 }
 
 function hasValidRequirementOrder(requirements: PlannedRequirement[]): boolean {

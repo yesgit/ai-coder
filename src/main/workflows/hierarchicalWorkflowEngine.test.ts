@@ -353,6 +353,55 @@ describe("hierarchical workflow engine", () => {
     })).toThrow("需要修改时必须签发非空 allowed_files");
   });
 
+  it("preserves rejected phase drafts and distinct correction reasons across retries", () => {
+    let state = activateR33();
+    state = passCurrentPhase(state);
+    const workUnitId = state.active_work_unit!.id;
+    state = applyHierarchicalEvent(state, {
+      type: "phase_started",
+      work_unit_id: workUnitId,
+      occurred_at: NOW
+    });
+    state = applyHierarchicalEvent(state, {
+      type: "phase_failed",
+      work_unit_id: workUnitId,
+      reason: "缺少 selected reference",
+      route: "retry",
+      error_fingerprint: "missing-reference",
+      rejected_output: "{\"status\":\"passed\",\"handoff\":{}}",
+      occurred_at: NOW
+    });
+    state = applyHierarchicalEvent(state, {
+      type: "phase_started",
+      work_unit_id: workUnitId,
+      occurred_at: NOW
+    });
+    state = applyHierarchicalEvent(state, {
+      type: "phase_failed",
+      work_unit_id: workUnitId,
+      reason: "manual target should be removed",
+      route: "retry",
+      error_fingerprint: "manual-target",
+      rejected_output: "{\"status\":\"passed\",\"handoff\":{\"call_contract\":{}}}",
+      occurred_at: NOW
+    });
+
+    expect(state.active_work_unit).toMatchObject({
+      id: workUnitId,
+      status: "ready",
+      attempt: 3,
+      correction_history: [
+        "缺少 selected reference",
+        "manual target should be removed"
+      ],
+      last_rejected_output: "{\"status\":\"passed\",\"handoff\":{\"call_contract\":{}}}"
+    });
+    expect(state.phase_runs.filter((run) => run.status === "failed")).toEqual([
+      expect.objectContaining({ failure_reason: "缺少 selected reference" }),
+      expect.objectContaining({ failure_reason: "manual target should be removed" })
+    ]);
+  });
+
   it("skips implement when prepare proves the full behavior contract is already satisfied", () => {
     let state = activateR33();
     state = passCurrentPhase(state);

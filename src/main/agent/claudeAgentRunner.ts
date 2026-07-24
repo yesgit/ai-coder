@@ -71,6 +71,16 @@ interface HierarchicalRoleQueryResult {
   transcript: string;
 }
 
+class HierarchicalRoleValidationError extends Error {
+  readonly rejectedOutput?: string;
+
+  constructor(message: string, rejectedOutput?: string) {
+    super(message);
+    this.name = "HierarchicalRoleValidationError";
+    this.rejectedOutput = rejectedOutput;
+  }
+}
+
 interface HierarchicalWorkUnitSnapshot {
   work_unit_id: string;
   files: Array<{
@@ -437,12 +447,14 @@ export class ClaudeAgentRunner {
               this.raiseHierarchicalHostBlocker(input.session, "agent_failed", error, { fingerprint });
             }
           } else if (roleOperation.kind === "run_phase") {
+            const failedAttempt = input.session.hierarchical_state?.active_work_unit?.attempt ?? 1;
             const previousRepeats = countConsecutiveHierarchicalPhaseFailures(
               input.session,
               roleOperation.work_unit_id,
               fingerprint
             );
             const repeats = previousRepeats + 1;
+            const sameFailureLimit = roleOperation.phase === "investigate" ? 6 : 3;
             const recoveryRoute = repeats >= 3
               ? hierarchicalPhaseSelfHealRoute(roleOperation.phase)
               : "retry";
@@ -451,20 +463,26 @@ export class ClaudeAgentRunner {
               work_unit_id: roleOperation.work_unit_id,
               reason: message,
               route: recoveryRoute,
-              error_fingerprint: fingerprint
+              error_fingerprint: fingerprint,
+              ...(error instanceof HierarchicalRoleValidationError && error.rejectedOutput
+                ? { rejected_output: error.rejectedOutput }
+                : {})
             }]);
+            const retryBasis = error instanceof HierarchicalRoleValidationError && error.rejectedOutput
+              ? "基于被拒草稿"
+              : "保留已完成证据";
             if (repeats >= 3 && recoveryRoute !== "retry") {
               await this.recordProgress(
                 input,
                 "status",
-                `当前 ${roleOperation.phase} 连续 ${repeats} 次遇到同类问题；宿主保持 Goal 运行并退回 ${recoveryRoute} 自愈：${message}`,
+                `当前 ${roleOperation.phase} 的工作单元 attempt ${failedAttempt} 连续 ${repeats} 次遇到同类问题；宿主保留被拒草稿与历史原因，并退回 ${recoveryRoute} 自愈：${message}`,
                 "milestone"
               );
             } else {
               await this.recordProgress(
                 input,
                 "status",
-                `阶段角色失败，宿主仅重试当前工作单元（${repeats}/6）：${message}`,
+                `阶段输出未通过宿主校验；将${retryBasis}定向修正当前工作单元（attempt ${failedAttempt}；同类问题 ${repeats}/${sameFailureLimit}）：${message}`,
                 "milestone"
               );
             }
@@ -583,7 +601,11 @@ export class ClaudeAgentRunner {
         ...(this.options.pluginPaths?.length
           ? { plugins: this.options.pluginPaths.map((pluginPath) => ({ type: "local" as const, path: pluginPath })) }
           : {}),
-        tools: spec.tools,
+        // Keep guarded write tools visible even during read-only phases. If a model
+        // reaches for Edit too early, canUseTool can explain the phase transition;
+        // hiding it produces an unhelpful "No such tool" and often causes Bash or
+        // ask_human workarounds.
+        tools: buildHierarchicalSdkToolSurface(spec.tools),
         disallowedTools: buildDisallowedClaudeTools(input.workflow),
         permissionMode: "default",
         settingSources: [],
@@ -593,6 +615,10 @@ export class ClaudeAgentRunner {
           toolInput: Record<string, unknown>,
           options: { toolUseID: string }
         ) => {
+          const hierarchicalMcpBoundary = getHierarchicalMcpBoundaryMessage(input.session, toolName);
+          if (hierarchicalMcpBoundary) {
+            return recoverableDenial("hierarchical-mcp-boundary", hierarchicalMcpBoundary);
+          }
           const projectPathError = operation.kind === "run_alignment_batch"
             ? null
             : getHierarchicalProjectPathError(input.session, toolName, toolInput);
@@ -618,11 +644,12 @@ export class ClaudeAgentRunner {
             return recoverableDenial("malformed-tool-input", `分层角色工具参数无效：${malformed}`);
           }
           if (toolName === "Bash" && isMutatingShellCommand(String(toolInput.command ?? ""))) {
-            const message = [
-              "分层角色的 Bash 仅用于读取和验证；代码修改必须通过受租约约束的 Edit。",
-              "分支、stash、reset、restore 属于已锁定的 Goal 工作区契约，当前叶子角色不得重做；请保留已完成 R-ID 的累计修改并继续当前需求。"
-            ].join(" ");
+            const message = hierarchicalMutatingShellCorrection(operation);
             return recoverableDenial("mutating-shell", message);
+          }
+          const leaseError = getHierarchicalCapabilityLeaseError(input.session, toolName, toolInput);
+          if (leaseError) {
+            return recoverableDenial("file-lease", leaseError);
           }
           const writeSafetyError = await getHierarchicalWriteSafetyError(
             input.session,
@@ -631,10 +658,6 @@ export class ClaudeAgentRunner {
           );
           if (writeSafetyError) {
             return recoverableDenial("overwrite-existing-file", writeSafetyError);
-          }
-          const leaseError = getHierarchicalCapabilityLeaseError(input.session, toolName, toolInput);
-          if (leaseError) {
-            return recoverableDenial("file-lease", leaseError);
           }
           const safety = checkCommandSafety(stageId, toolName, toolInput);
           if (!safety.allow) {
@@ -686,7 +709,11 @@ export class ClaudeAgentRunner {
         }
       }
     } catch (error) {
-      if (abortController.signal.aborted || !hasSuccessfulSdkTerminalResult(sdkMessages)) {
+      const recoverableStructuredDraft = extractRecoverableStructuredOutputToolInput(sdkMessages);
+      if (
+        abortController.signal.aborted
+        || (!hasSuccessfulSdkTerminalResult(sdkMessages) && !recoverableStructuredDraft)
+      ) {
         throw enrichClaudeSdkProcessError(error, sdkStderr);
       }
       postResultProcessError = error;
@@ -694,34 +721,60 @@ export class ClaudeAgentRunner {
 
     if (abortController.signal.aborted) throw new Error("分层角色查询被中止");
     const output = extractClaudeStageOutput(sdkMessages);
-    if (output.error) throw new Error(output.error);
-    const transcript = formatClaudeTranscript(sdkMessages) || formatStructuredOutput(output.structuredOutput);
+    const recoveredStructuredOutput = output.structuredOutput === undefined
+      ? extractRecoverableStructuredOutputToolInput(sdkMessages)
+      : undefined;
+    if (output.error && !recoveredStructuredOutput) throw new Error(output.error);
+    if (recoveredStructuredOutput) {
+      await this.recordProgress(
+        input,
+        "tool_policy",
+        [
+          `宿主已从轻微损坏的 StructuredOutput 工具名恢复 ${spec.phaseLabel} 草稿，并继续执行同一套阶段校验。`,
+          ...(output.error ? [`SDK 原错误已降级为可修正协议噪声：${output.error.slice(0, 160)}`] : [])
+        ].join(" "),
+        "milestone"
+      );
+    }
     const structured = output.structuredOutput !== undefined
       ? output.structuredOutput
-      : output.resultText || output.assistantText;
-    validateHierarchicalPlannerEnumeratedCoverage(input.session, operation, structured);
-    const events = parseHierarchicalRoleResult(operation, structured);
-    validateHierarchicalContractToolEvidence(input.session, operation, events, stageId);
-    validateHierarchicalBehaviorObligationContinuity(input.session, operation, events);
-    for (const event of events) {
-      if (event.type !== "phase_passed" || !event.allowed_files) continue;
-      const normalizedAllowedFiles: string[] = [];
-      for (const filePath of event.allowed_files) {
-        const normalized = normalizeHierarchicalLeasePath(input.session.project_path, filePath);
-        if (normalized !== filePath) {
-          await this.recordProgress(
-            input,
-            "tool_policy",
-            `宿主已将 allowed_files 中的格式噪声规范化：${filePath} → ${normalized}`,
-            "milestone"
-          );
+      : recoveredStructuredOutput ?? (output.resultText || output.assistantText);
+    const transcript = recoveredStructuredOutput
+      ? formatStructuredOutput(recoveredStructuredOutput)
+      : formatClaudeTranscript(sdkMessages) || formatStructuredOutput(structured);
+    let events: HierarchicalEvent[];
+    try {
+      validateHierarchicalPlannerEnumeratedCoverage(input.session, operation, structured);
+      events = parseHierarchicalRoleResult(operation, structured);
+      validateHierarchicalContractToolEvidence(input.session, operation, events, stageId);
+      validateHierarchicalBehaviorObligationContinuity(input.session, operation, events);
+      for (const event of events) {
+        if (event.type !== "phase_passed" || !event.allowed_files) continue;
+        const normalizedAllowedFiles: string[] = [];
+        for (const filePath of event.allowed_files) {
+          const normalized = normalizeHierarchicalLeasePath(input.session.project_path, filePath);
+          if (normalized !== filePath) {
+            await this.recordProgress(
+              input,
+              "tool_policy",
+              `宿主已将 allowed_files 中的格式噪声规范化：${filePath} → ${normalized}`,
+              "milestone"
+            );
+          }
+          normalizedAllowedFiles.push(normalized);
         }
-        normalizedAllowedFiles.push(normalized);
+        event.allowed_files = [...new Set(normalizedAllowedFiles)];
+        for (const filePath of event.allowed_files) {
+          await assertPathInsideProject(input.session.project_path, filePath);
+        }
       }
-      event.allowed_files = [...new Set(normalizedAllowedFiles)];
-      for (const filePath of event.allowed_files) {
-        await assertPathInsideProject(input.session.project_path, filePath);
-      }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      const correction = hierarchicalValidationCorrection(operation, reason);
+      throw new HierarchicalRoleValidationError(
+        `${reason}\n可原地修正：${correction}`,
+        formatRejectedHierarchicalOutput(structured)
+      );
     }
     if (postResultProcessError) {
       const warning = postResultProcessError instanceof Error
@@ -2855,6 +2908,13 @@ export class ClaudeAgentRunner {
         },
         async (args) => {
           const session = input.session;
+          const hierarchicalBoundary = getHierarchicalMcpBoundaryMessage(
+            session,
+            "mcp__ai_coder__ask_human"
+          );
+          if (hierarchicalBoundary) {
+            return { content: [{ type: "text", text: hierarchicalBoundary }] };
+          }
           const toolInput = args as Record<string, unknown>;
           const qualityFailure = evaluateHumanQuestionRequest(toolInput);
           if (qualityFailure) {
@@ -2912,6 +2972,13 @@ export class ClaudeAgentRunner {
         },
         async (args) => {
           const session = input.session;
+          const hierarchicalBoundary = getHierarchicalMcpBoundaryMessage(
+            session,
+            "mcp__ai_coder__update_task_tree"
+          );
+          if (hierarchicalBoundary) {
+            return { content: [{ type: "text", text: hierarchicalBoundary }] };
+          }
           try {
             const repairedMutation = repairIncompleteTaskStatusMutation(
               session,
@@ -2942,6 +3009,13 @@ export class ClaudeAgentRunner {
           next_action: z.string().max(2_000).optional().describe("准备执行的下一项具体行动；省略时继承上一版")
         },
         async (args) => {
+          const hierarchicalBoundary = getHierarchicalMcpBoundaryMessage(
+            input.session,
+            "mcp__ai_coder__checkpoint_exploration"
+          );
+          if (hierarchicalBoundary) {
+            return { content: [{ type: "text", text: hierarchicalBoundary }] };
+          }
           try {
             const result = applyExplorationCheckpoint(input.session, normalizeExplorationCheckpointArgs(args));
             if (input.workflow.simple_profile_loop === true) {
@@ -3090,7 +3164,11 @@ export function validateHierarchicalContractToolEvidence(
         continue;
       }
       throw new Error(
-        `目标 ${targetFile}#${symbol} 可由符号契约分析器解析，不得用 manual-static-analysis 绕过完整调用点调查`
+        [
+          `目标 ${targetFile}#${symbol} 可由符号契约分析器解析，不能声明为 manual-static-analysis。`,
+          "如果它是本需求会调用、复用或修改的函数/组件，请用 analyze_symbol_contract 完成 contract、calls、wrappers、references 全部分页并声明 symbol-analyzer；",
+          "如果它只是常量、路由表或静态配置，请从 analyzed_targets 删除，保留在 allowed_files 与 patch_plan 即可。"
+        ].join("")
       );
     }
     if (method !== "symbol-analyzer") continue;
@@ -3211,20 +3289,11 @@ export function validateHierarchicalBehaviorObligationContinuity(
         `prepare 必须分析 investigate 选中的同功能入口文件：${selectedLocation}`
       );
     }
-    const codeAllowedFiles = (passed.allowed_files ?? [])
-      .filter((filePath) => /\.[cm]?[jt]sx?$/i.test(filePath))
-      .map((filePath) => path.resolve(
-        session.project_path,
-        normalizeHierarchicalLeasePath(session.project_path, filePath)
-      ));
-    const missingChangeFiles = codeAllowedFiles.filter((filePath) => !analyzedFiles.has(filePath));
-    if (missingChangeFiles.length > 0) {
-      throw new Error(
-        `prepare 的 analyzed_targets 未覆盖实际代码修改文件：${missingChangeFiles
-          .map((filePath) => path.relative(session.project_path, filePath))
-          .join(", ")}`
-      );
-    }
+    // analyzed_targets describes callable contracts, not a second copy of the
+    // write lease. Static route maps, constants and data files legitimately
+    // appear in allowed_files without exposing a callable symbol. Requiring
+    // one target per changed file forced roles to invent manual symbol analyses,
+    // which then conflicted with the analyzer-availability gate.
     const obligations = Array.isArray(passed.handoff?.behavior_obligations)
       ? passed.handoff.behavior_obligations.filter(isPlainObject)
       : [];
@@ -3384,6 +3453,48 @@ export function validateHierarchicalPlannerEnumeratedCoverage(
   }
 }
 
+function formatRejectedHierarchicalOutput(value: unknown): string | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  let rendered: string;
+  try {
+    rendered = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  } catch {
+    return undefined;
+  }
+  const trimmed = rendered.trim();
+  if (!trimmed) return undefined;
+  return trimmed.length <= 12_000
+    ? trimmed
+    : `${trimmed.slice(0, 12_000)}\n…（宿主仅保留前 12000 字符供定向修正）`;
+}
+
+function hierarchicalValidationCorrection(
+  operation: Extract<HierarchicalNextOperation, {
+    kind: "run_alignment_batch" | "run_planner" | "run_phase" | "run_integrator"
+  }>,
+  reason: string
+): string {
+  if (/manual-static-analysis/.test(reason)) {
+    return "不要重做整轮调查：真实函数/组件改为 symbol-analyzer 并只补缺少的分页；纯常量、路由表或静态配置从 analyzed_targets 删除，仍保留在 allowed_files/patch_plan。";
+  }
+  if (/未实际执行 contract 符号契约分析/.test(reason)) {
+    return "只对该 target_file#symbol 补一次 contract 调用；calls、wrappers、references 已完成的本阶段工具证据会继续保留。";
+  }
+  if (/调查未覆盖全部分页|符号分析不完整/.test(reason)) {
+    return "根据错误指出的 section 和总数补齐缺页，再沿用上次草稿；不要重复已经完成的 section。";
+  }
+  if (/选中的同功能入口/.test(reason)) {
+    return "把 investigate 已选 reference 的真实函数/组件加入 analyzed_targets，并让六类 behavior_obligations 同时引用 reference 与当前目标的 path:line 证据。";
+  }
+  if (/allowed_files/.test(reason)) {
+    return "只规范化或补齐精确的项目相对文件路径；prepare 不要 Edit，宿主接受后会自动把这些文件租给 implement。";
+  }
+  if (operation.kind === "run_phase") {
+    return `保留上次结构化草稿和已完成工具证据，只修正 ${operation.phase} 契约中被点名的字段后重新提交 StructuredOutput；不要提前进入其他阶段或询问用户开启工具。`;
+  }
+  return "保留上次结构化草稿，只修正错误点后重新提交；不要丢弃已完成证据或把内部格式问题转成用户问题。";
+}
+
 function coversPaginatedContractSection(
   total: number,
   pages: Array<{ offset: number; limit: number }>
@@ -3494,7 +3605,60 @@ async function assertHierarchicalWorkUnitIntegrity(snapshot: HierarchicalWorkUni
   }
 }
 
-function getHierarchicalCapabilityLeaseError(
+export function buildHierarchicalSdkToolSurface(declaredTools: string[]): string[] {
+  return [...new Set([...declaredTools, "Edit", "Write"])];
+}
+
+export function getHierarchicalMcpBoundaryMessage(
+  session: AgentSession,
+  toolName: string
+): string | null {
+  if (!session.hierarchical_state) return null;
+  if (toolName === "mcp__ai_coder__ask_human") {
+    return [
+      "当前是宿主持有状态迁移的分层循环，叶子角色不能用 ask_human 申请 Edit、Bash 或切换阶段。",
+      "工具/权限/结构化输出问题属于内部可修正问题：保留现有调查并提交本阶段 handoff；",
+      "只有结构化结果中的 user_decision 或 external_resource_missing 业务 blocker 才会由宿主决定是否询问用户。"
+    ].join("");
+  }
+  if (
+    toolName === "mcp__ai_coder__update_task_tree"
+    || toolName === "mcp__ai_coder__checkpoint_exploration"
+  ) {
+    return [
+      `${toolName} 属于旧 Profile 循环，当前 Goal/Requirement/Phase 已由分层宿主持有。`,
+      "不要初始化第二套任务树或 checkpoint；继续当前叶子并通过 StructuredOutput 提交阶段 handoff。"
+    ].join("");
+  }
+  return null;
+}
+
+function hierarchicalMutatingShellCorrection(
+  operation: Extract<HierarchicalNextOperation, {
+    kind: "run_alignment_batch" | "run_planner" | "run_phase" | "run_integrator"
+  }>
+): string {
+  if (operation.kind === "run_phase" && operation.phase === "implement") {
+    return [
+      "implement 中 Bash 仅用于检查和验证，文件修改必须通过受租约约束的 Edit；",
+      "若目标文件不在租约中，返回 failed 并选择 prepare 修正 allowed_files，不要改写命令规避策略。"
+    ].join("");
+  }
+  if (operation.kind === "run_phase" && operation.phase === "prepare") {
+    return [
+      "prepare 是只读阶段，不需要现在修改代码。",
+      "请把拟修改文件写入 allowed_files、把最小改动写入 patch_plan，并提交 StructuredOutput；",
+      "宿主验收后会自动进入 implement 并授予 Edit。不要请求用户启用工具。"
+    ].join("");
+  }
+  const phase = operation.kind === "run_phase" ? operation.phase : operation.kind;
+  return [
+    `${phase} 是只读阶段，Bash 只能用于读取或验证，不能修改文件。`,
+    "保留已取得证据并提交当前阶段结构化结果；宿主会在需要时推进到 implement。"
+  ].join("");
+}
+
+export function getHierarchicalCapabilityLeaseError(
   session: AgentSession,
   toolName: string,
   toolInput: Record<string, unknown>
@@ -3502,7 +3666,18 @@ function getHierarchicalCapabilityLeaseError(
   if (toolName !== "Edit" && toolName !== "Write" && toolName !== "NotebookEdit") return null;
   const workUnit = session.hierarchical_state?.active_work_unit;
   if (!workUnit || workUnit.phase !== "implement" || workUnit.status !== "running") {
-    return `当前分层阶段没有 ${toolName} 写权限租约。`;
+    const phase = workUnit?.phase ?? session.current_stage;
+    if (phase === "prepare" || session.current_stage.endsWith("/prepare")) {
+      return [
+        `当前是 prepare，只需提交 allowed_files、patch_plan 和完整 handoff，不需要 ${toolName}。`,
+        "宿主验收 prepare 后会自动进入 implement 并开放租约文件的 Edit；",
+        "请保留现有调查并修正结构化输出，不要改用 Bash 或向用户申请工具。"
+      ].join("");
+    }
+    return [
+      `当前 ${phase || "分层"} 阶段没有 ${toolName} 写权限租约。`,
+      "请完成当前只读阶段的结构化 handoff；需要修改时宿主会推进到 implement。"
+    ].join("");
   }
   const suppliedPath = optionalString(toolInput.file_path ?? toolInput.notebook_path);
   if (!suppliedPath) return `${toolName} 缺少文件路径，无法核对阶段写权限租约。`;
@@ -5045,6 +5220,34 @@ export function extractSdkToolUses(message: unknown): SdkToolUse[] {
     if (!id || !tool) return [];
     return [{ id, tool, input: isPlainObject(block.input) ? block.input : {} }];
   });
+}
+
+/**
+ * Third-party Anthropic-compatible models occasionally misspell the SDK's
+ * synthetic StructuredOutput tool name while still producing a useful object.
+ * The SDK cannot dispatch an unknown name, but the host can safely recover the
+ * arguments and run the exact same parser and semantic gates locally.
+ */
+export function extractRecoverableStructuredOutputToolInput(
+  messages: unknown[]
+): Record<string, unknown> | undefined {
+  let recovered: Record<string, unknown> | undefined;
+  for (const message of messages) {
+    for (const toolUse of extractSdkToolUses(message)) {
+      const normalized = toolUse.tool.toLowerCase().replace(/[^a-z]/g, "");
+      const looksLikeStructuredOutput = normalized === "structuredoutput"
+        || (
+          normalized.startsWith("struct")
+          && normalized.endsWith("output")
+          && normalized.length >= "structedoutput".length
+          && normalized.length <= "structuredstructuredoutput".length
+        );
+      if (looksLikeStructuredOutput && Object.keys(toolUse.input).length > 0) {
+        recovered = toolUse.input;
+      }
+    }
+  }
+  return recovered;
 }
 
 /**

@@ -407,6 +407,42 @@ describe("hierarchicalRoleProtocol", () => {
     })).toThrow("符号分析不完整");
   });
 
+  it("feeds the rejected draft and cumulative correction history into a phase retry", () => {
+    const session = plannedSession();
+    const state = session.hierarchical_state!;
+    state.requirements[0]!.current_phase = "prepare";
+    state.active_work_unit = {
+      id: "R1:prepare",
+      requirement_id: "R1",
+      phase: "prepare",
+      status: "ready",
+      assigned_role: "implementation-preparer",
+      attempt: 3,
+      baseline_knowledge_revision: 0,
+      allowed_files: [],
+      failure_reason: "manual-static-analysis 目标可由分析器解析",
+      correction_history: [
+        "analyzed_targets 不应伪造静态配置目标",
+        "manual-static-analysis 目标可由分析器解析"
+      ],
+      last_rejected_output: "{\"status\":\"passed\",\"handoff\":{\"call_contract\":{}}}"
+    };
+
+    const spec = buildHierarchicalRoleSpec(session, workflow, {
+      kind: "run_phase",
+      requirement_id: "R1",
+      work_unit_id: "R1:prepare",
+      phase: "prepare",
+      role: "implementation-preparer"
+    });
+
+    expect(spec.prompt).toContain("宿主已累计的拒绝原因");
+    expect(spec.prompt).toContain("后一次修正不能重新引入前一次错误");
+    expect(spec.prompt).toContain("上次被拒绝的结构化草稿");
+    expect(spec.prompt).toContain("\"call_contract\"");
+    expect(spec.prompt).toContain("不要向用户申请阶段工具");
+  });
+
   it("announces the exact prepare shape up front and requires all six behavior dimensions", () => {
     const session = plannedSession();
     const operation = {

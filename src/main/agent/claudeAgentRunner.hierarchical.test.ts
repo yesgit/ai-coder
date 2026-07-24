@@ -4,7 +4,11 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import type { AgentSession, WorkflowTemplate } from "../../shared/types.js";
 import {
+  buildHierarchicalSdkToolSurface,
   ClaudeAgentRunner,
+  extractRecoverableStructuredOutputToolInput,
+  getHierarchicalCapabilityLeaseError,
+  getHierarchicalMcpBoundaryMessage,
   validateHierarchicalBehaviorObligationContinuity,
   validateHierarchicalContractToolEvidence,
   validateHierarchicalPlannerEnumeratedCoverage
@@ -166,6 +170,58 @@ function integrationContractResults(requirementIds: string[], evidence: string) 
 }
 
 describe("ClaudeAgentRunner hierarchical mode", () => {
+  it("keeps guarded write tools visible and redirects legacy MCP tools without involving the user", () => {
+    expect(buildHierarchicalSdkToolSurface(["Read", "Bash"])).toEqual([
+      "Read",
+      "Bash",
+      "Edit",
+      "Write"
+    ]);
+
+    const session = createSession();
+    session.hierarchical_state = createHierarchicalExecutionState(session.task_prompt);
+    expect(getHierarchicalMcpBoundaryMessage(
+      session,
+      "mcp__ai_coder__ask_human"
+    )).toContain("不能用 ask_human 申请 Edit");
+    expect(getHierarchicalMcpBoundaryMessage(
+      session,
+      "mcp__ai_coder__update_task_tree"
+    )).toContain("旧 Profile 循环");
+    session.current_stage = "R1/prepare";
+    expect(getHierarchicalCapabilityLeaseError(session, "Edit", {
+      file_path: "src/route.ts"
+    })).toContain("宿主验收 prepare 后会自动进入 implement");
+    expect(session.pending_human_questions ?? []).toHaveLength(0);
+  });
+
+  it("recovers a structured phase draft from common StructuredOutput name corruption", () => {
+    const draft = { status: "passed", summary: "prepared" };
+    expect(extractRecoverableStructuredOutputToolInput([{
+      type: "assistant",
+      message: {
+        content: [{
+          type: "tool_use",
+          id: "structured-1",
+          name: "StructuredStructOutput",
+          input: draft
+        }]
+      }
+    }])).toEqual(draft);
+
+    expect(extractRecoverableStructuredOutputToolInput([{
+      type: "assistant",
+      message: {
+        content: [{
+          type: "tool_use",
+          id: "unrelated-1",
+          name: "update_task_tree",
+          input: draft
+        }]
+      }
+    }])).toBeUndefined();
+  });
+
   it("requires every in-scope business sequence while ignoring earlier attachment context", () => {
     const session = createSession();
     session.task_prompt = "请从序号 33 开始实现所有页面跳转";
@@ -296,7 +352,9 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       summary: "prepared",
       handoff: prepareHandoff,
       evidence_refs: ["target.ts:1", "reference.ts:5"],
-      allowed_files: ["target.ts"]
+      // Static configuration files need a write lease and patch plan, but they
+      // are not callable contracts and must not be forced into analyzed_targets.
+      allowed_files: ["target.ts", "RouterDisplayName.js", "Const/index.js"]
     };
     const prepareOperation = {
       kind: "run_phase" as const,
@@ -610,8 +668,41 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     let deniedLeaseMessage = "";
     let deniedShellMessage = "";
     let deniedWriteMessage = "";
+    let prepareEditMessage = "";
+    let prepareAskMessage = "";
     async function* query(params: unknown) {
       const currentCall = call++;
+      if (currentCall === 2) {
+        const typed = params as {
+          options: {
+            tools: string[];
+            canUseTool: (
+              name: string,
+              input: Record<string, unknown>,
+              options: { toolUseID: string }
+            ) => Promise<{ behavior: string; message?: string }>;
+          };
+        };
+        expect(typed.options.tools).toContain("Edit");
+        const prepareEditDecision = await typed.options.canUseTool(
+          "Edit",
+          { file_path: "package.json", old_string: "a", new_string: "b" },
+          { toolUseID: "prepare-edit-denied-with-guidance" }
+        );
+        prepareEditMessage = prepareEditDecision.message ?? "";
+        const prepareAskDecision = await typed.options.canUseTool(
+          "mcp__ai_coder__ask_human",
+          {
+            question: "是否启用 Edit？",
+            type: "single",
+            already_checked: ["当前工具列表"],
+            why_needed: "模型认为需要修改文件才能继续",
+            options: [{ value: "yes", label: "启用" }]
+          },
+          { toolUseID: "prepare-ask-human-denied" }
+        );
+        prepareAskMessage = prepareAskDecision.message ?? "";
+      }
       if (currentCall === 3) {
         const canUseTool = (params as {
           options: {
@@ -636,7 +727,7 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
         deniedShellMessage = shellDecision.message ?? "";
         const writeDecision = await canUseTool(
           "Write",
-          { file_path: "src/shared/types.ts", content: "truncated" },
+          { file_path: "package.json", content: "truncated" },
           { toolUseID: "existing-write-denied" }
         );
         deniedWriteMessage = writeDecision.message ?? "";
@@ -673,6 +764,120 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     expect(deniedLeaseMessage).toContain("不允许修改");
     expect(deniedShellMessage).toContain("必须通过受租约约束的 Edit");
     expect(deniedWriteMessage).toContain("禁止使用 Write 覆盖现有文件");
+    expect(prepareEditMessage).toContain("宿主验收 prepare 后会自动进入 implement");
+    expect(prepareAskMessage).toContain("不能用 ask_human 申请 Edit");
+    expect(updated.pending_human_questions ?? []).toHaveLength(0);
+  });
+
+  it("retries a rejected prepare draft in place with cumulative correction context", async () => {
+    const invalidPrepareHandoff = handoffFor("prepare", "package.json", "package.json") as Record<string, unknown>;
+    (invalidPrepareHandoff.call_contract as { analyzed_targets: unknown[] }).analyzed_targets = [];
+    const outputs = [
+      {
+        status: "passed",
+        summary: "stable plan",
+        definition_of_done: ["route works"],
+        requirements: [{
+          id: "R1",
+          source_anchor: "user:route",
+          observable_result: "route works",
+          acceptance: ["route is independently verified"],
+          dependencies: []
+        }]
+      },
+      {
+        status: "passed",
+        summary: "located route",
+        evidence_refs: ["package.json:1"],
+        handoff: handoffFor("investigate", "package.json", "package.json")
+      },
+      {
+        status: "passed",
+        summary: "incomplete prepare draft",
+        evidence_refs: ["package.json:1"],
+        handoff: invalidPrepareHandoff,
+        allowed_files: ["package.json"]
+      },
+      {
+        status: "passed",
+        summary: "corrected prepare draft",
+        evidence_refs: ["package.json:1"],
+        handoff: handoffFor("prepare", "package.json", "package.json"),
+        allowed_files: ["package.json"]
+      },
+      {
+        status: "passed",
+        summary: "implemented",
+        evidence_refs: ["git diff --check: pass"],
+        handoff: handoffFor("implement", "package.json", "package.json")
+      },
+      {
+        status: "passed",
+        summary: "verified",
+        evidence_refs: ["focused test: pass"],
+        handoff: handoffFor("verify", "package.json", "package.json"),
+        acceptance_results: [{
+          acceptance_id: "R1-A1",
+          status: "pass",
+          evidence_refs: ["focused test: pass"]
+        }]
+      },
+      {
+        status: "passed",
+        summary: "complete",
+        evidence_refs: ["audit:pass"],
+        contract_results: integrationContractResults(["R1"], "package.json:1")
+      }
+    ];
+    const prompts: string[] = [];
+    let call = 0;
+    async function* query(params: unknown) {
+      prompts.push(String((params as { prompt?: unknown }).prompt ?? ""));
+      const currentCall = call++;
+      if (currentCall === 3) {
+        yield {
+          type: "assistant",
+          message: {
+            content: [{
+              type: "tool_use",
+              id: "corrupted-structured-prepare",
+              name: "StructuredStructOutput",
+              input: outputs[currentCall]
+            }]
+          }
+        };
+        throw new Error("No such tool available: StructuredStructOutput");
+      }
+      yield {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        structured_output: outputs[currentCall]
+      };
+    }
+
+    const updated = await new ClaudeAgentRunner({
+      queryOverride: query,
+      pluginPaths: [path.resolve("plugins/careful-coder")]
+    }).run({ session: createSession(), workflow });
+
+    expect(updated.status, updated.error).toBe("completed");
+    expect(call).toBe(7);
+    expect(prompts[3]).toContain("上次被拒绝的结构化草稿");
+    expect(prompts[3]).toContain("incomplete prepare draft");
+    expect(prompts[3]).toContain("prepare 至少需要一个完整调查的目标函数或组件");
+    expect(prompts[3]).toContain("不要向用户申请阶段工具");
+    expect(updated.progress_events).toContainEqual(expect.objectContaining({
+      message: expect.stringContaining("轻微损坏的 StructuredOutput 工具名恢复")
+    }));
+    expect(updated.progress_events).toContainEqual(expect.objectContaining({
+      message: expect.stringContaining("attempt 1；同类问题 1/3")
+    }));
+    expect(updated.hierarchical_state?.phase_runs).toContainEqual(expect.objectContaining({
+      phase: "prepare",
+      status: "failed",
+      failure_reason: expect.stringContaining("prepare 至少需要一个完整调查")
+    }));
   });
 
   it("restores only the current implement snapshot and retries after a recoverable crash", async () => {
