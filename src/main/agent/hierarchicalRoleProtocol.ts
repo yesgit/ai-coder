@@ -825,14 +825,14 @@ function phaseInstructions(
       return [
         "执行最小修改并取得真实 diff；不得处理其他需求点。",
         `允许修改文件：${allowedFiles.length > 0 ? allowedFiles.join(", ") : "未准备——应返回 blocked"}`,
-        "必须逐项落实 prepare 冻结的 behavior_obligations，并在 obligation_results 中用相同 ID 提交 observed_behavior 和代码证据；observed_behavior 必须与冻结的 required_behavior 精确一致，不得更换目标、参数、guard 或同功能参考。",
+        "必须逐项落实 prepare 冻结的 behavior_obligations，并在 obligation_results 中用相同 ID 提交 observed_behavior 和 path:line 代码证据。observed_behavior 应忠实描述最终代码事实，不必逐字复制 required_behavior；若实际实现未满足某项义务，返回 failed，不能靠改写措辞通过。",
         "必须实际运行至少一条与本改动相关的验证或语法/diff 检查，并在 evidence_refs 中引用。"
       ].join("\n");
     case "verify":
       return [
         "只读独立核对，不信任 executor 自述。",
         `必须返回 ${requirement.acceptance.length} 条 acceptance_results，逐项 PASS/FAIL 并附证据。`,
-        "还必须逐项核对 prepare 冻结的全部 behavior_obligations，contract_results 的 ID 必须完整一致，observed_behavior 必须逐字复述最终代码实际行为；verifier 不得现场发明‘备选方案’或新的 intentional-difference。",
+        "还必须逐项核对 prepare 冻结的全部 behavior_obligations，contract_results 的 ID 必须完整一致，并用 observed_behavior + path:line 证据描述最终代码实际行为；文字不要求与 required_behavior 逐字一致。若目标、参数、guard、上下文或副作用实质不符，必须把对应 status 标为 fail；verifier 不得现场发明‘备选方案’或新的 intentional-difference。",
         "任何一项无法确认都返回 failed，并选择回 implement、prepare 或 investigate。"
       ].join("\n");
   }

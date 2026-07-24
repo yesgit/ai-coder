@@ -454,6 +454,11 @@ export class ClaudeAgentRunner {
               fingerprint
             );
             const repeats = previousRepeats + 1;
+            const totalFailures = countHierarchicalPhaseFailures(
+              input.session,
+              roleOperation.work_unit_id,
+              fingerprint
+            ) + 1;
             const sameFailureLimit = roleOperation.phase === "investigate" ? 6 : 3;
             const recoveryRoute = repeats >= 3
               ? hierarchicalPhaseSelfHealRoute(roleOperation.phase)
@@ -471,7 +476,22 @@ export class ClaudeAgentRunner {
             const retryBasis = error instanceof HierarchicalRoleValidationError && error.rejectedOutput
               ? "基于被拒草稿"
               : "保留已完成证据";
-            if (repeats >= 3 && recoveryRoute !== "retry") {
+            if (totalFailures >= 6) {
+              const exhausted = new Error(
+                `${roleOperation.phase} 的同类错误跨阶段自愈后仍累计出现 ${totalFailures} 次：${message}`
+              );
+              this.raiseHierarchicalHostBlocker(input.session, "agent_failed", exhausted, {
+                requirementId: roleOperation.requirement_id,
+                workUnitId: roleOperation.work_unit_id,
+                fingerprint: `phase-recovery-exhausted-${fingerprint}`
+              });
+              await this.recordProgress(
+                input,
+                "status",
+                `当前 ${roleOperation.phase} 已获得 ${totalFailures} 次定向修正机会且同类错误仍未消除；宿主停止无限往返并保留诊断：${message}`,
+                "milestone"
+              );
+            } else if (repeats >= 3 && recoveryRoute !== "retry") {
               await this.recordProgress(
                 input,
                 "status",
@@ -485,15 +505,6 @@ export class ClaudeAgentRunner {
                 `阶段输出未通过宿主校验；将${retryBasis}定向修正当前工作单元（attempt ${failedAttempt}；同类问题 ${repeats}/${sameFailureLimit}）：${message}`,
                 "milestone"
               );
-            }
-            // investigate 已经是最内层取证阶段，没有更早阶段可退。给带失败上下文的
-            // 自愈重试更大窗口；只有六次完全相同的失败才升级为宿主故障。
-            if (repeats >= 6 && recoveryRoute === "retry") {
-              this.raiseHierarchicalHostBlocker(input.session, "agent_failed", error, {
-                requirementId: roleOperation.requirement_id,
-                workUnitId: roleOperation.work_unit_id,
-                fingerprint
-              });
             }
           } else {
             if (roleOperation.kind === "run_planner") {
@@ -3245,7 +3256,8 @@ export function validateHierarchicalBehaviorObligationContinuity(
         prepare.handoff.behavior_obligations,
         passedIntegration.contract_results.filter((result) => result.requirement_id === requirement.id),
         `${requirement.id}/integrate-final-workspace`,
-        ["pass"]
+        ["pass"],
+        session.project_path
       );
     }
     return;
@@ -3339,14 +3351,16 @@ export function validateHierarchicalBehaviorObligationContinuity(
       prepare.handoff.behavior_obligations,
       passed.handoff?.obligation_results,
       `${operation.requirement_id}/implement`,
-      ["applied", "already-satisfied"]
+      ["applied", "already-satisfied"],
+      session.project_path
     );
   } else if (operation.phase === "verify") {
     assertObligationResultClosure(
       prepare.handoff.behavior_obligations,
       passed.handoff?.contract_results,
       `${operation.requirement_id}/verify`,
-      ["pass"]
+      ["pass"],
+      session.project_path
     );
   }
 }
@@ -3365,16 +3379,13 @@ function assertObligationResultClosure(
   rawObligations: unknown,
   rawResults: unknown,
   label: string,
-  passingStatuses: string[]
+  passingStatuses: string[],
+  projectPath: string
 ): void {
   const obligations = Array.isArray(rawObligations) ? rawObligations.filter(isPlainObject) : [];
   const expected = obligations
     .map((obligation) => optionalString(obligation.id))
     .filter((id): id is string => Boolean(id));
-  const requiredBehaviorById = new Map(obligations.map((obligation) => [
-    optionalString(obligation.id) ?? "",
-    optionalString(obligation.required_behavior) ?? ""
-  ]));
   if (expected.length === 0) throw new Error(`${label} 缺少 prepare behavior_obligations`);
   const results = Array.isArray(rawResults) ? rawResults.filter(isPlainObject) : [];
   const actual = results
@@ -3393,18 +3404,19 @@ function assertObligationResultClosure(
     if (!passingStatuses.includes(status)) {
       throw new Error(`${label} 行为义务 ${obligationId || "<unknown>"} 未通过：${status}`);
     }
-    const requiredBehavior = normalizeBehaviorStatement(requiredBehaviorById.get(obligationId) ?? "");
-    const observedBehavior = normalizeBehaviorStatement(optionalString(result.observed_behavior) ?? "");
-    if (!requiredBehavior || observedBehavior !== requiredBehavior) {
-      throw new Error(
-        `${label} 行为义务 ${obligationId || "<unknown>"} 的最终观察与冻结契约不一致`
-      );
+    if (!optionalString(result.observed_behavior)) {
+      throw new Error(`${label} 行为义务 ${obligationId || "<unknown>"} 缺少 observed_behavior`);
+    }
+    const evidence = Array.isArray(result.evidence_refs)
+      ? result.evidence_refs.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+      : [];
+    if (evidence.length === 0) {
+      throw new Error(`${label} 行为义务 ${obligationId || "<unknown>"} 缺少 evidence_refs`);
+    }
+    if (!evidence.some((item) => evidenceLocationFile(item, projectPath))) {
+      throw new Error(`${label} 行为义务 ${obligationId || "<unknown>"} 缺少 path:line 代码证据`);
     }
   }
-}
-
-function normalizeBehaviorStatement(value: string): string {
-  return value.replace(/\s+/g, " ").trim();
 }
 
 function evidenceLocationFile(value: string, projectPath: string): string | null {
@@ -3526,12 +3538,28 @@ function countConsecutiveHierarchicalPhaseFailures(
   let count = 0;
   for (let index = (session.hierarchical_state?.phase_runs.length ?? 0) - 1; index >= 0; index -= 1) {
     const run = session.hierarchical_state?.phase_runs[index];
-    if (!run || run.work_unit_id !== workUnitId) continue;
-    if (run.status === "running") continue;
+    if (!run) continue;
+    if (run.work_unit_id === workUnitId && run.status === "running") continue;
+    // A settled run from prepare/investigate/verify means the workflow actually
+    // made progress between attempts. Do not label failures on both sides of
+    // that successful self-heal as one uninterrupted streak.
+    if (run.work_unit_id !== workUnitId) break;
     if (run.status !== "failed" || run.error_fingerprint !== fingerprint) break;
     count += 1;
   }
   return count;
+}
+
+function countHierarchicalPhaseFailures(
+  session: AgentSession,
+  workUnitId: string,
+  fingerprint: string
+): number {
+  return (session.hierarchical_state?.phase_runs ?? []).filter((run) =>
+    run.work_unit_id === workUnitId
+    && run.status === "failed"
+    && run.error_fingerprint === fingerprint
+  ).length;
 }
 
 function hierarchicalPhaseSelfHealRoute(

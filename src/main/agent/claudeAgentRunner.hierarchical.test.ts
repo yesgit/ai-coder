@@ -305,7 +305,7 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     }
   });
 
-  it("keeps destination, arguments, guards and context obligations frozen through verify and integration", () => {
+  it("closes frozen obligations by id, status and evidence without requiring identical prose", () => {
     const session = createSession();
     const state = createHierarchicalExecutionState(session.task_prompt);
     const investigateHandoff = handoffFor("investigate");
@@ -379,6 +379,30 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     )).toThrow("必须分析 investigate 选中的同功能入口文件");
     analyzedTargets.push(referenceTarget);
 
+    const implementHandoff = handoffFor("implement") as Record<string, unknown>;
+    const implementResults = implementHandoff.obligation_results as Array<Record<string, unknown>>;
+    implementResults.forEach((result) => {
+      result.observed_behavior = `最终代码已落实 ${String(result.obligation_id)}，实现位置见 target.ts:1`;
+    });
+    const implementEvent = {
+      type: "phase_passed" as const,
+      work_unit_id: "R1:implement",
+      summary: "implemented",
+      handoff: implementHandoff,
+      evidence_refs: ["target.ts:1"]
+    };
+    expect(() => validateHierarchicalBehaviorObligationContinuity(
+      session,
+      {
+        kind: "run_phase",
+        requirement_id: "R1",
+        work_unit_id: "R1:implement",
+        phase: "implement",
+        role: "task-executor"
+      },
+      [implementEvent]
+    )).not.toThrow();
+
     const verifyHandoff = handoffFor("verify") as Record<string, unknown>;
     const verifyEvent = {
       type: "phase_passed" as const,
@@ -401,22 +425,41 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     )).not.toThrow();
 
     const results = verifyHandoff.contract_results as Array<Record<string, unknown>>;
-    for (const [obligationId, wrongBehavior] of [
-      ["B-destination", "PageCommonWebView instead of native component"],
-      ["B-arguments", "arguments missing productType"],
-      ["B-preconditions", "goLogin added without canonical guard"],
-      ["B-context", "navigator and dispatch omitted"]
-    ]) {
-      const result = results.find((item) => item.obligation_id === obligationId)!;
-      const original = result.observed_behavior;
-      result.observed_behavior = wrongBehavior;
-      expect(() => validateHierarchicalBehaviorObligationContinuity(
-        session,
-        verifyOperation,
-        [verifyEvent]
-      )).toThrow("最终观察与冻结契约不一致");
-      result.observed_behavior = original;
-    }
+    results.forEach((result) => {
+      result.observed_behavior = `独立核对 ${String(result.obligation_id)} 已由最终代码满足，见 target.ts:1`;
+    });
+    expect(() => validateHierarchicalBehaviorObligationContinuity(
+      session,
+      verifyOperation,
+      [verifyEvent]
+    )).not.toThrow();
+
+    const failedDestination = results.find((item) => item.obligation_id === "B-destination")!;
+    failedDestination.status = "fail";
+    failedDestination.observed_behavior = "最终代码跳到了错误组件，见 target.ts:1";
+    expect(() => validateHierarchicalBehaviorObligationContinuity(
+      session,
+      verifyOperation,
+      [verifyEvent]
+    )).toThrow("行为义务 B-destination 未通过：fail");
+    failedDestination.status = "pass";
+
+    const originalEvidence = failedDestination.evidence_refs;
+    failedDestination.evidence_refs = [];
+    expect(() => validateHierarchicalBehaviorObligationContinuity(
+      session,
+      verifyOperation,
+      [verifyEvent]
+    )).toThrow("行为义务 B-destination 缺少 evidence_refs");
+    failedDestination.evidence_refs = originalEvidence;
+
+    failedDestination.evidence_refs = ["destination checked"];
+    expect(() => validateHierarchicalBehaviorObligationContinuity(
+      session,
+      verifyOperation,
+      [verifyEvent]
+    )).toThrow("行为义务 B-destination 缺少 path:line 代码证据");
+    failedDestination.evidence_refs = originalEvidence;
 
     results.splice(results.findIndex((result) => result.obligation_id === "B-preconditions"), 1);
     expect(() => validateHierarchicalBehaviorObligationContinuity(
@@ -439,13 +482,17 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       workspace_revision: 0,
       created_at: state.created_at
     });
+    const finalContractResults = integrationContractResults(["R1"], "target.ts:1");
+    finalContractResults.forEach((result) => {
+      result.observed_behavior = `全局审计重新观察 ${result.obligation_id} 已满足，见 target.ts:1`;
+    });
     expect(() => validateHierarchicalBehaviorObligationContinuity(
       session,
       { kind: "run_integrator" },
       [{
         type: "integration_passed",
         evidence_refs: ["target.ts:1"],
-        contract_results: integrationContractResults(["R1"], "target.ts:1")
+        contract_results: finalContractResults
       }]
     )).not.toThrow();
   });
@@ -618,6 +665,15 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
   });
 
   it("drives one requirement vertically through all phases and global integration", async () => {
+    const paraphrasedImplementHandoff = handoffFor(
+      "implement",
+      "package.json",
+      "package.json"
+    ) as Record<string, unknown>;
+    (paraphrasedImplementHandoff.obligation_results as Array<Record<string, unknown>>)
+      .forEach((result) => {
+        result.observed_behavior = `代码已完成 ${String(result.obligation_id)}，证据 package.json:1`;
+      });
     const outputs = [
       {
         status: "passed",
@@ -648,7 +704,7 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
         status: "passed",
         summary: "implemented",
         evidence_refs: ["git diff --check: pass"],
-        handoff: handoffFor("implement", "package.json", "package.json")
+        handoff: paraphrasedImplementHandoff
       },
       {
         status: "passed",
@@ -1016,6 +1072,76 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       expect(updated.progress_events).toContainEqual(expect.objectContaining({
         message: expect.stringContaining("退回 prepare 自愈")
       }));
+    } finally {
+      await rm(projectPath, { recursive: true, force: true });
+    }
+  });
+
+  it("stops an unchanged implement/prepare failure cycle after six correction opportunities", async () => {
+    const projectPath = await mkdtemp(path.join(os.tmpdir(), "ai-coder-bounded-self-heal-"));
+    await writeFile(path.join(projectPath, "target.js"), "export const stable = true;\n");
+    await writeFile(path.join(projectPath, "reference.js"), "export const fixtureReference = true;\n");
+    let implementAttempts = 0;
+    let prepareAttempts = 0;
+
+    async function* query(params: unknown) {
+      const prompt = String((params as { prompt?: unknown }).prompt ?? "");
+      let structuredOutput: Record<string, unknown>;
+      if (prompt.includes("建立一次性、稳定的需求账本")) {
+        structuredOutput = {
+          status: "passed", summary: "plan", definition_of_done: ["done"],
+          requirements: [{
+            id: "R1", source_anchor: "user:R1", observable_result: "done",
+            acceptance: ["done"], dependencies: []
+          }]
+        };
+      } else {
+        const phase = /G1 > R1 > (investigate|prepare|implement|verify) >/.exec(prompt)?.[1];
+        if (!phase) throw new Error("unexpected prompt");
+        if (phase === "prepare") prepareAttempts += 1;
+        if (phase === "implement") {
+          implementAttempts += 1;
+          throw new Error("unchanged implementation fault");
+        }
+        structuredOutput = {
+          status: "passed", summary: `${phase} passed`, evidence_refs: [`${phase}:evidence`],
+          handoff: handoffFor(phase, "target.js", "reference.js"),
+          ...(phase === "prepare" ? { allowed_files: ["target.js"] } : {})
+        };
+      }
+      yield { type: "result", subtype: "success", is_error: false, structured_output: structuredOutput };
+    }
+
+    try {
+      const session = createSession();
+      session.project_path = projectPath;
+      const updated = await new ClaudeAgentRunner({
+        queryOverride: query,
+        pluginPaths: [path.resolve("plugins/careful-coder")]
+      }).run({ session, workflow });
+
+      expect(implementAttempts).toBe(6);
+      expect(prepareAttempts).toBe(2);
+      expect(updated.status).toBe("interrupted");
+      expect(updated.pending_human_questions ?? []).toHaveLength(0);
+      expect(updated.hierarchical_state?.blockers).toContainEqual(expect.objectContaining({
+        kind: "agent_failed",
+        owner: "host",
+        user_input_required: false,
+        status: "open"
+      }));
+      const progressEvents = updated.progress_events ?? [];
+      expect(progressEvents).toContainEqual(expect.objectContaining({
+        message: expect.stringContaining("6 次定向修正机会")
+      }));
+      const selfHealMessages = progressEvents
+        .filter((event) => event.message.includes("退回 prepare 自愈"))
+        .map((event) => event.message);
+      expect(selfHealMessages).toHaveLength(1);
+      expect(selfHealMessages[0]).toContain("连续 3 次");
+      expect(progressEvents.filter((event) =>
+        event.message.includes("同类问题 1/3")
+      )).toHaveLength(2);
     } finally {
       await rm(projectPath, { recursive: true, force: true });
     }
