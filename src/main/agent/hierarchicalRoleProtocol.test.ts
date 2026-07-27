@@ -50,6 +50,14 @@ function handoffFor(phase: "investigate" | "prepare" | "implement" | "verify") {
     return {
       confirmed_facts: ["target confirmed"],
       target_locations: ["src/target.ts:1"],
+      feature_census: {
+        applicability: "required",
+        reason: "功能以用户行为描述，必须普查实现候选",
+        status: "complete",
+        report_digest: "a".repeat(64),
+        candidate_accounting: { total: 1, yes: 1, no: 0, unknown: 0, accounted: true },
+        selected_candidate_ids: ["candidate-target"]
+      },
       target_investigation: {
         target_kind: "function",
         definition: "target is defined at src/target.ts:1",
@@ -67,6 +75,7 @@ function handoffFor(phase: "investigate" | "prepare" | "implement" | "verify") {
         candidates: [{
           reference_kind: "same-feature-entry",
           location: "src/reference.ts:5",
+          contract_location: "src/reference.ts:5",
           feature_equivalence: ["same user-visible feature at src/reference.ts:5"],
           similarity: ["same callable shape"],
           reusable_behavior: ["preserve argument forwarding"],
@@ -92,7 +101,7 @@ function handoffFor(phase: "investigate" | "prepare" | "implement" | "verify") {
         analyzed_targets: [{
           target_file: "src/target.ts",
           symbol: "target",
-          analysis_method: "symbol-analyzer",
+          analysis_method: "investigation-script",
           method_reason: "",
           analyzer_sections: ["contract", "calls", "wrappers", "references"],
           all_pages_consumed: true,
@@ -312,7 +321,13 @@ describe("hierarchicalRoleProtocol", () => {
       role: "code-investigator"
     });
 
-    expect(spec.tools).toEqual(["Read", "Grep", "Glob", "Bash"]);
+    expect(spec.tools).toEqual([
+      "Read",
+      "Grep",
+      "Glob",
+      "Bash",
+      "mcp__ai_coder__locate_feature_implementation"
+    ]);
     expect(spec.tools).not.toContain("Task");
     expect(spec.prompt).toContain("G1 > R1 > investigate > R1:investigate");
     expect(spec.prompt).toContain("## 唯一项目根目录\n/tmp/project");
@@ -358,6 +373,109 @@ describe("hierarchicalRoleProtocol", () => {
     })).toThrow("未找到同类实现时必须说明 no_reference_reason");
   });
 
+  it("does not allow investigate to hide an unclassified feature candidate", () => {
+    const handoff = handoffFor("investigate") as Record<string, unknown>;
+    const census = handoff.feature_census as {
+      candidate_accounting: {
+        total: number;
+        yes: number;
+        no: number;
+        unknown: number;
+        accounted: true;
+      };
+    };
+    census.candidate_accounting = { total: 2, yes: 1, no: 0, unknown: 1, accounted: true };
+
+    expect(() => parseHierarchicalRoleResult({
+      kind: "run_phase",
+      requirement_id: "R1",
+      work_unit_id: "R1:investigate",
+      phase: "investigate",
+      role: "code-investigator"
+    }, {
+      status: "passed",
+      summary: "one possible implementation was silently omitted",
+      evidence_refs: ["src/target.ts:1"],
+      handoff
+    })).toThrow("unknown 候选");
+  });
+
+  it("requires a callable contract location separately from the same-feature entry", () => {
+    const handoff = handoffFor("investigate") as Record<string, unknown>;
+    const analysis = handoff.reference_analysis as { candidates: Array<Record<string, unknown>> };
+    delete analysis.candidates[0]!.contract_location;
+
+    expect(() => parseHierarchicalRoleResult({
+      kind: "run_phase",
+      requirement_id: "R1",
+      work_unit_id: "R1:investigate",
+      phase: "investigate",
+      role: "code-investigator"
+    }, {
+      status: "passed",
+      summary: "entry found without tracing its callable destination",
+      evidence_refs: ["src/reference.ts:5"],
+      handoff
+    })).toThrow("contract_location");
+  });
+
+  it("allows distinct same-feature entries to converge on the current target component", () => {
+    const handoff = handoffFor("investigate") as Record<string, unknown>;
+    const target = handoff.target_investigation as Record<string, unknown>;
+    target.definition = "LQBInvest component at lib/views/myAssets/LQBInvest.js:33";
+    const analysis = handoff.reference_analysis as {
+      candidates: Array<Record<string, unknown>>;
+      selected_location: string;
+    };
+    const candidate = analysis.candidates[0]!;
+    candidate.location = "lib/views/myAssets/MyAssetsNewRevision.js:800";
+    candidate.contract_location = "lib/views/myAssets/LQBInvest.js:33";
+    candidate.evidence_refs = [
+      "lib/views/myAssets/MyAssetsNewRevision.js:800",
+      "lib/views/myAssets/LQBInvest.js:33"
+    ];
+    analysis.selected_location = "lib/views/myAssets/MyAssetsNewRevision.js:800";
+
+    expect(() => parseHierarchicalRoleResult({
+      kind: "run_phase",
+      requirement_id: "R1",
+      work_unit_id: "R1:investigate",
+      phase: "investigate",
+      role: "code-investigator"
+    }, {
+      status: "passed",
+      summary: "an existing entry reaches the same destination component",
+      evidence_refs: ["lib/views/myAssets/LQBInvest.js:33"],
+      handoff
+    })).not.toThrow();
+  });
+
+  it("rejects the current target definition when it is reused as the reference entry", () => {
+    const handoff = handoffFor("investigate") as Record<string, unknown>;
+    const analysis = handoff.reference_analysis as {
+      candidates: Array<Record<string, unknown>>;
+      selected_location: string;
+    };
+    const candidate = analysis.candidates[0]!;
+    candidate.location = "src/target.ts:1";
+    candidate.contract_location = "src/reference.ts:5";
+    candidate.evidence_refs = ["src/target.ts:1", "src/reference.ts:5"];
+    analysis.selected_location = "src/target.ts:1";
+
+    expect(() => parseHierarchicalRoleResult({
+      kind: "run_phase",
+      requirement_id: "R1",
+      work_unit_id: "R1:investigate",
+      phase: "investigate",
+      role: "code-investigator"
+    }, {
+      status: "passed",
+      summary: "the current target was incorrectly selected as its own entry",
+      evidence_refs: ["src/target.ts:1"],
+      handoff
+    })).toThrow("candidate.location=src/target.ts:1");
+  });
+
   it("rejects a merely similar sibling branch as the canonical reference", () => {
     const handoff = handoffFor("investigate") as Record<string, unknown>;
     const analysis = handoff.reference_analysis as { candidates: Array<Record<string, unknown>> };
@@ -386,7 +504,8 @@ describe("hierarchicalRoleProtocol", () => {
       phase: "prepare",
       role: "implementation-preparer"
     });
-    expect(spec.tools).toContain("mcp__ai_coder__analyze_symbol_contract");
+    expect(spec.tools).toContain("mcp__ai_coder__investigate_symbol_contract");
+    expect(spec.tools).not.toContain("mcp__ai_coder__analyze_symbol_contract");
 
     const handoff = handoffFor("prepare") as Record<string, unknown>;
     const callContract = handoff.call_contract as { analyzed_targets: Array<Record<string, unknown>> };
@@ -404,7 +523,7 @@ describe("hierarchicalRoleProtocol", () => {
       evidence_refs: ["src/target.ts:1"],
       handoff,
       allowed_files: ["src/target.ts"]
-    })).toThrow("符号分析不完整");
+    })).toThrow("调查脚本证据不完整");
   });
 
   it("feeds the rejected draft and cumulative correction history into a phase retry", () => {

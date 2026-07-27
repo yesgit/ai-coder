@@ -4,7 +4,12 @@ import { access, chmod, readFile, readdir, stat, unlink, writeFile } from "node:
 import path from "node:path";
 import type { AgentMessage, AgentSession, Attachment, ExplorationCheckpoint, ExplorationDisposition, ExplorationPhase, HierarchicalBlockerKind, HierarchicalExecutionState, HierarchicalWorkPhase, HumanQuestion, HumanQuestionOption, SessionProgressEvent, StageAgentResult, TaskTree, WorkflowStage, WorkflowTemplate } from "../../shared/types.js";
 import { isMeaningfulAgentText } from "../../shared/agentMessages.js";
+import { censusFeatureImplementations } from "../analysis/featureImplementationCensus.js";
 import { analyzeSymbolContract } from "../analysis/symbolContractAnalyzer.js";
+import {
+  getCachedSymbolInvestigationReport,
+  investigateSymbolContract
+} from "../analysis/symbolInvestigationScript.js";
 import {
   approveOrDenyToolUse,
   assertPathInsideProject,
@@ -579,7 +584,11 @@ export class ClaudeAgentRunner {
       : "";
     const prompt = [spec.prompt, skillContracts].filter(Boolean).join("\n\n");
     const query = await this.resolveQuery();
-    const needsContractAnalyzer = spec.tools.includes("mcp__ai_coder__analyze_symbol_contract");
+    const needsContractAnalyzer = spec.tools.some((toolName) => (
+      toolName === "mcp__ai_coder__analyze_symbol_contract"
+      || toolName === "mcp__ai_coder__investigate_symbol_contract"
+      || toolName === "mcp__ai_coder__locate_feature_implementation"
+    ));
     const mcpServer = needsContractAnalyzer ? await this.resolveMcpServer(input) : null;
     if (needsContractAnalyzer && !mcpServer) {
       throw new Error("当前阶段要求完整调查目标函数/组件，但符号契约分析工具初始化失败");
@@ -1700,7 +1709,9 @@ export class ClaudeAgentRunner {
               toolName === "Skill" ||
               toolName === "mcp__ai_coder__ask_human" ||
               toolName === "mcp__ai_coder__checkpoint_exploration" ||
-              toolName === "mcp__ai_coder__analyze_symbol_contract"
+              toolName === "mcp__ai_coder__analyze_symbol_contract" ||
+              toolName === "mcp__ai_coder__investigate_symbol_contract" ||
+              toolName === "mcp__ai_coder__locate_feature_implementation"
             ) {
               return { behavior: "allow", updatedInput: toolInput };
             }
@@ -1934,7 +1945,8 @@ export class ClaudeAgentRunner {
         "复杂入口硬规则：多附件、多需求点、跨文件或指定基线的请求在进入实现前必须委托 task-planner。planner 尚未成功启动时，根 Agent 可以做最小只读取证以解除阻塞，但不得一次性读取全部附件或重复撞同一门禁。根 Agent 只负责编排和知识归并，任何工作区修改必须委托 task-executor，并在完成后委托 task-verifier。",
         "Task 调用必须显式填写 subagent_type。复杂入口的正确格式是 `Task({ subagent_type: \"task-planner\", description: \"拆分需求\", prompt: \"只读分析并返回 R-ID 与证据\" })`；不要省略 subagent_type，也不要用 Skill 调用替代 Task。",
         "当前阶段已经注入的核心 Skill 不得再次调用 Skill 工具；应直接落实其契约。只有能力目录里未注入且确实需要的额外 Skill 才调用 Skill 工具。",
-        "调用契约硬规则：拟议实现只要会调用、复用或修改已有函数、方法、Hook 或组件，第一次相关修改前必须通过 Task 使用 call-contract-investigator，并把结果归并进知识雪球；主线程自行 Read/Grep/Bash 不能替代。只有纯文案、静态数据或样式且不涉及任何既有函数/组件时才可判定不适用，并记录依据。",
+        "功能定位硬规则：目标以业务功能、用户行为、页面、事件或协议值描述且没有唯一精确符号时，必须真实调用 mcp__ai_coder__locate_feature_implementation；逐项裁决全部 unknown 并重跑到 complete，不能只选最像候选或用 Read/Grep 自述代替。",
+        "调用契约硬规则：拟议实现只要会调用、复用或修改已有函数、方法、Hook 或组件，第一次相关修改前必须通过 Task 使用 call-contract-investigator；该调查者必须真实调用 mcp__ai_coder__investigate_symbol_contract 完整调查脚本，再把结果归并进知识雪球。主线程自行 Read/Grep/Bash、零散符号分析或文字声明不能替代。只有纯文案、静态数据或样式且不涉及任何既有函数/组件时才可判定不适用，并记录依据。",
         "只调用工具列表中展示的精确工具名，并使用标准 tool_use 格式。"
       ].filter(Boolean).join("\n\n");
     }
@@ -2691,6 +2703,8 @@ export class ClaudeAgentRunner {
       ? [
           ["mcp__ai_coder__checkpoint_exploration", "归并知识、声明 phase 与 next_action"],
           ["mcp__ai_coder__update_task_tree", "维护传统全局任务树；简单模式通常无需调用"],
+          ["mcp__ai_coder__locate_feature_implementation", "完整普查功能实现候选并逐项提交是/不是证据"],
+          ["mcp__ai_coder__investigate_symbol_contract", "运行宿主持有的完整函数/组件调查脚本"],
           ["mcp__ai_coder__analyze_symbol_contract", "只读分析函数/组件及静态调用契约"],
           ["mcp__ai_coder__ask_human", "仅在外部信息确实阻塞时询问用户"]
         ] as const
@@ -2698,7 +2712,8 @@ export class ClaudeAgentRunner {
     return [
       "## 当前可用能力（与知识雪球、阶段任务同时生效）",
       "先根据当前缺失信息明确选择 Skill、Sub-agent 或直接工具，并把选择理由写回知识雪球。跨多文件追踪、独立验证或完整性审查与某个 Sub-agent 职责匹配时优先委托；简单单点事实直接用工具。只选能推进当前阶段任务的最小能力。",
-      "硬规则：凡拟议实现会调用、复用或修改已有函数、方法、Hook 或组件，第一次相关修改前必须通过 Task 使用 call-contract-investigator；主线程搜索不能替代。纯文案、静态数据或样式且不涉及既有函数/组件时才可记录依据后判定不适用。",
+      "功能定位硬规则：目标以业务功能、用户行为、页面、事件或协议值描述且没有唯一精确符号时，必须调用 locate_feature_implementation；首次报告后逐项裁决全部 unknown，再调用到 complete，候选排名或普通搜索不能替代。",
+      "调用契约硬规则：凡拟议实现会调用、复用或修改已有函数、方法、Hook 或组件，第一次相关修改前必须通过 Task 使用 call-contract-investigator，且调查者必须真实调用 investigate_symbol_contract 完整调查脚本；主线程搜索、零散 analyze_symbol_contract 或文字声明不能替代。纯文案、静态数据或样式且不涉及既有函数/组件时才可记录依据后判定不适用。",
       "",
       "### Skills（工作流核心项已由宿主加载；目录中的其他项可用 Skill 加载）",
       ...(skills.length > 0
@@ -3104,9 +3119,139 @@ export class ClaudeAgentRunner {
           }
         }
       );
+      const investigateSymbolContractTool = (tool as (
+        name: string,
+        description: string,
+        schema: Record<string, unknown>,
+        handler: (...args: unknown[]) => Promise<unknown>
+      ) => unknown)(
+        "investigate_symbol_contract",
+        [
+          "运行宿主持有的完整函数/组件调查脚本。",
+          "脚本自动消费 contract、calls、wrappers、references 全部分页，并递归调查公共封装；",
+          "返回参数/Props 类型与说明、全部静态调用方式、前置条件、公共封装图、间接引用和明确的静态分析边界。",
+          "prepare 中只要会调用、复用或修改既有函数/组件，就必须为每个 analyzed_target 调用本工具；Read/Grep 或零散 analyze_symbol_contract 不能替代。"
+        ].join(""),
+        {
+          target_file: z.string().min(1).describe("目标符号定义文件，相对于项目根目录"),
+          symbol: z.string().min(1).describe("函数、方法、类或组件的精确符号名"),
+          target_line: z.number().int().min(1).optional().describe("同一文件存在同名符号时，用定义所在行消歧"),
+          max_wrapper_depth: z.number().int().min(0).max(20).optional()
+            .describe("公共封装递归深度，默认 8；报告 partial 时可提高到 20"),
+          max_wrapper_symbols: z.number().int().min(1).max(500).optional()
+            .describe("公共封装递归符号上限，默认 100；报告 partial 时可提高到 500")
+        },
+        async (args) => {
+          const toolInput = args as {
+            target_file: string;
+            symbol: string;
+            target_line?: number;
+            max_wrapper_depth?: number;
+            max_wrapper_symbols?: number;
+          };
+          try {
+            await assertPathInsideProject(input.session.project_path, toolInput.target_file);
+            const report = investigateSymbolContract({
+              projectPath: input.session.project_path,
+              targetFile: toolInput.target_file,
+              symbol: toolInput.symbol,
+              targetLine: toolInput.target_line,
+              maxWrapperDepth: toolInput.max_wrapper_depth,
+              maxWrapperSymbols: toolInput.max_wrapper_symbols
+            });
+            // Compact JSON is lossless and materially reduces SDK spillover into
+            // an external tool-results file on large call graphs.
+            return { content: [{ type: "text", text: JSON.stringify(report) }] };
+          } catch (error) {
+            return {
+              content: [{
+                type: "text",
+                text: `完整调用契约调查失败：${error instanceof Error ? error.message : String(error)}`
+              }],
+              isError: true
+            };
+          }
+        }
+      );
+      const locateFeatureImplementationTool = (tool as (
+        name: string,
+        description: string,
+        schema: Record<string, unknown>,
+        handler: (...args: unknown[]) => Promise<unknown>
+      ) => unknown)(
+        "locate_feature_implementation",
+        [
+          "运行宿主持有的功能实现候选普查脚本。脚本扫描范围内全部 TypeScript/JavaScript/React 文件，",
+          "合并符号名、路径、定义正文、配置邻接以及完整上下游调用图候选；每个候选都必须记账为 yes/no/unknown，",
+          "并分别保存正反证据。首次调用若返回 unknown，必须逐项读取证据后通过 adjudications 再调用，",
+          "直到 status=complete；所有 yes 目标会自动执行完整调用契约调查。普通 Read/Grep、模型排名或只选一个最像的目标不能替代。"
+        ].join(""),
+        {
+          feature: z.string().min(1).describe("完整的用户可观察功能描述，不要只传某个猜测符号名"),
+          aliases: z.array(z.string().min(1)).optional()
+            .describe("从需求、代码和历史命名提取的全部别名、缩写、错拼及协议 token"),
+          acceptance_clues: z.array(z.string().min(1)).optional()
+            .describe("验收标准中的页面名、动作、路由值、文案、埋点或其他正向线索"),
+          negative_clues: z.array(z.string().min(1)).optional()
+            .describe("明确不属于目标功能的说明页、记录页等排除线索"),
+          scope_paths: z.array(z.string().min(1)).optional()
+            .describe("可选项目相对目录；省略时扫描整个项目"),
+          adjudications: z.array(z.object({
+            candidate_id: z.string().min(1),
+            verdict: z.enum(["yes", "no"]),
+            reason: z.string().min(1),
+            evidence_refs: z.array(z.string().min(1)).min(1)
+          })).optional().describe("对首次报告中所有未决候选逐项提交的是/不是结论及 path:line 证据")
+        },
+        async (args) => {
+          const toolInput = args as {
+            feature: string;
+            aliases?: string[];
+            acceptance_clues?: string[];
+            negative_clues?: string[];
+            scope_paths?: string[];
+            adjudications?: Array<{
+              candidate_id: string;
+              verdict: "yes" | "no";
+              reason: string;
+              evidence_refs: string[];
+            }>;
+          };
+          try {
+            for (const scope of toolInput.scope_paths ?? []) {
+              await assertPathInsideProject(input.session.project_path, scope);
+            }
+            const report = censusFeatureImplementations({
+              projectPath: input.session.project_path,
+              feature: toolInput.feature,
+              aliases: toolInput.aliases,
+              acceptanceClues: toolInput.acceptance_clues,
+              negativeClues: toolInput.negative_clues,
+              scopePaths: toolInput.scope_paths,
+              adjudications: toolInput.adjudications
+            });
+            return { content: [{ type: "text", text: JSON.stringify(report, null, 2) }] };
+          } catch (error) {
+            return {
+              content: [{
+                type: "text",
+                text: `功能实现候选普查失败：${error instanceof Error ? error.message : String(error)}`
+              }],
+              isError: true
+            };
+          }
+        }
+      );
       const server = (createSdkMcpServer as (opts: { name: string; tools: unknown[] }) => unknown)({
         name: "ai_coder",
-        tools: [askHumanTool, taskTreeTool, explorationCheckpointTool, analyzeSymbolContractTool]
+        tools: [
+          askHumanTool,
+          taskTreeTool,
+          explorationCheckpointTool,
+          locateFeatureImplementationTool,
+          investigateSymbolContractTool,
+          analyzeSymbolContractTool
+        ]
       });
       this.mcpServerCache.set(input, { server });
       return server;
@@ -3144,11 +3289,16 @@ export function validateHierarchicalContractToolEvidence(
   events: HierarchicalEvent[],
   stageId: string
 ): void {
-  if (operation.kind !== "run_phase" || operation.phase !== "prepare") return;
+  if (operation.kind !== "run_phase") return;
   const passed = events.find((event): event is Extract<HierarchicalEvent, { type: "phase_passed" }> => (
     event.type === "phase_passed"
   ));
   if (!passed) return;
+  if (operation.phase === "investigate") {
+    validateHierarchicalFeatureCensusEvidence(session, passed, stageId);
+    return;
+  }
+  if (operation.phase !== "prepare") return;
   const callContract = isPlainObject(passed.handoff?.call_contract) ? passed.handoff.call_contract : undefined;
   const targets = Array.isArray(callContract?.analyzed_targets) ? callContract.analyzed_targets : [];
   for (const rawTarget of targets) {
@@ -3177,16 +3327,16 @@ export function validateHierarchicalContractToolEvidence(
       throw new Error(
         [
           `目标 ${targetFile}#${symbol} 可由符号契约分析器解析，不能声明为 manual-static-analysis。`,
-          "如果它是本需求会调用、复用或修改的函数/组件，请用 analyze_symbol_contract 完成 contract、calls、wrappers、references 全部分页并声明 symbol-analyzer；",
+          "如果它是本需求会调用、复用或修改的函数/组件，请调用 investigate_symbol_contract 完整调查脚本并声明 investigation-script；",
           "如果它只是常量、路由表或静态配置，请从 analyzed_targets 删除，保留在 allowed_files 与 patch_plan 即可。"
         ].join("")
       );
     }
-    if (method !== "symbol-analyzer") continue;
+    if (method !== "investigation-script") continue;
 
     const targetPath = path.resolve(session.project_path, targetFile);
     const calls = session.tool_calls.filter((call) => {
-      if (call.stage_id !== stageId || call.tool !== "mcp__ai_coder__analyze_symbol_contract") return false;
+      if (call.stage_id !== stageId || call.tool !== "mcp__ai_coder__investigate_symbol_contract") return false;
       if (call.status !== "completed" || !isPlainObject(call.input)) return false;
       const calledFile = optionalString(call.input.target_file);
       return Boolean(
@@ -3195,39 +3345,156 @@ export function validateHierarchicalContractToolEvidence(
         && optionalString(call.input.symbol) === symbol
       );
     });
-    const contractCalled = calls.some((call) => (
-      isPlainObject(call.input) && optionalString(call.input.section) === "contract"
-    ));
-    if (!contractCalled) {
-      throw new Error(`目标 ${targetFile}#${symbol} 未实际执行 contract 符号契约分析`);
+    if (calls.length === 0) {
+      throw new Error(`目标 ${targetFile}#${symbol} 未实际执行完整调用契约调查脚本`);
     }
 
-    const actual = analyzeSymbolContract({
+    const lastCallInput = calls[calls.length - 1]?.input;
+    const investigationInput = {
       projectPath: session.project_path,
       targetFile,
       symbol,
-      section: "all"
-    });
-    const totals: Record<"calls" | "wrappers" | "references", number> = {
-      calls: actual.coverage.total_call_sites,
-      wrappers: actual.coverage.total_public_wrappers,
-      references: actual.coverage.total_non_call_references
+      targetLine: isPlainObject(lastCallInput) && typeof lastCallInput.target_line === "number"
+        ? lastCallInput.target_line
+        : undefined,
+      maxWrapperDepth: isPlainObject(lastCallInput) && typeof lastCallInput.max_wrapper_depth === "number"
+        ? lastCallInput.max_wrapper_depth
+        : undefined,
+      maxWrapperSymbols: isPlainObject(lastCallInput) && typeof lastCallInput.max_wrapper_symbols === "number"
+        ? lastCallInput.max_wrapper_symbols
+        : undefined
     };
-    for (const section of ["calls", "wrappers", "references"] as const) {
-      const pages = calls
-        .filter((call) => isPlainObject(call.input) && optionalString(call.input.section) === section)
-        .map((call) => {
-          const input = call.input as Record<string, unknown>;
-          const offset = typeof input.offset === "number" ? Math.max(0, input.offset) : 0;
-          const limit = typeof input.limit === "number" ? Math.min(100, Math.max(1, input.limit)) : 50;
-          return { offset, limit };
-        });
-      if (!coversPaginatedContractSection(totals[section], pages)) {
-        throw new Error(
-          `目标 ${targetFile}#${symbol} 的 ${section} 调查未覆盖全部分页（总数 ${totals[section]}）`
-        );
-      }
+    // The MCP handler has already produced this deterministic host-owned report
+    // in the same read-only phase. Reuse it during output validation instead of
+    // parsing the entire project twice. A process restart misses the cache and
+    // safely falls back to a fresh analysis.
+    const report = getCachedSymbolInvestigationReport(investigationInput)
+      ?? investigateSymbolContract(investigationInput);
+    if (!report.all_pages_consumed) {
+      throw new Error(`目标 ${targetFile}#${symbol} 的调查脚本未消费全部分页`);
     }
+    if (!report.wrapper_graph.complete || report.status === "partial") {
+      throw new Error(
+        `目标 ${targetFile}#${symbol} 的公共封装调查未闭合：${report.wrapper_graph.truncated_reasons.join("；")}`
+      );
+    }
+    const unresolved = Array.isArray(rawTarget.unresolved)
+      ? rawTarget.unresolved.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+      : [];
+    const indirectReferences = Array.isArray(rawTarget.wrappers_and_indirect_references)
+      ? rawTarget.wrappers_and_indirect_references
+        .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+      : [];
+    const referenceAccounting = [...indirectReferences, ...unresolved];
+    const unaccountedReferences = report.unresolved_dynamic_references.filter((reference) => {
+      const anchor = `${reference.location.file}:${reference.location.line}`;
+      return !referenceAccounting.some((item) => item.includes(anchor));
+    });
+    if (unaccountedReferences.length > 0) {
+      throw new Error(
+        [
+          `目标 ${targetFile}#${symbol} 仍有 ${unaccountedReferences.length} 个间接/动态引用未逐项交代：`,
+          unaccountedReferences
+            .slice(0, 8)
+            .map((reference) => `${reference.location.file}:${reference.location.line}(${reference.kind})`)
+            .join(", "),
+          "；已追踪结果写入 wrappers_and_indirect_references，尚不能闭合的边界写入 unresolved"
+        ].join("")
+      );
+    }
+  }
+}
+
+function validateHierarchicalFeatureCensusEvidence(
+  session: AgentSession,
+  passed: Extract<HierarchicalEvent, { type: "phase_passed" }>,
+  stageId: string
+): void {
+  const handoff = isPlainObject(passed.handoff) ? passed.handoff : {};
+  const target = isPlainObject(handoff.target_investigation) ? handoff.target_investigation : {};
+  const targetKind = optionalString(target.target_kind)?.toLocaleLowerCase() ?? "";
+  const referenceAnalysis = isPlainObject(handoff.reference_analysis) ? handoff.reference_analysis : {};
+  const referenceCandidates = Array.isArray(referenceAnalysis.candidates)
+    ? referenceAnalysis.candidates
+    : [];
+  const featureCensus = isPlainObject(handoff.feature_census) ? handoff.feature_census : {};
+  const applicability = optionalString(featureCensus.applicability);
+  const callableTarget = /function|method|hook|component|class|callable/.test(targetKind);
+  const requiresCensus = callableTarget
+    || referenceCandidates.length > 0;
+  if (!requiresCensus) {
+    if (applicability === "required") {
+      throw new Error("静态配置目标不应伪造功能实现候选普查；请说明 not-applicable 依据");
+    }
+    return;
+  }
+  if (applicability !== "required") {
+    throw new Error("函数/组件目标必须实际执行完整功能实现候选普查，不能声明 not-applicable");
+  }
+  const calls = session.tool_calls.filter((call) => (
+    call.stage_id === stageId
+    && call.tool === "mcp__ai_coder__locate_feature_implementation"
+    && call.status === "completed"
+    && isPlainObject(call.input)
+  ));
+  if (calls.length === 0) {
+    throw new Error("当前 investigate 未实际执行功能实现候选普查脚本");
+  }
+  const lastInput = calls[calls.length - 1]!.input as Record<string, unknown>;
+  const feature = optionalString(lastInput.feature);
+  if (!feature) throw new Error("功能实现候选普查调用缺少完整 feature");
+  const report = censusFeatureImplementations({
+    projectPath: session.project_path,
+    feature,
+    aliases: optionalStringArray(lastInput.aliases),
+    acceptanceClues: optionalStringArray(lastInput.acceptance_clues),
+    negativeClues: optionalStringArray(lastInput.negative_clues),
+    scopePaths: optionalStringArray(lastInput.scope_paths),
+    adjudications: Array.isArray(lastInput.adjudications)
+      ? lastInput.adjudications
+        .filter(isPlainObject)
+        .map((item) => ({
+          candidate_id: optionalString(item.candidate_id) ?? "",
+          verdict: optionalString(item.verdict) === "yes" ? "yes" as const : "no" as const,
+          reason: optionalString(item.reason) ?? "",
+          evidence_refs: optionalStringArray(item.evidence_refs) ?? []
+        }))
+      : undefined
+  });
+  if (report.status !== "complete") {
+    throw new Error(
+      `功能实现候选普查未闭合：unknown=${report.candidate_accounting.unknown}；${report.unresolved.join("；")}`
+    );
+  }
+  const declaredDigest = optionalString(featureCensus.report_digest);
+  if (declaredDigest !== report.report_digest) {
+    throw new Error("feature_census.report_digest 与宿主重算的真实普查报告不一致");
+  }
+  const declaredAccounting = isPlainObject(featureCensus.candidate_accounting)
+    ? featureCensus.candidate_accounting
+    : {};
+  for (const field of ["total", "yes", "no", "unknown"] as const) {
+    if (declaredAccounting[field] !== report.candidate_accounting[field]) {
+      throw new Error(`feature_census.candidate_accounting.${field} 与真实普查报告不一致`);
+    }
+  }
+  const declaredSelected = new Set(optionalStringArray(featureCensus.selected_candidate_ids));
+  const reportSelected = new Set(report.selected_targets.map((targetItem) => targetItem.candidate_id));
+  if (
+    declaredSelected.size !== reportSelected.size
+    || [...reportSelected].some((candidateId) => !declaredSelected.has(candidateId))
+  ) {
+    throw new Error("feature_census.selected_candidate_ids 未完整对应所有 yes 候选");
+  }
+  const targetDefinition = firstPathLineToken(optionalString(target.definition) ?? "");
+  if (
+    callableTarget
+    && targetDefinition
+    && !report.selected_targets.some((targetItem) => (
+      `${targetItem.definition.file}:${targetItem.definition.line}` === targetDefinition
+    ))
+  ) {
+    throw new Error(`目标定义 ${targetDefinition} 未被功能普查以 yes 证据选中`);
   }
 }
 
@@ -3286,6 +3553,12 @@ export function validateHierarchicalBehaviorObligationContinuity(
     const selectedAnchor = selectedLocation
       ? evidenceLocationAnchor(selectedLocation, session.project_path)
       : null;
+    const candidates = Array.isArray(referenceAnalysis?.candidates)
+      ? referenceAnalysis.candidates.filter(isPlainObject)
+      : [];
+    const selectedCandidate = candidates.find((candidate) => (
+      optionalString(candidate.location) === selectedLocation
+    ));
     const callContract = isPlainObject(passed.handoff?.call_contract)
       ? passed.handoff.call_contract
       : undefined;
@@ -3296,9 +3569,36 @@ export function validateHierarchicalBehaviorObligationContinuity(
       .map((target) => optionalString(target.target_file))
       .filter((value): value is string => Boolean(value))
       .map((value) => path.resolve(session.project_path, value)));
-    if (selectedFile && !analyzedFiles.has(selectedFile)) {
+    const explicitContractLocation = optionalString(selectedCandidate?.contract_location);
+    const legacyDestinationLocation = firstEmbeddedEvidenceLocation(
+      optionalString(selectedCandidate?.destination) ?? ""
+    );
+    const legacyAnalyzedEvidenceLocation = Array.isArray(selectedCandidate?.evidence_refs)
+      ? selectedCandidate.evidence_refs
+        .filter((item): item is string => typeof item === "string")
+        .find((item) => {
+          const file = evidenceLocationFile(item, session.project_path);
+          return Boolean(file && analyzedFiles.has(file) && file !== selectedFile);
+        })
+      : undefined;
+    // contract_location was added after early hierarchical sessions had already
+    // persisted investigate artifacts. Prefer it for new work, while allowing an
+    // old artifact to recover from an explicit destination/evidence path instead
+    // of forcing the same prepare/investigate loop again.
+    const referenceContractLocation = explicitContractLocation
+      ?? legacyDestinationLocation
+      ?? legacyAnalyzedEvidenceLocation
+      ?? selectedLocation;
+    const referenceContractFile = referenceContractLocation
+      ? evidenceLocationFile(referenceContractLocation, session.project_path)
+      : null;
+    if (referenceContractFile && !analyzedFiles.has(referenceContractFile)) {
       throw new Error(
-        `prepare 必须分析 investigate 选中的同功能入口文件：${selectedLocation}`
+        [
+          "prepare 必须分析 investigate 选中的同功能入口对应的真实函数/组件：",
+          `入口 ${selectedLocation ?? "<unknown>"}；`,
+          `契约 ${referenceContractLocation ?? "<unknown>"}`
+        ].join("")
       );
     }
     // analyzed_targets describes callable contracts, not a second copy of the
@@ -3309,6 +3609,16 @@ export function validateHierarchicalBehaviorObligationContinuity(
     const obligations = Array.isArray(passed.handoff?.behavior_obligations)
       ? passed.handoff.behavior_obligations.filter(isPlainObject)
       : [];
+    const targetInvestigation = isPlainObject(investigate.handoff.target_investigation)
+      ? investigate.handoff.target_investigation
+      : undefined;
+    const targetDefinitionLocation = firstEmbeddedEvidenceLocation(
+      optionalString(targetInvestigation?.definition) ?? ""
+    );
+    const targetFile = targetDefinitionLocation
+      ? evidenceLocationFile(targetDefinitionLocation, session.project_path)
+      : null;
+    const disposition = optionalString(passed.handoff?.change_disposition);
     if (selectedFile) {
       for (const obligation of obligations) {
         const evidence = Array.isArray(obligation.evidence_refs)
@@ -3319,15 +3629,24 @@ export function validateHierarchicalBehaviorObligationContinuity(
             `行为义务 ${optionalString(obligation.id) ?? "<unknown>"} 未引用选定同功能入口 ${selectedLocation}`
           );
         }
-        if (
-          selectedAnchor
-          && !evidence.some((item) => {
+        // changes_required freezes behavior that does not exist yet. Requiring
+        // every obligation to cite the future branch traps prepare in an
+        // impossible retry loop. investigate already proves the existing target
+        // context; implement and verify must later prove the actual target code.
+        // A no-op claim is different and must prove current target behavior now.
+        const hasCurrentTargetEvidence = targetFile
+          ? evidence.some((item) => {
+            const file = evidenceLocationFile(item, session.project_path);
+            const anchor = evidenceLocationAnchor(item, session.project_path);
+            return file === targetFile && Boolean(anchor && anchor !== selectedAnchor);
+          })
+          : evidence.some((item) => {
             const anchor = evidenceLocationAnchor(item, session.project_path);
             return Boolean(anchor && anchor !== selectedAnchor);
-          })
-        ) {
+          });
+        if (disposition === "already_satisfied" && selectedAnchor && !hasCurrentTargetEvidence) {
           throw new Error(
-            `行为义务 ${optionalString(obligation.id) ?? "<unknown>"} 缺少当前目标代码的独立 path:line 证据`
+            `already_satisfied 行为义务 ${optionalString(obligation.id) ?? "<unknown>"} 缺少当前目标代码的独立 path:line 证据`
           );
         }
       }
@@ -3433,6 +3752,10 @@ function evidenceLocationAnchor(value: string, projectPath: string): string | nu
   return `${path.resolve(projectPath, match[1])}:${Number(match[2])}`;
 }
 
+function firstEmbeddedEvidenceLocation(value: string): string | null {
+  return value.match(/(?:^|\s|\()(\S+\.[A-Za-z0-9]+:\d+(?::\d+)?)(?:\b|$)/)?.[1] ?? null;
+}
+
 export function validateHierarchicalPlannerEnumeratedCoverage(
   session: AgentSession,
   operation: Extract<HierarchicalNextOperation, { kind: "run_phase" | "run_alignment_batch" | "run_planner" | "run_integrator" }>,
@@ -3486,17 +3809,26 @@ function hierarchicalValidationCorrection(
   }>,
   reason: string
 ): string {
+  if (/功能实现候选普查|feature_census|locate_feature_implementation/.test(reason)) {
+    return "调用 locate_feature_implementation 扫描完整功能描述和全部别名；对报告中的每个 unknown 候选逐项读取代码，提交 yes/no、reason 与 path:line adjudications 后再次调用。只有 status=complete、所有候选完整记账且所有 yes 自动完成调用契约调查后才能提交 investigate。";
+  }
   if (/manual-static-analysis/.test(reason)) {
-    return "不要重做整轮调查：真实函数/组件改为 symbol-analyzer 并只补缺少的分页；纯常量、路由表或静态配置从 analyzed_targets 删除，仍保留在 allowed_files/patch_plan。";
+    return "不要重做整轮调查：真实函数/组件调用一次 investigate_symbol_contract 完整调查脚本并声明 investigation-script；纯常量、路由表或静态配置从 analyzed_targets 删除，仍保留在 allowed_files/patch_plan。";
   }
-  if (/未实际执行 contract 符号契约分析/.test(reason)) {
-    return "只对该 target_file#symbol 补一次 contract 调用；calls、wrappers、references 已完成的本阶段工具证据会继续保留。";
+  if (/未实际执行完整调用契约调查脚本/.test(reason)) {
+    return "只对错误点名的 target_file#symbol 调用一次 investigate_symbol_contract；脚本会自动完成全部 section、分页和公共封装递归，不要再手工拼分页证明。";
   }
-  if (/调查未覆盖全部分页|符号分析不完整/.test(reason)) {
-    return "根据错误指出的 section 和总数补齐缺页，再沿用上次草稿；不要重复已经完成的 section。";
+  if (/调查脚本证据不完整|未消费全部分页|公共封装调查未闭合/.test(reason)) {
+    return "重新运行错误点名目标的 investigate_symbol_contract，并沿用脚本报告；若因 wrapper 深度或数量上限而 partial，可提高 max_wrapper_depth/max_wrapper_symbols 后重跑；其他截断原因必须退回 investigate 继续定位，不能靠修改 handoff 文案通过。";
+  }
+  if (/间接\/动态引用/.test(reason)) {
+    return "逐项读取调查脚本列出的 references，追到运行时入口；已闭合的引用按 path:line 写入 wrappers_and_indirect_references，仍无法静态闭合的边界写入 unresolved，不能省略或合并成无证据概述。";
+  }
+  if (/冒充同功能既有入口/.test(reason)) {
+    return "只修正 investigate.reference_analysis：candidate.location 必须指向与 target_investigation.definition 不同的既有用户入口或调用点；若新旧入口最终进入同一函数/组件，contract_location 可以与当前目标定义相同。";
   }
   if (/选中的同功能入口/.test(reason)) {
-    return "把 investigate 已选 reference 的真实函数/组件加入 analyzed_targets，并让六类 behavior_obligations 同时引用 reference 与当前目标的 path:line 证据。";
+    return "保留静态入口在 candidate.location，并把沿该入口到达的真实函数/组件写入 contract_location；prepare 只将该真实契约加入 analyzed_targets，六类 behavior_obligations 同时引用入口与当前目标的 path:line 证据。";
   }
   if (/allowed_files/.test(reason)) {
     return "只规范化或补齐精确的项目相对文件路径；prepare 不要 Edit，宿主接受后会自动把这些文件租给 implement。";
@@ -3505,22 +3837,6 @@ function hierarchicalValidationCorrection(
     return `保留上次结构化草稿和已完成工具证据，只修正 ${operation.phase} 契约中被点名的字段后重新提交 StructuredOutput；不要提前进入其他阶段或询问用户开启工具。`;
   }
   return "保留上次结构化草稿，只修正错误点后重新提交；不要丢弃已完成证据或把内部格式问题转成用户问题。";
-}
-
-function coversPaginatedContractSection(
-  total: number,
-  pages: Array<{ offset: number; limit: number }>
-): boolean {
-  if (pages.length === 0) return false;
-  if (total === 0) return pages.some((page) => page.offset === 0);
-  const sorted = [...pages].sort((left, right) => left.offset - right.offset);
-  let coveredUntil = 0;
-  for (const page of sorted) {
-    if (page.offset > coveredUntil) return false;
-    coveredUntil = Math.max(coveredUntil, page.offset + page.limit);
-    if (coveredUntil >= total) return true;
-  }
-  return false;
 }
 
 function hierarchicalErrorFingerprint(scope: string, message: string): string {
@@ -4394,7 +4710,7 @@ function hasMergedCallContractPrerequisite(session: AgentSession): boolean {
   }
   const hasContractConclusionInMemory = /(?:调用契约|契约调查)[\s\S]{0,800}(?:证据|文件|路径|组件|函数|方法|参数|调用方|返回值|副作用|path:line)/i.test(checkpoint.text);
   if (!hasContractConclusionInMemory) return false;
-  return session.tool_calls.some((toolCall, index) =>
+  const hasCompletedInvestigator = session.tool_calls.some((toolCall, index) =>
     index < checkpoint.observed_tool_call_count
     && toolCall.tool === "Task"
     && isPlainObject(toolCall.input)
@@ -4402,6 +4718,15 @@ function hasMergedCallContractPrerequisite(session: AgentSession): boolean {
     && toolCall.status === "completed"
     && Boolean(toolCall.output_summary?.trim())
   );
+  const hasCompletedInvestigationScript = session.tool_calls.some((toolCall, index) =>
+    index < checkpoint.observed_tool_call_count
+    && toolCall.tool === "mcp__ai_coder__investigate_symbol_contract"
+    && toolCall.status === "completed"
+    && isPlainObject(toolCall.input)
+    && Boolean(optionalString(toolCall.input.target_file))
+    && Boolean(optionalString(toolCall.input.symbol))
+  );
+  return hasCompletedInvestigator && hasCompletedInvestigationScript;
 }
 
 export function getSimpleExecutorPrerequisiteGuardError(
@@ -4413,7 +4738,7 @@ export function getSimpleExecutorPrerequisiteGuardError(
   if (hasMergedCallContractPrerequisite(session)) return null;
   return [
     "task-executor 前置门禁未通过：当前知识雪球中没有已归并且带证据的 call-contract-investigator 独立调查结果。",
-    "调查 Task 必须 completed 且返回非空结论，随后 checkpoint 必须实际写入调用契约证据。",
+    "调查 Task 必须 completed，且内部必须真实调用 mcp__ai_coder__investigate_symbol_contract；随后 checkpoint 必须实际写入调用契约证据。",
     "若任务确实只涉及纯文案、静态数据或纯样式，请先在 checkpoint 中记录“调用契约不适用”及具体依据。"
   ].join("");
 }
@@ -4433,6 +4758,8 @@ function requiresFreshExplorationCheckpoint(
     toolName === "mcp__ai_coder__checkpoint_exploration"
     || toolName === "Skill"
     || ["Read", "Grep", "Glob", "LS"].includes(toolName)
+    || toolName === "mcp__ai_coder__locate_feature_implementation"
+    || toolName === "mcp__ai_coder__investigate_symbol_contract"
     || toolName === "mcp__ai_coder__analyze_symbol_contract"
   ) {
     return false;
@@ -5068,6 +5395,18 @@ export function detectCorruptedToolName(toolName: string): string | null {
   }
   if (/checkpoint_exploration/i.test(toolName) && toolName !== "mcp__ai_coder__checkpoint_exploration") {
     return `探索 checkpoint 工具名损坏：${toolName}；请使用精确工具名 mcp__ai_coder__checkpoint_exploration`;
+  }
+  if (
+    /locate_feature_implementation/i.test(toolName)
+    && toolName !== "mcp__ai_coder__locate_feature_implementation"
+  ) {
+    return `功能实现候选普查工具名损坏：${toolName}；请使用精确工具名 mcp__ai_coder__locate_feature_implementation`;
+  }
+  if (
+    /investigate_symbol_contract/i.test(toolName)
+    && toolName !== "mcp__ai_coder__investigate_symbol_contract"
+  ) {
+    return `完整调用契约调查工具名损坏：${toolName}；请使用精确工具名 mcp__ai_coder__investigate_symbol_contract`;
   }
   return null;
 }
@@ -5865,6 +6204,18 @@ function normalizeTaskStatus(value: unknown): TaskTreeMutationArgs["new_status"]
 
 function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function optionalStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value
+    .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+    .map((item) => item.trim());
+}
+
+function firstPathLineToken(value: string): string | null {
+  const match = /(?:^|[\s(（["'`])((?:[A-Za-z]:[\\/]|\/)?[^:\s,，;；)）\]"'`]+:\d+)(?=$|[\s,，;；)）\]"'`])/u.exec(value);
+  return match?.[1]?.replaceAll("\\", "/") ?? null;
 }
 
 function repairConcurrentProfileTasks(session: AgentSession): string | null {

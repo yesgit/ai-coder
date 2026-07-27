@@ -11,18 +11,23 @@ Build an evidence-backed usage model before editing an existing callable. Treat 
 
 1. Resolve one exact target file and symbol. If the symbol is ambiguous, pass `target_line` to identify its definition before investigating.
    - When the target came from a Chinese business term or mixed pinyin/abbreviation, first apply the alias-discovery rules in [chinese-naming-discovery.md](../exploring-codebase/references/chinese-naming-discovery.md). Record ambiguous matches instead of silently choosing one.
-2. Call `mcp__ai_coder__analyze_symbol_contract` with `section="contract"`. Record every input, prop and output:
+2. Call `mcp__ai_coder__investigate_symbol_contract` once for the exact target. This host-owned script automatically consumes `contract`, `calls`, `wrappers`, and `references` in full, including every pagination offset, and recursively investigates public wrappers. `Read`, `Grep`, `Bash`, prose claims, or piecemeal `analyze_symbol_contract` calls do not satisfy this prerequisite. Record every input, prop and output from the report:
    - meaning and type;
    - required or optional;
    - declaration default and destructuring default;
    - return type or component output.
-3. Call the tool with `section="calls"`, `offset=0`, and `limit=100`. Continue with each returned `next_offset` until it is `null`. Do not claim "all callers" before consuming every page.
-4. For every call site, inspect the cited source around the call. Confirm:
+3. Check the report before interpretation:
+   - `all_pages_consumed` must be `true`;
+   - all four entries in `sections_completed` must be present;
+   - `wrapper_graph.complete` must be `true`;
+   - a `partial` report is not a completed investigation;
+   - every item in `unresolved_dynamic_references` must be followed or explicitly retained as an unresolved boundary.
+4. For every reported call site, inspect the cited source around the call. Confirm:
    - exact argument or prop values and omitted values;
    - local guards, earlier returns, route/state/permission prerequisites;
    - caller-specific assumptions not visible to the static analyzer.
-5. Call the tool with `section="wrappers"`, starting at `offset=0`; consume every page. For every exported/public wrapper, trace how each wrapper parameter is transformed, defaulted, dropped, merged, or forwarded to the target. Then recursively analyze that wrapper to collect its callers and parameter combinations. Continue until reaching runtime entry points or an explicitly unresolved external boundary. Count distinct parameter-presence combinations separately from distinct runtime values.
-6. Call the tool with `section="references"`, starting at `offset=0`; consume every page. Investigate every callback, assignment, registration, re-export, dependency-injection, event, or other non-call reference until its runtime invocation is found or recorded as unresolved.
+5. For every exported/public wrapper in the report and recursive `wrapper_graph`, trace how each wrapper parameter is transformed, defaulted, dropped, merged, or forwarded to the target. Count distinct parameter-presence combinations separately from distinct runtime values.
+6. Investigate every callback, assignment, registration, re-export, dependency-injection, event, or other non-call reference until its runtime invocation is found or recorded as unresolved.
 7. Read the target implementation. Confirm guards, defaults implemented inside the body, state reads/writes, side effects, error behavior, ordering constraints, and output consumers.
 8. Compare the proposed change against every observed combination and unresolved reference. Expand verification when a dynamic edge or business prerequisite remains uncertain.
 

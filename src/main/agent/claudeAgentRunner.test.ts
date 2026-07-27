@@ -820,6 +820,22 @@ describe("ClaudeAgentRunner", () => {
       session,
       "Task",
       { subagent_type: "task-executor" }
+    )).toContain("investigate_symbol_contract");
+
+    session.tool_calls.push({
+      id: "contract-script",
+      stage_id: "profile",
+      tool: "mcp__ai_coder__investigate_symbol_contract",
+      input: { target_file: "src/Panel.tsx", symbol: "Panel", target_line: 42 },
+      status: "completed",
+      output_summary: "完整调查脚本已消费全部分页",
+      created_at: "t"
+    });
+    session.exploration_checkpoints![0]!.observed_tool_call_count = 2;
+    expect(getSimpleExecutorPrerequisiteGuardError(
+      session,
+      "Task",
+      { subagent_type: "task-executor" }
     )).toBeNull();
   });
 
@@ -1945,6 +1961,10 @@ describe("ClaudeAgentRunner", () => {
     expect(detectCorruptedToolName("mcp__ai_c__update_task_tree")).toContain("mcp__ai_coder__update_task_tree");
     expect(detectCorruptedToolName("mcp__ai_coder__checkpoint_checkpoint_exploration"))
       .toContain("mcp__ai_coder__checkpoint_exploration");
+    expect(detectCorruptedToolName("mcp__ai_c__investigate_symbol_contract"))
+      .toContain("mcp__ai_coder__investigate_symbol_contract");
+    expect(detectCorruptedToolName("mcp__ai_c__locate_feature_implementation"))
+      .toContain("mcp__ai_coder__locate_feature_implementation");
     expect(detectCorruptedToolName('"Bash" <parameter=command')).toContain("损坏的协议标记");
     expect(detectCorruptedToolName("mcp__ai_coder__update_task_tree")).toBeNull();
     expect(detectCorruptedToolName("Read")).toBeNull();

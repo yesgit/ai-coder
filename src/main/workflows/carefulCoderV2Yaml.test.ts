@@ -110,10 +110,12 @@ describe("careful-coder.yaml latest", () => {
     // verification agents are read-only
     expect(v5.agents!["task-verifier"].tools).not.toContain("edit_file");
     expect(v5.agents!["task-planner"].tools).not.toContain("Edit");
+    expect(v5.agents!["task-planner"].tools).toContain("mcp__ai_coder__locate_feature_implementation");
+    expect(v5.agents!["task-planner"].prompt).toContain("status=complete");
     expect(v5.agents!["pre-behavior-snapshot"].tools).not.toContain("edit_file");
     expect(v5.agents!["completeness-checker"].tools).not.toContain("edit_file");
     expect(v5.agents!["call-contract-investigator"].tools).not.toContain("Edit");
-    expect(v5.agents!["call-contract-investigator"].tools).toContain("mcp__ai_coder__analyze_symbol_contract");
+    expect(v5.agents!["call-contract-investigator"].tools).toContain("mcp__ai_coder__investigate_symbol_contract");
     // task-executor can write
     expect(v5.agents!["task-executor"].tools).toContain("Edit");
   });
@@ -124,6 +126,8 @@ describe("careful-coder.yaml latest", () => {
     expect(v5.system_prompt).toContain("一次只推进一个");
     expect(v5.system_prompt).toContain("next_action` 只能指向其中一个需求点");
     expect(v5.system_prompt).toContain("完成即核对");
+    expect(v5.system_prompt).toContain("功能实现普查硬规则");
+    expect(v5.system_prompt).toContain("locate_feature_implementation");
     expect(v5.system_prompt).toContain("用户原始目标与输入 → 当前知识雪球 → 当前阶段任务 → 当前执行观察");
     expect(v5.agents!["task-planner"].prompt).toContain("独立 task");
     expect(v5.agents!["task-executor"].prompt).toContain("一个 R-ID / 一个独立需求点");

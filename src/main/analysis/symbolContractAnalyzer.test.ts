@@ -125,4 +125,61 @@ describe("analyzeSymbolContract", () => {
     expect(result.target).toMatchObject({ symbol: "Action", file: "target.tsx" });
     expect(result.coverage.total_call_sites).toBe(2);
   });
+
+  it("reports every overload and class component prop contract", async () => {
+    const root = await createFixture();
+    await writeFile(path.join(root, "contracts.ts"), `
+export function format(value: string): string;
+export function format(value: number, radix: number): string;
+export function format(value: string | number, radix = 10): string {
+  return typeof value === "number" ? value.toString(radix) : value;
+}
+
+class Component<Props> {}
+export interface PanelProps {
+  /** Navigation object forwarded by the caller. */
+  navigator: { push(route: string): void };
+  /** Optional display title. */
+  title?: string;
+}
+export class Panel extends Component<PanelProps> {}
+`);
+
+    const overloads = analyzeSymbolContract({
+      projectPath: root,
+      targetFile: "contracts.ts",
+      symbol: "format",
+      section: "contract"
+    });
+    expect(overloads.contract?.signatures).toHaveLength(2);
+    expect(overloads.contract?.signatures.map((signature) =>
+      signature.inputs.map((input) => `${input.name}:${input.type}`)
+    )).toEqual(expect.arrayContaining([
+      ["value:string"],
+      ["value:number", "radix:number"]
+    ]));
+
+    const component = analyzeSymbolContract({
+      projectPath: root,
+      targetFile: "contracts.ts",
+      symbol: "Panel",
+      section: "contract"
+    });
+    expect(component.contract?.component_props).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        name: "navigator",
+        required: true,
+        meaning: "Navigation object forwarded by the caller."
+      }),
+      expect.objectContaining({
+        name: "title",
+        required: false,
+        meaning: "Optional display title."
+      })
+    ]));
+    expect(component.contract?.inputs[0]).toMatchObject({
+      name: "props",
+      type: "PanelProps"
+    });
+  });
 });

@@ -83,6 +83,10 @@ export interface SymbolContractAnalysis {
     inputs: ParameterContract[];
     outputs: Array<{ type: string; meaning: string | null }>;
     component_props: ParameterContract[];
+    signatures: Array<{
+      inputs: ParameterContract[];
+      output: { type: string; meaning: string | null };
+    }>;
   };
   calls?: {
     items: CallSite[];
@@ -140,7 +144,9 @@ export function analyzeSymbolContract(input: AnalyzeSymbolContractInput): Symbol
   const target = resolveTargetSymbol(sourceFile, input.symbol, checker, input.targetLine);
   const targetDeclarations = target.symbol.getDeclarations() ?? [target.declaration];
   const targetDeclarationSet = new Set(targetDeclarations);
-  const signatures = checker.getTypeOfSymbolAtLocation(target.symbol, target.declaration).getCallSignatures();
+  const targetType = checker.getTypeOfSymbolAtLocation(target.symbol, target.declaration);
+  const callSignatures = targetType.getCallSignatures();
+  const signatures = callSignatures.length > 0 ? callSignatures : targetType.getConstructSignatures();
   const contract = buildContract(signatures, target.declaration, checker);
 
   const callSites: CallSite[] = [];
@@ -400,10 +406,72 @@ function buildContract(
     type: checker.typeToString(item.getReturnType(), declaration, ts.TypeFormatFlags.NoTruncation),
     meaning: documentationOf(symbolOfDeclaration(item.declaration, checker), checker)
   }));
-  const componentProps = looksLikeComponent(declaration, signatures, checker) && inputs.length === 1
-    ? (inputs[0].properties ?? [])
-    : [];
-  return { inputs, outputs, component_props: componentProps };
+  const classComponentProps = classComponentPropsContract(declaration, checker);
+  const componentProps = classComponentProps.length > 0
+    ? classComponentProps
+    : looksLikeComponent(declaration, signatures, checker) && inputs.length === 1
+      ? (inputs[0].properties ?? [])
+      : [];
+  const effectiveInputs = inputs.length > 0
+    ? inputs
+    : classComponentProps.length > 0
+      ? [{
+          name: "props",
+          type: classComponentPropsType(declaration, checker) ?? "<unknown>",
+          required: true,
+          default_logic: null,
+          meaning: null,
+          properties: classComponentProps
+        }]
+      : [];
+  const signatureContracts = signatures.map((signature) => ({
+    inputs: signature.getParameters().map((parameter) => parameterContract(parameter, checker, declaration)),
+    output: {
+      type: checker.typeToString(signature.getReturnType(), declaration, ts.TypeFormatFlags.NoTruncation),
+      meaning: documentationOf(symbolOfDeclaration(signature.declaration, checker), checker)
+    }
+  }));
+  return {
+    inputs: effectiveInputs,
+    outputs,
+    component_props: componentProps,
+    signatures: signatureContracts
+  };
+}
+
+function classComponentPropsContract(
+  declaration: ts.Declaration,
+  checker: ts.TypeChecker
+): ParameterContract[] {
+  const type = classComponentPropsTypeNode(declaration);
+  if (!type) return [];
+  const propsType = checker.getTypeFromTypeNode(type);
+  return checker.getPropertiesOfType(propsType)
+    .slice(0, 100)
+    .map((property) => parameterContract(property, checker, declaration));
+}
+
+function classComponentPropsType(
+  declaration: ts.Declaration,
+  checker: ts.TypeChecker
+): string | null {
+  const type = classComponentPropsTypeNode(declaration);
+  return type
+    ? checker.typeToString(checker.getTypeFromTypeNode(type), declaration, ts.TypeFormatFlags.NoTruncation)
+    : null;
+}
+
+function classComponentPropsTypeNode(declaration: ts.Declaration): ts.TypeNode | null {
+  if (!ts.isClassDeclaration(declaration)) return null;
+  for (const clause of declaration.heritageClauses ?? []) {
+    if (clause.token !== ts.SyntaxKind.ExtendsKeyword) continue;
+    for (const heritageType of clause.types) {
+      const baseName = heritageType.expression.getText();
+      if (!/(?:^|\.)(?:Component|PureComponent)$/.test(baseName)) continue;
+      if (heritageType.typeArguments?.[0]) return heritageType.typeArguments[0];
+    }
+  }
+  return null;
 }
 
 function parameterContract(

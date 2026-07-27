@@ -39,6 +39,12 @@ prepare 签发规范化的项目相对文件租约。implement 启动前，宿�
 
 `prepare.call_contract.analyzed_targets` 只描述真实函数、方法、类或组件的调用契约，不要求和 `allowed_files` 一一对应。常量表、路由配置、静态数据和样式文件只进入 `allowed_files`、`patch_plan` 与修改前证据，避免为了满足文件覆盖而伪造手工符号分析。
 
+同功能参考将用户入口 `location` 与最终真实函数/组件 `contract_location` 分开记录。入口可以是路由常量或静态配置；prepare 只对 `contract_location` 建立调用契约，并用入口证据冻结六类行为义务。`changes_required` 描述的是尚待实现的未来契约，不得要求不存在的新分支提供当前代码行；目标现状和修改上下文由 investigate 交接物证明，实际目标代码证据由 implement 与 verify 在修改后逐项提交。只有 `already_satisfied` 才需要在 prepare 同时证明当前目标已满足每项义务。
+
+investigate 在目标由业务功能、用户行为、页面、事件或协议值描述时，必须调用宿主持有的 `locate_feature_implementation` 功能普查脚本。脚本扫描 TypeScript/JavaScript/React 项目中的全部受支持源文件，合并符号名、文件路径、定义正文、配置邻接及完整上下游调用图候选，并将每个候选记账为 yes/no/unknown。首次报告中的 unknown 必须逐项读取代码并携带 path:line adjudication 重跑，直到 `status=complete`；宿主按真实 tool call、报告 digest、候选计数和最终 yes 集合重算校验，Read/Grep、候选排名或模型自述不能替代。每个 yes 函数/组件会自动进入完整调用契约调查；不支持语言中命中功能证据时报告保持 partial，不允许静默漏掉。
+
+prepare 对真实函数、方法、Hook 或组件使用宿主持有的 `investigate_symbol_contract` 调查脚本。一次工具调用会自动消费 contract、calls、wrappers、references 全部分页并递归调查公共封装；宿主按真实 `tool_calls` 逐目标核验，Read/Grep/Bash、零散分析调用或结构化输出中的文字声明均不能替代。动态引用必须继续追踪或进入 `unresolved`，公共封装递归被截断时 prepare 不得通过。同一只读阶段的宿主验收会复用该次可信报告，不再重复构建整个 TypeScript 项目；进程重启后缓存缺失时才安全重算。
+
 只读阶段仍向 SDK 暴露受宿主门禁保护的 `Edit`/`Write` 名称。过早调用不会得到“工具不存在”，而会得到当前阶段应提交什么、何时自动进入 implement 的修正指引。Bash 写入同样按阶段返回下一步；分层角色调用旧 Profile 的任务树、checkpoint 或用 `ask_human` 申请内部工具时，宿主会原地引导回当前 handoff，不创建用户问题。
 
 ## 阶段角色与能力

@@ -7,6 +7,13 @@ description: Trace a requested behavior through an unfamiliar codebase before ch
 
 Trace from observable behavior to the code that produces it. Do not stop at a symbol definition or configuration table.
 
+When the target is described as a feature, user behavior, page, event, route token, or protocol value rather than one exact symbol, call `mcp__ai_coder__locate_feature_implementation`. Treat it as a census, not a ranking:
+
+- preserve every candidate returned by symbol, path, declaration text, configuration adjacency, and upstream/downstream call-graph discovery;
+- inspect every `unknown`, then rerun with a `yes` or `no` adjudication, reason, and `path:line` evidence for each;
+- do not claim discovery is complete until the report says `status=complete`, candidate accounting has `unknown=0`, and every selected `yes` target has a contract digest;
+- retain rejected candidates and their negative evidence so similarly named pages, tests, static identifiers, and the code currently being proposed cannot silently become the reference.
+
 1. Confirm every code read comes from the user-authorized baseline, then find the runtime entry point: event, API, route, command, or component that users actually trigger. If the current working tree is explicitly excluded, use `git show <ref>:<path>` or an isolated worktree instead of Read on the current file.
 2. Follow callers and consumers until you can name the execution path, guards, parameters, side effects, and final target.
 3. Search for analogous working behavior and compare the whole path, not just identifiers.

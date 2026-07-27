@@ -526,6 +526,64 @@ function validatePhaseHandoffSemantics(
       requireNonEmptyStringArray(target[field], `handoff.target_investigation.${field}`);
     }
     requirePathLineEvidence(target.evidence_refs, "handoff.target_investigation.evidence_refs");
+    const census = requiredRecord(handoff.feature_census, "handoff.feature_census");
+    const applicability = requiredString(
+      census.applicability,
+      "handoff.feature_census.applicability"
+    );
+    if (applicability !== "required" && applicability !== "not-applicable") {
+      throw new Error("feature_census.applicability 必须是 required 或 not-applicable");
+    }
+    requiredString(census.reason, "handoff.feature_census.reason");
+    if (applicability === "required") {
+      if (requiredString(census.status, "handoff.feature_census.status") !== "complete") {
+        throw new Error("功能实现候选普查未 complete，不能结束 investigate");
+      }
+      if (!/^[a-f0-9]{64}$/.test(requiredString(
+        census.report_digest,
+        "handoff.feature_census.report_digest"
+      ))) {
+        throw new Error("feature_census.report_digest 必须是完整调查报告 SHA-256");
+      }
+      const accounting = requiredRecord(
+        census.candidate_accounting,
+        "handoff.feature_census.candidate_accounting"
+      );
+      const total = requiredNonNegativeInteger(
+        accounting.total,
+        "handoff.feature_census.candidate_accounting.total"
+      );
+      const yes = requiredNonNegativeInteger(
+        accounting.yes,
+        "handoff.feature_census.candidate_accounting.yes"
+      );
+      const no = requiredNonNegativeInteger(
+        accounting.no,
+        "handoff.feature_census.candidate_accounting.no"
+      );
+      const unknown = requiredNonNegativeInteger(
+        accounting.unknown,
+        "handoff.feature_census.candidate_accounting.unknown"
+      );
+      if (accounting.accounted !== true) {
+        throw new Error("feature_census.candidate_accounting.accounted 必须为 true");
+      }
+      if (total !== yes + no + unknown) {
+        throw new Error("feature_census 候选计数未完整记账");
+      }
+      if (unknown !== 0) {
+        throw new Error("feature_census 仍有 unknown 候选未逐项给出是/不是证据");
+      }
+      const selectedCandidateIds = stringArray(
+        census.selected_candidate_ids,
+        "handoff.feature_census.selected_candidate_ids"
+      );
+      if (selectedCandidateIds.length !== yes) {
+        throw new Error(
+          `feature_census.selected_candidate_ids 必须逐项对应全部 yes 候选：yes=${yes}，selected=${selectedCandidateIds.length}`
+        );
+      }
+    }
 
     const reference = requiredRecord(handoff.reference_analysis, "handoff.reference_analysis");
     requireNonEmptyStringArray(reference.search_scope, "handoff.reference_analysis.search_scope");
@@ -546,19 +604,20 @@ function validatePhaseHandoffSemantics(
       throw new Error("存在同类实现候选时必须说明 selection_reason");
     }
     const candidateLocations = candidates.map((candidate, index) => {
+      const prefix = `handoff.reference_analysis.candidates[${index}]`;
       if (requiredString(
         candidate.reference_kind,
-        `handoff.reference_analysis.candidates[${index}].reference_kind`
+        `${prefix}.reference_kind`
       ) !== "same-feature-entry") {
         throw new Error("同类实现候选必须是同一业务功能的既有用户入口，不能只选外形相似的兄弟分支");
       }
       requireNonEmptyStringArray(
         candidate.feature_equivalence,
-        `handoff.reference_analysis.candidates[${index}].feature_equivalence`
+        `${prefix}.feature_equivalence`
       );
-      requireNonEmptyStringArray(candidate.similarity, `handoff.reference_analysis.candidates[${index}].similarity`);
-      requireNonEmptyStringArray(candidate.reusable_behavior, `handoff.reference_analysis.candidates[${index}].reusable_behavior`);
-      requireNonEmptyStringArray(candidate.differences, `handoff.reference_analysis.candidates[${index}].differences`);
+      requireNonEmptyStringArray(candidate.similarity, `${prefix}.similarity`);
+      requireNonEmptyStringArray(candidate.reusable_behavior, `${prefix}.reusable_behavior`);
+      requireNonEmptyStringArray(candidate.differences, `${prefix}.differences`);
       for (const field of [
         "arguments",
         "preconditions",
@@ -567,21 +626,28 @@ function validatePhaseHandoffSemantics(
       ] as const) {
         requireNonEmptyStringArray(
           candidate[field],
-          `handoff.reference_analysis.candidates[${index}].${field}`
+          `${prefix}.${field}`
         );
       }
-      requiredString(candidate.destination, `handoff.reference_analysis.candidates[${index}].destination`);
-      requiredString(candidate.invocation, `handoff.reference_analysis.candidates[${index}].invocation`);
-      requirePathLineEvidence(candidate.evidence_refs, `handoff.reference_analysis.candidates[${index}].evidence_refs`);
-      return requiredString(candidate.location, `handoff.reference_analysis.candidates[${index}].location`);
+      requiredString(candidate.destination, `${prefix}.destination`);
+      requiredString(candidate.invocation, `${prefix}.invocation`);
+      requirePathLineEvidence(candidate.evidence_refs, `${prefix}.evidence_refs`);
+      const location = requiredString(candidate.location, `${prefix}.location`);
+      const contractLocation = requiredString(candidate.contract_location, `${prefix}.contract_location`);
+      requirePathLineString(location, `${prefix}.location`);
+      requirePathLineString(contractLocation, `${prefix}.contract_location`);
+      return location;
     });
     if (!candidateLocations.includes(selected)) {
       throw new Error("selected_location 必须对应 reference_analysis.candidates 中的一个候选");
     }
     const targetDefinition = firstPathLineToken(requiredString(target.definition, "handoff.target_investigation.definition"));
-    const selectedDefinition = firstPathLineToken(selected);
-    if (targetDefinition && selectedDefinition && targetDefinition === selectedDefinition) {
-      throw new Error("不得把当前待实现代码本身冒充同功能既有入口");
+    const selectedEntryDefinition = firstPathLineToken(selected);
+    if (targetDefinition && selectedEntryDefinition && targetDefinition === selectedEntryDefinition) {
+      throw new Error(
+        `不得把当前待实现代码本身冒充同功能既有入口：target=${targetDefinition}；candidate.location=${selectedEntryDefinition}。`
+        + "不同既有入口可以共享同一 contract_location，但 candidate.location 必须指向独立入口"
+      );
     }
     return;
   }
@@ -623,11 +689,11 @@ function validatePhaseHandoffSemantics(
       requireNonEmptyStringArray(target[field], `${prefix}.${field}`);
     }
     requirePathLineEvidence(target.evidence_refs, `${prefix}.evidence_refs`);
-    if (method === "symbol-analyzer") {
+    if (method === "investigation-script") {
       const sections = new Set(stringArray(target.analyzer_sections, `${prefix}.analyzer_sections`));
       const missing = [...requiredSections].filter((section) => !sections.has(section));
       if (missing.length > 0 || target.all_pages_consumed !== true) {
-        throw new Error(`${prefix} 的符号分析不完整：缺少 ${missing.join(", ") || "完整分页证明"}`);
+        throw new Error(`${prefix} 的调查脚本证据不完整：缺少 ${missing.join(", ") || "完整分页证明"}`);
       }
     } else if (method === "manual-static-analysis") {
       if (!requiredString(target.method_reason, `${prefix}.method_reason`).trim()) {
@@ -714,6 +780,12 @@ function requirePathLineEvidence(value: unknown, label: string): void {
   }
 }
 
+function requirePathLineString(value: string, label: string): void {
+  if (!firstPathLineToken(value)) {
+    throw new Error(`${label} 必须是 path:line 代码位置`);
+  }
+}
+
 function firstPathLineToken(value: string): string | null {
   return value.match(/(?:^|\s|\()(\S+\.[A-Za-z0-9]+:\d+)/)?.[1] ?? null;
 }
@@ -777,10 +849,13 @@ function phaseConfiguration(phase: Exclude<HierarchicalWorkPhase, "close">): {
 } {
   switch (phase) {
     case "investigate":
-      return { tools: ["Read", "Grep", "Glob", "Bash"], skills: ["exploring-codebase"] };
+      return {
+        tools: ["Read", "Grep", "Glob", "Bash", "mcp__ai_coder__locate_feature_implementation"],
+        skills: ["exploring-codebase"]
+      };
     case "prepare":
       return {
-        tools: ["Read", "Grep", "Glob", "Bash", "mcp__ai_coder__analyze_symbol_contract"],
+        tools: ["Read", "Grep", "Glob", "Bash", "mcp__ai_coder__investigate_symbol_contract"],
         skills: ["preserving-existing-behavior", "investigating-call-contracts"]
       };
     case "implement":
@@ -802,8 +877,12 @@ function phaseInstructions(
     case "investigate":
       return [
         "只读取证：定位目标代码、最相似既有实现、真实调用方和关键未知。",
+        "只要需求以业务功能、用户行为、页面或协议标识描述，而不是用户已经给出唯一精确符号，就必须调用 locate_feature_implementation 做完整候选普查。首次返回 unknown 时逐项读取并提交 yes/no adjudications，直到 status=complete；普通 Read/Grep、只报最像候选或模型自述不能替代。",
+        "功能普查必须覆盖符号名、路径、定义正文、配置邻接和完整上下游调用图；每个候选都要保留 evidence_for、evidence_against 与 yes/no 结论，不能静默丢弃相似候选。",
         "目标函数/组件必须逐项调查定义、输入、输出、内部调用、guard、状态/副作用和调用方；某项不存在也要用证据明确写‘无’，不得省略。",
         "同类实现不是外形相似的路由分支。必须优先找到应用内进入同一业务功能的既有用户入口，沿该入口追到最终组件/函数，并记录目标、调用方式、完整参数、guard、上下文透传和副作用。",
+        "reference candidate 的 location 记录用户入口或路由配置位置，contract_location 必须单独记录沿入口追踪到的最终真实函数/组件定义；静态常量入口不得冒充调用契约目标。",
+        "不同既有入口可以合法汇聚到同一最终函数/组件，因此 candidate.contract_location 可以与 target definition 相同；禁止的是 candidate.location 直接指向当前待实现位置、刚新增代码或当前目标定义本身。",
         "每个候选都必须证明 feature_equivalence，并提交完整行为指纹；不得拿当前待实现分支、刚新增代码或仅同属导航模块的兄弟分支冒充同功能参考。",
         "同功能入口必须先列候选再选择：记录搜索范围、相似依据、可复用行为和差异；确无同功能入口时写明搜索范围与未找到原因。",
         "附件 token 与代码名称存在大小写、缩写、OCR、历史错拼或编号冲突时，保留附件原词并建立‘原词 → 候选 → 代码 canonical symbol’映射；定义、配置消费者、调用点和同类实现能够收敛时直接记录校正，不得要求用户确认命名差异。",
@@ -813,10 +892,11 @@ function phaseInstructions(
     case "prepare":
       return [
         "只读取证：建立调用契约、pre-behavior、修改处置和验证入口。需要修改时必须返回非空 allowed_files；完整契约已满足时走有证据的 no-op。",
-        "对每个将调用、复用或修改的既有函数/组件，优先使用 analyze_symbol_contract，并完整覆盖 contract、calls、wrappers、references 及全部分页。",
+        "对每个将调用、复用或修改的既有函数/组件，必须调用 investigate_symbol_contract 完整调查脚本；脚本会自动覆盖 contract、calls、wrappers、references 全部分页并递归调查公共封装。Read/Grep/Bash、零散 analyze_symbol_contract 或模型自述均不能替代。",
         "analyzed_targets 只登记函数、方法、类或组件等真实调用契约目标；常量表、路由配置对象、静态数据和样式文件即使列入 allowed_files，也不要为了凑文件覆盖伪造符号契约目标。",
-        "如果真实调用契约目标不受分析器支持，才改为 manual-static-analysis，说明原因并用 path:line 补齐同样的契约维度。纯静态配置改动直接写入 patch_plan、pre_behavior 和 allowed_files。",
+        "调查脚本成功时 analysis_method 必须写 investigation-script，并把报告中的动态引用、递归封装截断或静态分析边界保留在 unresolved。只有真实调用契约目标不受脚本支持时，才改为 manual-static-analysis，说明原因并用 path:line 补齐同样的契约维度。纯静态配置改动直接写入 patch_plan、pre_behavior 和 allowed_files。",
         "必须把 investigate 选中的同功能入口落实为 reference_application，并生成恰好六类稳定 behavior_obligations：destination、invocation、arguments、preconditions、context、side_effects。",
+        "changes_required 的 behavior_obligations 是尚待实现的未来契约：每项引用同功能既有入口证据，不得虚构尚不存在的新分支 path:line。目标现状和插入上下文沿用 investigate 已验证证据，实际目标代码证据由 implement、verify 逐项提交；只有 already_satisfied 才必须在 prepare 为每项同时给出当前目标代码证据。",
         "默认逐维度复用同功能入口。任何 intentional-difference 都必须引用用户要求或既有架构证据；不能以‘当前代码已经这样写’作为差异依据。",
         "若六类义务已全部满足，返回 change_disposition=already_satisfied、空 allowed_files 和逐项 satisfaction_evidence，宿主将跳过 implement 直接独立验证；否则返回 changes_required 和非空 allowed_files。",
         "prepare 是只读阶段，不需要 Edit。提交合格 handoff 后宿主会自动进入 implement 并授予 allowed_files 的 Edit 权限；不得改用 Bash 写文件，也不得要求用户启用内部工具。"
@@ -897,6 +977,7 @@ function phaseHandoffSchema(
   const referenceCandidateSchema = strictObjectSchema({
     reference_kind: { type: "string", enum: ["same-feature-entry"] },
     location: { type: "string", minLength: 1 },
+    contract_location: { type: "string", minLength: 1 },
     feature_equivalence: stringList(1),
     similarity: stringList(1),
     reusable_behavior: stringList(1),
@@ -912,7 +993,7 @@ function phaseHandoffSchema(
   const analyzedTargetSchema = strictObjectSchema({
     target_file: { type: "string", minLength: 1 },
     symbol: { type: "string", minLength: 1 },
-    analysis_method: { type: "string", enum: ["symbol-analyzer", "manual-static-analysis"] },
+    analysis_method: { type: "string", enum: ["investigation-script", "manual-static-analysis"] },
     method_reason: { type: "string" },
     analyzer_sections: stringList(),
     all_pages_consumed: { type: "boolean" },
@@ -947,6 +1028,20 @@ function phaseHandoffSchema(
       return strictObjectSchema({
         confirmed_facts: stringList(1),
         target_locations: stringList(1),
+        feature_census: strictObjectSchema({
+          applicability: { type: "string", enum: ["required", "not-applicable"] },
+          reason: { type: "string", minLength: 1 },
+          status: { type: "string", enum: ["complete", "not-applicable"] },
+          report_digest: { type: "string" },
+          candidate_accounting: strictObjectSchema({
+            total: { type: "integer", minimum: 0 },
+            yes: { type: "integer", minimum: 0 },
+            no: { type: "integer", minimum: 0 },
+            unknown: { type: "integer", minimum: 0 },
+            accounted: { type: "boolean", const: true }
+          }),
+          selected_candidate_ids: stringList()
+        }),
         target_investigation: strictObjectSchema({
           target_kind: { type: "string", minLength: 1 },
           definition: { type: "string", minLength: 1 },
@@ -1048,7 +1143,7 @@ function phaseHandoffContract(
 ): string {
   switch (phase) {
     case "investigate":
-      return "必须提交 confirmed_facts、target_locations、target_investigation、reference_analysis、open_unknowns；同类参考必须是同一业务功能的既有入口，并覆盖目标、调用方式、参数、前置条件、上下文和副作用。";
+      return "必须提交 confirmed_facts、target_locations、feature_census、target_investigation、reference_analysis、open_unknowns；业务功能目标必须真实完成全候选普查并逐项给出 yes/no 正反证据，同类参考必须是同一业务功能的既有入口，分开记录入口 location 与最终函数/组件 contract_location，并覆盖目标、调用方式、参数、前置条件、上下文和副作用。";
     case "prepare":
       return "必须提交结构化 call_contract、reference_application、六类 behavior_obligations、change_disposition、satisfaction_evidence、pre_behavior、preserve_invariants、patch_plan、verification_plan；changes_required 另行提交非空 allowed_files，already_satisfied 提交空数组。";
     case "implement":
@@ -1066,8 +1161,9 @@ function phaseOutputSkeleton(
       return [
         "{ status, summary, evidence_refs,",
         "  handoff: { confirmed_facts, target_locations,",
+        "    feature_census: { applicability: \"required\"|\"not-applicable\", reason, status: \"complete\"|\"not-applicable\", report_digest, candidate_accounting: { total, yes, no, unknown, accounted: true }, selected_candidate_ids },",
         "    target_investigation: { target_kind, definition, inputs, outputs, internal_calls, guards, state_and_side_effects, callers, evidence_refs, unresolved },",
-        "    reference_analysis: { search_scope, candidates: [{ reference_kind: \"same-feature-entry\", location, feature_equivalence, similarity, reusable_behavior, differences, destination, invocation, arguments, preconditions, context_forwarding, side_effects, evidence_refs }], selected_location, selection_reason, no_reference_reason },",
+        "    reference_analysis: { search_scope, candidates: [{ reference_kind: \"same-feature-entry\", location, contract_location, feature_equivalence, similarity, reusable_behavior, differences, destination, invocation, arguments, preconditions, context_forwarding, side_effects, evidence_refs }], selected_location, selection_reason, no_reference_reason },",
         "    open_unknowns } }"
       ].join("\n");
     case "prepare":
@@ -1346,6 +1442,13 @@ function requiredRecord(value: unknown, name: string): Record<string, unknown> {
 function requiredString(value: unknown, name: string): string {
   if (typeof value !== "string" || !value.trim()) throw new Error(`${name} 必须是非空字符串`);
   return value.trim();
+}
+
+function requiredNonNegativeInteger(value: unknown, name: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new Error(`${name} 必须是非负整数`);
+  }
+  return value;
 }
 
 function requiredArray(value: unknown, name: string): unknown[] {
