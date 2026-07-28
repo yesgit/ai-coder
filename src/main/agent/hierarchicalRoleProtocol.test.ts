@@ -50,6 +50,15 @@ function handoffFor(phase: "investigate" | "prepare" | "implement" | "verify") {
     return {
       confirmed_facts: ["target confirmed"],
       target_locations: ["src/target.ts:1"],
+      target_mappings: [{
+        target_key: "route",
+        requested_token: "route",
+        canonical_token: "route",
+        dispatcher_location: "src/target.ts:1",
+        contract_symbol: "reference",
+        contract_location: "src/reference.ts:5",
+        evidence_refs: ["src/target.ts:1", "src/reference.ts:5"]
+      }],
       feature_census: {
         applicability: "required",
         reason: "功能以用户行为描述，必须普查实现候选",
@@ -73,9 +82,11 @@ function handoffFor(phase: "investigate" | "prepare" | "implement" | "verify") {
       reference_analysis: {
         search_scope: ["searched src/**/*.ts"],
         candidates: [{
+          target_key: "route",
           reference_kind: "same-feature-entry",
           location: "src/reference.ts:5",
           contract_location: "src/reference.ts:5",
+          contract_symbol: "reference",
           feature_equivalence: ["same user-visible feature at src/reference.ts:5"],
           similarity: ["same callable shape"],
           reusable_behavior: ["preserve argument forwarding"],
@@ -88,9 +99,12 @@ function handoffFor(phase: "investigate" | "prepare" | "implement" | "verify") {
           side_effects: ["no side effects at src/reference.ts:5"],
           evidence_refs: ["src/reference.ts:5"]
         }],
-        selected_location: "src/reference.ts:5",
-        selection_reason: "closest behavior contract",
-        no_reference_reason: ""
+        target_selections: [{
+          target_key: "route",
+          selected_location: "src/reference.ts:5",
+          selection_reason: "closest behavior contract",
+          no_reference_reason: ""
+        }]
       },
       open_unknowns: []
     };
@@ -135,6 +149,7 @@ function handoffFor(phase: "investigate" | "prepare" | "implement" | "verify") {
         }]
       },
       reference_application: [{
+        target_key: "route",
         dimension: "argument forwarding",
         target_behavior: "forward input",
         reference_behavior: "forward input",
@@ -179,6 +194,7 @@ function behaviorObligations(reference: string, target: string) {
   ].map(([id, dimension]) => ({
     id,
     dimension,
+    target_keys: ["route"],
     reference_behavior: `${dimension} from ${reference}`,
     required_behavior: `${dimension} at ${target}`,
     decision: "reuse",
@@ -360,9 +376,12 @@ describe("hierarchicalRoleProtocol", () => {
     handoff.reference_analysis = {
       search_scope: ["searched src/**/*.ts"],
       candidates: [],
-      selected_location: "",
-      selection_reason: "",
-      no_reference_reason: ""
+      target_selections: [{
+        target_key: "route",
+        selected_location: "",
+        selection_reason: "",
+        no_reference_reason: ""
+      }]
     };
 
     expect(() => parseHierarchicalRoleResult(operation, {
@@ -370,7 +389,7 @@ describe("hierarchicalRoleProtocol", () => {
       summary: "reference search omitted",
       evidence_refs: ["src/target.ts:1"],
       handoff
-    })).toThrow("未找到同类实现时必须说明 no_reference_reason");
+    })).toThrow("逐目标说明 no_reference_reason");
   });
 
   it("does not allow investigate to hide an unclassified feature candidate", () => {
@@ -400,6 +419,53 @@ describe("hierarchicalRoleProtocol", () => {
     })).toThrow("unknown 候选");
   });
 
+  it("does not allow a passed investigate phase to retain material open unknowns", () => {
+    const handoff = handoffFor("investigate") as Record<string, unknown>;
+    handoff.open_unknowns = [
+      "LqbHomeV3 是复用 CurrencyFundExplain 还是进入独立首页组件尚未闭合"
+    ];
+
+    expect(() => parseHierarchicalRoleResult({
+      kind: "run_phase",
+      requirement_id: "R1",
+      work_unit_id: "R1:investigate",
+      phase: "investigate",
+      role: "code-investigator"
+    }, {
+      status: "passed",
+      summary: "target was guessed despite an unresolved destination",
+      evidence_refs: ["src/target.ts:1"],
+      handoff
+    })).toThrow("open_unknowns");
+  });
+
+  it("requires a reference decision for every independently mapped target", () => {
+    const handoff = handoffFor("investigate") as Record<string, unknown>;
+    const mappings = handoff.target_mappings as Array<Record<string, unknown>>;
+    mappings.push({
+      target_key: "second-route",
+      requested_token: "TGZCRZ",
+      canonical_token: "TGZCRZ",
+      dispatcher_location: "src/target.ts:1",
+      contract_symbol: "secondReference",
+      contract_location: "src/secondReference.ts:3",
+      evidence_refs: ["src/target.ts:1", "src/secondReference.ts:3"]
+    });
+
+    expect(() => parseHierarchicalRoleResult({
+      kind: "run_phase",
+      requirement_id: "R1",
+      work_unit_id: "R1:investigate",
+      phase: "investigate",
+      role: "code-investigator"
+    }, {
+      status: "passed",
+      summary: "only one of two page targets was investigated",
+      evidence_refs: ["src/target.ts:1"],
+      handoff
+    })).toThrow("second-route");
+  });
+
   it("requires a callable contract location separately from the same-feature entry", () => {
     const handoff = handoffFor("investigate") as Record<string, unknown>;
     const analysis = handoff.reference_analysis as { candidates: Array<Record<string, unknown>> };
@@ -425,16 +491,20 @@ describe("hierarchicalRoleProtocol", () => {
     target.definition = "LQBInvest component at lib/views/myAssets/LQBInvest.js:33";
     const analysis = handoff.reference_analysis as {
       candidates: Array<Record<string, unknown>>;
-      selected_location: string;
+      target_selections: Array<Record<string, unknown>>;
     };
+    const mappings = handoff.target_mappings as Array<Record<string, unknown>>;
     const candidate = analysis.candidates[0]!;
     candidate.location = "lib/views/myAssets/MyAssetsNewRevision.js:800";
     candidate.contract_location = "lib/views/myAssets/LQBInvest.js:33";
+    candidate.contract_symbol = "LQBInvest";
     candidate.evidence_refs = [
       "lib/views/myAssets/MyAssetsNewRevision.js:800",
       "lib/views/myAssets/LQBInvest.js:33"
     ];
-    analysis.selected_location = "lib/views/myAssets/MyAssetsNewRevision.js:800";
+    mappings[0]!.contract_location = "lib/views/myAssets/LQBInvest.js:33";
+    mappings[0]!.contract_symbol = "LQBInvest";
+    analysis.target_selections[0]!.selected_location = "lib/views/myAssets/MyAssetsNewRevision.js:800";
 
     expect(() => parseHierarchicalRoleResult({
       kind: "run_phase",
@@ -454,13 +524,13 @@ describe("hierarchicalRoleProtocol", () => {
     const handoff = handoffFor("investigate") as Record<string, unknown>;
     const analysis = handoff.reference_analysis as {
       candidates: Array<Record<string, unknown>>;
-      selected_location: string;
+      target_selections: Array<Record<string, unknown>>;
     };
     const candidate = analysis.candidates[0]!;
     candidate.location = "src/target.ts:1";
     candidate.contract_location = "src/reference.ts:5";
     candidate.evidence_refs = ["src/target.ts:1", "src/reference.ts:5"];
-    analysis.selected_location = "src/target.ts:1";
+    analysis.target_selections[0]!.selected_location = "src/target.ts:1";
 
     expect(() => parseHierarchicalRoleResult({
       kind: "run_phase",

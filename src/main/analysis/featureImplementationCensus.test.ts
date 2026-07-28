@@ -4,6 +4,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   censusFeatureImplementations,
+  formatFeatureImplementationCensusToolResult,
   type FeatureCandidateAdjudication
 } from "./featureImplementationCensus.js";
 
@@ -67,7 +68,7 @@ export function mockLQBVoiceJump() {
 }
 
 describe("censusFeatureImplementations", () => {
-  it("enumerates every evidence-connected candidate and accounts for each verdict", async () => {
+  it("enumerates distinctive evidence-bearing candidates and accounts for each verdict", async () => {
     const root = await createNavigationFixture();
     const report = censusFeatureImplementations({
       projectPath: root,
@@ -84,8 +85,7 @@ describe("censusFeatureImplementations", () => {
       "TransactionRecordLQB",
       "goLqbInvest",
       "redirectActionPush",
-      "autoPushPage",
-      "mockLQBVoiceJump"
+      "autoPushPage"
     ]));
     expect(report.candidate_accounting.total).toBe(
       report.candidate_accounting.yes
@@ -97,15 +97,14 @@ describe("censusFeatureImplementations", () => {
       all_supported_files_scanned: true,
       graph_traversal_complete: true
     });
-    expect(report.candidates.find((candidate) => candidate.symbol === "mockLQBVoiceJump"))
-      .toMatchObject({ verdict: "no" });
     expect(report.candidates.find((candidate) => candidate.symbol === "CurrencyFundExplain")
       ?.evidence_against.some((item) => item.kind === "negative-clue")).toBe(true);
-    expect(report.status).toBe("partial");
+    expect(report.status).toBe("complete");
+    expect(report.candidate_accounting.unknown).toBe(0);
     expect(report.report_digest).toMatch(/^[a-f0-9]{64}$/);
   });
 
-  it("accepts evidence-backed verdicts, investigates every yes target, and closes the census", async () => {
+  it("accepts evidence-backed verdicts, fingerprints every yes target, and closes the census", async () => {
     const root = await createNavigationFixture();
     const initial = censusFeatureImplementations({
       projectPath: root,
@@ -150,8 +149,7 @@ describe("censusFeatureImplementations", () => {
       .toBe(true);
     expect(report.rejected_candidates.map((candidate) => candidate.symbol)).toEqual(expect.arrayContaining([
       "CurrencyFundExplain",
-      "TransactionRecordLQB",
-      "mockLQBVoiceJump"
+      "TransactionRecordLQB"
     ]));
     expect(report.unresolved).toEqual([]);
   });
@@ -187,7 +185,7 @@ fun openLqbHome() {
     expect(report.unresolved.join("\n")).toContain("当前脚本不支持语义解析");
   });
 
-  it("does not claim completeness across a dynamic dispatch boundary", async () => {
+  it("records dynamic dispatch limits without blocking feature-location completion", async () => {
     const root = await createNavigationFixture();
     await writeFile(path.join(root, "dynamic.ts"), `
 export function openLqbDynamically(
@@ -215,8 +213,92 @@ export function openLqbDynamically(
       adjudications
     });
 
-    expect(report.status).toBe("partial");
-    expect(report.unresolved.join("\n")).toContain("动态调用边界无法静态穷举");
+    expect(report.status).toBe("complete");
+    expect(report.selected_targets).toHaveLength(1);
+    expect(report.candidates.find((candidate) => candidate.symbol === "openLqbDynamically")
+      ?.call_contract?.unresolved_dynamic_references).toBeGreaterThan(0);
+  });
+
+  it("does not let a rejected dynamic candidate keep the census partial", async () => {
+    const root = await createNavigationFixture();
+    await writeFile(path.join(root, "dynamic.ts"), `
+export function unrelatedDynamicLqbWrapper(
+  handlers: Record<string, () => void>,
+  runtimePageName: string
+) {
+  handlers[runtimePageName]();
+}
+`);
+    const initial = censusFeatureImplementations({
+      projectPath: root,
+      feature: "零钱宝动态候选",
+      aliases: ["unrelatedDynamicLqbWrapper"]
+    });
+    const adjudications: FeatureCandidateAdjudication[] = initial.candidates.map((candidate) => ({
+      candidate_id: candidate.id,
+      verdict: "no",
+      reason: "运行时处理器包装器不是目标功能实现",
+      evidence_refs: [`${candidate.definition.file}:${candidate.definition.line}`]
+    }));
+    const report = censusFeatureImplementations({
+      projectPath: root,
+      feature: "零钱宝动态候选",
+      aliases: ["unrelatedDynamicLqbWrapper"],
+      adjudications
+    });
+
+    expect(report.status).toBe("complete");
+    expect(report.candidate_accounting.unknown).toBe(0);
+    expect(report.unresolved.join("\n")).not.toContain("动态调用边界无法静态穷举");
+  });
+
+  it("returns a compact adjudication view with host metadata before candidates", async () => {
+    const root = await createNavigationFixture();
+    const report = censusFeatureImplementations({
+      projectPath: root,
+      feature: "语音跳转至零钱宝页面",
+      aliases: ["零钱宝", "LQB", "LQBInvest", "LQBTR"]
+    });
+    const formatted = formatFeatureImplementationCensusToolResult(report);
+    const parsed = JSON.parse(formatted) as Record<string, unknown>;
+
+    expect(formatted.indexOf("\"report_digest\"")).toBeLessThan(
+      formatted.indexOf("\"candidates\"")
+    );
+    expect(formatted.length).toBeLessThan(JSON.stringify(report, null, 2).length);
+    expect(parsed).toMatchObject({
+      report_digest: report.report_digest,
+      status: report.status,
+      candidate_accounting: report.candidate_accounting
+    });
+    expect((parsed.candidates as unknown[]).length).toBe(
+      report.candidate_accounting.unknown
+    );
+    expect(parsed.selected_targets).toEqual(report.selected_targets);
+    expect(parsed.rejected_candidate_count).toBe(report.rejected_candidates.length);
+  });
+
+  it("does not let a short legacy alias expand semantic analysis across unrelated files", async () => {
+    const root = await createNavigationFixture();
+    await Promise.all(Array.from({ length: 40 }, (_, index) => (
+      writeFile(path.join(root, `legacy-${index}.ts`), `
+export function legacyLqbHelper${index}() {
+  return "LQB";
+}
+`)
+    )));
+
+    const report = censusFeatureImplementations({
+      projectPath: root,
+      feature: "为语音页面跳转新增零钱宝协议",
+      aliases: ["LQB", "redirectActionPush", "CurrencyFundExplain"]
+    });
+
+    expect(report.coverage.files_discovered).toBeGreaterThan(40);
+    expect(report.coverage.files_scanned).toBeLessThan(10);
+    expect(report.candidate_accounting.unknown).toBe(0);
+    expect(report.selected_targets.map((candidate) => candidate.symbol))
+      .toContain("redirectActionPush");
   });
 
   it("rejects fabricated adjudication evidence", async () => {

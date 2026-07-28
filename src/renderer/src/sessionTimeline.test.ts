@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildSessionTimeline } from "./sessionTimeline.js";
+import { buildSessionTimeline, getSessionTimelineRevision } from "./sessionTimeline.js";
 import type { AgentSession } from "../../shared/types.js";
 
 const session: AgentSession = {
@@ -52,6 +52,34 @@ const session: AgentSession = {
 };
 
 describe("buildSessionTimeline", () => {
+  it("keeps the timeline revision stable for transient-only SDK progress", () => {
+    const baseline = getSessionTimelineRevision(session);
+    const withTransient = getSessionTimelineRevision({
+      ...session,
+      updated_at: "2026-06-03T01:06:00.000Z",
+      progress_events: [{
+        id: "sdk-transient",
+        type: "sdk_message",
+        message: "请求 Read(target.ts)",
+        visibility: "transient",
+        created_at: "2026-06-03T01:06:00.000Z"
+      }]
+    });
+    const withMilestone = getSessionTimelineRevision({
+      ...session,
+      progress_events: [{
+        id: "stage-retry",
+        type: "status",
+        message: "阶段正在重试",
+        visibility: "milestone",
+        created_at: "2026-06-03T01:06:00.000Z"
+      }]
+    });
+
+    expect(withTransient).toBe(baseline);
+    expect(withMilestone).not.toBe(baseline);
+  });
+
   it("merges session records into chronological timeline events", () => {
     const events = buildSessionTimeline(session);
 

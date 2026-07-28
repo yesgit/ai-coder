@@ -39,9 +39,11 @@ prepare 签发规范化的项目相对文件租约。implement 启动前，宿�
 
 `prepare.call_contract.analyzed_targets` 只描述真实函数、方法、类或组件的调用契约，不要求和 `allowed_files` 一一对应。常量表、路由配置、静态数据和样式文件只进入 `allowed_files`、`patch_plan` 与修改前证据，避免为了满足文件覆盖而伪造手工符号分析。
 
-同功能参考将用户入口 `location` 与最终真实函数/组件 `contract_location` 分开记录。入口可以是路由常量或静态配置；prepare 只对 `contract_location` 建立调用契约，并用入口证据冻结六类行为义务。`changes_required` 描述的是尚待实现的未来契约，不得要求不存在的新分支提供当前代码行；目标现状和修改上下文由 investigate 交接物证明，实际目标代码证据由 implement 与 verify 在修改后逐项提交。只有 `already_satisfied` 才需要在 prepare 同时证明当前目标已满足每项义务。
+同功能参考按每个原始页面/协议 token 建立独立 `target_key`。`target_mappings` 保留原词、canonical token、公共 dispatcher，以及最终真实 `contract_symbol@contract_location`；公共分发函数不能冒充目的组件。每个 target 的既有用户入口 `location` 与最终契约分开记录，入口可以是路由常量或静态配置。prepare 必须逐目标调查精确到文件、符号和定义行的调用契约，并让六类行为义务的 `target_keys` 覆盖全部目标。`changes_required` 描述的是尚待实现的未来契约，不得要求不存在的新分支提供当前代码行；目标现状和修改上下文由 investigate 交接物证明，实际目标代码证据由 implement 与 verify 在修改后逐项提交。只有 `already_satisfied` 才需要在 prepare 同时证明当前目标已满足每项义务。
 
-investigate 在目标由业务功能、用户行为、页面、事件或协议值描述时，必须调用宿主持有的 `locate_feature_implementation` 功能普查脚本。脚本扫描 TypeScript/JavaScript/React 项目中的全部受支持源文件，合并符号名、文件路径、定义正文、配置邻接及完整上下游调用图候选，并将每个候选记账为 yes/no/unknown。首次报告中的 unknown 必须逐项读取代码并携带 path:line adjudication 重跑，直到 `status=complete`；宿主按真实 tool call、报告 digest、候选计数和最终 yes 集合重算校验，Read/Grep、候选排名或模型自述不能替代。每个 yes 函数/组件会自动进入完整调用契约调查；不支持语言中命中功能证据时报告保持 partial，不允许静默漏掉。
+`investigate` 只有在 `open_unknowns` 为空时才能通过。参考入口与最终契约还必须来自任务 Git 基线；工作区或前序需求刚新增/改写的代码不得反向充当“既有同功能实现”。若仓库证据无法裁决且不同答案会改变用户可观察行为，应返回 `blocked + user_decision`，不能猜测目标组件。
+
+investigate 在目标由业务功能、用户行为、页面、事件或协议值描述时，必须调用宿主持有的 `locate_feature_implementation` 功能普查脚本。脚本先对 TypeScript/JavaScript/React 项目中的全部受支持源文件做词面普查，再对独特证据命中文件执行受限语义分析，合并符号名、文件路径、定义正文、配置邻接及直接证据上下游两跳调用图候选，并将每个候选记账为 yes/no/unknown。首次报告中的 unknown 必须逐项读取代码并携带 path:line adjudication 重跑，直到 `status=complete`；宿主按真实 tool call、报告 digest、候选计数和最终 yes 集合重算校验，Read/Grep、候选排名或模型自述不能替代。每个 yes 函数/组件会生成宿主持有的调用图指纹；prepare 再对最终将调用、复用或修改的真实函数/组件执行完整调用契约调查。不支持语言中命中功能证据时报告保持 partial，不允许静默漏掉。
 
 prepare 对真实函数、方法、Hook 或组件使用宿主持有的 `investigate_symbol_contract` 调查脚本。一次工具调用会自动消费 contract、calls、wrappers、references 全部分页并递归调查公共封装；宿主按真实 `tool_calls` 逐目标核验，Read/Grep/Bash、零散分析调用或结构化输出中的文字声明均不能替代。动态引用必须继续追踪或进入 `unresolved`，公共封装递归被截断时 prepare 不得通过。同一只读阶段的宿主验收会复用该次可信报告，不再重复构建整个 TypeScript 项目；进程重启后缓存缺失时才安全重算。
 

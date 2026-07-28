@@ -1,5 +1,7 @@
 import path from "node:path";
+import { readFileSync } from "node:fs";
 import ts from "typescript";
+import { createBoundedTypeScriptProgram } from "./boundedTypeScriptProgram.js";
 
 export type SymbolAnalysisSection = "all" | "contract" | "calls" | "wrappers" | "references";
 
@@ -133,7 +135,7 @@ export function analyzeSymbolContract(input: AnalyzeSymbolContractInput): Symbol
     : path.resolve(projectPath, input.targetFile);
   assertInsideProject(projectPath, targetFile);
 
-  const programBuild = createProgram(projectPath, targetFile);
+  const programBuild = createProgram(projectPath, targetFile, input.symbol);
   const program = programBuild.program;
   const checker = program.getTypeChecker();
   const sourceFile = program.getSourceFile(targetFile);
@@ -265,73 +267,27 @@ export function analyzeSymbolContract(input: AnalyzeSymbolContractInput): Symbol
 
 function createProgram(
   projectPath: string,
-  targetFile: string
+  targetFile: string,
+  symbol: string
 ): {
   program: ts.Program;
   mode: "project-config" | "syntax-fallback";
   warnings: string[];
 } {
-  const configPath = ts.findConfigFile(projectPath, ts.sys.fileExists, "tsconfig.json");
-  if (configPath) {
-    const config = ts.readConfigFile(configPath, ts.sys.readFile);
-    if (!config.error) {
-      const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, path.dirname(configPath), {
-        noEmit: true,
-        allowJs: true
-      }, configPath);
-      if (parsed.errors.length === 0) {
-        const allProjectFiles = discoverProjectSources(projectPath);
-        const rootNames = [...new Set([...parsed.fileNames, ...allProjectFiles, targetFile])];
-        return {
-          program: ts.createProgram({ rootNames, options: parsed.options }),
-          mode: "project-config",
-          warnings: []
-        };
-      }
-      return createFallbackProgram(
-        projectPath,
-        targetFile,
-        parsed.errors.map(formatDiagnostic)
-      );
+  const sourceFiles = discoverProjectSources(projectPath);
+  const evidenceFiles = sourceFiles.filter((file) => {
+    if (path.resolve(file) === path.resolve(targetFile)) return true;
+    if (symbol.length <= 3 || /^(?:fun|callback|sucFun|errFun|render)$/i.test(symbol)) {
+      return false;
     }
-    return createFallbackProgram(
-      projectPath,
-      targetFile,
-      [formatDiagnostic(config.error)]
-    );
-  }
-
-  return createFallbackProgram(projectPath, targetFile, []);
-}
-
-function createFallbackProgram(
-  projectPath: string,
-  targetFile: string,
-  warnings: string[]
-): {
-  program: ts.Program;
-  mode: "syntax-fallback";
-  warnings: string[];
-} {
-  const rootNames = discoverProjectSources(projectPath);
-  if (!rootNames.includes(targetFile)) rootNames.push(targetFile);
-  return {
-    program: ts.createProgram({
-      rootNames,
-      options: {
-        allowJs: true,
-        checkJs: false,
-        jsx: ts.JsxEmit.ReactJSX,
-        module: ts.ModuleKind.NodeNext,
-        moduleResolution: ts.ModuleResolutionKind.NodeNext,
-        noEmit: true,
-        skipLibCheck: true,
-        target: ts.ScriptTarget.ES2022
-      }
-    }),
-    mode: "syntax-fallback",
-    warnings
-  };
+    try {
+      return readFileSync(file, "utf8").includes(symbol);
+    } catch {
+      return false;
+    }
+  });
+  if (!evidenceFiles.includes(targetFile)) evidenceFiles.push(targetFile);
+  return createBoundedTypeScriptProgram(projectPath, evidenceFiles);
 }
 
 function discoverProjectSources(projectPath: string): string[] {

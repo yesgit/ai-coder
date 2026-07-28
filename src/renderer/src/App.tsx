@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -14,7 +14,7 @@ import type {
   WorkflowLoadIssue,
   WorkflowTemplate
 } from "../../shared/types.js";
-import { buildSessionTimeline } from "./sessionTimeline.js";
+import { buildSessionTimeline, getSessionTimelineRevision } from "./sessionTimeline.js";
 import type { TimelineEvent } from "./sessionTimeline.js";
 import { summarizeSessionTitle } from "../../shared/sessionTitle.js";
 import { getVisibleSessions, groupSessionsByProject, resolveActiveSessionId, resolveComposerSession } from "./sessionSelection.js";
@@ -191,14 +191,34 @@ export default function App() {
   // 收到后直接更新 sessions 列表里对应条目（activeSession 是从 sessions 派生的 useMemo，
   // 会自动跟随）。避免依赖 3s 轮询才能看到"在跑"。轮询仍保留作兜底（冷启动/推送丢失）。
   useEffect(() => {
+    const pending = new Map<string, AgentSession>();
+    let flushTimer: number | undefined;
+    const flush = () => {
+      flushTimer = undefined;
+      if (pending.size === 0) return;
+      const updates = new Map(pending);
+      pending.clear();
+      setSessions((previous) => {
+        const existingIds = new Set(previous.map((session) => session.id));
+        const merged = previous.map((session) => updates.get(session.id) ?? session);
+        for (const [id, session] of updates) {
+          if (!existingIds.has(id)) merged.push(session);
+        }
+        return merged;
+      });
+    };
     const unsubscribe = window.aiCoder.onSessionProgress((updated: AgentSession) => {
-      setSessions((prev) =>
-        prev.some((s) => s.id === updated.id)
-          ? prev.map((s) => (s.id === updated.id ? updated : s))
-          : prev
-      );
+      pending.set(updated.id, updated);
+      // SDK streams can emit several full-session snapshots in one rendering
+      // frame. Keep only the newest snapshot per session and render at most ten
+      // times per second; milestones and approvals still arrive immediately
+      // relative to human interaction.
+      flushTimer ??= window.setTimeout(flush, 100);
     });
-    return unsubscribe;
+    return () => {
+      unsubscribe();
+      if (flushTimer !== undefined) window.clearTimeout(flushTimer);
+    };
   }, []);
 
   async function refreshRuntimeStatus() {
@@ -779,12 +799,22 @@ export default function App() {
     () => (activeWorkflow ? buildWorkflowStageDisplays(activeWorkflow.stages, activeSession, activeWorkflow.id) : []),
     [activeWorkflow, activeSession]
   );
+  const timelineRevision = activeSession
+    ? getSessionTimelineRevision(activeSession)
+    : "";
   const timelineAll = useMemo(
     () => (activeSession ? buildSessionTimeline(activeSession) : []),
-    [activeSession]
+    // Transient SDK events do not affect the timeline. Reuse the existing
+    // Markdown/tool-detail tree until a timeline-visible record changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [timelineRevision]
   );
   const timeline = useMemo(() => timelineAll.slice(0, timelineLimit), [timelineAll, timelineLimit]);
   const showMoreTimeline = timelineAll.length > timelineLimit;
+  const loadMoreTimeline = useCallback(
+    () => setTimelineLimit((current) => current + 50),
+    []
+  );
   const isHierarchicalMode = activeWorkflow?.execution_mode === "hierarchical" || Boolean(activeSession?.hierarchical_state);
   const isProfileMode = (activeWorkflow?.stages.length ?? 0) === 0;
   const isLegacyProfileMode = isProfileMode && !isHierarchicalMode;
@@ -1384,37 +1414,12 @@ export default function App() {
                   {pendingReworkRequests.length > 0 && (
                     <div className="pending-banner">{pendingReworkRequests.length} 个返工请求等待审批。</div>
                   )}
-                  <section className="execution-history">
-                    <div className="panel-heading execution-history-heading">
-                      <h3>执行过程</h3>
-                      <small>{timelineAll.length} 条记录</small>
-                    </div>
-                    <div className="execution-history-scroll">
-                      <div className="timeline">
-                        {timeline.map((event: TimelineEvent) => (
-                          <article key={event.id} className={`timeline-item ${event.type}`}>
-                            <div className="timeline-meta">
-                              <time>{formatTimestamp(event.timestamp)}</time>
-                              {event.status && <span className="timeline-status">{formatStatus(event.status)}</span>}
-                            </div>
-                            <div className="timeline-body">
-                              <strong>{event.title}</strong>
-                              {event.detail && (
-                                <MarkdownContent>{truncateDetail(event.detail)}</MarkdownContent>
-                              )}
-                            </div>
-                          </article>
-                        ))}
-                      </div>
-                      {showMoreTimeline && (
-                        <div className="timeline-more">
-                          <button className="secondary" onClick={() => setTimelineLimit((n) => n + 50)}>
-                            加载更多（显示更多 50 条）
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  </section>
+                  <ExecutionHistory
+                    total={timelineAll.length}
+                    timeline={timeline}
+                    showMore={showMoreTimeline}
+                    onLoadMore={loadMoreTimeline}
+                  />
               </>
               ) : (
                 <div className="empty-state">
@@ -1665,6 +1670,54 @@ const markdownComponents: Components = {
 /** 统一的 Markdown 渲染组件 */
 const MAX_DETAIL_LENGTH = 3000;
 const MAX_ACTIVITY_MESSAGE_LENGTH = 200;
+
+const ExecutionHistory = memo(function ExecutionHistory({
+  total,
+  timeline,
+  showMore,
+  onLoadMore
+}: {
+  total: number;
+  timeline: TimelineEvent[];
+  showMore: boolean;
+  onLoadMore: () => void;
+}) {
+  return (
+    <section className="execution-history">
+      <div className="panel-heading execution-history-heading">
+        <h3>执行过程</h3>
+        <small>{total} 条记录</small>
+      </div>
+      <div className="execution-history-scroll">
+        <div className="timeline">
+          {timeline.map((event) => (
+            <article key={event.id} className={`timeline-item ${event.type}`}>
+              <div className="timeline-meta">
+                <time>{formatTimestamp(event.timestamp)}</time>
+                {event.status && (
+                  <span className="timeline-status">{formatStatus(event.status)}</span>
+                )}
+              </div>
+              <div className="timeline-body">
+                <strong>{event.title}</strong>
+                {event.detail && (
+                  <MarkdownContent>{truncateDetail(event.detail)}</MarkdownContent>
+                )}
+              </div>
+            </article>
+          ))}
+        </div>
+        {showMore && (
+          <div className="timeline-more">
+            <button className="secondary" onClick={onLoadMore}>
+              加载更多（显示更多 50 条）
+            </button>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+});
 
 function truncateDetail(text: string): string {
   if (text.length <= MAX_DETAIL_LENGTH) return text;

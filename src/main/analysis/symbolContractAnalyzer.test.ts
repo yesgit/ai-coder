@@ -182,4 +182,24 @@ export class Panel extends Component<PanelProps> {}
       type: "PanelProps"
     });
   });
+
+  it("keeps unrelated configured sources out of a symbol investigation program", async () => {
+    const root = await createFixture();
+    await Promise.all(Array.from({ length: 40 }, (_, index) => (
+      writeFile(path.join(root, `unrelated-${index}.ts`), `
+export function helper${index}(value: string) {
+  return value;
+}
+`)
+    )));
+
+    const result = analyzeSymbolContract({
+      projectPath: root,
+      targetFile: "target.tsx",
+      symbol: "Action"
+    });
+
+    expect(result.coverage.files_scanned).toBe(2);
+    expect(result.coverage.total_call_sites).toBe(2);
+  });
 });

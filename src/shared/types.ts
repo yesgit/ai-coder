@@ -465,6 +465,37 @@ export interface SessionProgressEvent {
   created_at: string;
 }
 
+/**
+ * Host-generated receipt for a completed feature census. The receipt keeps
+ * validation metadata without persisting the potentially huge graph report,
+ * and lets resumed sessions validate without rebuilding a TypeScript Program
+ * on Electron's main thread.
+ */
+export interface FeatureCensusReceipt {
+  stage_id: string;
+  input_digest: string;
+  status: "complete" | "partial";
+  report_digest: string;
+  candidate_accounting: {
+    total: number;
+    yes: number;
+    no: number;
+    unknown: number;
+    accounted: true;
+  };
+  selected_targets: Array<{
+    candidate_id: string;
+    symbol: string;
+    definition: {
+      file: string;
+      line: number;
+      column: number;
+    };
+  }>;
+  unresolved: string[];
+  created_at: string;
+}
+
 export interface ApprovalRecord {
   id: string;
   stage_id: string;
@@ -758,6 +789,8 @@ export interface AgentSession {
   file_changes: FileChangeRecord[];
   approvals: ApprovalRecord[];
   progress_events?: SessionProgressEvent[];
+  /** 宿主普查 Worker 生成的可持久化校验回执；仅保留最近若干条。 */
+  feature_census_receipts?: FeatureCensusReceipt[];
   stage_runs?: StageRun[];
   rework_requests?: ReworkRequest[];
   pending_human_questions?: HumanQuestion[];

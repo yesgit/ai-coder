@@ -521,6 +521,16 @@ function validatePhaseHandoffSemantics(
   handoff: Record<string, unknown>
 ): void {
   if (phase === "investigate") {
+    const openUnknowns = stringArray(handoff.open_unknowns, "handoff.open_unknowns");
+    if (openUnknowns.length > 0) {
+      throw new Error(
+        [
+          "investigate 仍有未闭合的 open_unknowns，不能以 passed 结束：",
+          openUnknowns.join("；"),
+          "。继续取证；仓库无法裁决且不同答案会改变用户可观察行为时，返回 blocked + user_decision"
+        ].join("")
+      );
+    }
     const target = requiredRecord(handoff.target_investigation, "handoff.target_investigation");
     for (const field of ["inputs", "outputs", "internal_calls", "guards", "state_and_side_effects", "callers"] as const) {
       requireNonEmptyStringArray(target[field], `handoff.target_investigation.${field}`);
@@ -585,26 +595,44 @@ function validatePhaseHandoffSemantics(
       }
     }
 
+    const targetMappings = requiredArray(handoff.target_mappings, "handoff.target_mappings")
+      .map((item, index) => requiredRecord(item, `handoff.target_mappings[${index}]`));
+    if (targetMappings.length === 0) {
+      throw new Error("investigate 至少需要一条逐目标映射，不能只确认公共分发函数");
+    }
+    const targetKeys = new Set<string>();
+    const targetMappingByKey = new Map<string, Record<string, unknown>>();
+    targetMappings.forEach((mapping, index) => {
+      const prefix = `handoff.target_mappings[${index}]`;
+      const targetKey = requiredString(mapping.target_key, `${prefix}.target_key`).trim();
+      if (targetKeys.has(targetKey)) throw new Error(`target_mappings.target_key 重复：${targetKey}`);
+      targetKeys.add(targetKey);
+      targetMappingByKey.set(targetKey, mapping);
+      requiredString(mapping.requested_token, `${prefix}.requested_token`);
+      requiredString(mapping.canonical_token, `${prefix}.canonical_token`);
+      requiredString(mapping.contract_symbol, `${prefix}.contract_symbol`);
+      requirePathLineString(
+        requiredString(mapping.dispatcher_location, `${prefix}.dispatcher_location`),
+        `${prefix}.dispatcher_location`
+      );
+      requirePathLineString(
+        requiredString(mapping.contract_location, `${prefix}.contract_location`),
+        `${prefix}.contract_location`
+      );
+      requirePathLineEvidence(mapping.evidence_refs, `${prefix}.evidence_refs`);
+    });
+
     const reference = requiredRecord(handoff.reference_analysis, "handoff.reference_analysis");
     requireNonEmptyStringArray(reference.search_scope, "handoff.reference_analysis.search_scope");
     const candidates = requiredArray(reference.candidates, "handoff.reference_analysis.candidates")
       .map((item, index) => requiredRecord(item, `handoff.reference_analysis.candidates[${index}]`));
-    if (candidates.length === 0) {
-      const noReferenceReason = typeof reference.no_reference_reason === "string"
-        ? reference.no_reference_reason.trim()
-        : "";
-      if (!noReferenceReason) {
-        throw new Error("未找到同类实现时必须说明 no_reference_reason 和已搜索范围");
-      }
-      return;
-    }
-    const selected = requiredString(reference.selected_location, "handoff.reference_analysis.selected_location").trim();
-    if (!selected) throw new Error("存在同类实现候选时必须选择 selected_location");
-    if (!requiredString(reference.selection_reason, "handoff.reference_analysis.selection_reason").trim()) {
-      throw new Error("存在同类实现候选时必须说明 selection_reason");
-    }
-    const candidateLocations = candidates.map((candidate, index) => {
+    const candidatesByTarget = new Map<string, Array<Record<string, unknown>>>();
+    candidates.forEach((candidate, index) => {
       const prefix = `handoff.reference_analysis.candidates[${index}]`;
+      const targetKey = requiredString(candidate.target_key, `${prefix}.target_key`).trim();
+      if (!targetKeys.has(targetKey)) {
+        throw new Error(`${prefix}.target_key 未对应 target_mappings：${targetKey}`);
+      }
       if (requiredString(
         candidate.reference_kind,
         `${prefix}.reference_kind`
@@ -631,23 +659,98 @@ function validatePhaseHandoffSemantics(
       }
       requiredString(candidate.destination, `${prefix}.destination`);
       requiredString(candidate.invocation, `${prefix}.invocation`);
+      const contractSymbol = requiredString(candidate.contract_symbol, `${prefix}.contract_symbol`);
       requirePathLineEvidence(candidate.evidence_refs, `${prefix}.evidence_refs`);
       const location = requiredString(candidate.location, `${prefix}.location`);
       const contractLocation = requiredString(candidate.contract_location, `${prefix}.contract_location`);
       requirePathLineString(location, `${prefix}.location`);
       requirePathLineString(contractLocation, `${prefix}.contract_location`);
-      return location;
+      const mapping = targetMappingByKey.get(targetKey)!;
+      if (
+        contractSymbol !== requiredString(mapping.contract_symbol, `target_mappings.${targetKey}.contract_symbol`)
+        || firstPathLineToken(contractLocation) !== firstPathLineToken(requiredString(
+          mapping.contract_location,
+          `target_mappings.${targetKey}.contract_location`
+        ))
+      ) {
+        throw new Error(
+          `${prefix} 未追到 ${targetKey} 已确认的同一最终函数/组件：`
+          + `${contractSymbol}@${contractLocation}`
+        );
+      }
+      const bucket = candidatesByTarget.get(targetKey) ?? [];
+      bucket.push(candidate);
+      candidatesByTarget.set(targetKey, bucket);
     });
-    if (!candidateLocations.includes(selected)) {
-      throw new Error("selected_location 必须对应 reference_analysis.candidates 中的一个候选");
-    }
-    const targetDefinition = firstPathLineToken(requiredString(target.definition, "handoff.target_investigation.definition"));
-    const selectedEntryDefinition = firstPathLineToken(selected);
-    if (targetDefinition && selectedEntryDefinition && targetDefinition === selectedEntryDefinition) {
-      throw new Error(
-        `不得把当前待实现代码本身冒充同功能既有入口：target=${targetDefinition}；candidate.location=${selectedEntryDefinition}。`
-        + "不同既有入口可以共享同一 contract_location，但 candidate.location 必须指向独立入口"
-      );
+
+    const selections = requiredArray(
+      reference.target_selections,
+      "handoff.reference_analysis.target_selections"
+    ).map((item, index) => requiredRecord(
+      item,
+      `handoff.reference_analysis.target_selections[${index}]`
+    ));
+    const selectionKeys = new Set<string>();
+    const targetDefinition = firstPathLineToken(requiredString(
+      target.definition,
+      "handoff.target_investigation.definition"
+    ));
+    selections.forEach((selection, index) => {
+      const prefix = `handoff.reference_analysis.target_selections[${index}]`;
+      const targetKey = requiredString(selection.target_key, `${prefix}.target_key`).trim();
+      if (!targetKeys.has(targetKey)) {
+        throw new Error(`${prefix}.target_key 未对应 target_mappings：${targetKey}`);
+      }
+      if (selectionKeys.has(targetKey)) {
+        throw new Error(`每个 target_key 只能有一条 reference selection：${targetKey}`);
+      }
+      selectionKeys.add(targetKey);
+      if (typeof selection.selected_location !== "string") {
+        throw new Error(`${prefix}.selected_location 必须是字符串`);
+      }
+      if (typeof selection.selection_reason !== "string") {
+        throw new Error(`${prefix}.selection_reason 必须是字符串`);
+      }
+      if (typeof selection.no_reference_reason !== "string") {
+        throw new Error(`${prefix}.no_reference_reason 必须是字符串`);
+      }
+      const selected = selection.selected_location.trim();
+      const selectionReason = selection.selection_reason.trim();
+      const noReferenceReason = selection.no_reference_reason.trim();
+      const targetCandidates = candidatesByTarget.get(targetKey) ?? [];
+      if (targetCandidates.length === 0) {
+        if (selected || selectionReason || !noReferenceReason) {
+          throw new Error(
+            `${targetKey} 未找到同功能入口时 selected_location/selection_reason 必须为空，`
+            + "并逐目标说明 no_reference_reason"
+          );
+        }
+        return;
+      }
+      if (!selected || !selectionReason || noReferenceReason) {
+        throw new Error(
+          `${targetKey} 存在同功能候选时必须选择 selected_location、说明 selection_reason，`
+          + "且 no_reference_reason 为空"
+        );
+      }
+      const selectedCandidate = targetCandidates.find((candidate) => (
+        requiredString(candidate.location, `${prefix}.candidate.location`) === selected
+      ));
+      if (!selectedCandidate) {
+        throw new Error(`${targetKey}.selected_location 必须对应同一 target_key 的 candidate.location`);
+      }
+      const selectedEntryDefinition = firstPathLineToken(selected);
+      if (targetDefinition && selectedEntryDefinition && targetDefinition === selectedEntryDefinition) {
+        throw new Error(
+          `不得把当前待实现代码本身冒充同功能既有入口：target=${targetDefinition}；`
+          + `candidate.location=${selectedEntryDefinition}。不同既有入口可以共享同一 contract_location，`
+          + "但 candidate.location 必须指向独立入口"
+        );
+      }
+    });
+    const missingSelectionKeys = [...targetKeys].filter((targetKey) => !selectionKeys.has(targetKey));
+    if (missingSelectionKeys.length > 0) {
+      throw new Error(`以下目标缺少逐目标 reference selection：${missingSelectionKeys.join(", ")}`);
     }
     return;
   }
@@ -729,6 +832,7 @@ function validateBehaviorObligations(value: unknown, label: string): string[] {
     }
     if (dimensions.has(dimension)) throw new Error(`${label} 的行为维度重复：${dimension}`);
     dimensions.add(dimension);
+    requireNonEmptyStringArray(obligation.target_keys, `${prefix}.target_keys`);
     requiredString(obligation.reference_behavior, `${prefix}.reference_behavior`);
     requiredString(obligation.required_behavior, `${prefix}.required_behavior`);
     const decision = requiredString(obligation.decision, `${prefix}.decision`);
@@ -878,16 +982,17 @@ function phaseInstructions(
       return [
         "只读取证：定位目标代码、最相似既有实现、真实调用方和关键未知。",
         "只要需求以业务功能、用户行为、页面或协议标识描述，而不是用户已经给出唯一精确符号，就必须调用 locate_feature_implementation 做完整候选普查。首次返回 unknown 时逐项读取并提交 yes/no adjudications，直到 status=complete；普通 Read/Grep、只报最像候选或模型自述不能替代。",
-        "功能普查必须覆盖符号名、路径、定义正文、配置邻接和完整上下游调用图；每个候选都要保留 evidence_for、evidence_against 与 yes/no 结论，不能静默丢弃相似候选。",
+        "功能普查必须对范围内源码完成词面普查，并对独特证据命中文件覆盖符号名、路径、定义正文、配置邻接和直接证据上下游两跳调用图；每个进入语义候选集的目标都要保留 evidence_for、evidence_against 与 yes/no 结论，不能静默丢弃强证据候选。",
         "目标函数/组件必须逐项调查定义、输入、输出、内部调用、guard、状态/副作用和调用方；某项不存在也要用证据明确写‘无’，不得省略。",
         "同类实现不是外形相似的路由分支。必须优先找到应用内进入同一业务功能的既有用户入口，沿该入口追到最终组件/函数，并记录目标、调用方式、完整参数、guard、上下文透传和副作用。",
-        "reference candidate 的 location 记录用户入口或路由配置位置，contract_location 必须单独记录沿入口追踪到的最终真实函数/组件定义；静态常量入口不得冒充调用契约目标。",
+        "每个原始页面/协议 token 都必须在 target_mappings 中单独记录 target_key、原词、canonical token、公共 dispatcher 位置，以及最终 contract_symbol@contract_location；公共 dispatcher 不能冒充最终页面组件。",
+        "reference candidate 的 target_key 必须对应一条 target_mappings；location 记录用户入口或路由配置位置，contract_symbol@contract_location 必须精确记录沿入口追踪到的最终真实函数/组件定义；静态常量入口不得冒充调用契约目标。",
         "不同既有入口可以合法汇聚到同一最终函数/组件，因此 candidate.contract_location 可以与 target definition 相同；禁止的是 candidate.location 直接指向当前待实现位置、刚新增代码或当前目标定义本身。",
         "每个候选都必须证明 feature_equivalence，并提交完整行为指纹；不得拿当前待实现分支、刚新增代码或仅同属导航模块的兄弟分支冒充同功能参考。",
-        "同功能入口必须先列候选再选择：记录搜索范围、相似依据、可复用行为和差异；确无同功能入口时写明搜索范围与未找到原因。",
+        "同功能入口必须按 target_key 先列候选再在 target_selections 逐目标选择：记录搜索范围、相似依据、可复用行为和差异；某个目标确无同功能入口时，只能在该 target_key 的 selection 写明未找到原因。",
         "附件 token 与代码名称存在大小写、缩写、OCR、历史错拼或编号冲突时，保留附件原词并建立‘原词 → 候选 → 代码 canonical symbol’映射；定义、配置消费者、调用点和同类实现能够收敛时直接记录校正，不得要求用户确认命名差异。",
         "只有不同候选会产生不同的用户可观察行为且仓库证据无法裁决时，才允许 status=blocked + user_decision；外部必需资源确实缺失时可用 external_resource_missing。evidence_blocked 不属于允许的阶段出口，会被宿主退回自愈。",
-        "通过时 target_investigation 和每个参考候选都必须包含 path:line 证据。"
+        "通过时 open_unknowns 必须为空，target_investigation、每条 target_mappings 和每个参考候选都必须包含 path:line 证据。"
       ].join("\n");
     case "prepare":
       return [
@@ -895,7 +1000,7 @@ function phaseInstructions(
         "对每个将调用、复用或修改的既有函数/组件，必须调用 investigate_symbol_contract 完整调查脚本；脚本会自动覆盖 contract、calls、wrappers、references 全部分页并递归调查公共封装。Read/Grep/Bash、零散 analyze_symbol_contract 或模型自述均不能替代。",
         "analyzed_targets 只登记函数、方法、类或组件等真实调用契约目标；常量表、路由配置对象、静态数据和样式文件即使列入 allowed_files，也不要为了凑文件覆盖伪造符号契约目标。",
         "调查脚本成功时 analysis_method 必须写 investigation-script，并把报告中的动态引用、递归封装截断或静态分析边界保留在 unresolved。只有真实调用契约目标不受脚本支持时，才改为 manual-static-analysis，说明原因并用 path:line 补齐同样的契约维度。纯静态配置改动直接写入 patch_plan、pre_behavior 和 allowed_files。",
-        "必须把 investigate 选中的同功能入口落实为 reference_application，并生成恰好六类稳定 behavior_obligations：destination、invocation、arguments、preconditions、context、side_effects。",
+        "必须把 investigate 的每个 target_key 逐项落实为 reference_application；六类 behavior_obligations 仍按 destination、invocation、arguments、preconditions、context、side_effects 冻结，但每项 target_keys 必须完整覆盖全部目标。",
         "changes_required 的 behavior_obligations 是尚待实现的未来契约：每项引用同功能既有入口证据，不得虚构尚不存在的新分支 path:line。目标现状和插入上下文沿用 investigate 已验证证据，实际目标代码证据由 implement、verify 逐项提交；只有 already_satisfied 才必须在 prepare 为每项同时给出当前目标代码证据。",
         "默认逐维度复用同功能入口。任何 intentional-difference 都必须引用用户要求或既有架构证据；不能以‘当前代码已经这样写’作为差异依据。",
         "若六类义务已全部满足，返回 change_disposition=already_satisfied、空 allowed_files 和逐项 satisfaction_evidence，宿主将跳过 implement 直接独立验证；否则返回 changes_required 和非空 allowed_files。",
@@ -975,9 +1080,11 @@ function phaseHandoffSchema(
   });
   const evidenceList = (): Record<string, unknown> => stringList(1);
   const referenceCandidateSchema = strictObjectSchema({
+    target_key: { type: "string", minLength: 1 },
     reference_kind: { type: "string", enum: ["same-feature-entry"] },
     location: { type: "string", minLength: 1 },
     contract_location: { type: "string", minLength: 1 },
+    contract_symbol: { type: "string", minLength: 1 },
     feature_equivalence: stringList(1),
     similarity: stringList(1),
     reusable_behavior: stringList(1),
@@ -1011,6 +1118,7 @@ function phaseHandoffSchema(
   const behaviorObligationSchema = strictObjectSchema({
     id: { type: "string", pattern: "^B[A-Za-z0-9._-]+$" },
     dimension: { type: "string", enum: [...REQUIRED_BEHAVIOR_DIMENSIONS] },
+    target_keys: stringList(1),
     reference_behavior: { type: "string", minLength: 1 },
     required_behavior: { type: "string", minLength: 1 },
     decision: { type: "string", enum: ["reuse", "intentional-difference", "not-applicable"] },
@@ -1028,6 +1136,19 @@ function phaseHandoffSchema(
       return strictObjectSchema({
         confirmed_facts: stringList(1),
         target_locations: stringList(1),
+        target_mappings: {
+          type: "array",
+          minItems: 1,
+          items: strictObjectSchema({
+            target_key: { type: "string", minLength: 1 },
+            requested_token: { type: "string", minLength: 1 },
+            canonical_token: { type: "string", minLength: 1 },
+            dispatcher_location: { type: "string", minLength: 1 },
+            contract_symbol: { type: "string", minLength: 1 },
+            contract_location: { type: "string", minLength: 1 },
+            evidence_refs: evidenceList()
+          })
+        },
         feature_census: strictObjectSchema({
           applicability: { type: "string", enum: ["required", "not-applicable"] },
           reason: { type: "string", minLength: 1 },
@@ -1060,9 +1181,16 @@ function phaseHandoffSchema(
             type: "array",
             items: referenceCandidateSchema
           },
-          selected_location: { type: "string" },
-          selection_reason: { type: "string" },
-          no_reference_reason: { type: "string" }
+          target_selections: {
+            type: "array",
+            minItems: 1,
+            items: strictObjectSchema({
+              target_key: { type: "string", minLength: 1 },
+              selected_location: { type: "string" },
+              selection_reason: { type: "string" },
+              no_reference_reason: { type: "string" }
+            })
+          }
         }),
         open_unknowns: stringList()
       });
@@ -1079,6 +1207,7 @@ function phaseHandoffSchema(
           type: "array",
           minItems: 1,
           items: strictObjectSchema({
+            target_key: { type: "string", minLength: 1 },
             dimension: { type: "string", minLength: 1 },
             target_behavior: { type: "string", minLength: 1 },
             reference_behavior: { type: "string", minLength: 1 },
@@ -1143,7 +1272,7 @@ function phaseHandoffContract(
 ): string {
   switch (phase) {
     case "investigate":
-      return "必须提交 confirmed_facts、target_locations、feature_census、target_investigation、reference_analysis、open_unknowns；业务功能目标必须真实完成全候选普查并逐项给出 yes/no 正反证据，同类参考必须是同一业务功能的既有入口，分开记录入口 location 与最终函数/组件 contract_location，并覆盖目标、调用方式、参数、前置条件、上下文和副作用。";
+      return "必须提交 confirmed_facts、target_locations、逐 token 的 target_mappings、feature_census、target_investigation、reference_analysis、空的 open_unknowns；业务功能目标必须真实完成全候选普查并逐项给出 yes/no 正反证据，同类参考必须是同一业务功能的既有入口，分开记录入口 location 与最终 contract_symbol@contract_location，并覆盖目标、调用方式、参数、前置条件、上下文和副作用。";
     case "prepare":
       return "必须提交结构化 call_contract、reference_application、六类 behavior_obligations、change_disposition、satisfaction_evidence、pre_behavior、preserve_invariants、patch_plan、verification_plan；changes_required 另行提交非空 allowed_files，already_satisfied 提交空数组。";
     case "implement":
@@ -1161,16 +1290,17 @@ function phaseOutputSkeleton(
       return [
         "{ status, summary, evidence_refs,",
         "  handoff: { confirmed_facts, target_locations,",
+        "    target_mappings: [{ target_key, requested_token, canonical_token, dispatcher_location, contract_symbol, contract_location, evidence_refs }],",
         "    feature_census: { applicability: \"required\"|\"not-applicable\", reason, status: \"complete\"|\"not-applicable\", report_digest, candidate_accounting: { total, yes, no, unknown, accounted: true }, selected_candidate_ids },",
         "    target_investigation: { target_kind, definition, inputs, outputs, internal_calls, guards, state_and_side_effects, callers, evidence_refs, unresolved },",
-        "    reference_analysis: { search_scope, candidates: [{ reference_kind: \"same-feature-entry\", location, contract_location, feature_equivalence, similarity, reusable_behavior, differences, destination, invocation, arguments, preconditions, context_forwarding, side_effects, evidence_refs }], selected_location, selection_reason, no_reference_reason },",
+        "    reference_analysis: { search_scope, candidates: [{ target_key, reference_kind: \"same-feature-entry\", location, contract_symbol, contract_location, feature_equivalence, similarity, reusable_behavior, differences, destination, invocation, arguments, preconditions, context_forwarding, side_effects, evidence_refs }], target_selections: [{ target_key, selected_location, selection_reason, no_reference_reason }] },",
         "    open_unknowns } }"
       ].join("\n");
     case "prepare":
       return [
         "{ status, summary, evidence_refs, allowed_files,",
         "  handoff: { call_contract: { analyzed_targets }, reference_application,",
-        "    behavior_obligations: [恰好六项：destination/invocation/arguments/preconditions/context/side_effects],",
+        "    behavior_obligations: [恰好六项：每项含覆盖全部目标的 target_keys，维度为 destination/invocation/arguments/preconditions/context/side_effects],",
         "    change_disposition: \"changes_required\" | \"already_satisfied\", satisfaction_evidence,",
         "    pre_behavior, preserve_invariants, patch_plan, verification_plan } }"
       ].join("\n");

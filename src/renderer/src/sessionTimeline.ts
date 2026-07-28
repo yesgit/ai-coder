@@ -27,6 +27,65 @@ export interface TimelineEvent {
   needs_user_action?: boolean;
 }
 
+/**
+ * Revision of data that is actually rendered by the execution timeline.
+ * Transient SDK progress deliberately does not participate: it belongs to the
+ * activity stream, and rebuilding every Markdown/tool detail for each token or
+ * tool-status snippet made long-running sessions progressively janky.
+ */
+export function getSessionTimelineRevision(session: AgentSession): string {
+  const milestones = (session.progress_events ?? []).filter(
+    (event) => event.visibility === "milestone"
+  );
+  return [
+    session.id,
+    session.status,
+    session.error ?? "",
+    session.task_prompt,
+    session.messages.map((message) => [
+      message.role,
+      message.kind ?? "",
+      message.created_at,
+      message.content.length,
+      message.attachments?.length ?? 0
+    ].join(":")).join(","),
+    (session.stage_runs ?? []).map((run) => [
+      run.id,
+      run.status,
+      run.completed_at ?? "",
+      run.output_summary?.length ?? 0,
+      run.rework_reason?.length ?? 0
+    ].join(":")).join(","),
+    milestones.map((event) => event.id).join(","),
+    session.approvals.map((approval) => [
+      approval.id,
+      approval.status,
+      approval.resolved_at ?? ""
+    ].join(":")).join(","),
+    session.tool_calls.map((call) => [
+      call.id,
+      call.status,
+      call.resolved_at ?? "",
+      call.output_summary?.length ?? 0
+    ].join(":")).join(","),
+    session.file_changes.map((change) => [
+      change.path,
+      change.operation,
+      change.approved
+    ].join(":")).join(","),
+    (session.rework_requests ?? []).map((request) => [
+      request.id,
+      request.status,
+      request.resolved_at ?? ""
+    ].join(":")).join(","),
+    (session.pending_human_questions ?? []).map((question) => [
+      question.id,
+      question.status,
+      question.resolved_at ?? ""
+    ].join(":")).join(",")
+  ].join("|");
+}
+
 export function buildSessionTimeline(session: AgentSession): TimelineEvent[] {
   const events: TimelineEvent[] = [
     {

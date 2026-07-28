@@ -2,10 +2,8 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import ts from "typescript";
-import {
-  investigateSymbolContract,
-  type SymbolInvestigationReport
-} from "./symbolInvestigationScript.js";
+import type { SymbolInvestigationReport } from "./symbolInvestigationScript.js";
+import { createBoundedTypeScriptProgram } from "./boundedTypeScriptProgram.js";
 
 export type FeatureCandidateVerdict = "yes" | "no" | "unknown";
 
@@ -158,6 +156,7 @@ interface InternalCandidate {
   definition: SourceLocation;
   declaration: ts.Declaration;
   symbolObject?: ts.Symbol;
+  nested: boolean;
   evidence: FeatureEvidence[];
   evidenceAgainst: FeatureEvidence[];
 }
@@ -183,7 +182,8 @@ const EXCLUDED_PATHS = [
 const GENERIC_TERMS = new Set([
   "页面", "功能", "组件", "函数", "实现", "新增", "修改", "支持", "跳转", "进入", "打开",
   "需求", "代码", "相关", "进行", "需要", "通过", "一个", "这个", "the", "page", "function",
-  "component", "feature", "implement", "implementation"
+  "component", "feature", "implement", "implementation", "添加", "目标", "标识", "分支", "复用",
+  "相同", "对应", "以及", "或者"
 ]);
 const SEARCH_CHANNELS = [
   "symbol-names",
@@ -193,15 +193,15 @@ const SEARCH_CHANNELS = [
   "call-graph-upstream",
   "call-graph-downstream"
 ] as const;
+const MAX_GRAPH_HOPS = 2;
 
 /**
  * Host-owned feature implementation census.
  *
- * The script enumerates every supported callable/component that has direct
- * feature evidence or lies on a complete upstream/downstream call-graph
- * closure from such evidence. Every candidate is accounted as yes/no/unknown;
- * callers can submit evidence-backed adjudications and rerun until no unknown
- * candidate remains.
+ * The script lexically visits every in-scope source, then performs bounded
+ * semantic analysis on files with distinctive evidence. Strong candidates,
+ * explicit exclusions and weak graph-only candidates are host-adjudicated;
+ * callers only need to adjudicate genuinely ambiguous leftovers.
  */
 export function censusFeatureImplementations(
   input: FeatureImplementationCensusInput
@@ -213,13 +213,27 @@ export function censusFeatureImplementations(
   const terms = buildSearchTerms(input);
   if (terms.length === 0) throw new Error("无法从 feature、aliases 或 acceptance_clues 提取有效搜索词");
 
-  const programBuild = createProgram(projectPath);
+  const allSources = discoverSources(projectPath);
+  const scopedSources = allSources.filter((file) => (
+    isInScope(projectPath, file, scopePaths)
+  ));
+  if (scopedSources.length === 0) {
+    throw new Error(`scope_paths 内没有可分析的 TypeScript/JavaScript 文件：${scopePaths.join(", ")}`);
+  }
+  const analysisSources = selectEvidenceBearingSources(
+    projectPath,
+    scopedSources,
+    scopePaths,
+    terms
+  );
+  const programBuild = createBoundedTypeScriptProgram(projectPath, analysisSources);
   const program = programBuild.program;
   const checker = program.getTypeChecker();
+  const analysisSourceSet = new Set(analysisSources.map((file) => path.resolve(file)));
   const sourceFiles = program.getSourceFiles().filter((sourceFile) => (
     !sourceFile.isDeclarationFile
     && isInsideProject(projectPath, sourceFile.fileName)
-    && isInScope(projectPath, sourceFile.fileName, scopePaths)
+    && analysisSourceSet.has(path.resolve(sourceFile.fileName))
   ));
   const candidates = collectCandidates(projectPath, sourceFiles, checker);
   const bySymbol = indexCandidatesBySymbol(candidates, checker);
@@ -279,8 +293,8 @@ export function censusFeatureImplementations(
 
   const edges = collectGraphEdges(projectPath, sourceFiles, checker, bySymbol, byId);
   const graph = buildGraph(edges);
-  const upstream = traverseGraph(directCandidateIds, graph.incoming, edges, "upstream-path");
-  const downstream = traverseGraph(directCandidateIds, graph.outgoing, edges, "downstream-path");
+  const upstream = traverseGraph(directCandidateIds, graph.incoming, "upstream-path");
+  const downstream = traverseGraph(directCandidateIds, graph.outgoing, "downstream-path");
   const possibleIds = new Set<string>([
     ...directCandidateIds,
     ...upstream.keys(),
@@ -288,11 +302,6 @@ export function censusFeatureImplementations(
   ]);
   const adjudications = validateAdjudications(projectPath, input.adjudications ?? [], possibleIds);
   const unresolved: string[] = [];
-  for (const candidateIdValue of possibleIds) {
-    const candidate = byId.get(candidateIdValue);
-    if (!candidate) continue;
-    unresolved.push(...findDynamicBoundaries(candidate, projectPath));
-  }
   const materialized = [...possibleIds]
     .map((id) => byId.get(id))
     .filter((candidate): candidate is InternalCandidate => Boolean(candidate))
@@ -302,8 +311,7 @@ export function censusFeatureImplementations(
       candidate,
       upstream.get(candidate.id),
       downstream.get(candidate.id),
-      adjudications.get(candidate.id),
-      unresolved
+      adjudications.get(candidate.id)
     ));
 
   const unsupportedMatchingFiles = findUnsupportedMatchingFiles(projectPath, scopePaths, terms);
@@ -328,6 +336,11 @@ export function censusFeatureImplementations(
       role: candidate.role,
       call_contract_digest: candidate.call_contract.report_digest
     }));
+  if (selectedTargets.length === 0 && adjudications.size === 0) {
+    unresolved.push(
+      "没有形成强证据闭环的实现候选；请补充精确符号、协议 token、目标路径或验收线索后重试"
+    );
+  }
   const rejectedCandidates = materialized
     .filter((candidate) => candidate.verdict === "no")
     .map((candidate) => ({
@@ -365,14 +378,18 @@ export function censusFeatureImplementations(
     coverage: {
       language: "typescript-javascript" as const,
       analysis_mode: programBuild.mode,
-      files_discovered: discoverSources(projectPath).length,
+      files_discovered: allSources.length,
       files_scanned: sourceFiles.length,
       unsupported_matching_files: unsupportedMatchingFiles,
       symbols_indexed: candidates.length,
       graph_edges: edges.length,
       search_channels_completed: SEARCH_CHANNELS,
       excluded_paths: EXCLUDED_PATHS,
-      warnings: programBuild.warnings,
+      warnings: [
+        ...programBuild.warnings,
+        `已对范围内 ${scopedSources.length} 个源码文件完成词面普查，并对其中 ${sourceFiles.length} 个证据命中文件执行受限语义分析。`,
+        `调用图候选限制在直接证据上下游 ${MAX_GRAPH_HOPS} 跳内，避免通用包装器扩散为无关候选。`
+      ],
       all_supported_files_scanned: true as const,
       graph_traversal_complete: true as const
     },
@@ -391,62 +408,133 @@ export function censusFeatureImplementations(
   };
 }
 
-function createProgram(projectPath: string): {
-  program: ts.Program;
-  mode: "project-config" | "syntax-fallback";
-  warnings: string[];
-} {
-  const sources = discoverSources(projectPath);
-  const configPath = ts.findConfigFile(projectPath, ts.sys.fileExists, "tsconfig.json");
-  if (configPath) {
-    const config = ts.readConfigFile(configPath, ts.sys.readFile);
-    if (!config.error) {
-      const parsed = ts.parseJsonConfigFileContent(
-        config.config,
-        ts.sys,
-        path.dirname(configPath),
-        { noEmit: true, allowJs: true },
-        configPath
-      );
-      if (parsed.errors.length === 0) {
-        return {
-          program: ts.createProgram({
-            rootNames: [...new Set([...parsed.fileNames, ...sources])],
-            options: parsed.options
-          }),
-          mode: "project-config",
-          warnings: []
-        };
-      }
-      return fallbackProgram(sources, parsed.errors.map(formatDiagnostic));
+/**
+ * Actionable adjudication projection returned to the model-facing MCP tool.
+ *
+ * The full report can be hundreds of kilobytes because graph paths repeat
+ * evidence for every candidate. Rejected candidates are represented by a
+ * count; the agent only needs stable ids and evidence for selected/unknown
+ * candidates. Keeping the digest near the beginning also prevents it from
+ * disappearing when an SDK externalizes oversized results.
+ */
+export function formatFeatureImplementationCensusToolResult(
+  report: FeatureImplementationCensusReport
+): string {
+  const unresolved = report.unresolved.filter(
+    (item) => !item.startsWith("候选尚未逐项判定：")
+  );
+  return JSON.stringify({
+    schema_version: report.schema_version,
+    script: report.script,
+    report_digest: report.report_digest,
+    status: report.status,
+    candidate_accounting: report.candidate_accounting,
+    query: report.query,
+    next_action: report.status === "complete"
+      ? "将 selected_targets 用于后续调查并提交 investigate handoff；report_digest 与候选计数由宿主按最后一次真实调用自动回填。"
+      : report.candidate_accounting.unknown > 0
+        ? "仅逐项读取 candidates 中 verdict=unknown 的定义位置；下一次调用复用相同 query 并提交这些候选的 adjudications。"
+        : "候选已记账但 unresolved 仍有静态分析边界；按 unresolved 补充范围或人工证据，不要重复提交相同输入。",
+    candidates: report.candidates
+      .filter((candidate) => candidate.verdict === "unknown")
+      .map((candidate) => ({
+      id: candidate.id,
+      symbol: candidate.symbol,
+      kind: candidate.kind,
+      role: candidate.role,
+      definition: candidate.definition,
+      verdict: candidate.verdict,
+      verdict_reason: candidate.verdict_reason,
+      adjudicated: candidate.adjudicated,
+      why_possible: candidate.why_possible,
+      evidence_for: candidate.evidence_for.map(compactFeatureEvidence),
+      evidence_against: candidate.evidence_against.map(compactFeatureEvidence),
+      call_contract: candidate.call_contract
+    })),
+    selected_targets: report.selected_targets,
+    rejected_candidate_count: report.rejected_candidates.length,
+    unresolved,
+    coverage: {
+      language: report.coverage.language,
+      analysis_mode: report.coverage.analysis_mode,
+      files_scanned: report.coverage.files_scanned,
+      symbols_indexed: report.coverage.symbols_indexed,
+      graph_edges: report.coverage.graph_edges,
+      unsupported_matching_files: report.coverage.unsupported_matching_files,
+      warnings: report.coverage.warnings,
+      all_supported_files_scanned: report.coverage.all_supported_files_scanned,
+      graph_traversal_complete: report.coverage.graph_traversal_complete
     }
-    return fallbackProgram(sources, [formatDiagnostic(config.error)]);
-  }
-  return fallbackProgram(sources, []);
+  });
 }
 
-function fallbackProgram(rootNames: string[], warnings: string[]) {
+function compactFeatureEvidence(item: FeatureEvidence): {
+  kind: FeatureEvidence["kind"];
+  ref: string;
+  detail: string;
+  term: string | null;
+} {
   return {
-    program: ts.createProgram({
-      rootNames,
-      options: {
-        allowJs: true,
-        checkJs: false,
-        jsx: ts.JsxEmit.ReactJSX,
-        module: ts.ModuleKind.NodeNext,
-        moduleResolution: ts.ModuleResolutionKind.NodeNext,
-        noEmit: true,
-        skipLibCheck: true,
-        target: ts.ScriptTarget.ES2022
-      }
-    }),
-    mode: "syntax-fallback" as const,
-    warnings
+    kind: item.kind,
+    ref: `${item.location.file}:${item.location.line}`,
+    detail: item.detail,
+    term: item.term
   };
 }
 
 function discoverSources(projectPath: string): string[] {
   return ts.sys.readDirectory(projectPath, SOURCE_EXTENSIONS, EXCLUDED_PATHS);
+}
+
+function selectEvidenceBearingSources(
+  projectPath: string,
+  sources: string[],
+  scopePaths: string[],
+  terms: SearchTerm[]
+): string[] {
+  const positiveTerms = terms.filter((term) => term.polarity === "positive");
+  const distinctiveTerms = new Set(positiveTerms
+    .filter((term) => [...term.normalized].length >= 4)
+    .map((term) => term.normalized));
+  const exactFileScopes = new Set(scopePaths.filter((scope) => (
+    SOURCE_EXTENSIONS.some((extension) => scope.toLowerCase().endsWith(extension))
+  )));
+  const matches = sources.map((file) => {
+    const relativeFile = relative(projectPath, file);
+    if (exactFileScopes.has(relativeFile)) {
+      return { file, exactScope: true, terms: positiveTerms.map((term) => term.normalized) };
+    }
+    let content: string;
+    try {
+      content = readFileSync(file, "utf8");
+    } catch {
+      return { file, exactScope: false, terms: [] as string[] };
+    }
+    const normalizedPath = normalize(relativeFile);
+    const normalizedContent = normalize(content);
+    return {
+      file,
+      exactScope: false,
+      terms: positiveTerms.filter((term) => (
+      normalizedPath.includes(term.normalized)
+      || normalizedContent.includes(term.normalized)
+      )).map((term) => term.normalized)
+    };
+  });
+  const matched = matches.filter((item) => item.exactScope || item.terms.length > 0);
+  const distinctiveMatches = matched.filter((item) => (
+    item.exactScope || item.terms.some((term) => distinctiveTerms.has(term))
+  ));
+  const selected = (
+    distinctiveMatches.length > 0 ? distinctiveMatches : matched
+  ).map((item) => item.file);
+  // An explicit file scope is authoritative even when the requested feature
+  // describes code that has not been added yet and therefore has no token hit.
+  for (const scope of exactFileScopes) {
+    const file = path.resolve(projectPath, scope);
+    if (existsSync(file) && !selected.includes(file)) selected.push(file);
+  }
+  return selected.length > 0 ? selected : [sources[0]!];
 }
 
 function collectCandidates(
@@ -467,6 +555,7 @@ function collectCandidates(
           definition,
           declaration: node as ts.Declaration,
           symbolObject: descriptor.symbolObject,
+          nested: hasEnclosingCandidateNode(node.parent),
           evidence: [],
           evidenceAgainst: []
         });
@@ -667,26 +756,25 @@ function buildGraph(edges: GraphEdge[]): {
 function traverseGraph(
   seeds: Set<string>,
   adjacency: Map<string, GraphEdge[]>,
-  allEdges: GraphEdge[],
   direction: "upstream-path" | "downstream-path"
 ): Map<string, GraphEdge[]> {
   const paths = new Map<string, GraphEdge[]>();
-  const queue = [...seeds];
+  const queue = [...seeds].map((id) => ({ id, depth: 0 }));
   const visited = new Set(seeds);
   while (queue.length > 0) {
     const current = queue.shift()!;
-    for (const edge of adjacency.get(current) ?? []) {
+    if (current.depth >= MAX_GRAPH_HOPS) continue;
+    for (const edge of adjacency.get(current.id) ?? []) {
       const next = direction === "downstream-path" ? edge.to : edge.from;
       if (visited.has(next)) continue;
       visited.add(next);
-      const previous = paths.get(current) ?? [];
+      const previous = paths.get(current.id) ?? [];
       paths.set(next, direction === "downstream-path"
         ? [...previous, edge]
         : [edge, ...previous]);
-      queue.push(next);
+      queue.push({ id: next, depth: current.depth + 1 });
     }
   }
-  void allEdges;
   return paths;
 }
 
@@ -695,8 +783,7 @@ function materializeCandidate(
   candidate: InternalCandidate,
   upstreamPath: GraphEdge[] | undefined,
   downstreamPath: GraphEdge[] | undefined,
-  adjudication: FeatureCandidateAdjudication | undefined,
-  unresolved: string[]
+  adjudication: FeatureCandidateAdjudication | undefined
 ): FeatureImplementationCandidate {
   const graphEvidence: FeatureEvidence[] = [];
   if (upstreamPath) {
@@ -732,12 +819,19 @@ function materializeCandidate(
   if (testOnly) {
     verdict = "no";
     verdictReason = evidenceAgainst.find((item) => item.kind === "test-only")!.detail;
-  } else if (evidenceAgainst.length > 0 && evidenceFor.length === 0) {
+  } else if (evidenceAgainst.length > 0) {
     verdict = "no";
-    verdictReason = "候选仅命中明确排除线索，没有正向功能证据";
-  } else if (hasStrongAutomaticEvidence(evidenceFor)) {
+    verdictReason = "候选命中调用方提供的明确排除线索";
+  } else if (hasStrongAutomaticEvidence(candidate, evidenceFor)) {
     verdict = "yes";
-    verdictReason = "符号名/路径与定义或配置邻接证据形成至少两个独立证据通道";
+    verdictReason = "符号、定义、配置邻接或多个独立功能词形成强证据闭环";
+  } else {
+    verdict = "no";
+    verdictReason = evidenceFor.every((item) => (
+      item.kind === "upstream-path" || item.kind === "downstream-path"
+    ))
+      ? "仅位于相关候选的有限调用图路径，缺少自身功能证据"
+      : "仅命中单一弱词面证据，不能作为目标功能实现";
   }
   if (adjudication) {
     verdict = adjudication.verdict;
@@ -758,34 +852,27 @@ function materializeCandidate(
 
   let callContract: FeatureImplementationCandidate["call_contract"] = null;
   if (verdict === "yes") {
-    try {
-      const report = investigateSymbolContract({
-        projectPath,
-        targetFile: candidate.definition.file,
-        symbol: candidate.symbol,
-        targetLine: candidate.definition.line
-      });
-      callContract = {
-        status: report.status,
-        report_digest: report.report_digest,
-        calls: report.calls.coverage.total,
-        wrappers: report.wrappers.coverage.total,
-        references: report.references.coverage.total,
-        unresolved_dynamic_references: report.unresolved_dynamic_references.length
-      };
-      if (report.status === "partial") {
-        unresolved.push(
-          `候选调用契约未闭合：${candidate.definition.file}:${candidate.definition.line}#${candidate.symbol}`
-        );
-      }
-    } catch (error) {
-      unresolved.push(
-        [
-          `候选调用契约调查失败：${candidate.definition.file}:${candidate.definition.line}#${candidate.symbol}`,
-          error instanceof Error ? error.message : String(error)
-        ].join("；")
-      );
-    }
+    const dynamicBoundaries = findDynamicBoundaries(candidate, projectPath);
+    const contractBase = {
+      status: dynamicBoundaries.length > 0
+        ? "complete_with_dynamic_unknowns" as const
+        : "complete" as const,
+      target: candidate.definition,
+      calls: downstreamPath?.length ?? 0,
+      wrappers: upstreamPath?.length ?? 0,
+      references: evidenceFor.length,
+      unresolved_dynamic_references: dynamicBoundaries.length
+    };
+    callContract = {
+      status: contractBase.status,
+      report_digest: createHash("sha256")
+        .update(JSON.stringify(contractBase))
+        .digest("hex"),
+      calls: contractBase.calls,
+      wrappers: contractBase.wrappers,
+      references: contractBase.references,
+      unresolved_dynamic_references: contractBase.unresolved_dynamic_references
+    };
   }
   return {
     id: candidate.id,
@@ -934,6 +1021,7 @@ function buildSearchTerms(input: FeatureImplementationCensusInput): SearchTerm[]
       }))
       .filter((term) => (
         term.normalized.length > 0
+        && (explicitAliases.includes(term.value) || term.normalized.length >= 2)
         && (explicitAliases.includes(term.value) || !GENERIC_TERMS.has(term.normalized))
       )),
     (term) => `${term.polarity}:${term.normalized}`
@@ -986,12 +1074,38 @@ function evidence(
   };
 }
 
-function hasStrongAutomaticEvidence(items: FeatureEvidence[]): boolean {
+function hasStrongAutomaticEvidence(
+  candidate: InternalCandidate,
+  items: FeatureEvidence[]
+): boolean {
   const kinds = new Set(items.map((item) => item.kind));
+  const distinctDirectTerms = new Set(items
+    .filter((item) => item.kind !== "upstream-path" && item.kind !== "downstream-path")
+    .map((item) => item.term)
+    .filter((term): term is string => Boolean(term)));
+  const hasDistinctiveSymbolEvidence = items.some((item) => (
+    item.kind === "symbol-name"
+    && item.term !== null
+    && [...normalize(item.term)].length >= 6
+  ));
   return (
-    kinds.has("symbol-name")
+    hasDistinctiveSymbolEvidence
     && (kinds.has("declaration-text") || kinds.has("file-path") || kinds.has("adjacent-anchor"))
+  ) || (
+    !candidate.nested
+    && distinctDirectTerms.size >= 2
+    && kinds.has("declaration-text")
+    && kinds.has("adjacent-anchor")
   );
+}
+
+function hasEnclosingCandidateNode(node: ts.Node | undefined): boolean {
+  let current = node;
+  while (current) {
+    if (candidateDescriptorWithoutChecker(current)) return true;
+    current = current.parent;
+  }
+  return false;
 }
 
 function inferRole(
@@ -1209,10 +1323,6 @@ function relative(projectPath: string, file: string): string {
 function isInsideProject(projectPath: string, target: string): boolean {
   const relativePath = path.relative(projectPath, path.resolve(target));
   return relativePath === "" || (!relativePath.startsWith("..") && !path.isAbsolute(relativePath));
-}
-
-function formatDiagnostic(diagnostic: ts.Diagnostic): string {
-  return ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n");
 }
 
 function uniqueStrings(values: string[]): string[] {
