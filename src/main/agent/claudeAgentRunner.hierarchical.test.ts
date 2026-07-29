@@ -16,6 +16,7 @@ import {
   isLineAddedByGitDiff,
   reconcileHierarchicalFeatureCensusHandoff,
   reconcileHierarchicalPrepareContractHandoff,
+  reconcileHierarchicalPrepareObligationEvidence,
   recordFeatureCensusReceipt,
   validateHierarchicalBehaviorObligationContinuity,
   validateHierarchicalContractToolEvidence,
@@ -730,6 +731,68 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     expect(first).not.toBe(digestShape);
   });
 
+  it("groups rotating obligation-citation failures under one class fingerprint", () => {
+    const destination = hierarchicalErrorFingerprint(
+      "R33/prepare",
+      "行为义务 B1-destination 未引用 零钱宝 的选定同功能入口 lib/views/homepage/components/IconConfiguration.js:36"
+    );
+    const argumentsFp = hierarchicalErrorFingerprint(
+      "R33/prepare",
+      "行为义务 B3-arguments 未引用 转托管入 的选定同功能入口 lib/views/homepage/utils/homepageRedirection.js:58"
+    );
+    // Same violation class -> same fingerprint, so the bounded-recovery streak
+    // counts "still missing an obligation citation" instead of churning B1->B3
+    // and resetting to 1/6 on every rotation.
+    expect(destination).toBe(argumentsFp);
+    // A different violation class produces a distinct fingerprint.
+    const referenceApplication = hierarchicalErrorFingerprint(
+      "R33/prepare",
+      "reference_application 未逐目标覆盖 TQlqbmore"
+    );
+    expect(destination).not.toBe(referenceApplication);
+    // A fail-collect composite listing several missing obligations still
+    // collapses to the single obligation-evidence-missing class fingerprint.
+    const composite = hierarchicalErrorFingerprint(
+      "R33/prepare",
+      "prepare 阶段交接物未通过校验，共 4 处：\n"
+      + "- 行为义务 B1-destination 未引用 零钱宝 的选定同功能入口 lib/a.js:36\n"
+      + "- 行为义务 B3-arguments 未引用 零钱宝 的选定同功能入口 lib/a.js:36\n"
+      + "- 行为义务 B4-preconditions 未引用 零钱宝 的选定同功能入口 lib/a.js:36\n"
+      + "- 行为义务 B6-side_effects 未引用 零钱宝 的选定同功能入口 lib/a.js:36"
+    );
+    expect(composite).toBe(destination);
+  });
+
+  it("groups investigate handoff violations into per-section class fingerprints", () => {
+    const contractMismatchA = hierarchicalErrorFingerprint(
+      "R33/investigate",
+      "target_mappings.LQB 的 contract_symbol/contract_location 未命中同一定义：redirectActionPush@lib/views/homepage/utils/homepageRedirection.js:171"
+    );
+    const contractMismatchB = hierarchicalErrorFingerprint(
+      "R33/investigate",
+      "target_mappings.LgbWealth 的 contract_symbol/contract_location 未命中同一定义：redirectActionPush@lib/views/homepage/utils/homepageRedirection.js:58"
+    );
+    expect(contractMismatchA).toBe(contractMismatchB);
+    // Coverage and contract-mismatch are both target_mappings issues -> same class.
+    const coverage = hierarchicalErrorFingerprint(
+      "R33/investigate",
+      "target_mappings 未逐项覆盖需求中的 pageName 原词：LgbWealth"
+    );
+    expect(coverage).toBe(contractMismatchA);
+    // A different section (reference_analysis) produces a distinct fingerprint.
+    const referenceSelection = hierarchicalErrorFingerprint(
+      "R33/investigate",
+      "以下目标缺少逐目标 reference selection：LgbWealth"
+    );
+    expect(referenceSelection).not.toBe(contractMismatchA);
+    // candidates-traced and reference-selection are both reference_analysis -> same class.
+    const candidatesTraced = hierarchicalErrorFingerprint(
+      "R33/investigate",
+      "handoff.reference_analysis.candidates[0] 未追到 LQB 已确认的同一最终函数/组件：redirectActionPush@lib/views/homepage/utils/homepageRedirection.js:58"
+    );
+    expect(candidatesTraced).toBe(referenceSelection);
+  });
+
   it("closes frozen obligations by id, status and evidence without requiring identical prose", () => {
     const session = createSession();
     const state = createHierarchicalExecutionState(session.task_prompt);
@@ -1012,6 +1075,169 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
         contract_results: finalContractResults
       }]
     )).not.toThrow();
+  });
+
+  it("surfaces every missing obligation citation in one fail-collect rejection", () => {
+    const session = createSession();
+    const state = createHierarchicalExecutionState(session.task_prompt);
+    const investigateHandoff = handoffFor("investigate", "target.ts", "reference.ts", true);
+    const prepareHandoff = handoffFor("prepare") as Record<string, unknown>;
+    state.requirements = [{
+      id: "R1",
+      source_anchor: "user:R1",
+      observable_result: "route works",
+      acceptance: [{ id: "R1-A1", criterion: "route works", status: "pass", evidence_refs: ["target.ts:1"] }],
+      dependencies: [],
+      status: "completed",
+      evidence_refs: ["target.ts:1"]
+    }];
+    state.phase_artifacts = [{
+      id: "R1:investigate:artifact",
+      work_unit_id: "R1:investigate",
+      requirement_id: "R1",
+      phase: "investigate",
+      attempt: 1,
+      summary: "same-feature entry selected",
+      handoff: investigateHandoff,
+      evidence_refs: ["reference.ts:5"],
+      knowledge_revision: 0,
+      workspace_revision: 0,
+      created_at: state.created_at
+    }];
+    session.hierarchical_state = state;
+
+    const obligations = prepareHandoff.behavior_obligations as Array<Record<string, unknown>>;
+    // Two obligations drop the reference.ts citation; the other four keep it.
+    const dropEvidence = ["target.ts:1"];
+    (obligations.find((obligation) => obligation.id === "B-destination")!).evidence_refs = dropEvidence;
+    (obligations.find((obligation) => obligation.id === "B-arguments")!).evidence_refs = dropEvidence;
+
+    const prepareEvent = {
+      type: "phase_passed" as const,
+      work_unit_id: "R1:prepare",
+      summary: "prepared",
+      handoff: prepareHandoff,
+      evidence_refs: ["target.ts:1", "reference.ts:5"],
+      allowed_files: ["target.ts"]
+    };
+    const prepareOperation = {
+      kind: "run_phase" as const,
+      requirement_id: "R1",
+      work_unit_id: "R1:prepare",
+      phase: "prepare" as const,
+      role: "implementation-preparer"
+    };
+
+    let thrown: Error | undefined;
+    try {
+      validateHierarchicalBehaviorObligationContinuity(session, prepareOperation, [prepareEvent]);
+    } catch (error) {
+      thrown = error instanceof Error ? error : new Error(String(error));
+    }
+    expect(thrown).toBeDefined();
+    // Both missing obligations appear in the single rejection, not just the first.
+    expect(thrown!.message).toContain("prepare 阶段交接物未通过校验，共 2 处");
+    expect(thrown!.message).toContain("行为义务 B-destination 未引用 route 的选定同功能入口 reference.ts:5");
+    expect(thrown!.message).toContain("行为义务 B-arguments 未引用 route 的选定同功能入口 reference.ts:5");
+    // The four obligations that kept their citation are NOT flagged.
+    expect(thrown!.message).not.toContain("B-invocation");
+  });
+
+  it("prefills investigate-selected entry citations into obligations before validation", () => {
+    const session = createSession();
+    const state = createHierarchicalExecutionState(session.task_prompt);
+    const investigateHandoff = handoffFor("investigate", "target.ts", "reference.ts", true);
+    const prepareHandoff = handoffFor("prepare") as Record<string, unknown>;
+    state.requirements = [{
+      id: "R1",
+      source_anchor: "user:R1",
+      observable_result: "route works",
+      acceptance: [{ id: "R1-A1", criterion: "route works", status: "pass", evidence_refs: ["target.ts:1"] }],
+      dependencies: [],
+      status: "completed",
+      evidence_refs: ["target.ts:1"]
+    }];
+    state.phase_artifacts = [{
+      id: "R1:investigate:artifact",
+      work_unit_id: "R1:investigate",
+      requirement_id: "R1",
+      phase: "investigate",
+      attempt: 1,
+      summary: "same-feature entry selected",
+      handoff: investigateHandoff,
+      evidence_refs: ["reference.ts:5"],
+      knowledge_revision: 0,
+      workspace_revision: 0,
+      created_at: state.created_at
+    }];
+    session.hierarchical_state = state;
+
+    const prepareStructured = {
+      status: "passed",
+      summary: "prepared",
+      handoff: prepareHandoff,
+      evidence_refs: ["target.ts:1", "reference.ts:5"],
+      allowed_files: ["target.ts"]
+    };
+    const obligations = prepareHandoff.behavior_obligations as Array<Record<string, unknown>>;
+    // Every obligation drops the reference.ts citation and target coverage.
+    obligations.forEach((obligation) => {
+      obligation.evidence_refs = ["target.ts:1"];
+      obligation.target_keys = [];
+    });
+
+    const prepareOperation = {
+      kind: "run_phase" as const,
+      requirement_id: "R1",
+      work_unit_id: "R1:prepare",
+      phase: "prepare" as const,
+      role: "implementation-preparer"
+    };
+
+    reconcileHierarchicalPrepareObligationEvidence(session, prepareOperation, prepareStructured);
+
+    for (const obligation of obligations) {
+      const evidence = obligation.evidence_refs as string[];
+      expect(evidence).toContain("reference.ts:5");
+      expect(evidence).toContain("target.ts:1"); // prefill is additive, never drops existing evidence
+      expect(obligation.target_keys).toContain("route");
+    }
+
+    // With prefilled citations, the validator no longer rejects for missing
+    // entry citations; the safety net stays dormant for the covered target.
+    const prepareEvent = {
+      type: "phase_passed" as const,
+      work_unit_id: "R1:prepare",
+      summary: "prepared",
+      handoff: prepareHandoff,
+      evidence_refs: ["target.ts:1", "reference.ts:5"],
+      allowed_files: ["target.ts"]
+    };
+    expect(() => validateHierarchicalBehaviorObligationContinuity(
+      session,
+      prepareOperation,
+      [prepareEvent]
+    )).not.toThrow();
+
+    // No selected entry (static config) -> prefill is a no-op.
+    const staticInvestigate = handoffFor("investigate", "target.ts", "reference.ts", false);
+    state.phase_artifacts = [{
+      id: "R1:investigate:artifact",
+      work_unit_id: "R1:investigate",
+      requirement_id: "R1",
+      phase: "investigate",
+      attempt: 1,
+      summary: "static config",
+      handoff: staticInvestigate,
+      evidence_refs: ["target.ts:1"],
+      knowledge_revision: 0,
+      workspace_revision: 0,
+      created_at: state.created_at
+    }];
+    const before = obligations.map((obligation) => obligation.evidence_refs);
+    reconcileHierarchicalPrepareObligationEvidence(session, prepareOperation, prepareStructured);
+    const after = obligations.map((obligation) => obligation.evidence_refs);
+    expect(after).toEqual(before);
   });
 
   it("separates a static same-feature entry from its callable contract target", () => {
@@ -1761,6 +1987,148 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     } finally {
       await rm(projectPath, { recursive: true, force: true });
     }
+  });
+
+  it("escalates a stuck investigate phase to a blocker after three consecutive same-class failures", async () => {
+    const projectPath = await mkdtemp(path.join(os.tmpdir(), "ai-coder-investigate-stuck-"));
+    let investigateAttempts = 0;
+
+    async function* query(params: unknown) {
+      const prompt = String((params as { prompt?: unknown }).prompt ?? "");
+      let structuredOutput: Record<string, unknown>;
+      if (prompt.includes("建立一次性、稳定的需求账本")) {
+        structuredOutput = {
+          status: "passed", summary: "plan", definition_of_done: ["done"],
+          requirements: [{
+            id: "R1", source_anchor: "user:R1", observable_result: "done",
+            acceptance: ["done"], dependencies: []
+          }]
+        };
+      } else {
+        const phase = /G1 > R1 > (investigate|prepare|implement|verify) >/.exec(prompt)?.[1];
+        if (!phase) throw new Error("unexpected prompt");
+        if (phase === "investigate") {
+          investigateAttempts += 1;
+          throw new Error("unchanged investigate fault");
+        }
+        structuredOutput = {
+          status: "passed", summary: `${phase} passed`, evidence_refs: [`${phase}:evidence`],
+          handoff: handoffFor(phase, "target.js", "reference.js")
+        };
+      }
+      yield { type: "result", subtype: "success", is_error: false, structured_output: structuredOutput };
+    }
+
+    try {
+      const session = createSession();
+      session.project_path = projectPath;
+      const updated = await new ClaudeAgentRunner({
+        queryOverride: query,
+        pluginPaths: [path.resolve("plugins/careful-coder")]
+      }).run({ session, workflow });
+
+      // investigate is the first phase (no prior phase to retreat to); after 3
+      // consecutive same-class failures it escalates to a blocker instead of
+      // churning toward the 6-cap.
+      expect(investigateAttempts).toBe(3);
+      expect(updated.status).toBe("interrupted");
+      expect(updated.pending_human_questions ?? []).toHaveLength(0);
+      expect(updated.hierarchical_state?.blockers).toContainEqual(expect.objectContaining({
+        kind: "agent_failed",
+        owner: "host",
+        user_input_required: false,
+        status: "open"
+      }));
+      const progressEvents = updated.progress_events ?? [];
+      expect(progressEvents).toContainEqual(expect.objectContaining({
+        message: expect.stringContaining("连续 3 次遇到同类问题")
+      }));
+      expect(progressEvents).toContainEqual(expect.objectContaining({
+        message: expect.stringContaining("升级为阻塞")
+      }));
+      // The 6-cap hard stop did not fire (escalation came first).
+      expect(progressEvents.some((event) => event.message.includes("6 次定向修正机会"))).toBe(false);
+    } finally {
+      await rm(projectPath, { recursive: true, force: true });
+    }
+  });
+
+  it("collects multiple census violations in one fail-collect rejection", () => {
+    const session = createSession();
+    const state = createHierarchicalExecutionState(session.task_prompt);
+    state.requirements = [{
+      id: "R1",
+      source_anchor: "user:R1",
+      observable_result: "route works",
+      acceptance: [{ id: "R1-A1", criterion: "route works", status: "pass", evidence_refs: ["target.ts:1"] }],
+      dependencies: [],
+      status: "completed",
+      evidence_refs: ["target.ts:1"]
+    }];
+    session.hierarchical_state = state;
+
+    const censusInput = { feature: "route", aliases: ["route"] };
+    const fakeReport = {
+      status: "complete" as const,
+      report_digest: "a".repeat(64),
+      candidate_accounting: { total: 2, yes: 2, no: 0, unknown: 0, accounted: true as const },
+      selected_targets: [
+        { candidate_id: "cand-1", symbol: "target", kind: "function" as const, definition: { file: "target.ts", line: 1, column: 0 }, role: "entry" as const, call_contract_digest: "d1" },
+        { candidate_id: "cand-2", symbol: "reference", kind: "function" as const, definition: { file: "reference.ts", line: 5, column: 0 }, role: "entry" as const, call_contract_digest: "d2" }
+      ],
+      unresolved: [] as string[]
+    };
+    const stageId = "hierarchical:R1/investigate";
+    session.tool_calls = [{
+      id: "census-call",
+      stage_id: stageId,
+      tool: "mcp__ai_coder__locate_feature_implementation",
+      input: censusInput,
+      status: "completed" as const,
+      created_at: state.created_at
+    }];
+    recordFeatureCensusReceipt(session, stageId, censusInput, fakeReport);
+    expect((session.feature_census_receipts ?? []).length).toBeGreaterThan(0);
+
+    const handoff = handoffFor("investigate", "target.ts", "reference.ts", true) as Record<string, unknown>;
+    const featureCensus = handoff.feature_census as Record<string, unknown>;
+    // Align the handoff's census fields with the fake report so we reach the
+    // selected_candidate_ids / target-definition checks we actually want to test.
+    featureCensus.report_digest = fakeReport.report_digest;
+    featureCensus.candidate_accounting = { ...fakeReport.candidate_accounting };
+    featureCensus.selected_candidate_ids = ["cand-wrong"];
+    const targetInvestigation = handoff.target_investigation as Record<string, unknown>;
+    targetInvestigation.definition = "other.ts:99";
+
+    const investigateEvent = {
+      type: "phase_passed" as const,
+      work_unit_id: "R1:investigate",
+      summary: "investigated",
+      handoff,
+      evidence_refs: ["target.ts:1"]
+    };
+    const investigateOperation = {
+      kind: "run_phase" as const,
+      requirement_id: "R1",
+      work_unit_id: "R1:investigate",
+      phase: "investigate" as const,
+      role: "code-investigator"
+    };
+
+    let thrown: Error | undefined;
+    try {
+      validateHierarchicalContractToolEvidence(session, investigateOperation, [investigateEvent], stageId);
+    } catch (error) {
+      thrown = error instanceof Error ? error : new Error(String(error));
+    }
+
+    expect(thrown).toBeDefined();
+    // Both census violations should appear in one composite message (along with
+    // any target_mappings violations -- the point is they are collected, not
+    // thrown one-at-a-time).
+    expect(thrown!.message).toContain("investigate 阶段交接物未通过校验，共");
+    expect(thrown!.message).toContain("feature_census.selected_candidate_ids 未完整对应所有 yes 候选");
+    expect(thrown!.message).toContain("未被功能普查以 yes 证据选中");
   });
 
   it("classifies repeated planner failures as a system fault instead of asking the user", async () => {

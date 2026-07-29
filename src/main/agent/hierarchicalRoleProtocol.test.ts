@@ -392,6 +392,51 @@ describe("hierarchicalRoleProtocol", () => {
     })).toThrow("逐目标说明 no_reference_reason");
   });
 
+  it("surfaces every investigate reference-analysis violation in one fail-collect rejection", () => {
+    const operation = {
+      kind: "run_phase" as const,
+      requirement_id: "R1",
+      work_unit_id: "R1:investigate",
+      phase: "investigate" as const,
+      role: "code-investigator"
+    };
+    const handoff = handoffFor("investigate") as Record<string, unknown>;
+    // Add a second target with no candidate and no selection.
+    (handoff.target_mappings as Array<Record<string, unknown>>).push({
+      target_key: "second",
+      requested_token: "second",
+      canonical_token: "second",
+      dispatcher_location: "src/target.ts:1",
+      contract_symbol: "reference",
+      contract_location: "src/reference.ts:5",
+      evidence_refs: ["src/target.ts:1", "src/reference.ts:5"]
+    });
+    const referenceAnalysis = handoff.reference_analysis as {
+      candidates: Array<Record<string, unknown>>;
+    };
+    // route's candidate no longer traces to route's mapping contract.
+    referenceAnalysis.candidates[0]!.contract_symbol = "wrongSymbol";
+
+    let thrown: Error | undefined;
+    try {
+      parseHierarchicalRoleResult(operation, {
+        status: "passed",
+        summary: "investigated",
+        evidence_refs: ["src/target.ts:1"],
+        handoff
+      });
+    } catch (error) {
+      thrown = error instanceof Error ? error : new Error(String(error));
+    }
+    expect(thrown).toBeDefined();
+    expect(thrown!.message).toContain("investigate 阶段交接物未通过校验，共 2 处");
+    expect(thrown!.message).toContain("未追到 route 已确认的同一最终函数/组件");
+    // Both sides of the mismatch are shown so the model can see what to fix.
+    expect(thrown!.message).toContain("candidate wrongSymbol@src/reference.ts:5");
+    expect(thrown!.message).toContain("target_mappings 声明的 reference@src/reference.ts:5");
+    expect(thrown!.message).toContain("以下目标缺少逐目标 reference selection：second");
+  });
+
   it("does not allow investigate to hide an unclassified feature candidate", () => {
     const handoff = handoffFor("investigate") as Record<string, unknown>;
     const census = handoff.feature_census as {

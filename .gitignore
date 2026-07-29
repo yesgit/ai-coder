@@ -6,6 +6,7 @@ coverage
 .DS_Store
 
 release
+release-fixed
 .claude/settings.local.json
 squashfs-root/__pycache__
 squashfs-root/

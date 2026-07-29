@@ -521,6 +521,7 @@ function validatePhaseHandoffSemantics(
   handoff: Record<string, unknown>
 ): void {
   if (phase === "investigate") {
+    const violations: string[] = [];
     const openUnknowns = stringArray(handoff.open_unknowns, "handoff.open_unknowns");
     if (openUnknowns.length > 0) {
       throw new Error(
@@ -631,13 +632,14 @@ function validatePhaseHandoffSemantics(
       const prefix = `handoff.reference_analysis.candidates[${index}]`;
       const targetKey = requiredString(candidate.target_key, `${prefix}.target_key`).trim();
       if (!targetKeys.has(targetKey)) {
-        throw new Error(`${prefix}.target_key 未对应 target_mappings：${targetKey}`);
+        violations.push(`${prefix}.target_key 未对应 target_mappings：${targetKey}`);
+        return;
       }
       if (requiredString(
         candidate.reference_kind,
         `${prefix}.reference_kind`
       ) !== "same-feature-entry") {
-        throw new Error("同类实现候选必须是同一业务功能的既有用户入口，不能只选外形相似的兄弟分支");
+        violations.push("同类实现候选必须是同一业务功能的既有用户入口，不能只选外形相似的兄弟分支");
       }
       requireNonEmptyStringArray(
         candidate.feature_equivalence,
@@ -666,16 +668,14 @@ function validatePhaseHandoffSemantics(
       requirePathLineString(location, `${prefix}.location`);
       requirePathLineString(contractLocation, `${prefix}.contract_location`);
       const mapping = targetMappingByKey.get(targetKey)!;
+      const mappingSymbol = requiredString(mapping.contract_symbol, `target_mappings.${targetKey}.contract_symbol`);
+      const mappingLocation = requiredString(mapping.contract_location, `target_mappings.${targetKey}.contract_location`);
       if (
-        contractSymbol !== requiredString(mapping.contract_symbol, `target_mappings.${targetKey}.contract_symbol`)
-        || firstPathLineToken(contractLocation) !== firstPathLineToken(requiredString(
-          mapping.contract_location,
-          `target_mappings.${targetKey}.contract_location`
-        ))
+        contractSymbol !== mappingSymbol
+        || firstPathLineToken(contractLocation) !== firstPathLineToken(mappingLocation)
       ) {
-        throw new Error(
-          `${prefix} 未追到 ${targetKey} 已确认的同一最终函数/组件：`
-          + `${contractSymbol}@${contractLocation}`
+        violations.push(
+          `${prefix} 未追到 ${targetKey} 已确认的同一最终函数/组件：candidate ${contractSymbol}@${contractLocation} ≠ target_mappings 声明的 ${mappingSymbol}@${mappingLocation}（contract_symbol 与 contract_location 必须逐字指向同一定义）`
         );
       }
       const bucket = candidatesByTarget.get(targetKey) ?? [];
@@ -699,10 +699,12 @@ function validatePhaseHandoffSemantics(
       const prefix = `handoff.reference_analysis.target_selections[${index}]`;
       const targetKey = requiredString(selection.target_key, `${prefix}.target_key`).trim();
       if (!targetKeys.has(targetKey)) {
-        throw new Error(`${prefix}.target_key 未对应 target_mappings：${targetKey}`);
+        violations.push(`${prefix}.target_key 未对应 target_mappings：${targetKey}`);
+        return;
       }
       if (selectionKeys.has(targetKey)) {
-        throw new Error(`每个 target_key 只能有一条 reference selection：${targetKey}`);
+        violations.push(`每个 target_key 只能有一条 reference selection：${targetKey}`);
+        return;
       }
       selectionKeys.add(targetKey);
       if (typeof selection.selected_location !== "string") {
@@ -720,7 +722,7 @@ function validatePhaseHandoffSemantics(
       const targetCandidates = candidatesByTarget.get(targetKey) ?? [];
       if (targetCandidates.length === 0) {
         if (selected || selectionReason || !noReferenceReason) {
-          throw new Error(
+          violations.push(
             `${targetKey} 未找到同功能入口时 selected_location/selection_reason 必须为空，`
             + "并逐目标说明 no_reference_reason"
           );
@@ -728,20 +730,22 @@ function validatePhaseHandoffSemantics(
         return;
       }
       if (!selected || !selectionReason || noReferenceReason) {
-        throw new Error(
+        violations.push(
           `${targetKey} 存在同功能候选时必须选择 selected_location、说明 selection_reason，`
           + "且 no_reference_reason 为空"
         );
+        return;
       }
       const selectedCandidate = targetCandidates.find((candidate) => (
         requiredString(candidate.location, `${prefix}.candidate.location`) === selected
       ));
       if (!selectedCandidate) {
-        throw new Error(`${targetKey}.selected_location 必须对应同一 target_key 的 candidate.location`);
+        violations.push(`${targetKey}.selected_location 必须对应同一 target_key 的 candidate.location`);
+        return;
       }
       const selectedEntryDefinition = firstPathLineToken(selected);
       if (targetDefinition && selectedEntryDefinition && targetDefinition === selectedEntryDefinition) {
-        throw new Error(
+        violations.push(
           `不得把当前待实现代码本身冒充同功能既有入口：target=${targetDefinition}；`
           + `candidate.location=${selectedEntryDefinition}。不同既有入口可以共享同一 contract_location，`
           + "但 candidate.location 必须指向独立入口"
@@ -750,7 +754,13 @@ function validatePhaseHandoffSemantics(
     });
     const missingSelectionKeys = [...targetKeys].filter((targetKey) => !selectionKeys.has(targetKey));
     if (missingSelectionKeys.length > 0) {
-      throw new Error(`以下目标缺少逐目标 reference selection：${missingSelectionKeys.join(", ")}`);
+      violations.push(`以下目标缺少逐目标 reference selection：${missingSelectionKeys.join(", ")}`);
+    }
+    if (violations.length > 0) {
+      throw new Error(
+        `investigate 阶段交接物未通过校验，共 ${violations.length} 处：\n`
+        + violations.map((violation) => `- ${violation}`).join("\n")
+      );
     }
     return;
   }

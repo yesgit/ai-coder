@@ -477,7 +477,9 @@ export class ClaudeAgentRunner {
               roleOperation.phase,
               message
             );
-            const sameFailureLimit = selfHealRoute === "retry" ? 6 : 3;
+            const sameFailureLimit = selfHealRoute === "retry" && roleOperation.phase !== "investigate"
+              ? 6
+              : 3;
             const recoveryRoute = repeats >= 3
               ? selfHealRoute
               : "retry";
@@ -507,6 +509,25 @@ export class ClaudeAgentRunner {
                 input,
                 "status",
                 `当前 ${roleOperation.phase} 已获得 ${totalFailures} 次定向修正机会且同类错误仍未消除；宿主停止无限往返并保留诊断：${message}`,
+                "milestone"
+              );
+            } else if (roleOperation.phase === "investigate" && repeats >= 3) {
+              // investigate is the first phase: there is no prior phase to
+              // retreat to. After 3 consecutive same-class failures, escalate to
+              // a host blocker instead of churning toward the 6-cap, so a stuck
+              // investigation fails fast rather than burning attempts.
+              const stuck = new Error(
+                `investigate 连续 ${repeats} 次遇到同类问题，无前置阶段可退回，宿主升级为阻塞：${message}`
+              );
+              this.raiseHierarchicalHostBlocker(input.session, "agent_failed", stuck, {
+                requirementId: roleOperation.requirement_id,
+                workUnitId: roleOperation.work_unit_id,
+                fingerprint: `phase-investigate-stuck-${fingerprint}`
+              });
+              await this.recordProgress(
+                input,
+                "status",
+                `当前 investigate 工作单元 attempt ${failedAttempt} 连续 ${repeats} 次遇到同类问题；无前置阶段可退回，宿主升级为阻塞并保留诊断：${message}`,
                 "milestone"
               );
             } else if (repeats >= 3 && recoveryRoute !== "retry") {
@@ -800,6 +821,7 @@ export class ClaudeAgentRunner {
       structured,
       stageId
     );
+    reconcileHierarchicalPrepareObligationEvidence(input.session, operation, structured);
     const transcript = recoveredStructuredOutput
       ? formatStructuredOutput(recoveredStructuredOutput)
       : formatClaudeTranscript(sdkMessages) || formatStructuredOutput(structured);
@@ -3678,6 +3700,71 @@ export function reconcileHierarchicalPrepareContractHandoff(
   }
 }
 
+type HierarchicalInvestigateArtifact = ReturnType<typeof latestHierarchicalArtifact>;
+
+// Same-feature entry locations the investigate phase already selected, keyed by
+// target_key. Used to prefill obligation evidence so a weak model does not have
+// to rediscover and re-cite the identical path:line across six obligation slots.
+function prepareSelectedEntries(
+  investigate: HierarchicalInvestigateArtifact,
+  projectPath: string
+): Array<{ targetKey: string; location: string }> {
+  if (!investigate) return [];
+  const referenceAnalysis = isPlainObject(investigate.handoff.reference_analysis)
+    ? investigate.handoff.reference_analysis
+    : null;
+  const selections = Array.isArray(referenceAnalysis?.target_selections)
+    ? referenceAnalysis.target_selections.filter(isPlainObject)
+    : [];
+  return selections.flatMap((selection) => {
+    const targetKey = optionalString(selection.target_key);
+    const location = optionalString(selection.selected_location);
+    return targetKey && location && evidenceLocationFile(location, projectPath)
+      ? [{ targetKey, location }]
+      : [];
+  });
+}
+
+// Prefill (every prepare attempt, before validation) the same-feature entry
+// citation and target coverage the host already knows from investigate. The
+// validator's citation/coverage checks remain as safety nets for cases this
+// cannot cover (no selected entry, or a target the model must still resolve).
+export function reconcileHierarchicalPrepareObligationEvidence(
+  session: AgentSession,
+  operation: Extract<HierarchicalNextOperation, {
+    kind: "run_phase" | "run_alignment_batch" | "run_planner" | "run_integrator"
+  }>,
+  structured: unknown
+): void {
+  if (operation.kind !== "run_phase" || operation.phase !== "prepare" || !isPlainObject(structured)) return;
+  const handoff = isPlainObject(structured.handoff) ? structured.handoff : null;
+  const obligations = handoff && Array.isArray(handoff.behavior_obligations)
+    ? handoff.behavior_obligations.filter(isPlainObject)
+    : [];
+  if (obligations.length === 0) return;
+  const state = session.hierarchical_state;
+  const investigate = state
+    ? latestHierarchicalArtifact(state, operation.requirement_id, "investigate")
+    : undefined;
+  const selectedEntries = prepareSelectedEntries(investigate, session.project_path);
+  if (selectedEntries.length === 0) return;
+  for (const obligation of obligations) {
+    const targetKeys = new Set(optionalStringArray(obligation.target_keys) ?? []);
+    for (const { targetKey } of selectedEntries) targetKeys.add(targetKey);
+    obligation.target_keys = [...targetKeys];
+    const evidence = Array.isArray(obligation.evidence_refs)
+      ? obligation.evidence_refs.filter((item): item is string => typeof item === "string")
+      : [];
+    for (const { location } of selectedEntries) {
+      const file = evidenceLocationFile(location, session.project_path);
+      if (file && !evidence.some((item) => evidenceLocationFile(item, session.project_path) === file)) {
+        evidence.push(location);
+      }
+    }
+    obligation.evidence_refs = evidence;
+  }
+}
+
 function uniqueContractRequests(
   items: Array<Record<string, unknown>>
 ): Array<{ location: string; symbol?: string; exact: boolean }> {
@@ -3978,6 +4065,7 @@ function validateHierarchicalFeatureCensusEvidence(
   const requirement = session.hierarchical_state?.requirements.find((item) => (
     item.id === passed.work_unit_id.split(":")[0]
   ));
+  const violations: string[] = [];
   const requestedTokens = extractPageNameTokens([
     requirement?.observable_result ?? "",
     ...(requirement?.acceptance.map((item) => item.criterion) ?? [])
@@ -3991,7 +4079,7 @@ function validateHierarchicalFeatureCensusEvidence(
     );
     const missingTokens = requestedTokens.filter((token) => !declaredTokens.has(token));
     if (missingTokens.length > 0) {
-      throw new Error(
+      violations.push(
         `target_mappings 未逐项覆盖需求中的 pageName 原词：${missingTokens.join(", ")}`
       );
     }
@@ -4039,7 +4127,7 @@ function validateHierarchicalFeatureCensusEvidence(
     declaredSelected.size !== reportSelected.size
     || [...reportSelected].some((candidateId) => !declaredSelected.has(candidateId))
   ) {
-    throw new Error("feature_census.selected_candidate_ids 未完整对应所有 yes 候选");
+    violations.push("feature_census.selected_candidate_ids 未完整对应所有 yes 候选");
   }
   const targetDefinition = firstPathLineToken(optionalString(target.definition) ?? "");
   if (
@@ -4049,15 +4137,22 @@ function validateHierarchicalFeatureCensusEvidence(
       `${targetItem.definition.file}:${targetItem.definition.line}` === targetDefinition
     ))
   ) {
-    throw new Error(`目标定义 ${targetDefinition} 未被功能普查以 yes 证据选中`);
+    violations.push(`目标定义 ${targetDefinition} 未被功能普查以 yes 证据选中（需将该候选加入 feature_census.selected_candidate_ids，或改用普查已选中的 candidate location）`);
   }
 
   validateInvestigateTargetMappingEvidence(
     session,
     handoff,
     referenceAnalysis,
-    referenceCandidates
+    referenceCandidates,
+    violations
   );
+  if (violations.length > 0) {
+    throw new Error(
+      `investigate 阶段交接物未通过校验，共 ${violations.length} 处：\n`
+      + violations.map((violation) => `- ${violation}`).join("\n")
+    );
+  }
 }
 
 export function extractPageNameTokens(values: string[]): string[] {
@@ -4090,19 +4185,21 @@ function validateInvestigateTargetMappingEvidence(
   session: AgentSession,
   handoff: Record<string, unknown>,
   referenceAnalysis: Record<string, unknown>,
-  referenceCandidates: unknown[]
+  referenceCandidates: unknown[],
+  violations: string[]
 ): void {
   const targetMappings = Array.isArray(handoff.target_mappings)
     ? handoff.target_mappings.filter(isPlainObject)
     : [];
   for (const mapping of targetMappings) {
     const targetKey = optionalString(mapping.target_key) ?? "<unknown>";
-    assertExactDeclaredContract(
+    const contractError = assertExactDeclaredContract(
       session.project_path,
       optionalString(mapping.contract_symbol),
       optionalString(mapping.contract_location),
       `target_mappings.${targetKey}`
     );
+    if (contractError) violations.push(contractError);
   }
 
   const targetSelections = Array.isArray(referenceAnalysis.target_selections)
@@ -4118,22 +4215,24 @@ function validateInvestigateTargetMappingEvidence(
       && optionalString(item.location) === selectedLocation
     ));
     if (!candidate || !isPlainObject(candidate)) {
-      throw new Error(`目标 ${targetKey ?? "<unknown>"} 的选定同功能入口缺少候选证据`);
+      violations.push(`目标 ${targetKey ?? "<unknown>"} 的选定同功能入口缺少候选证据`);
+      continue;
     }
     const contractSymbol = optionalString(candidate.contract_symbol);
     const contractLocation = optionalString(candidate.contract_location);
-    assertExactDeclaredContract(
+    const candidateContractError = assertExactDeclaredContract(
       session.project_path,
       contractSymbol,
       contractLocation,
       `reference candidate ${targetKey ?? "<unknown>"}`
     );
+    if (candidateContractError) violations.push(candidateContractError);
     for (const [kind, location] of [
       ["入口", selectedLocation],
       ["最终契约", contractLocation]
     ] as const) {
       if (location && isWorkingTreeAddedEvidenceLocation(session.project_path, location)) {
-        throw new Error(
+        violations.push(
           `同功能参考必须来自任务基线；${targetKey ?? "<unknown>"} 的${kind} ${location} `
           + "是当前工作区新增或改写的代码，不能拿本轮/前序需求刚新增的实现反向证明目标"
         );
@@ -4147,14 +4246,14 @@ function assertExactDeclaredContract(
   symbol: string | undefined,
   location: string | undefined,
   label: string
-): void {
+): string | undefined {
   if (!symbol || !location) {
-    throw new Error(`${label} 必须声明精确 contract_symbol@contract_location`);
+    return `${label} 必须声明精确 contract_symbol@contract_location`;
   }
   const anchor = evidenceLocationAnchor(location, projectPath);
   const absoluteFile = evidenceLocationFile(location, projectPath);
   if (!anchor || !absoluteFile) {
-    throw new Error(`${label}.contract_location 不是有效 path:line：${location}`);
+    return `${label}.contract_location 不是有效 path:line：${location}`;
   }
   const relativeFile = path.relative(projectPath, absoluteFile);
   if (
@@ -4162,7 +4261,7 @@ function assertExactDeclaredContract(
     || path.isAbsolute(relativeFile)
     || !existsSync(absoluteFile)
   ) {
-    throw new Error(`${label} 的契约文件不在项目内或不存在：${location}`);
+    return `${label} 的契约文件不在项目内或不存在：${location}`;
   }
   const expectedLine = Number(anchor.slice(anchor.lastIndexOf(":") + 1));
   if (/\.[cm]?[jt]sx?$/i.test(relativeFile)) {
@@ -4176,10 +4275,8 @@ function assertExactDeclaredContract(
         section: "contract"
       });
     } catch (error) {
-      throw new Error(
-        `${label} 未解析到真实函数/组件 ${symbol}@${location}：`
-        + `${error instanceof Error ? error.message : String(error)}`
-      );
+      return `${label} 未解析到真实函数/组件 ${symbol}@${location}：`
+        + `${error instanceof Error ? error.message : String(error)}`;
     }
     const exactDefinition = report.target.definitions.some((definition) => (
       evidenceLocationAnchor(
@@ -4188,12 +4285,10 @@ function assertExactDeclaredContract(
       ) === anchor
     ));
     if (!exactDefinition || report.target.symbol !== symbol) {
-      throw new Error(
-        `${label} 的 contract_symbol/contract_location 未命中同一定义：`
-        + `${symbol}@${location}`
-      );
+      return `${label} 的 contract_symbol/contract_location 未命中同一定义：`
+        + `${symbol}@${location}`;
     }
-    return;
+    return undefined;
   }
 
   const lines = readFileSync(absoluteFile, "utf8").split(/\r?\n/);
@@ -4202,8 +4297,9 @@ function assertExactDeclaredContract(
     Math.min(lines.length, expectedLine + 2)
   ).join("\n");
   if (!definitionWindow.includes(symbol)) {
-    throw new Error(`${label} 的定义行附近没有符号 ${symbol}：${location}`);
+    return `${label} 的定义行附近没有符号 ${symbol}：${location}`;
   }
+  return undefined;
 }
 
 export function isWorkingTreeAddedEvidenceLocation(
@@ -4351,6 +4447,10 @@ export function validateHierarchicalBehaviorObligationContinuity(
         mappingKeys.push(legacyTargetKey);
       }
     }
+    // Collect every prepare-handoff completeness violation before throwing, so a
+    // weak model sees the full set of missing citations in one rejection and can
+    // fix all six obligations in a single pass instead of one-at-a-time.
+    const violations: string[] = [];
     const callContract = isPlainObject(passed.handoff?.call_contract)
       ? passed.handoff.call_contract
       : undefined;
@@ -4402,7 +4502,7 @@ export function validateHierarchicalBehaviorObligationContinuity(
         ));
       });
       if (!analyzed) {
-        throw new Error(
+        violations.push(
           "prepare 必须逐目标分析 investigate 选中的同功能入口对应的真实函数/组件："
           + `${request.symbol ?? "<legacy-symbol>"}@${request.location}`
         );
@@ -4421,7 +4521,7 @@ export function validateHierarchicalBehaviorObligationContinuity(
       : [];
     for (const targetKey of mappingKeys) {
       if (!applications.some((application) => optionalString(application.target_key) === targetKey)) {
-        throw new Error(`reference_application 未逐目标覆盖 ${targetKey}`);
+        violations.push(`reference_application 未逐目标覆盖 ${targetKey}`);
       }
     }
     const unexpectedApplicationKeys = applications
@@ -4430,7 +4530,7 @@ export function validateHierarchicalBehaviorObligationContinuity(
         typeof targetKey === "string" && !mappingKeys.includes(targetKey)
       ));
     if (unexpectedApplicationKeys.length > 0) {
-      throw new Error(
+      violations.push(
         `reference_application 包含未声明的 target_key：${uniqueStrings(unexpectedApplicationKeys).join(", ")}`
       );
     }
@@ -4451,13 +4551,13 @@ export function validateHierarchicalBehaviorObligationContinuity(
         (targetKey) => !mappingKeys.includes(targetKey)
       );
       if (missingTargetKeys.length > 0) {
-        throw new Error(
+        violations.push(
           `行为义务 ${optionalString(obligation.id) ?? "<unknown>"} 未覆盖目标：`
           + missingTargetKeys.join(", ")
         );
       }
       if (unexpectedTargetKeys.length > 0) {
-        throw new Error(
+        violations.push(
           `行为义务 ${optionalString(obligation.id) ?? "<unknown>"} 包含未声明目标：`
           + unexpectedTargetKeys.join(", ")
         );
@@ -4472,7 +4572,7 @@ export function validateHierarchicalBehaviorObligationContinuity(
             evidenceLocationFile(item, session.project_path) === selected.selectedFile
           ))
         ) {
-          throw new Error(
+          violations.push(
             `行为义务 ${optionalString(obligation.id) ?? "<unknown>"} `
             + `未引用 ${selected.targetKey} 的选定同功能入口 ${selected.selectedLocation}`
           );
@@ -4493,7 +4593,7 @@ export function validateHierarchicalBehaviorObligationContinuity(
             return Boolean(anchor && !selectedAnchors.has(anchor));
           });
         if (!hasCurrentTargetEvidence) {
-          throw new Error(
+          violations.push(
             `already_satisfied 行为义务 ${optionalString(obligation.id) ?? "<unknown>"} `
             + "缺少当前目标代码的独立 path:line 证据"
           );
@@ -4505,8 +4605,14 @@ export function validateHierarchicalBehaviorObligationContinuity(
         ? passed.handoff.satisfaction_evidence.filter((item): item is string => typeof item === "string")
         : [];
       if (satisfaction.length < obligations.length) {
-        throw new Error("already_satisfied 必须为每条行为义务提供独立 satisfaction_evidence");
+        violations.push("already_satisfied 必须为每条行为义务提供独立 satisfaction_evidence");
       }
+    }
+    if (violations.length > 0) {
+      throw new Error(
+        `prepare 阶段交接物未通过校验，共 ${violations.length} 处：\n`
+        + violations.map((violation) => `- ${violation}`).join("\n")
+      );
     }
     return;
   }
@@ -4792,6 +4898,40 @@ function normalizeHierarchicalErrorForFingerprint(message: string): string {
   }
   if (/feature_census\.selected_candidate_ids/.test(reason)) {
     return "feature-census-selected-candidates";
+  }
+  // A composite prepare/implement/verify rejection may list many violations at
+  // once (fail-collect). Fingerprint the SET of violation classes present, not
+  // the specific obligation id or path, so the bounded-recovery streak reflects
+  // "still stuck on the same class" instead of churning as the model fixes one
+  // obligation and the validator surfaces the next.
+  const violationClasses: Array<[RegExp, string]> = [
+    [/行为义务.*未引用.*选定同功能入口/, "obligation-evidence-missing"],
+    [/行为义务.*未覆盖目标/, "obligation-target-coverage-missing"],
+    [/行为义务.*包含未声明目标/, "obligation-unexpected-target"],
+    [/reference_application 未逐目标覆盖/, "reference-application-coverage-missing"],
+    [/reference_application 包含未声明的 target_key/, "reference-application-unexpected-target"],
+    [/prepare 必须逐目标分析.*真实函数\/组件/, "analyzed-targets-missing"],
+    [/already_satisfied 行为义务.*缺少当前目标代码/, "already-satisfied-target-evidence-missing"],
+    [/already_satisfied 必须为每条行为义务提供独立 satisfaction_evidence/, "satisfaction-evidence-missing"],
+    [/行为义务 ID 未闭环/, "obligation-id-not-closed"],
+    [/行为义务.*未通过：/, "obligation-result-not-passing"],
+    [/行为义务.*缺少 observed_behavior/, "obligation-result-missing-observed"],
+    [/行为义务.*缺少 evidence_refs/, "obligation-result-missing-evidence"],
+    [/行为义务.*缺少 path:line 代码证据/, "obligation-result-missing-pathline"],
+    // investigate（validateHierarchicalFeatureCensusEvidence / validateInvestigateTargetMappingEvidence /
+    // validatePhaseHandoffSemantics）-- group by handoff section so the streak
+    // counts "still has investigate handoff gaps" instead of churning across the
+    // many distinct investigate checks.
+    [/target_mappings 未逐项覆盖需求中的 pageName 原词|未命中同一定义|未声明精确 contract_symbol@contract_location|contract_location 不是有效 path:line|契约文件不在项目内或不存在|未解析到真实函数\/组件|定义行附近没有符号/, "investigate-target-mappings"],
+    [/未追到.*同一最终函数\/组件|缺少逐目标 reference selection|target_key 未对应 target_mappings|只能有一条 reference selection|未找到同功能入口时|存在同功能候选时必须选择|selected_location 必须对应|冒充同功能既有入口|选定同功能入口缺少候选证据|同功能参考必须来自任务基线/, "investigate-reference-analysis"],
+    [/selected_candidate_ids 未完整对应|未被功能普查以 yes 证据选中/, "investigate-feature-census"]
+  ];
+  const matchedViolationClasses = new Set<string>();
+  for (const [pattern, token] of violationClasses) {
+    if (pattern.test(reason)) matchedViolationClasses.add(token);
+  }
+  if (matchedViolationClasses.size > 0) {
+    return `hierarchical-contract:${[...matchedViolationClasses].sort().join(",")}`;
   }
   // Counts, attempt labels and changing path inventories are diagnostic
   // payload, not distinct failure classes. Normalizing them keeps the bounded
