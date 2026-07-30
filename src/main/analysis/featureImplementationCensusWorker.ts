@@ -23,6 +23,7 @@ try {
         candidate_accounting: report.candidate_accounting,
         selected_targets: report.selected_targets,
         unresolved: report.unresolved,
+        closure: report.closure,
         coverage: {
           files_scanned: report.coverage.files_scanned,
           symbols_indexed: report.coverage.symbols_indexed,

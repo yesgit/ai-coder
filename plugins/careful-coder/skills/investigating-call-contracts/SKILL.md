@@ -21,6 +21,8 @@ Build an evidence-backed usage model before editing an existing callable. Treat 
    - all four entries in `sections_completed` must be present;
    - `wrapper_graph.complete` must be `true`;
    - a `partial` report is not a completed investigation;
+   - `reference_accounting.accounted` must be `true`, and `total` must equal `resolved + irrelevant + blocked`;
+   - use stable `reference_id` values from `reference_cards` when explaining individual call or non-call references;
    - every item in `unresolved_dynamic_references` must be followed or explicitly retained as an unresolved boundary.
 4. For every reported call site, inspect the cited source around the call. Confirm:
    - exact argument or prop values and omitted values;
@@ -55,7 +57,7 @@ Do not emit a large schema merely to satisfy formatting. Produce a concise decis
 - compatibility obligations for the proposed change;
 - focused verification cases derived from observed combinations.
 
-The investigation is complete only when every tool-reported call/reference is accounted for, or each remaining gap is explicitly marked as a blocking or residual unknown.
+The static inventory is complete only when every tool-reported call/reference is accounted for. The behavioral investigation is complete only when `blocked=0`; otherwise preserve `runtime_verification_required=true` and close the boundary with a focused runtime test or report it as blocked.
 
 ## Framework boundaries
 

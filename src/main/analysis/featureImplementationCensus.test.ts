@@ -99,8 +99,13 @@ describe("censusFeatureImplementations", () => {
     });
     expect(report.candidates.find((candidate) => candidate.symbol === "CurrencyFundExplain")
       ?.evidence_against.some((item) => item.kind === "negative-clue")).toBe(true);
-    expect(report.status).toBe("complete");
-    expect(report.candidate_accounting.unknown).toBe(0);
+    expect(report.status).toBe("partial");
+    expect(report.candidate_accounting.unknown).toBeGreaterThan(0);
+    expect(report.closure).toMatchObject({
+      inventory_complete: true,
+      semantic_complete: false,
+      closeable: false
+    });
     expect(report.report_digest).toMatch(/^[a-f0-9]{64}$/);
   });
 
@@ -145,13 +150,20 @@ describe("censusFeatureImplementations", () => {
       "redirectActionPush",
       "autoPushPage"
     ]));
-    expect(report.selected_targets.every((target) => /^[a-f0-9]{64}$/.test(target.call_contract_digest)))
+    expect(report.selected_targets.every((target) => /^[a-f0-9]{64}$/.test(target.trace_summary_digest)))
       .toBe(true);
     expect(report.rejected_candidates.map((candidate) => candidate.symbol)).toEqual(expect.arrayContaining([
       "CurrencyFundExplain",
       "TransactionRecordLQB"
     ]));
     expect(report.unresolved).toEqual([]);
+    expect(report.closure).toEqual({
+      inventory_complete: true,
+      semantic_complete: true,
+      runtime_verification_required: false,
+      runtime_complete: true,
+      closeable: true
+    });
   });
 
   it("stays partial when matching code exists in an unsupported language", async () => {
@@ -216,10 +228,16 @@ export function openLqbDynamically(
     expect(report.status).toBe("complete");
     expect(report.selected_targets).toHaveLength(1);
     expect(report.candidates.find((candidate) => candidate.symbol === "openLqbDynamically")
-      ?.call_contract?.unresolved_dynamic_references).toBeGreaterThan(0);
+      ?.trace_summary?.unresolved_dynamic_references).toBeGreaterThan(0);
+    expect(report.closure).toMatchObject({
+      semantic_complete: true,
+      runtime_verification_required: true,
+      runtime_complete: false,
+      closeable: false
+    });
   });
 
-  it("does not let a rejected dynamic candidate keep the census partial", async () => {
+  it("does not claim completion when every candidate was rejected", async () => {
     const root = await createNavigationFixture();
     await writeFile(path.join(root, "dynamic.ts"), `
 export function unrelatedDynamicLqbWrapper(
@@ -247,8 +265,11 @@ export function unrelatedDynamicLqbWrapper(
       adjudications
     });
 
-    expect(report.status).toBe("complete");
+    expect(report.status).toBe("partial");
     expect(report.candidate_accounting.unknown).toBe(0);
+    expect(report.selected_targets).toEqual([]);
+    expect(report.closure.semantic_complete).toBe(false);
+    expect(report.unresolved.join("\n")).toContain("全部候选均被排除");
     expect(report.unresolved.join("\n")).not.toContain("动态调用边界无法静态穷举");
   });
 
@@ -271,11 +292,10 @@ export function unrelatedDynamicLqbWrapper(
       status: report.status,
       candidate_accounting: report.candidate_accounting
     });
-    expect((parsed.candidates as unknown[]).length).toBe(
-      report.candidate_accounting.unknown
-    );
+    expect((parsed.candidates as unknown[]).length).toBeLessThanOrEqual(24);
     expect(parsed.selected_targets).toEqual(report.selected_targets);
-    expect(parsed.rejected_candidate_count).toBe(report.rejected_candidates.length);
+    expect(parsed.rejected_candidates).toEqual(report.rejected_candidates);
+    expect(parsed.closure).toEqual(report.closure);
   });
 
   it("does not let a short legacy alias expand semantic analysis across unrelated files", async () => {
@@ -296,9 +316,60 @@ export function legacyLqbHelper${index}() {
 
     expect(report.coverage.files_discovered).toBeGreaterThan(40);
     expect(report.coverage.files_scanned).toBeLessThan(10);
-    expect(report.candidate_accounting.unknown).toBe(0);
-    expect(report.selected_targets.map((candidate) => candidate.symbol))
-      .toContain("redirectActionPush");
+    expect(report.candidate_accounting.unknown).toBeGreaterThan(0);
+    expect(report.selected_targets).toEqual([]);
+    expect(report.status).toBe("partial");
+  });
+
+  it("returns unknown candidates in bounded adjudication batches without losing host accounting", async () => {
+    const root = await createNavigationFixture();
+    await writeFile(path.join(root, "many.ts"), Array.from({ length: 30 }, (_, index) => (
+      `export function ExactFeatureCandidate${index}() { return "ExactFeature"; }`
+    )).join("\n"));
+
+    const report = censusFeatureImplementations({
+      projectPath: root,
+      feature: "ExactFeature",
+      aliases: ["ExactFeature"]
+    });
+    const parsed = JSON.parse(
+      formatFeatureImplementationCensusToolResult(report)
+    ) as {
+      candidates: unknown[];
+      adjudication_batch: {
+        returned: number;
+        remaining_after_batch: number;
+      };
+    };
+
+    expect(report.candidate_accounting.unknown).toBeGreaterThan(24);
+    expect(parsed.candidates).toHaveLength(24);
+    expect(parsed.adjudication_batch).toEqual({
+      returned: 24,
+      remaining_after_batch: report.candidate_accounting.unknown - 24
+    });
+  });
+
+  it("rejects adjudication evidence unrelated to the candidate declaration or discovered evidence", async () => {
+    const root = await createNavigationFixture();
+    const initial = censusFeatureImplementations({
+      projectPath: root,
+      feature: "零钱宝主页",
+      aliases: ["LQBInvest"]
+    });
+    const candidate = initial.candidates.find((item) => item.symbol === "LQBInvest")!;
+
+    expect(() => censusFeatureImplementations({
+      projectPath: root,
+      feature: "零钱宝主页",
+      aliases: ["LQBInvest"],
+      adjudications: [{
+        candidate_id: candidate.id,
+        verdict: "yes",
+        reason: "uses an unrelated but valid project line",
+        evidence_refs: ["navigation.tsx:1"]
+      }]
+    })).toThrow("证据未落在候选声明或已发现证据上");
   });
 
   it("rejects fabricated adjudication evidence", async () => {

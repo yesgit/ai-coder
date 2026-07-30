@@ -10,8 +10,10 @@ Trace from observable behavior to the code that produces it. Do not stop at a sy
 When the target is described as a feature, user behavior, page, event, route token, or protocol value rather than one exact symbol, call `mcp__ai_coder__locate_feature_implementation`. Treat it as a census, not a ranking:
 
 - preserve every candidate returned by symbol, path, declaration text, configuration adjacency, and upstream/downstream call-graph discovery;
-- inspect every `unknown`, then rerun with a `yes` or `no` adjudication, reason, and `path:line` evidence for each;
-- do not claim discovery is complete until the report says `status=complete`, candidate accounting has `unknown=0`, and every selected `yes` target has a contract digest;
+- inspect every returned `unknown` batch, then rerun with the cumulative `yes` or `no` adjudications, reasons, and candidate-scoped `path:line` evidence; do not submit only the latest batch;
+- never convert strong lexical similarity directly into `yes`, or weak similarity directly into `no`; only explicit negative evidence may be rejected mechanically;
+- do not claim discovery is complete until the report says `status=complete`, candidate accounting has `unknown=0`, at least one selected `yes` target exists, and every selected target has a bounded trace-summary digest;
+- distinguish `closure.semantic_complete` from `closure.closeable`; a runtime boundary may permit code-location work to continue while still requiring a later runtime verification;
 - retain rejected candidates and their negative evidence so similarly named pages, tests, static identifiers, and the code currently being proposed cannot silently become the reference.
 
 1. Confirm every code read comes from the user-authorized baseline, then find the runtime entry point: event, API, route, command, or component that users actually trigger. If the current working tree is explicitly excluded, use `git show <ref>:<path>` or an isolated worktree instead of Read on the current file.

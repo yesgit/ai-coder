@@ -676,6 +676,8 @@ function validatePhaseHandoffSemantics(
       ) {
         violations.push(
           `${prefix} 未追到 ${targetKey} 已确认的同一最终函数/组件：candidate ${contractSymbol}@${contractLocation} ≠ target_mappings 声明的 ${mappingSymbol}@${mappingLocation}（contract_symbol 与 contract_location 必须逐字指向同一定义）`
+          + "；dispatcher_location 已单独记录公共分发器，不要为了匹配而把 candidate.contract 改成分发器，"
+          + "应沿目标分支和既有入口追到共同的最终页面组件/业务函数，并修正错误的一侧"
         );
       }
       const bucket = candidatesByTarget.get(targetKey) ?? [];
@@ -991,8 +993,9 @@ function phaseInstructions(
     case "investigate":
       return [
         "只读取证：定位目标代码、最相似既有实现、真实调用方和关键未知。",
-        "只要需求以业务功能、用户行为、页面或协议标识描述，而不是用户已经给出唯一精确符号，就必须调用 locate_feature_implementation 做完整候选普查。首次返回 unknown 时逐项读取并提交 yes/no adjudications，直到 status=complete；普通 Read/Grep、只报最像候选或模型自述不能替代。",
-        "功能普查必须对范围内源码完成词面普查，并对独特证据命中文件覆盖符号名、路径、定义正文、配置邻接和直接证据上下游两跳调用图；每个进入语义候选集的目标都要保留 evidence_for、evidence_against 与 yes/no 结论，不能静默丢弃强证据候选。",
+        "只要需求以业务功能、用户行为、页面或协议标识描述，而不是用户已经给出唯一精确符号，就必须调用 locate_feature_implementation 做完整候选普查。脚本不会根据词面强弱自动确认或排除正向候选；每次只逐项读取本批 unknown，累计提交 yes/no adjudications，直到 status=complete。普通 Read/Grep、只报最像候选或模型自述不能替代。",
+        "功能普查必须对范围内源码完成词面普查，并对独特证据命中文件覆盖符号名、路径、定义正文、配置邻接和直接证据上下游两跳调用图；每个进入语义候选集的目标都要保留 evidence_for、evidence_against 与 yes/no 结论。弱证据只能保持 unknown，不能静默排除；强词面证据也必须经语义裁决才能成为 yes。",
+        "feature_census 只需提交 applicability 与 reason；status、report_digest、candidate_accounting、selected_candidate_ids 和 runtime_verification_required 全部由宿主从最后一次真实普查回填，不要手抄。",
         "目标函数/组件必须逐项调查定义、输入、输出、内部调用、guard、状态/副作用和调用方；某项不存在也要用证据明确写‘无’，不得省略。",
         "同类实现不是外形相似的路由分支。必须优先找到应用内进入同一业务功能的既有用户入口，沿该入口追到最终组件/函数，并记录目标、调用方式、完整参数、guard、上下文透传和副作用。",
         "每个原始页面/协议 token 都必须在 target_mappings 中单独记录 target_key、原词、canonical token、公共 dispatcher 位置，以及最终 contract_symbol@contract_location；公共 dispatcher 不能冒充最终页面组件。",
@@ -1007,7 +1010,7 @@ function phaseInstructions(
     case "prepare":
       return [
         "只读取证：建立调用契约、pre-behavior、修改处置和验证入口。需要修改时必须返回非空 allowed_files；完整契约已满足时走有证据的 no-op。",
-        "对每个将调用、复用或修改的既有函数/组件，必须调用 investigate_symbol_contract 完整调查脚本；脚本会自动覆盖 contract、calls、wrappers、references 全部分页并递归调查公共封装。Read/Grep/Bash、零散 analyze_symbol_contract 或模型自述均不能替代。",
+        "对每个将调用、复用或修改的既有函数/组件，必须调用 investigate_symbol_contract 完整调查脚本；脚本会自动覆盖 contract、calls、wrappers、references 全部分页并递归调查公共封装。analyzed_targets 对脚本支持的目标只需准确提交 target_file 与 symbol，宿主会回填定义、输入输出、调用点、包装层、guard、静态边界和证据；不要手抄报告。Read/Grep/Bash、零散 analyze_symbol_contract 或模型自述均不能替代。",
         "analyzed_targets 只登记函数、方法、类或组件等真实调用契约目标；常量表、路由配置对象、静态数据和样式文件即使列入 allowed_files，也不要为了凑文件覆盖伪造符号契约目标。",
         "调查脚本成功时 analysis_method 必须写 investigation-script，并把报告中的动态引用、递归封装截断或静态分析边界保留在 unresolved。只有真实调用契约目标不受脚本支持时，才改为 manual-static-analysis，说明原因并用 path:line 补齐同样的契约维度。纯静态配置改动直接写入 patch_plan、pre_behavior 和 allowed_files。",
         "必须把 investigate 的每个 target_key 逐项落实为 reference_application；六类 behavior_obligations 仍按 destination、invocation、arguments、preconditions、context、side_effects 冻结，但每项 target_keys 必须完整覆盖全部目标。",
@@ -1090,11 +1093,27 @@ function phaseHandoffSchema(
   });
   const evidenceList = (): Record<string, unknown> => stringList(1);
   const referenceCandidateSchema = strictObjectSchema({
-    target_key: { type: "string", minLength: 1 },
+    target_key: {
+      type: "string",
+      minLength: 1,
+      description: "必须对应同一 requested_token 的 target_mappings.target_key"
+    },
     reference_kind: { type: "string", enum: ["same-feature-entry"] },
-    location: { type: "string", minLength: 1 },
-    contract_location: { type: "string", minLength: 1 },
-    contract_symbol: { type: "string", minLength: 1 },
+    location: {
+      type: "string",
+      minLength: 1,
+      description: "任务 Git 基线中的独立用户入口/路由配置 path:line；不是当前待新增分支"
+    },
+    contract_location: {
+      type: "string",
+      minLength: 1,
+      description: "沿 location 追到的最终页面组件/业务函数定义 path:line；必须与对应 target mapping 的最终契约相同"
+    },
+    contract_symbol: {
+      type: "string",
+      minLength: 1,
+      description: "沿 location 追到的最终页面组件/业务函数；不得填写入口函数或公共 dispatcher"
+    },
     feature_equivalence: stringList(1),
     similarity: stringList(1),
     reusable_behavior: stringList(1),
@@ -1107,7 +1126,9 @@ function phaseHandoffSchema(
     side_effects: stringList(1),
     evidence_refs: evidenceList()
   });
-  const analyzedTargetSchema = strictObjectSchema({
+  const analyzedTargetSchema = {
+    type: "object",
+    properties: {
     target_file: { type: "string", minLength: 1 },
     symbol: { type: "string", minLength: 1 },
     analysis_method: { type: "string", enum: ["investigation-script", "manual-static-analysis"] },
@@ -1123,8 +1144,20 @@ function phaseHandoffSchema(
     state_and_side_effects: stringList(1),
     compatibility_obligations: stringList(1),
     unresolved: stringList(),
-    evidence_refs: evidenceList()
-  });
+    evidence_refs: evidenceList(),
+    investigation_report_digest: { type: "string" },
+    reference_accounting: strictObjectSchema({
+      total: { type: "integer", minimum: 0 },
+      resolved: { type: "integer", minimum: 0 },
+      irrelevant: { type: "integer", minimum: 0 },
+      blocked: { type: "integer", minimum: 0 },
+      accounted: { type: "boolean", const: true }
+    }),
+    runtime_verification_required: { type: "boolean" }
+    },
+    required: ["target_file", "symbol"],
+    additionalProperties: false
+  };
   const behaviorObligationSchema = strictObjectSchema({
     id: { type: "string", pattern: "^B[A-Za-z0-9._-]+$" },
     dimension: { type: "string", enum: [...REQUIRED_BEHAVIOR_DIMENSIONS] },
@@ -1150,16 +1183,42 @@ function phaseHandoffSchema(
           type: "array",
           minItems: 1,
           items: strictObjectSchema({
-            target_key: { type: "string", minLength: 1 },
-            requested_token: { type: "string", minLength: 1 },
-            canonical_token: { type: "string", minLength: 1 },
-            dispatcher_location: { type: "string", minLength: 1 },
-            contract_symbol: { type: "string", minLength: 1 },
-            contract_location: { type: "string", minLength: 1 },
+            target_key: {
+              type: "string",
+              minLength: 1,
+              description: "当前 requested_token 的稳定键；不得填写 Rxx-A1 等验收项 ID"
+            },
+            requested_token: {
+              type: "string",
+              minLength: 1,
+              description: "需求中 pageName/协议值的原词；不是 jumpLinkWX 等字段名或验收项 ID"
+            },
+            canonical_token: {
+              type: "string",
+              minLength: 1,
+              description: "代码中对应的规范 token；尚待新增时可与 requested_token 相同"
+            },
+            dispatcher_location: {
+              type: "string",
+              minLength: 1,
+              description: "公共路由/分发函数的 path:line，例如 redirectActionPush；不得与最终组件字段混淆"
+            },
+            contract_symbol: {
+              type: "string",
+              minLength: 1,
+              description: "分支最终进入的真实页面组件/业务函数，例如 ChangePassword；公共 dispatcher 不得填在这里"
+            },
+            contract_location: {
+              type: "string",
+              minLength: 1,
+              description: "contract_symbol 定义处的精确 path:line；不是 dispatcher 或待新增分支的位置"
+            },
             evidence_refs: evidenceList()
           })
         },
-        feature_census: strictObjectSchema({
+        feature_census: {
+          type: "object",
+          properties: {
           applicability: { type: "string", enum: ["required", "not-applicable"] },
           reason: { type: "string", minLength: 1 },
           status: { type: "string", enum: ["complete", "not-applicable"] },
@@ -1171,8 +1230,12 @@ function phaseHandoffSchema(
             unknown: { type: "integer", minimum: 0 },
             accounted: { type: "boolean", const: true }
           }),
-          selected_candidate_ids: stringList()
-        }),
+          selected_candidate_ids: stringList(),
+          runtime_verification_required: { type: "boolean" }
+          },
+          required: ["applicability", "reason"],
+          additionalProperties: false
+        },
         target_investigation: strictObjectSchema({
           target_kind: { type: "string", minLength: 1 },
           definition: { type: "string", minLength: 1 },
@@ -1301,7 +1364,7 @@ function phaseOutputSkeleton(
         "{ status, summary, evidence_refs,",
         "  handoff: { confirmed_facts, target_locations,",
         "    target_mappings: [{ target_key, requested_token, canonical_token, dispatcher_location, contract_symbol, contract_location, evidence_refs }],",
-        "    feature_census: { applicability: \"required\"|\"not-applicable\", reason, status: \"complete\"|\"not-applicable\", report_digest, candidate_accounting: { total, yes, no, unknown, accounted: true }, selected_candidate_ids },",
+        "    feature_census: { applicability: \"required\"|\"not-applicable\", reason }；required 时其余状态、摘要、计数、selected ids 与 runtime_verification_required 由宿主回填，",
         "    target_investigation: { target_kind, definition, inputs, outputs, internal_calls, guards, state_and_side_effects, callers, evidence_refs, unresolved },",
         "    reference_analysis: { search_scope, candidates: [{ target_key, reference_kind: \"same-feature-entry\", location, contract_symbol, contract_location, feature_equivalence, similarity, reusable_behavior, differences, destination, invocation, arguments, preconditions, context_forwarding, side_effects, evidence_refs }], target_selections: [{ target_key, selected_location, selection_reason, no_reference_reason }] },",
         "    open_unknowns } }"

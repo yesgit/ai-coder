@@ -493,6 +493,13 @@ export interface FeatureCensusReceipt {
     };
   }>;
   unresolved: string[];
+  closure?: {
+    inventory_complete: boolean;
+    semantic_complete: boolean;
+    runtime_verification_required: boolean;
+    runtime_complete: boolean;
+    closeable: boolean;
+  };
   created_at: string;
 }
 

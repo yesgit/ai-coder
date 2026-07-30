@@ -12,6 +12,7 @@ import {
 } from "../analysis/featureImplementationCensusWorkerClient.js";
 import { analyzeSymbolContract } from "../analysis/symbolContractAnalyzer.js";
 import {
+  formatSymbolInvestigationToolResult,
   getCachedSymbolInvestigationReport,
   investigateSymbolContract,
   type SymbolInvestigationReport
@@ -809,12 +810,42 @@ export class ClaudeAgentRunner {
     const structured = output.structuredOutput !== undefined
       ? output.structuredOutput
       : recoveredStructuredOutput ?? (output.resultText || output.assistantText);
+    const removedInvestigateMappings = reconcileHierarchicalInvestigateMappingScope(
+      input.session,
+      operation,
+      structured
+    );
+    if (removedInvestigateMappings.length > 0) {
+      await this.recordProgress(
+        input,
+        "tool_policy",
+        "宿主已从当前 investigate 草稿移除越出本需求的页面/协议映射及其参考项："
+          + removedInvestigateMappings.join(", "),
+        "milestone"
+      );
+    }
     reconcileHierarchicalFeatureCensusHandoff(
       input.session,
       operation,
       structured,
       stageId
     );
+    const reconciledFinalContracts = reconcileHierarchicalInvestigateFinalContracts(
+      input.session,
+      operation,
+      structured,
+      stageId
+    );
+    if (reconciledFinalContracts.length > 0) {
+      await this.recordProgress(
+        input,
+        "tool_policy",
+        "宿主已依据完整功能普查和入口源码，将公共分发器分支归一到最终函数/组件："
+          + reconciledFinalContracts.join(", "),
+        "milestone"
+      );
+    }
+    reconcileHierarchicalInvestigateReferenceHandoff(operation, structured);
     reconcileHierarchicalPrepareContractHandoff(
       input.session,
       operation,
@@ -828,6 +859,7 @@ export class ClaudeAgentRunner {
     let events: HierarchicalEvent[];
     try {
       validateHierarchicalPlannerEnumeratedCoverage(input.session, operation, structured);
+      validateHierarchicalInvestigateMappingScope(input.session, operation, structured);
       events = parseHierarchicalRoleResult(operation, structured);
       validateHierarchicalContractToolEvidence(input.session, operation, events, stageId);
       validateHierarchicalBehaviorObligationContinuity(input.session, operation, events);
@@ -2008,7 +2040,7 @@ export class ClaudeAgentRunner {
         "复杂入口硬规则：多附件、多需求点、跨文件或指定基线的请求在进入实现前必须委托 task-planner。planner 尚未成功启动时，根 Agent 可以做最小只读取证以解除阻塞，但不得一次性读取全部附件或重复撞同一门禁。根 Agent 只负责编排和知识归并，任何工作区修改必须委托 task-executor，并在完成后委托 task-verifier。",
         "Task 调用必须显式填写 subagent_type。复杂入口的正确格式是 `Task({ subagent_type: \"task-planner\", description: \"拆分需求\", prompt: \"只读分析并返回 R-ID 与证据\" })`；不要省略 subagent_type，也不要用 Skill 调用替代 Task。",
         "当前阶段已经注入的核心 Skill 不得再次调用 Skill 工具；应直接落实其契约。只有能力目录里未注入且确实需要的额外 Skill 才调用 Skill 工具。",
-        "功能定位硬规则：目标以业务功能、用户行为、页面、事件或协议值描述且没有唯一精确符号时，必须真实调用 mcp__ai_coder__locate_feature_implementation；宿主会自动排除弱词面/远端调用图候选，仅当报告仍有少量 unknown 时才逐项裁决并重跑到 complete，不能用 Read/Grep 自述代替。普查只生成 yes 目标的受限调用图指纹；最终复用目标的完整调用契约由 prepare 调查。",
+        "功能定位硬规则：目标以业务功能、用户行为、页面、事件或协议值描述且没有唯一精确符号时，必须真实调用 mcp__ai_coder__locate_feature_implementation；宿主只自动排除明确负向证据，不会按词面强弱确认或排除正向候选。逐批裁决报告返回的 unknown，累计 adjudications 并重跑到 complete，不能用 Read/Grep 自述代替。普查只生成 yes 目标的受限调用图摘要；最终复用目标的完整调用契约由 prepare 调查。",
         "调用契约硬规则：拟议实现只要会调用、复用或修改已有函数、方法、Hook 或组件，第一次相关修改前必须通过 Task 使用 call-contract-investigator；该调查者必须真实调用 mcp__ai_coder__investigate_symbol_contract 完整调查脚本，再把结果归并进知识雪球。主线程自行 Read/Grep/Bash、零散符号分析或文字声明不能替代。只有纯文案、静态数据或样式且不涉及任何既有函数/组件时才可判定不适用，并记录依据。",
         "只调用工具列表中展示的精确工具名，并使用标准 tool_use 格式。"
       ].filter(Boolean).join("\n\n");
@@ -2781,7 +2813,7 @@ export class ClaudeAgentRunner {
     return [
       "## 当前可用能力（与知识雪球、阶段任务同时生效）",
       "先根据当前缺失信息明确选择 Skill、Sub-agent 或直接工具，并把选择理由写回知识雪球。跨多文件追踪、独立验证或完整性审查与某个 Sub-agent 职责匹配时优先委托；简单单点事实直接用工具。只选能推进当前阶段任务的最小能力。",
-      "功能定位硬规则：目标以业务功能、用户行为、页面、事件或协议值描述且没有唯一精确符号时，必须调用 locate_feature_implementation；宿主自动排除弱关联候选，若报告仍有 unknown 再逐项裁决并调用到 complete，候选排名或普通搜索不能替代。普查提供受限调用图指纹，最终复用目标的完整调用契约留给 prepare。",
+      "功能定位硬规则：目标以业务功能、用户行为、页面、事件或协议值描述且没有唯一精确符号时，必须调用 locate_feature_implementation；宿主只自动排除明确负向证据，不会按词面强弱确认或排除正向候选。逐批裁决 unknown、累计 adjudications 并调用到 complete，候选排名或普通搜索不能替代。普查提供受限调用图摘要，最终复用目标的完整调用契约留给 prepare。",
       "调用契约硬规则：凡拟议实现会调用、复用或修改已有函数、方法、Hook 或组件，第一次相关修改前必须通过 Task 使用 call-contract-investigator，且调查者必须真实调用 investigate_symbol_contract 完整调查脚本；主线程搜索、零散 analyze_symbol_contract 或文字声明不能替代。纯文案、静态数据或样式且不涉及既有函数/组件时才可记录依据后判定不适用。",
       "",
       "### Skills（工作流核心项已由宿主加载；目录中的其他项可用 Skill 加载）",
@@ -3198,8 +3230,9 @@ export class ClaudeAgentRunner {
         [
           "运行宿主持有的完整函数/组件调查脚本。",
           "脚本自动消费 contract、calls、wrappers、references 全部分页，并递归调查公共封装；",
-          "返回参数/Props 类型与说明、全部静态调用方式、前置条件、公共封装图、间接引用和明确的静态分析边界。",
-          "prepare 中只要会调用、复用或修改既有函数/组件，就必须为每个 analyzed_target 调用本工具；Read/Grep 或零散 analyze_symbol_contract 不能替代。"
+          "返回参数/Props 类型与说明、全部静态调用方式、前置条件、公共封装图，以及带稳定 reference_id 和数量守恒的逐引用账本；",
+          "动态引用与语法回退会明确标记 runtime_verification_required。prepare 中只要会调用、复用或修改既有函数/组件，就必须为每个 analyzed_target 调用本工具；",
+          "analyzed_targets 只需准确提交 target_file 与 symbol，宿主自动回填脚本事实；Read/Grep 或零散 analyze_symbol_contract 不能替代。"
         ].join(""),
         {
           target_file: z.string().min(1).describe("目标符号定义文件，相对于项目根目录"),
@@ -3228,9 +3261,12 @@ export class ClaudeAgentRunner {
               maxWrapperDepth: toolInput.max_wrapper_depth,
               maxWrapperSymbols: toolInput.max_wrapper_symbols
             });
-            // Compact JSON is lossless and materially reduces SDK spillover into
-            // an external tool-results file on large call graphs.
-            return { content: [{ type: "text", text: JSON.stringify(report) }] };
+            return {
+              content: [{
+                type: "text",
+                text: formatSymbolInvestigationToolResult(report)
+              }]
+            };
           } catch (error) {
             return {
               content: [{
@@ -3252,8 +3288,8 @@ export class ClaudeAgentRunner {
         [
           "运行宿主持有的功能实现候选普查脚本。脚本先快速扫描范围内全部 TypeScript/JavaScript/React 文件，",
           "再对独特证据命中文件执行受限语义分析，合并符号名、路径、定义正文、配置邻接以及两跳调用图候选；",
-          "宿主自动将强证据记为 yes、弱词面或远端图关联记为 no。仅当返回少量 unknown 时才逐项读取证据并通过 adjudications 再调用，",
-          "直到 status=complete；yes 目标附带受限调用图指纹，最终复用目标由 prepare 执行完整调用契约调查。普通 Read/Grep、模型排名或只选一个最像的目标不能替代。"
+          "宿主只自动排除测试路径或明确 negative clue；所有正向候选无论词面强弱都先记为 unknown。每次逐项读取返回批次并累计 adjudications 再调用，",
+          "直到 status=complete；yes 目标只附带受限调用图摘要，最终复用目标由 prepare 执行完整调用契约调查。普通 Read/Grep、模型排名或只选一个最像的目标不能替代。"
         ].join(""),
         {
           feature: z.string().min(1).describe("完整的用户可观察功能描述，不要只传某个猜测符号名"),
@@ -3270,7 +3306,7 @@ export class ClaudeAgentRunner {
             verdict: z.enum(["yes", "no"]),
             reason: z.string().min(1),
             evidence_refs: z.array(z.string().min(1)).min(1)
-          })).optional().describe("对首次报告中所有未决候选逐项提交的是/不是结论及 path:line 证据")
+          })).optional().describe("累计提交此前所有已裁决候选的是/不是结论及候选声明或已发现证据的 path:line；不要只提交当前批次")
         },
         async (args) => {
           const toolInput = args as {
@@ -3503,6 +3539,28 @@ export function validateHierarchicalContractToolEvidence(
         `目标 ${targetFile}#${symbol} 的公共封装调查未闭合：${report.wrapper_graph.truncated_reasons.join("；")}`
       );
     }
+    const accounting = report.reference_accounting;
+    if (
+      !accounting.accounted
+      || accounting.total !== accounting.resolved + accounting.irrelevant + accounting.blocked
+    ) {
+      throw new Error(
+        `目标 ${targetFile}#${symbol} 的引用账本不守恒：`
+        + `total=${accounting.total}, resolved=${accounting.resolved}, `
+        + `irrelevant=${accounting.irrelevant}, blocked=${accounting.blocked}`
+      );
+    }
+    if (rawTarget.investigation_report_digest !== report.report_digest) {
+      throw new Error(`目标 ${targetFile}#${symbol} 的宿主调查摘要未正确回填`);
+    }
+    const declaredAccounting = isPlainObject(rawTarget.reference_accounting)
+      ? rawTarget.reference_accounting
+      : {};
+    for (const field of ["total", "resolved", "irrelevant", "blocked", "accounted"] as const) {
+      if (declaredAccounting[field] !== accounting[field]) {
+        throw new Error(`目标 ${targetFile}#${symbol} 的 reference_accounting.${field} 与宿主报告不一致`);
+      }
+    }
     const unresolved = Array.isArray(rawTarget.unresolved)
       ? rawTarget.unresolved.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
       : [];
@@ -3564,6 +3622,292 @@ export function reconcileHierarchicalFeatureCensusHandoff(
   census.selected_candidate_ids = report.selected_targets.map(
     (target) => target.candidate_id
   );
+  census.runtime_verification_required = (
+    report.closure?.runtime_verification_required ?? false
+  );
+}
+
+/**
+ * A single existing user entry can be valid evidence for several requested
+ * aliases when every alias reaches the exact same final callable/component.
+ *
+ * The investigate schema stores candidates per target_key. Smaller models
+ * commonly express the intended relation as one complete candidate plus one
+ * explicit selection per alias, omitting mechanically duplicated candidate
+ * rows. Before validation, copy that candidate only when:
+ * - the model explicitly selected the same entry for the missing target;
+ * - the selection is affirmative rather than a no-reference result; and
+ * - the candidate and target mapping declare the exact same final contract.
+ *
+ * This is a transcription reconciliation, not an evidence bypass. The cloned
+ * row still goes through all protocol, exact-symbol and Git-baseline checks.
+ */
+export function reconcileHierarchicalInvestigateReferenceHandoff(
+  operation: Extract<HierarchicalNextOperation, {
+    kind: "run_phase" | "run_alignment_batch" | "run_planner" | "run_integrator"
+  }>,
+  structured: unknown
+): void {
+  if (
+    operation.kind !== "run_phase"
+    || operation.phase !== "investigate"
+    || !isPlainObject(structured)
+  ) return;
+  const handoff = isPlainObject(structured.handoff) ? structured.handoff : null;
+  const referenceAnalysis = handoff && isPlainObject(handoff.reference_analysis)
+    ? handoff.reference_analysis
+    : null;
+  const candidateItems = referenceAnalysis && Array.isArray(referenceAnalysis.candidates)
+    ? referenceAnalysis.candidates
+    : [];
+  const candidates = candidateItems.filter(isPlainObject);
+  const selections = referenceAnalysis && Array.isArray(referenceAnalysis.target_selections)
+    ? referenceAnalysis.target_selections.filter(isPlainObject)
+    : [];
+  const targetMappings = handoff && Array.isArray(handoff.target_mappings)
+    ? handoff.target_mappings.filter(isPlainObject)
+    : [];
+  if (!referenceAnalysis || candidates.length === 0 || selections.length === 0) return;
+
+  const mappingByTarget = new Map(
+    targetMappings.flatMap((mapping) => {
+      const targetKey = optionalString(mapping.target_key);
+      return targetKey ? [[targetKey, mapping] as const] : [];
+    })
+  );
+  for (const selection of selections) {
+    const targetKey = optionalString(selection.target_key);
+    const selectedLocation = optionalString(selection.selected_location);
+    const selectionReason = optionalString(selection.selection_reason);
+    const noReferenceReason = optionalString(selection.no_reference_reason);
+    if (
+      !targetKey
+      || !selectedLocation
+      || !selectionReason
+      || noReferenceReason
+      || candidates.some((candidate) => (
+        optionalString(candidate.target_key) === targetKey
+        && optionalString(candidate.location) === selectedLocation
+      ))
+    ) continue;
+
+    const targetMapping = mappingByTarget.get(targetKey);
+    const targetContractSymbol = optionalString(targetMapping?.contract_symbol);
+    const targetContractLocation = optionalString(targetMapping?.contract_location);
+    if (!targetContractSymbol || !targetContractLocation) continue;
+    const sharedCandidate = candidates.find((candidate) => (
+      optionalString(candidate.location) === selectedLocation
+      && optionalString(candidate.contract_symbol) === targetContractSymbol
+      && firstPathLineToken(optionalString(candidate.contract_location) ?? "")
+        === firstPathLineToken(targetContractLocation)
+    ));
+    if (!sharedCandidate) continue;
+
+    const clonedCandidate = { ...sharedCandidate, target_key: targetKey };
+    candidateItems.push(clonedCandidate);
+    candidates.push(clonedCandidate);
+  }
+  for (const selection of selections) {
+    const targetKey = optionalString(selection.target_key);
+    if (!targetKey) continue;
+    const targetCandidates = candidates.filter(
+      (candidate) => optionalString(candidate.target_key) === targetKey
+    );
+    const selectedLocation = optionalString(selection.selected_location);
+    if (selectedLocation) {
+      const selectedAnchor = looseSubmittedPathLineAnchor(selectedLocation);
+      const canonicalMatches = selectedAnchor
+        ? targetCandidates.filter((candidate) => (
+            looseSubmittedPathLineAnchor(optionalString(candidate.location) ?? "")
+            === selectedAnchor
+          ))
+        : [];
+      if (canonicalMatches.length === 1) {
+        selection.selected_location = optionalString(canonicalMatches[0]!.location)!;
+      }
+    }
+    if (
+      targetCandidates.length === 0
+      && optionalString(selection.no_reference_reason)
+    ) {
+      selection.selected_location = "";
+      selection.selection_reason = "";
+    }
+  }
+}
+
+function looseSubmittedPathLineAnchor(value: string): string | null {
+  const match = /(?:^|[\s(（["'`])((?:[A-Za-z]:[\\/]|\/)?[^:\s,，;；)）\]"'`]+:\d+)(?::\d+)?(?:-\d+)?(?=$|[\s,，;；)）\]"'`])/u
+    .exec(value);
+  return match?.[1]?.replaceAll("\\", "/") ?? null;
+}
+
+/**
+ * Replace a dispatcher branch mistakenly transcribed as the final contract
+ * with a host-census-owned callable definition.
+ *
+ * This intentionally requires redundant agreement:
+ * - the submitted contract symbol resolves to the dispatcher definition while
+ *   its location points at that dispatcher or one of its branch lines;
+ * - every same-feature entry for the target names the same destination symbol
+ *   in both destination and invocation;
+ * - each entry's source window actually references that symbol; and
+ * - the complete host feature census selected exactly one matching definition.
+ *
+ * If any of those conditions is ambiguous, leave the draft untouched so the
+ * normal semantic and exact-definition validators report it.
+ */
+export function reconcileHierarchicalInvestigateFinalContracts(
+  session: AgentSession,
+  operation: Extract<HierarchicalNextOperation, {
+    kind: "run_phase" | "run_alignment_batch" | "run_planner" | "run_integrator"
+  }>,
+  structured: unknown,
+  stageId: string
+): string[] {
+  if (
+    operation.kind !== "run_phase"
+    || operation.phase !== "investigate"
+    || !isPlainObject(structured)
+  ) return [];
+  const handoff = isPlainObject(structured.handoff) ? structured.handoff : null;
+  const mappings = handoff && Array.isArray(handoff.target_mappings)
+    ? handoff.target_mappings.filter(isPlainObject)
+    : [];
+  const referenceAnalysis = handoff && isPlainObject(handoff.reference_analysis)
+    ? handoff.reference_analysis
+    : null;
+  const candidates = referenceAnalysis && Array.isArray(referenceAnalysis.candidates)
+    ? referenceAnalysis.candidates.filter(isPlainObject)
+    : [];
+  if (mappings.length === 0 || candidates.length === 0) return [];
+
+  const receipt = getLatestHierarchicalFeatureCensusEvidence(session, stageId)?.receipt;
+  if (!receipt || receipt.status !== "complete") return [];
+  const reconciled: string[] = [];
+  for (const mapping of mappings) {
+    const targetKey = optionalString(mapping.target_key);
+    const declaredSymbol = optionalString(mapping.contract_symbol);
+    const declaredLocation = optionalString(mapping.contract_location);
+    const dispatcherLocation = optionalString(mapping.dispatcher_location);
+    if (!targetKey || !declaredSymbol || !declaredLocation || !dispatcherLocation) continue;
+
+    const declaredAnchor = evidenceLocationAnchor(declaredLocation, session.project_path);
+    const dispatcherAnchor = evidenceLocationAnchor(dispatcherLocation, session.project_path);
+    const declaredFile = evidenceLocationFile(declaredLocation, session.project_path);
+    const dispatcherFile = evidenceLocationFile(dispatcherLocation, session.project_path);
+    const declaredUsesDispatcherSymbol = Boolean(
+      declaredAnchor
+      && dispatcherAnchor
+      && declaredFile === dispatcherFile
+      && sourceWindowDeclaresIdentifier(
+        session.project_path,
+        dispatcherLocation,
+        declaredSymbol
+      )
+    );
+    if (!declaredUsesDispatcherSymbol) continue;
+
+    const targetCandidates = candidates.filter(
+      (candidate) => optionalString(candidate.target_key) === targetKey
+    );
+    if (targetCandidates.length === 0) continue;
+    const matchingDefinitions = receipt.selected_targets.filter((target) => {
+      if (target.symbol === declaredSymbol) return false;
+      return targetCandidates.every((candidate) => (
+        investigateCandidateProvesDestination(
+          session.project_path,
+          candidate,
+          target.symbol
+        )
+      ));
+    });
+    const uniqueDefinitions = new Map(matchingDefinitions.map((target) => [
+      `${target.symbol}\0${target.definition.file}:${target.definition.line}`,
+      target
+    ]));
+    if (uniqueDefinitions.size !== 1) continue;
+
+    const finalTarget = [...uniqueDefinitions.values()][0]!;
+    const finalLocation = `${finalTarget.definition.file}:${finalTarget.definition.line}`;
+    mapping.contract_symbol = finalTarget.symbol;
+    mapping.contract_location = finalLocation;
+    appendInvestigateEvidence(mapping, finalLocation);
+    for (const candidate of targetCandidates) {
+      candidate.contract_symbol = finalTarget.symbol;
+      candidate.contract_location = finalLocation;
+      appendInvestigateEvidence(candidate, finalLocation);
+    }
+    reconciled.push(
+      `${targetKey}: ${declaredSymbol}@${declaredLocation}`
+      + ` → ${finalTarget.symbol}@${finalLocation}`
+    );
+  }
+  return reconciled;
+}
+
+function investigateCandidateProvesDestination(
+  projectPath: string,
+  candidate: Record<string, unknown>,
+  symbol: string
+): boolean {
+  const destination = optionalString(candidate.destination);
+  const invocation = optionalString(candidate.invocation);
+  const location = optionalString(candidate.location);
+  if (
+    !destination
+    || !invocation
+    || !location
+    || !containsExactIdentifier(destination, symbol)
+    || !containsExactIdentifier(invocation, symbol)
+  ) return false;
+  const absoluteFile = evidenceLocationFile(location, projectPath);
+  const anchor = evidenceLocationAnchor(location, projectPath);
+  if (!absoluteFile || !anchor || !existsSync(absoluteFile)) return false;
+  const line = Number(anchor.slice(anchor.lastIndexOf(":") + 1));
+  const lines = readFileSync(absoluteFile, "utf8").split(/\r?\n/);
+  const sourceWindow = lines.slice(
+    Math.max(0, line - 2),
+    Math.min(lines.length, line + 60)
+  ).join("\n");
+  return containsExactIdentifier(sourceWindow, symbol);
+}
+
+function sourceWindowDeclaresIdentifier(
+  projectPath: string,
+  location: string,
+  identifier: string
+): boolean {
+  const absoluteFile = evidenceLocationFile(location, projectPath);
+  const anchor = evidenceLocationAnchor(location, projectPath);
+  if (!absoluteFile || !anchor || !existsSync(absoluteFile)) return false;
+  const line = Number(anchor.slice(anchor.lastIndexOf(":") + 1));
+  const lines = readFileSync(absoluteFile, "utf8").split(/\r?\n/);
+  const declarationWindow = lines.slice(
+    Math.max(0, line - 2),
+    Math.min(lines.length, line + 3)
+  ).join("\n");
+  const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(
+    `(?:\\b(?:function|class)\\s+${escaped}\\b|\\b${escaped}\\s*(?:=|\\())`,
+    "u"
+  ).test(declarationWindow);
+}
+
+function containsExactIdentifier(value: string, identifier: string): boolean {
+  const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?<![$\\w])${escaped}(?![$\\w])`, "u").test(value);
+}
+
+function appendInvestigateEvidence(
+  item: Record<string, unknown>,
+  location: string
+): void {
+  const evidence = Array.isArray(item.evidence_refs)
+    ? item.evidence_refs.filter((value): value is string => typeof value === "string")
+    : [];
+  if (!evidence.includes(location)) evidence.push(location);
+  item.evidence_refs = evidence;
 }
 
 /**
@@ -3848,37 +4192,17 @@ function mergeHostOwnedSymbolInvestigation(
   target: Record<string, unknown>,
   report: SymbolInvestigationReport
 ): void {
-  const definition = report.target.definitions[0] ?? {
-    file: report.target.file,
-    line: 1,
-    column: 1
-  };
-  target.target_file = report.target.file;
-  target.symbol = report.target.symbol;
-  target.definition = `${report.target.symbol} ${report.target.kind}；${definition.file}:${definition.line}`;
-  target.analysis_method = "investigation-script";
-  target.method_reason = "";
-  target.analyzer_sections = [...report.sections_completed];
-  target.all_pages_consumed = report.all_pages_consumed;
-  const unresolved = Array.isArray(target.unresolved)
-    ? target.unresolved.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
-    : [];
-  target.unresolved = uniqueStrings([
-    ...unresolved,
-    ...report.unresolved_dynamic_references.map((reference) => (
-      [
-        `${reference.location.file}:${reference.location.line}`,
-        `${reference.kind} 静态引用`,
-        reference.expression
-      ].join("；")
-    ))
+  const host = analyzedTargetFromInvestigationReport(report);
+  const modelStateAndEffects = optionalStringArray(target.state_and_side_effects) ?? [];
+  const modelCompatibility = optionalStringArray(target.compatibility_obligations) ?? [];
+  Object.assign(target, host);
+  target.state_and_side_effects = uniqueStrings([
+    ...(host.state_and_side_effects as string[]),
+    ...modelStateAndEffects
   ]);
-  const evidence = Array.isArray(target.evidence_refs)
-    ? target.evidence_refs.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
-    : [];
-  target.evidence_refs = uniqueStrings([
-    ...evidence,
-    ...symbolInvestigationEvidenceRefs(report)
+  target.compatibility_obligations = uniqueStrings([
+    ...(host.compatibility_obligations as string[]),
+    ...modelCompatibility
   ]);
 }
 
@@ -3936,12 +4260,23 @@ function analyzedTargetFromInvestigationReport(
     compatibility_obligations: [
       `保持 ${report.target.symbol} 的输入、输出及既有调用组合兼容；${definitionRef}`
     ],
-    unresolved: report.static_analysis_limits.map((limit) => (
-      `静态分析边界：${limit}；${definitionRef}`
-    )),
-    evidence_refs: symbolInvestigationEvidenceRefs(report)
+    unresolved: uniqueStrings([
+      ...report.static_analysis_limits.map((limit) => (
+        `静态分析边界：${limit}；${definitionRef}`
+      )),
+      ...report.unresolved_dynamic_references.map((reference) => (
+        [
+          `${reference.location.file}:${reference.location.line}`,
+          `${reference.kind} 静态引用`,
+          reference.expression
+        ].join("；")
+      ))
+    ]),
+    evidence_refs: symbolInvestigationEvidenceRefs(report),
+    investigation_report_digest: report.report_digest,
+    reference_accounting: { ...report.reference_accounting },
+    runtime_verification_required: report.runtime_verification_required
   };
-  mergeHostOwnedSymbolInvestigation(target, report);
   return target;
 }
 
@@ -3970,7 +4305,7 @@ export function recordFeatureCensusReceipt(
   report: Pick<
     FeatureImplementationCensusReport,
     "status" | "report_digest" | "candidate_accounting" | "selected_targets" | "unresolved"
-  >
+  > & Partial<Pick<FeatureImplementationCensusReport, "closure">>
 ): FeatureCensusReceipt {
   const receipt: FeatureCensusReceipt = {
     stage_id: stageId,
@@ -3984,6 +4319,7 @@ export function recordFeatureCensusReceipt(
       definition: { ...target.definition }
     })),
     unresolved: [...report.unresolved],
+    ...(report.closure ? { closure: { ...report.closure } } : {}),
     created_at: new Date().toISOString()
   };
   const previous = session.feature_census_receipts ?? [];
@@ -4071,16 +4407,27 @@ function validateHierarchicalFeatureCensusEvidence(
     ...(requirement?.acceptance.map((item) => item.criterion) ?? [])
   ]);
   if (requestedTokens.length > 0) {
-    const declaredTokens = new Set(
-      (Array.isArray(handoff.target_mappings) ? handoff.target_mappings : [])
-        .filter(isPlainObject)
-        .map((mapping) => optionalString(mapping.requested_token))
-        .filter((value): value is string => Boolean(value))
-    );
+    const targetMappings = (Array.isArray(handoff.target_mappings) ? handoff.target_mappings : [])
+      .filter(isPlainObject);
+    const declaredTokens = new Set(targetMappings
+      .map((mapping) => optionalString(mapping.requested_token))
+      .filter((value): value is string => Boolean(value)));
     const missingTokens = requestedTokens.filter((token) => !declaredTokens.has(token));
     if (missingTokens.length > 0) {
       violations.push(
         `target_mappings 未逐项覆盖需求中的 pageName 原词：${missingTokens.join(", ")}`
+      );
+    }
+    const requestedTokenSet = new Set(requestedTokens);
+    const unexpectedMappings = targetMappings.flatMap((mapping) => {
+      const requestedToken = optionalString(mapping.requested_token);
+      if (!requestedToken || requestedTokenSet.has(requestedToken)) return [];
+      return [`${optionalString(mapping.target_key) ?? "<unknown>"}=${requestedToken}`];
+    });
+    if (unexpectedMappings.length > 0) {
+      violations.push(
+        "target_mappings 只能按需求中的 pageName/协议原词建账，不能按验收项 ID 或配置字段拆分："
+        + unexpectedMappings.join(", ")
       );
     }
   }
@@ -4121,6 +4468,13 @@ function validateHierarchicalFeatureCensusEvidence(
       throw new Error(`feature_census.candidate_accounting.${field} 与真实普查报告不一致`);
     }
   }
+  const expectedRuntimeVerification = report.closure?.runtime_verification_required ?? false;
+  if (
+    featureCensus.runtime_verification_required !== undefined
+    && featureCensus.runtime_verification_required !== expectedRuntimeVerification
+  ) {
+    throw new Error("feature_census.runtime_verification_required 与宿主普查报告不一致");
+  }
   const declaredSelected = new Set(optionalStringArray(featureCensus.selected_candidate_ids));
   const reportSelected = new Set(report.selected_targets.map((targetItem) => targetItem.candidate_id));
   if (
@@ -4145,6 +4499,7 @@ function validateHierarchicalFeatureCensusEvidence(
     handoff,
     referenceAnalysis,
     referenceCandidates,
+    report.selected_targets,
     violations
   );
   if (violations.length > 0) {
@@ -4165,14 +4520,52 @@ export function extractPageNameTokens(values: string[]): string[] {
     "are",
     "in",
     "or",
-    "and"
+    "and",
+    "confirm",
+    "confirms",
+    "confirmed",
+    "verify",
+    "verified",
+    "should",
+    "must",
+    "map",
+    "maps",
+    "mapped",
+    "mapping",
+    "route",
+    "routes",
+    "routing",
+    "target",
+    "page"
   ]);
   for (const value of values) {
     for (const match of value.matchAll(/\bpageName\b([^,，;；。\n]{0,120})/gi)) {
       const tail = (match[1] ?? "").split(/\blinkType\b/i)[0] ?? "";
+      const quotedSpans: Array<{ start: number; end: number }> = [];
+      for (const quotedMatch of tail.matchAll(/(["'`])([A-Za-z][A-Za-z0-9_.-]*)\1/g)) {
+        const token = quotedMatch[2]!;
+        tokens.add(token);
+        quotedSpans.push({
+          start: quotedMatch.index!,
+          end: quotedMatch.index! + quotedMatch[0].length
+        });
+      }
+      const hasValueMarker = /(?:===|==|=|:|值\s*(?:为|是)|取值\s*(?:为|是)?|\bvalues?\b|\bis\b|\bare\b)/i
+        .test(tail);
       for (const tokenMatch of tail.matchAll(/[A-Za-z][A-Za-z0-9_.-]*/g)) {
         const token = tokenMatch[0];
-        if (!ignored.has(token) && !ignored.has(token.toLocaleLowerCase())) {
+        const tokenIndex = tokenMatch.index!;
+        const insideQuotedValue = quotedSpans.some(
+          (span) => tokenIndex >= span.start && tokenIndex < span.end
+        );
+        if (insideQuotedValue) continue;
+        const normalized = token.toLocaleLowerCase();
+        const looksLikeProtocolToken = /[A-Z0-9]/.test(token);
+        if (
+          !ignored.has(token)
+          && !ignored.has(normalized)
+          && (hasValueMarker || looksLikeProtocolToken)
+        ) {
           tokens.add(token);
         }
       }
@@ -4181,20 +4574,192 @@ export function extractPageNameTokens(values: string[]): string[] {
   return [...tokens];
 }
 
+/**
+ * Remove mappings that deterministically belong outside the current
+ * requirement before the target-keyed investigate schema is validated.
+ *
+ * Alignment owns the requirement boundary. Once it names one or more
+ * pageName tokens, a later role must not widen that requirement by copying a
+ * neighbouring row, acceptance id, or configuration field into
+ * target_mappings. Retrying the model to perform this mechanical deletion is
+ * both unnecessary and brittle, so the host removes the out-of-scope rows and
+ * their dependent reference records. Missing or misspelled in-scope mappings
+ * are deliberately not repaired and remain validation errors.
+ */
+export function reconcileHierarchicalInvestigateMappingScope(
+  session: AgentSession,
+  operation: Extract<HierarchicalNextOperation, {
+    kind: "run_phase" | "run_alignment_batch" | "run_planner" | "run_integrator"
+  }>,
+  structured: unknown
+): string[] {
+  if (
+    operation.kind !== "run_phase"
+    || operation.phase !== "investigate"
+    || !isPlainObject(structured)
+  ) return [];
+  const requirement = session.hierarchical_state?.requirements.find(
+    (item) => item.id === operation.requirement_id
+  );
+  if (!requirement) return [];
+  const requestedTokens = extractPageNameTokens([
+    requirement.observable_result,
+    ...requirement.acceptance.map((item) => item.criterion)
+  ]);
+  if (requestedTokens.length === 0) return [];
+  const handoff = isPlainObject(structured.handoff) ? structured.handoff : null;
+  if (!handoff || !Array.isArray(handoff.target_mappings)) return [];
+
+  const requestedTokenSet = new Set(requestedTokens);
+  const retainedMappings: unknown[] = [];
+  const removedMappings: string[] = [];
+  const removedTargetKeys = new Set<string>();
+  for (const item of handoff.target_mappings) {
+    if (!isPlainObject(item)) {
+      retainedMappings.push(item);
+      continue;
+    }
+    const requestedToken = optionalString(item.requested_token);
+    if (!requestedToken || requestedTokenSet.has(requestedToken)) {
+      retainedMappings.push(item);
+      continue;
+    }
+    removedMappings.push(
+      `${optionalString(item.target_key) ?? "<unknown>"}=${requestedToken}`
+    );
+    const targetKey = optionalString(item.target_key);
+    if (targetKey) removedTargetKeys.add(targetKey);
+  }
+  if (removedMappings.length === 0) return [];
+  handoff.target_mappings = retainedMappings;
+
+  const retainedTargetKeys = new Set(retainedMappings.flatMap((item) => {
+    if (!isPlainObject(item)) return [];
+    const targetKey = optionalString(item.target_key);
+    return targetKey ? [targetKey] : [];
+  }));
+  const removedOnlyTargetKeys = new Set(
+    [...removedTargetKeys].filter((targetKey) => !retainedTargetKeys.has(targetKey))
+  );
+  const referenceAnalysis = isPlainObject(handoff.reference_analysis)
+    ? handoff.reference_analysis
+    : null;
+  if (referenceAnalysis && Array.isArray(referenceAnalysis.candidates)) {
+    referenceAnalysis.candidates = referenceAnalysis.candidates.filter((item) => {
+      if (!isPlainObject(item)) return true;
+      const targetKey = optionalString(item.target_key);
+      return !targetKey || !removedOnlyTargetKeys.has(targetKey);
+    });
+  }
+  if (referenceAnalysis && Array.isArray(referenceAnalysis.target_selections)) {
+    referenceAnalysis.target_selections = referenceAnalysis.target_selections.filter((item) => {
+      if (!isPlainObject(item)) return true;
+      const targetKey = optionalString(item.target_key);
+      return !targetKey || !removedOnlyTargetKeys.has(targetKey);
+    });
+  }
+  return removedMappings;
+}
+
+/**
+ * Reject acceptance-item/config-field pseudo targets before protocol validation
+ * asks the model to manufacture candidates and selections for them.
+ *
+ * The full investigate evidence validator repeats this check after parsing.
+ * This preflight exists because reference_analysis is keyed by target mapping:
+ * without it, one accidental Rxx-A1 mapping fans out into several irrelevant
+ * schema obligations before the host can explain that the mapping itself is
+ * invalid.
+ */
+export function validateHierarchicalInvestigateMappingScope(
+  session: AgentSession,
+  operation: Extract<HierarchicalNextOperation, {
+    kind: "run_phase" | "run_alignment_batch" | "run_planner" | "run_integrator"
+  }>,
+  structured: unknown
+): void {
+  if (
+    operation.kind !== "run_phase"
+    || operation.phase !== "investigate"
+    || !isPlainObject(structured)
+  ) return;
+  const requirement = session.hierarchical_state?.requirements.find(
+    (item) => item.id === operation.requirement_id
+  );
+  if (!requirement) return;
+  const requestedTokens = extractPageNameTokens([
+    requirement.observable_result,
+    ...requirement.acceptance.map((item) => item.criterion)
+  ]);
+  if (requestedTokens.length === 0) return;
+  const handoff = isPlainObject(structured.handoff) ? structured.handoff : null;
+  const targetMappings = handoff && Array.isArray(handoff.target_mappings)
+    ? handoff.target_mappings.filter(isPlainObject)
+    : [];
+  const requestedTokenSet = new Set(requestedTokens);
+  const unexpectedMappings = targetMappings.flatMap((mapping) => {
+    const requestedToken = optionalString(mapping.requested_token);
+    if (!requestedToken || requestedTokenSet.has(requestedToken)) return [];
+    return [`${optionalString(mapping.target_key) ?? "<unknown>"}=${requestedToken}`];
+  });
+  if (unexpectedMappings.length > 0) {
+    throw new Error(
+      "target_mappings 只能按需求中的 pageName/协议原词建账，不能按验收项 ID 或配置字段拆分："
+      + unexpectedMappings.join(", ")
+    );
+  }
+}
+
 function validateInvestigateTargetMappingEvidence(
   session: AgentSession,
   handoff: Record<string, unknown>,
   referenceAnalysis: Record<string, unknown>,
   referenceCandidates: unknown[],
+  censusTargets: FeatureCensusReceipt["selected_targets"],
   violations: string[]
 ): void {
+  const contractErrors = new Map<string, string | undefined>();
+  const validateContract = (
+    symbol: string | undefined,
+    location: string | undefined,
+    label: string
+  ): string | undefined => {
+    const anchor = location
+      ? evidenceLocationAnchor(location, session.project_path)
+      : null;
+    if (
+      symbol
+      && anchor
+      && censusTargets.some((target) => (
+        target.symbol === symbol
+        && evidenceLocationAnchor(
+          `${target.definition.file}:${target.definition.line}`,
+          session.project_path
+        ) === anchor
+      ))
+    ) {
+      return undefined;
+    }
+    const cacheKey = `${symbol ?? ""}\0${anchor ?? location ?? ""}`;
+    // One exact contract is sufficient evidence for every mapping/candidate
+    // that reuses it. Avoid rebuilding the same TypeScript Program merely to
+    // emit the same validation result under another label.
+    if (contractErrors.has(cacheKey)) return undefined;
+    const error = assertExactDeclaredContract(
+      session.project_path,
+      symbol,
+      location,
+      label
+    );
+    contractErrors.set(cacheKey, error);
+    return error;
+  };
   const targetMappings = Array.isArray(handoff.target_mappings)
     ? handoff.target_mappings.filter(isPlainObject)
     : [];
   for (const mapping of targetMappings) {
     const targetKey = optionalString(mapping.target_key) ?? "<unknown>";
-    const contractError = assertExactDeclaredContract(
-      session.project_path,
+    const contractError = validateContract(
       optionalString(mapping.contract_symbol),
       optionalString(mapping.contract_location),
       `target_mappings.${targetKey}`
@@ -4220,8 +4785,7 @@ function validateInvestigateTargetMappingEvidence(
     }
     const contractSymbol = optionalString(candidate.contract_symbol);
     const contractLocation = optionalString(candidate.contract_location);
-    const candidateContractError = assertExactDeclaredContract(
-      session.project_path,
+    const candidateContractError = validateContract(
       contractSymbol,
       contractLocation,
       `reference candidate ${targetKey ?? "<unknown>"}`
@@ -4231,7 +4795,7 @@ function validateInvestigateTargetMappingEvidence(
       ["入口", selectedLocation],
       ["最终契约", contractLocation]
     ] as const) {
-      if (location && isWorkingTreeAddedEvidenceLocation(session.project_path, location)) {
+      if (location && isWorkingTreeAddedEvidenceLocation(session, location)) {
         violations.push(
           `同功能参考必须来自任务基线；${targetKey ?? "<unknown>"} 的${kind} ${location} `
           + "是当前工作区新增或改写的代码，不能拿本轮/前序需求刚新增的实现反向证明目标"
@@ -4303,15 +4867,33 @@ function assertExactDeclaredContract(
 }
 
 export function isWorkingTreeAddedEvidenceLocation(
-  projectPath: string,
+  sessionOrProjectPath: AgentSession | string,
   location: string
 ): boolean {
+  const session = typeof sessionOrProjectPath === "string"
+    ? undefined
+    : sessionOrProjectPath;
+  const projectPath = typeof sessionOrProjectPath === "string"
+    ? sessionOrProjectPath
+    : sessionOrProjectPath.project_path;
   const token = firstPathLineToken(location) ?? location.trim();
   const absoluteFile = evidenceLocationFile(token, projectPath);
   const anchor = evidenceLocationAnchor(token, projectPath);
   if (!absoluteFile || !anchor) return false;
   const relativeFile = path.relative(projectPath, absoluteFile);
   if (relativeFile.startsWith("..") || path.isAbsolute(relativeFile)) return false;
+  if (session) {
+    const changedByCurrentSession = session.file_changes.some((change) => (
+      change.approved
+      && path.resolve(projectPath, change.path) === absoluteFile
+    ));
+    if (!changedByCurrentSession) {
+      // A dirty worktree can predate this task. Until this session actually
+      // edits the file, its existing content is part of the task baseline and
+      // must not be rejected merely because it differs from Git HEAD.
+      return false;
+    }
+  }
   const line = Number(anchor.slice(anchor.lastIndexOf(":") + 1));
   try {
     const status = execFileSync(
@@ -4822,7 +5404,7 @@ function compactRejectedHierarchicalValue(
   ]));
 }
 
-function hierarchicalValidationCorrection(
+export function hierarchicalValidationCorrection(
   operation: Extract<HierarchicalNextOperation, {
     kind: "run_alignment_batch" | "run_planner" | "run_phase" | "run_integrator"
   }>,
@@ -4843,8 +5425,14 @@ function hierarchicalValidationCorrection(
   if (/target_mappings 未逐项覆盖|pageName 原词/.test(reason)) {
     return "保留需求和附件中的 pageName 原始大小写/错拼，不要合并“或”连接的多个值；为错误点名的每个原词分别补一条 target_mappings，并逐条确认 canonical token、dispatcher 和最终 contract_symbol@contract_location。";
   }
+  if (/target_mappings 只能按需求中的 pageName\/协议原词建账|不能按验收项 ID 或配置字段拆分/.test(reason)) {
+    return "删除按 Rxx-A1 验收项、jumpLinkWX、dynamicPathToJSON、linkType 等字段拆出的 target_mappings 和对应 selections；每个需求原始 pageName/协议值只保留一条映射。验收项仍由 acceptance_results 逐项验证，不属于代码目标。";
+  }
+  if (/未追到.*同一最终函数\/组件/.test(reason)) {
+    return "先修正最终契约，不要只改 candidate 来迎合错误映射：dispatcher_location 单独填写 redirectActionPush 等公共分发器；target_mappings 与 reference candidate 的 contract_symbol@contract_location 都必须沿各自入口追到共同的最终页面组件/业务函数（例如 ChangePassword）。candidate.location 保留独立的任务基线入口，并确保 selection 的 target_key+selected_location 精确对应该 candidate。";
+  }
   if (/任务基线|当前工作区新增|反向证明/.test(reason)) {
-    return "保留当前实现，但不要把本轮或前序需求刚新增/改写的行当同功能参考；从任务开始前的 Git 基线寻找独立入口，找不到则在对应 target_selection 写 no_reference_reason。";
+    return "保留当前实现，但不要把本轮或前序需求刚新增/改写的分支当同功能参考；恢复使用任务基线中的独立用户入口，并把该入口与目标分支都追到共同的最终页面组件/业务函数。只有确实找不到独立入口时，才在对应 target_selection 写 no_reference_reason。";
   }
   if (/成功验证命令|Read\/Grep 只能证明文本存在/.test(reason)) {
     return "保留现有实现和调查；运行项目可用的最小真实验证（优先现有 test/lint/typecheck/build，其次语法检查与 git diff --check），确认工具成功后再原样提交 verify，不能把 Read/Grep 或命令文字当执行证据。";
@@ -4863,6 +5451,9 @@ function hierarchicalValidationCorrection(
   }
   if (/冒充同功能既有入口/.test(reason)) {
     return "只修正 investigate.reference_analysis：candidate.location 必须指向与 target_investigation.definition 不同的既有用户入口或调用点；若新旧入口最终进入同一函数/组件，contract_location 可以与当前目标定义相同。";
+  }
+  if (/未找到同功能入口时|存在同功能候选时必须选择|selected_location 必须对应/.test(reason)) {
+    return "只修正 investigate.reference_analysis 的逐目标对应关系：每条非空 selected_location 都必须有 target_key 和 location 同时匹配的 candidate；共享同一入口时，为每个 target_key 各提交一条 candidate（最终 contract_symbol@contract_location 可相同）。确实没有同功能入口时，才将 selected_location/selection_reason 置空并填写非空 no_reference_reason。";
   }
   if (/逐目标分析|真实函数\/组件|选中的同功能入口/.test(reason)) {
     return "不要改写 investigate 已确认的逐目标映射：对错误点名的每个 contract_symbol@contract_location 分别调用 investigate_symbol_contract；宿主只接受符号、文件和定义行完全一致的报告。六类义务的 target_keys 覆盖全部目标，并逐项引用各自既有入口。";
@@ -4922,7 +5513,7 @@ function normalizeHierarchicalErrorForFingerprint(message: string): string {
     // validatePhaseHandoffSemantics）-- group by handoff section so the streak
     // counts "still has investigate handoff gaps" instead of churning across the
     // many distinct investigate checks.
-    [/target_mappings 未逐项覆盖需求中的 pageName 原词|未命中同一定义|未声明精确 contract_symbol@contract_location|contract_location 不是有效 path:line|契约文件不在项目内或不存在|未解析到真实函数\/组件|定义行附近没有符号/, "investigate-target-mappings"],
+    [/target_mappings 未逐项覆盖需求中的 pageName 原词|target_mappings 只能按需求中的 pageName\/协议原词建账|不能按验收项 ID 或配置字段拆分|未命中同一定义|未声明精确 contract_symbol@contract_location|contract_location 不是有效 path:line|契约文件不在项目内或不存在|未解析到真实函数\/组件|定义行附近没有符号/, "investigate-target-mappings"],
     [/未追到.*同一最终函数\/组件|缺少逐目标 reference selection|target_key 未对应 target_mappings|只能有一条 reference selection|未找到同功能入口时|存在同功能候选时必须选择|selected_location 必须对应|冒充同功能既有入口|选定同功能入口缺少候选证据|同功能参考必须来自任务基线/, "investigate-reference-analysis"],
     [/selected_candidate_ids 未完整对应|未被功能普查以 yes 证据选中/, "investigate-feature-census"]
   ];
@@ -5492,7 +6083,15 @@ function lastSuccessfulValidationIndexAfterLastCodeChange(session: AgentSession)
       return;
     }
     const command = isPlainObject(toolCall.input) ? optionalString(toolCall.input.command) ?? "" : "";
-    if (/(?:^|\s)(?:test|check|lint|typecheck|build)(?:\s|$)|\b(?:vitest|jest|pytest|mocha|eslint|tsc|cargo\s+test|go\s+test|gradle\w*\s+test|mvn\s+test|node\s+--check)\b|git\s+diff\s+--check/i.test(command)) {
+    const output = toolCall.output_summary ?? "";
+    const masksFailure = /\|\||(?<!\|)\|(?!\|)/.test(command);
+    const reportsMissingExecutable = /command not found|未找到命令|找不到命令|not recognized as an internal or external command|no such file or directory/i
+      .test(output);
+    if (
+      !masksFailure
+      && !reportsMissingExecutable
+      && /(?:^|\s)(?:test|check|lint|typecheck|build)(?:\s|$)|\b(?:vitest|jest|pytest|mocha|eslint|tsc|cargo\s+test|go\s+test|gradle\w*\s+test|mvn\s+test|node\s+--check)\b|git\s+diff\s+--check/i.test(command)
+    ) {
       lastValidation = index;
     }
   });

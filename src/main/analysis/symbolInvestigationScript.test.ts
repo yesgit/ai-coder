@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  formatSymbolInvestigationToolResult,
   getCachedSymbolInvestigationReport,
   investigateSymbolContract
 } from "./symbolInvestigationScript.js";
@@ -63,8 +64,35 @@ describe("investigateSymbolContract", () => {
     expect(report.unresolved_dynamic_references).toEqual(expect.arrayContaining([
       expect.objectContaining({ expression: "target" })
     ]));
+    expect(report.reference_accounting.total).toBe(
+      report.reference_accounting.resolved
+      + report.reference_accounting.irrelevant
+      + report.reference_accounting.blocked
+    );
+    expect(report.reference_accounting.accounted).toBe(true);
+    expect(report.reference_accounting.blocked).toBeGreaterThan(0);
+    expect(report.reference_cards.every((card) => /^[a-f0-9]{20}$/.test(card.reference_id)))
+      .toBe(true);
+    expect(report.reference_cards).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "call",
+        disposition: "resolved",
+        provided_parameters: ["value", "enabled"]
+      }),
+      expect.objectContaining({
+        kind: "non-call-reference",
+        disposition: "blocked",
+        expression: "target"
+      })
+    ]));
+    expect(report.runtime_verification_required).toBe(true);
     expect(report.status).toBe("complete_with_dynamic_unknowns");
     expect(report.report_digest).toMatch(/^[a-f0-9]{64}$/);
+    const toolResult = formatSymbolInvestigationToolResult(report);
+    const parsedToolResult = JSON.parse(toolResult) as Record<string, unknown>;
+    expect(toolResult.length).toBeLessThan(JSON.stringify(report).length);
+    expect(parsedToolResult.reference_cards).toEqual(report.reference_cards);
+    expect(parsedToolResult.reference_accounting).toEqual(report.reference_accounting);
     expect(getCachedSymbolInvestigationReport({
       projectPath: root,
       targetFile: "target.ts",
@@ -97,5 +125,8 @@ describe("investigateSymbolContract", () => {
     expect(report.status).toBe("partial");
     expect(report.wrapper_graph.complete).toBe(false);
     expect(report.wrapper_graph.truncated_reasons[0]).toContain("最大深度");
+    expect(report.static_analysis_limits).toContain(
+      "未加载有效 TypeScript 项目配置，符号解析采用语法回退。"
+    );
   });
 });

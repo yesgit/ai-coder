@@ -16,6 +16,8 @@ type CallsPayload = NonNullable<SymbolContractAnalysis["calls"]>;
 type WrappersPayload = NonNullable<SymbolContractAnalysis["wrappers"]>;
 type ReferencesPayload = NonNullable<SymbolContractAnalysis["references"]>;
 type Page = CallsPayload["page"];
+type CallItem = CallsPayload["items"][number];
+type ReferenceItem = ReferencesPayload["items"][number];
 
 export interface InvestigateSymbolContractInput {
   projectPath: string;
@@ -56,6 +58,28 @@ export interface WrapperInvestigationNode extends CollectedSymbolContract {
   };
 }
 
+export interface SymbolReferenceCard {
+  reference_id: string;
+  target: {
+    file: string;
+    symbol: string;
+  };
+  location: {
+    file: string;
+    line: number;
+    column: number;
+  };
+  kind: "call" | "jsx" | "non-call-reference";
+  enclosing_callable: string | null;
+  arguments: CallItem["arguments"];
+  provided_parameters: string[];
+  omitted_parameters: string[];
+  preconditions: string[];
+  expression: string | null;
+  reference_kind: string | null;
+  disposition: "resolved" | "irrelevant" | "blocked";
+}
+
 export interface SymbolInvestigationReport extends CollectedSymbolContract {
   schema_version: 1;
   script: "symbol-contract-investigation";
@@ -71,6 +95,15 @@ export interface SymbolInvestigationReport extends CollectedSymbolContract {
   };
   unresolved_dynamic_references: ReferencesPayload["items"];
   static_analysis_limits: string[];
+  reference_cards: SymbolReferenceCard[];
+  reference_accounting: {
+    total: number;
+    resolved: number;
+    irrelevant: number;
+    blocked: number;
+    accounted: true;
+  };
+  runtime_verification_required: boolean;
   report_digest: string;
 }
 
@@ -168,6 +201,18 @@ export function investigateSymbolContract(
     ...primary.analyzer_coverage.static_analysis_limits,
     ...wrapperNodes.flatMap((node) => node.analyzer_coverage.static_analysis_limits)
   ])];
+  const referenceCards = buildReferenceCards(primary, wrapperNodes);
+  const referenceAccounting = {
+    total: referenceCards.length,
+    resolved: referenceCards.filter((card) => card.disposition === "resolved").length,
+    irrelevant: referenceCards.filter((card) => card.disposition === "irrelevant").length,
+    blocked: referenceCards.filter((card) => card.disposition === "blocked").length,
+    accounted: true as const
+  };
+  const runtimeVerificationRequired = (
+    referenceAccounting.blocked > 0
+    || staticAnalysisLimits.length > 0
+  );
   const base = {
     ...primary,
     schema_version: 1 as const,
@@ -183,10 +228,13 @@ export function investigateSymbolContract(
     },
     unresolved_dynamic_references: unresolvedDynamicReferences,
     static_analysis_limits: staticAnalysisLimits,
+    reference_cards: referenceCards,
+    reference_accounting: referenceAccounting,
+    runtime_verification_required: runtimeVerificationRequired,
     status: (
       truncatedReasons.length > 0
         ? "partial"
-        : unresolvedDynamicReferences.length > 0
+        : runtimeVerificationRequired
           ? "complete_with_dynamic_unknowns"
           : "complete"
     ) as SymbolInvestigationReport["status"]
@@ -197,6 +245,146 @@ export function investigateSymbolContract(
   };
   cacheCompletedReport(input, report);
   return report;
+}
+
+/**
+ * Model-facing projection of the host-owned report.
+ *
+ * `reference_cards` already contain every call and non-call reference, so the
+ * raw call/reference arrays and recursively repeated wrapper payloads would
+ * only force the model to read the same facts twice. The full report remains
+ * in the host cache for validation.
+ */
+export function formatSymbolInvestigationToolResult(
+  report: SymbolInvestigationReport
+): string {
+  return JSON.stringify({
+    schema_version: report.schema_version,
+    script: report.script,
+    report_digest: report.report_digest,
+    status: report.status,
+    target: report.target,
+    contract: report.contract,
+    sections_completed: report.sections_completed,
+    all_pages_consumed: report.all_pages_consumed,
+    analyzer_coverage: report.analyzer_coverage,
+    analyzer_runs: report.analyzer_runs,
+    calls: {
+      combinations: report.calls.combinations,
+      coverage: report.calls.coverage
+    },
+    wrappers: report.wrappers,
+    references: {
+      coverage: report.references.coverage
+    },
+    wrapper_graph: {
+      max_depth: report.wrapper_graph.max_depth,
+      max_symbols: report.wrapper_graph.max_symbols,
+      complete: report.wrapper_graph.complete,
+      truncated_reasons: report.wrapper_graph.truncated_reasons,
+      nodes: report.wrapper_graph.nodes.map((node) => ({
+        depth: node.depth,
+        source_wrapper: node.source_wrapper,
+        target: node.target,
+        contract: node.contract
+      }))
+    },
+    reference_cards: report.reference_cards,
+    reference_accounting: report.reference_accounting,
+    unresolved_dynamic_references: report.unresolved_dynamic_references,
+    static_analysis_limits: report.static_analysis_limits,
+    runtime_verification_required: report.runtime_verification_required
+  });
+}
+
+function buildReferenceCards(
+  primary: CollectedSymbolContract,
+  wrapperNodes: WrapperInvestigationNode[]
+): SymbolReferenceCard[] {
+  const cards = [
+    ...referenceCardsForCollectedTarget(primary),
+    ...wrapperNodes.flatMap(referenceCardsForCollectedTarget)
+  ];
+  const seen = new Set<string>();
+  return cards.filter((card) => {
+    if (seen.has(card.reference_id)) return false;
+    seen.add(card.reference_id);
+    return true;
+  });
+}
+
+function referenceCardsForCollectedTarget(
+  collected: CollectedSymbolContract
+): SymbolReferenceCard[] {
+  const target = {
+    file: collected.target.file,
+    symbol: collected.target.symbol
+  };
+  return [
+    ...collected.calls.items.map((call) => referenceCardForCall(target, call)),
+    ...collected.references.items.map((reference) => (
+      referenceCardForNonCallReference(target, reference)
+    ))
+  ];
+}
+
+function referenceCardForCall(
+  target: SymbolReferenceCard["target"],
+  call: CallItem
+): SymbolReferenceCard {
+  const identity = [
+    target.file,
+    target.symbol,
+    call.location.file,
+    call.location.line,
+    call.location.column,
+    call.kind
+  ].join("\0");
+  return {
+    reference_id: createHash("sha256").update(identity).digest("hex").slice(0, 20),
+    target,
+    location: call.location,
+    kind: call.kind,
+    enclosing_callable: call.enclosing_callable,
+    arguments: call.arguments,
+    provided_parameters: call.provided_parameters,
+    omitted_parameters: call.omitted_parameters,
+    preconditions: call.preconditions,
+    expression: null,
+    reference_kind: null,
+    disposition: "resolved"
+  };
+}
+
+function referenceCardForNonCallReference(
+  target: SymbolReferenceCard["target"],
+  reference: ReferenceItem
+): SymbolReferenceCard {
+  const identity = [
+    target.file,
+    target.symbol,
+    reference.location.file,
+    reference.location.line,
+    reference.location.column,
+    reference.kind,
+    reference.expression
+  ].join("\0");
+  return {
+    reference_id: createHash("sha256").update(identity).digest("hex").slice(0, 20),
+    target,
+    location: reference.location,
+    kind: "non-call-reference",
+    enclosing_callable: null,
+    arguments: [],
+    provided_parameters: [],
+    omitted_parameters: [],
+    preconditions: [],
+    expression: reference.expression,
+    reference_kind: reference.kind,
+    disposition: reference.kind === "import" || reference.kind === "export"
+      ? "irrelevant"
+      : "blocked"
+  };
 }
 
 /**

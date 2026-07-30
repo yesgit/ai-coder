@@ -80,6 +80,7 @@ export interface SymbolContractAnalysis {
     total_public_wrappers: number;
     total_non_call_references: number;
     static_analysis_limits: string[];
+    analysis_notes: string[];
   };
   contract?: {
     inputs: ParameterContract[];
@@ -222,7 +223,13 @@ export function analyzeSymbolContract(input: AnalyzeSymbolContractInput): Symbol
       total_call_sites: callSites.length,
       total_public_wrappers: wrappers.length,
       total_non_call_references: nonCallReferences.length,
-      static_analysis_limits: [
+      static_analysis_limits: programBuild.mode === "syntax-fallback"
+        ? [
+            "未加载有效 TypeScript 项目配置，符号解析采用语法回退。",
+            ...programBuild.warnings
+          ]
+        : [],
+      analysis_notes: [
         "反射、字符串注册、运行时依赖注入和外部包调用无法由静态分析证明完整。",
         "回调或函数值传递列在 references 中；其最终运行时调用方需要继续追踪。",
         "preconditions 只包含可从局部控制流直接观察到的条件，不等同于完整业务前置条件。"

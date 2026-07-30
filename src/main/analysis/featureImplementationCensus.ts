@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import ts from "typescript";
-import type { SymbolInvestigationReport } from "./symbolInvestigationScript.js";
 import { createBoundedTypeScriptProgram } from "./boundedTypeScriptProgram.js";
 
 export type FeatureCandidateVerdict = "yes" | "no" | "unknown";
@@ -67,8 +66,8 @@ export interface FeatureImplementationCandidate {
   verdict: FeatureCandidateVerdict;
   verdict_reason: string;
   adjudicated: boolean;
-  call_contract: null | {
-    status: SymbolInvestigationReport["status"];
+  trace_summary: null | {
+    status: "bounded" | "bounded_with_dynamic_unknowns";
     report_digest: string;
     calls: number;
     wrappers: number;
@@ -129,7 +128,7 @@ export interface FeatureImplementationCensusReport {
     kind: FeatureImplementationCandidate["kind"];
     definition: SourceLocation;
     role: FeatureImplementationCandidate["role"];
-    call_contract_digest: string;
+    trace_summary_digest: string;
   }>;
   rejected_candidates: Array<{
     candidate_id: string;
@@ -139,6 +138,13 @@ export interface FeatureImplementationCensusReport {
     evidence_refs: string[];
   }>;
   unresolved: string[];
+  closure: {
+    inventory_complete: boolean;
+    semantic_complete: boolean;
+    runtime_verification_required: boolean;
+    runtime_complete: boolean;
+    closeable: boolean;
+  };
   report_digest: string;
 }
 
@@ -194,14 +200,16 @@ const SEARCH_CHANNELS = [
   "call-graph-downstream"
 ] as const;
 const MAX_GRAPH_HOPS = 2;
+const MAX_ADJUDICATION_BATCH = 24;
 
 /**
  * Host-owned feature implementation census.
  *
  * The script lexically visits every in-scope source, then performs bounded
- * semantic analysis on files with distinctive evidence. Strong candidates,
- * explicit exclusions and weak graph-only candidates are host-adjudicated;
- * callers only need to adjudicate genuinely ambiguous leftovers.
+ * semantic analysis on files with distinctive evidence. The host may safely
+ * reject explicit exclusions, but it never promotes or rejects a positive
+ * candidate from lexical strength alone. Positive candidates remain unknown
+ * until an evidence-backed semantic adjudication is supplied.
  */
 export function censusFeatureImplementations(
   input: FeatureImplementationCensusInput
@@ -300,7 +308,11 @@ export function censusFeatureImplementations(
     ...upstream.keys(),
     ...downstream.keys()
   ]);
-  const adjudications = validateAdjudications(projectPath, input.adjudications ?? [], possibleIds);
+  const adjudications = validateAdjudications(
+    projectPath,
+    input.adjudications ?? [],
+    byId
+  );
   const unresolved: string[] = [];
   const materialized = [...possibleIds]
     .map((id) => byId.get(id))
@@ -326,19 +338,21 @@ export function censusFeatureImplementations(
   }
   const selectedTargets = materialized
     .filter((candidate): candidate is FeatureImplementationCandidate & {
-      call_contract: NonNullable<FeatureImplementationCandidate["call_contract"]>;
-    } => candidate.verdict === "yes" && candidate.call_contract !== null)
+      trace_summary: NonNullable<FeatureImplementationCandidate["trace_summary"]>;
+    } => candidate.verdict === "yes" && candidate.trace_summary !== null)
     .map((candidate) => ({
       candidate_id: candidate.id,
       symbol: candidate.symbol,
       kind: candidate.kind,
       definition: candidate.definition,
       role: candidate.role,
-      call_contract_digest: candidate.call_contract.report_digest
+      trace_summary_digest: candidate.trace_summary.report_digest
     }));
-  if (selectedTargets.length === 0 && adjudications.size === 0) {
+  if (selectedTargets.length === 0) {
     unresolved.push(
-      "没有形成强证据闭环的实现候选；请补充精确符号、协议 token、目标路径或验收线索后重试"
+      adjudications.size === 0
+        ? "尚未形成经语义裁决确认的实现候选；请逐项裁决未决候选"
+        : "全部候选均被排除，未形成目标功能实现；请补充精确符号、协议 token、目标路径或验收线索后重试"
     );
   }
   const rejectedCandidates = materialized
@@ -358,6 +372,20 @@ export function censusFeatureImplementations(
     no: materialized.filter((candidate) => candidate.verdict === "no").length,
     unknown: unknown.length,
     accounted: true as const
+  };
+  const inventoryComplete = unsupportedMatchingFiles.length === 0;
+  const semanticComplete = counts.unknown === 0 && selectedTargets.length > 0;
+  const runtimeVerificationRequired = materialized.some((candidate) => (
+    candidate.verdict === "yes"
+    && (candidate.trace_summary?.unresolved_dynamic_references ?? 0) > 0
+  ));
+  const runtimeComplete = !runtimeVerificationRequired;
+  const closure = {
+    inventory_complete: inventoryComplete,
+    semantic_complete: semanticComplete,
+    runtime_verification_required: runtimeVerificationRequired,
+    runtime_complete: runtimeComplete,
+    closeable: inventoryComplete && semanticComplete && runtimeComplete
   };
   const base = {
     schema_version: 1 as const,
@@ -400,7 +428,8 @@ export function censusFeatureImplementations(
     candidate_accounting: counts,
     selected_targets: selectedTargets,
     rejected_candidates: rejectedCandidates,
-    unresolved: uniqueStrings(unresolved)
+    unresolved: uniqueStrings(unresolved),
+    closure
   };
   return {
     ...base,
@@ -412,10 +441,11 @@ export function censusFeatureImplementations(
  * Actionable adjudication projection returned to the model-facing MCP tool.
  *
  * The full report can be hundreds of kilobytes because graph paths repeat
- * evidence for every candidate. Rejected candidates are represented by a
- * count; the agent only needs stable ids and evidence for selected/unknown
- * candidates. Keeping the digest near the beginning also prevents it from
- * disappearing when an SDK externalizes oversized results.
+ * evidence for every candidate. Unknown candidates are returned in bounded
+ * batches; the host still retains the full report and rejected candidates stay
+ * auditable instead of disappearing behind a count. Keeping the digest near
+ * the beginning also prevents it from disappearing when an SDK externalizes
+ * oversized results.
  */
 export function formatFeatureImplementationCensusToolResult(
   report: FeatureImplementationCensusReport
@@ -437,6 +467,7 @@ export function formatFeatureImplementationCensusToolResult(
         : "候选已记账但 unresolved 仍有静态分析边界；按 unresolved 补充范围或人工证据，不要重复提交相同输入。",
     candidates: report.candidates
       .filter((candidate) => candidate.verdict === "unknown")
+      .slice(0, MAX_ADJUDICATION_BATCH)
       .map((candidate) => ({
       id: candidate.id,
       symbol: candidate.symbol,
@@ -449,11 +480,19 @@ export function formatFeatureImplementationCensusToolResult(
       why_possible: candidate.why_possible,
       evidence_for: candidate.evidence_for.map(compactFeatureEvidence),
       evidence_against: candidate.evidence_against.map(compactFeatureEvidence),
-      call_contract: candidate.call_contract
+      trace_summary: candidate.trace_summary
     })),
     selected_targets: report.selected_targets,
-    rejected_candidate_count: report.rejected_candidates.length,
+    rejected_candidates: report.rejected_candidates,
+    adjudication_batch: {
+      returned: Math.min(report.candidate_accounting.unknown, MAX_ADJUDICATION_BATCH),
+      remaining_after_batch: Math.max(
+        0,
+        report.candidate_accounting.unknown - MAX_ADJUDICATION_BATCH
+      )
+    },
     unresolved,
+    closure: report.closure,
     coverage: {
       language: report.coverage.language,
       analysis_mode: report.coverage.analysis_mode,
@@ -822,16 +861,15 @@ function materializeCandidate(
   } else if (evidenceAgainst.length > 0) {
     verdict = "no";
     verdictReason = "候选命中调用方提供的明确排除线索";
-  } else if (hasStrongAutomaticEvidence(candidate, evidenceFor)) {
-    verdict = "yes";
-    verdictReason = "符号、定义、配置邻接或多个独立功能词形成强证据闭环";
   } else {
-    verdict = "no";
-    verdictReason = evidenceFor.every((item) => (
-      item.kind === "upstream-path" || item.kind === "downstream-path"
-    ))
-      ? "仅位于相关候选的有限调用图路径，缺少自身功能证据"
-      : "仅命中单一弱词面证据，不能作为目标功能实现";
+    verdict = "unknown";
+    verdictReason = hasStrongAutomaticEvidence(candidate, evidenceFor)
+      ? "候选具有较强自动证据，但业务等价性仍须语义裁决"
+      : evidenceFor.every((item) => (
+        item.kind === "upstream-path" || item.kind === "downstream-path"
+      ))
+        ? "候选仅位于有限调用图路径，必须检查其是否属于真实业务链"
+        : "候选只有弱词面证据，必须检查后才能确认或排除";
   }
   if (adjudication) {
     verdict = adjudication.verdict;
@@ -850,28 +888,28 @@ function materializeCandidate(
     else evidenceAgainst.push(...adjudicationEvidence);
   }
 
-  let callContract: FeatureImplementationCandidate["call_contract"] = null;
+  let traceSummary: FeatureImplementationCandidate["trace_summary"] = null;
   if (verdict === "yes") {
     const dynamicBoundaries = findDynamicBoundaries(candidate, projectPath);
-    const contractBase = {
+    const traceBase = {
       status: dynamicBoundaries.length > 0
-        ? "complete_with_dynamic_unknowns" as const
-        : "complete" as const,
+        ? "bounded_with_dynamic_unknowns" as const
+        : "bounded" as const,
       target: candidate.definition,
       calls: downstreamPath?.length ?? 0,
       wrappers: upstreamPath?.length ?? 0,
       references: evidenceFor.length,
       unresolved_dynamic_references: dynamicBoundaries.length
     };
-    callContract = {
-      status: contractBase.status,
+    traceSummary = {
+      status: traceBase.status,
       report_digest: createHash("sha256")
-        .update(JSON.stringify(contractBase))
+        .update(JSON.stringify(traceBase))
         .digest("hex"),
-      calls: contractBase.calls,
-      wrappers: contractBase.wrappers,
-      references: contractBase.references,
-      unresolved_dynamic_references: contractBase.unresolved_dynamic_references
+      calls: traceBase.calls,
+      wrappers: traceBase.wrappers,
+      references: traceBase.references,
+      unresolved_dynamic_references: traceBase.unresolved_dynamic_references
     };
   }
   return {
@@ -889,18 +927,19 @@ function materializeCandidate(
     verdict,
     verdict_reason: verdictReason,
     adjudicated,
-    call_contract: callContract
+    trace_summary: traceSummary
   };
 }
 
 function validateAdjudications(
   projectPath: string,
   adjudications: FeatureCandidateAdjudication[],
-  candidateIds: Set<string>
+  candidates: Map<string, InternalCandidate>
 ): Map<string, FeatureCandidateAdjudication> {
   const result = new Map<string, FeatureCandidateAdjudication>();
   for (const adjudication of adjudications) {
-    if (!candidateIds.has(adjudication.candidate_id)) {
+    const candidate = candidates.get(adjudication.candidate_id);
+    if (!candidate) {
       throw new Error(`adjudication 引用了本次普查不存在的候选：${adjudication.candidate_id}`);
     }
     if (!adjudication.reason?.trim()) {
@@ -909,6 +948,16 @@ function validateAdjudications(
     if (!Array.isArray(adjudication.evidence_refs) || adjudication.evidence_refs.length === 0) {
       throw new Error(`候选 ${adjudication.candidate_id} 的 adjudication 缺少 evidence_refs`);
     }
+    let candidateScopedEvidence = false;
+    const sourceFile = candidate.declaration.getSourceFile();
+    const declarationStart = sourceFile.getLineAndCharacterOfPosition(
+      candidate.declaration.getStart(sourceFile)
+    ).line + 1;
+    const declarationEnd = sourceFile.getLineAndCharacterOfPosition(
+      candidate.declaration.getEnd()
+    ).line + 1;
+    const candidateFile = path.resolve(projectPath, candidate.definition.file);
+    const knownEvidence = [...candidate.evidence, ...candidate.evidenceAgainst];
     for (const ref of adjudication.evidence_refs) {
       const location = parseEvidenceRef(ref);
       const absolute = path.resolve(projectPath, location.file);
@@ -919,6 +968,19 @@ function validateAdjudications(
       if (location.line > lineCount) {
         throw new Error(`adjudication 证据行号越界：${ref}`);
       }
+      const insideDeclaration = absolute === candidateFile
+        && location.line >= declarationStart
+        && location.line <= declarationEnd;
+      const matchesKnownEvidence = knownEvidence.some((item) => (
+        path.resolve(projectPath, item.location.file) === absolute
+        && item.location.line === location.line
+      ));
+      candidateScopedEvidence ||= insideDeclaration || matchesKnownEvidence;
+    }
+    if (!candidateScopedEvidence) {
+      throw new Error(
+        `候选 ${adjudication.candidate_id} 的 adjudication 证据未落在候选声明或已发现证据上`
+      );
     }
     if (result.has(adjudication.candidate_id)) {
       throw new Error(`候选 adjudication 重复：${adjudication.candidate_id}`);
