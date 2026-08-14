@@ -906,6 +906,26 @@ export interface StartSessionResult {
   session: AgentSession;
 }
 
+/**
+ * 应用级可配置设置。持久化在 ~/.ai-coder/settings.json，启动时读取并合并默认值。
+ * 新增字段时必须在 DEFAULT_APP_SETTINGS 中提供默认值。
+ */
+export interface AppSettings {
+  /**
+   * AI 提交代码时在 commit message 尾部追加的印记文本（git trailer 格式）。
+   * 留空字符串表示不追加印记。
+   * 默认值："Generated-by: AI Coder"
+   */
+  commit_mark: string;
+  /** 是否启用 commit 印记功能。false 时即使 commit_mark 非空也不追加。 */
+  commit_mark_enabled: boolean;
+}
+
+export const DEFAULT_APP_SETTINGS: AppSettings = {
+  commit_mark: "Generated-by: AI Coder",
+  commit_mark_enabled: true
+};
+
 export interface AgentRuntimeStatus {
   mode: "mock" | "live";
   sdk_available: boolean;
@@ -926,6 +946,10 @@ export interface ProjectOnboardingStatus {
 
 export interface AppApi {
   copyText(text: string): Promise<void>;
+  /** 获取应用级设置（合并默认值后返回）。 */
+  getSettings(): Promise<AppSettings>;
+  /** 更新应用级设置（partial merge），返回合并后的完整设置。 */
+  updateSettings(settings: Partial<AppSettings>): Promise<AppSettings>;
   selectProjectDirectory(): Promise<string | null>;
   authorizeSessionProject(projectPath: string): Promise<string>;
   getAgentRuntimeStatus(): Promise<AgentRuntimeStatus>;

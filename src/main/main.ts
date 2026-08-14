@@ -10,6 +10,7 @@ import { resolveCarefulCoderPluginPath } from "./agent/carefulCoderPlugin.js";
 import { normalizeAnthropicBaseUrl, selectClaudeProviderEnvironment } from "./agent/claudeRuntime.js";
 import { registerIpcHandlers } from "./ipc.js";
 import { SessionStore } from "./sessions/sessionStore.js";
+import { SettingsStore } from "./settings/settingsStore.js";
 import { WorkflowRegistry } from "./workflows/workflowRegistry.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -145,11 +146,16 @@ const carefulCoderPluginPath = resolveCarefulCoderPluginPath({
 });
 
 const sessions = new SessionStore();
+const settings = new SettingsStore();
 
 registerIpcHandlers(
   new WorkflowRegistry(builtinWorkflowDir),
   sessions,
-  new ClaudeAgentRunner({ pluginPaths: [carefulCoderPluginPath] })
+  settings,
+  new ClaudeAgentRunner({
+    pluginPaths: [carefulCoderPluginPath],
+    getCommitMark: () => settings.getCommitMark()
+  })
 );
 
 /**

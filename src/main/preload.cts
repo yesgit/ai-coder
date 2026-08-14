@@ -1,9 +1,12 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type { IpcRendererEvent } from "electron";
-import type { AgentSession, AppApi, Attachment, ResolveWorkflowInput, StartSessionInput } from "../shared/types.js";
+import type { AgentSession, AppApi, AppSettings, Attachment, ResolveWorkflowInput, StartSessionInput } from "../shared/types.js";
 
 const api: AppApi = {
   copyText: (text: string) => ipcRenderer.invoke("app:copy-text", text),
+  getSettings: () => ipcRenderer.invoke("settings:get") as Promise<AppSettings>,
+  updateSettings: (settings: Partial<AppSettings>) =>
+    ipcRenderer.invoke("settings:update", settings) as Promise<AppSettings>,
   selectProjectDirectory: () => ipcRenderer.invoke("project:select"),
   authorizeSessionProject: (projectPath: string) => ipcRenderer.invoke("project:authorize-session-project", projectPath),
   getAgentRuntimeStatus: () => ipcRenderer.invoke("agent:get-status"),

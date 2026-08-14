@@ -5,6 +5,7 @@ import remarkGfm from "remark-gfm";
 import type {
   AgentSession,
   AgentRuntimeStatus,
+  AppSettings,
   ApprovalRecord,
   Attachment,
   HumanQuestion,
@@ -65,6 +66,13 @@ export default function App() {
   const [mentionTarget, setMentionTarget] = useState<"task" | "chat">("task");
   const [dragOverTarget, setDragOverTarget] = useState<"task" | "chat" | null>(null);
   const [showTerminal, setShowTerminal] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
+  const [settingsDraft, setSettingsDraft] = useState<{ commit_mark: string; commit_mark_enabled: boolean }>({
+    commit_mark: "",
+    commit_mark_enabled: true
+  });
+  const [settingsSaving, setSettingsSaving] = useState(false);
   const taskFileInputRef = useRef<HTMLInputElement>(null);
   const [questionAnswers, setQuestionAnswers] = useState<Record<string, string | string[]>>({});
   // 单选/多选中选择"其他"时的自定义文本草稿，按 question id 存放
@@ -175,6 +183,7 @@ export default function App() {
     void refreshRuntimeStatus();
     void refreshWorkflows();
     void refreshSessions();
+    void refreshSettings();
   }, []);
 
   useEffect(() => {
@@ -223,6 +232,29 @@ export default function App() {
 
   async function refreshRuntimeStatus() {
     setRuntimeStatus(await window.aiCoder.getAgentRuntimeStatus());
+  }
+
+  async function refreshSettings() {
+    const settings = await window.aiCoder.getSettings();
+    setAppSettings(settings);
+    setSettingsDraft({
+      commit_mark: settings.commit_mark,
+      commit_mark_enabled: settings.commit_mark_enabled
+    });
+  }
+
+  async function saveSettings() {
+    setSettingsSaving(true);
+    try {
+      const updated = await window.aiCoder.updateSettings({
+        commit_mark: settingsDraft.commit_mark,
+        commit_mark_enabled: settingsDraft.commit_mark_enabled
+      });
+      setAppSettings(updated);
+      setShowSettings(false);
+    } finally {
+      setSettingsSaving(false);
+    }
   }
 
   async function refreshWorkflows(nextProjectPath = projectPath, preferredWorkflowId = taskWorkflowId) {
@@ -911,6 +943,7 @@ export default function App() {
             </div>}
             <button className="secondary" disabled={busy} onClick={chooseProject}>{busy ? "选择中..." : "选择项目"}</button>
             <button className={`secondary${showTerminal ? " terminal-active" : ""}`} disabled={!projectPath} onClick={() => setShowTerminal((s) => !s)} title="Claude 终端">{">_"}</button>
+            <button className="secondary" onClick={() => { void refreshSettings(); setShowSettings(true); }} title="应用设置">⚙</button>
           </div>
         </header>
 
@@ -1515,6 +1548,53 @@ export default function App() {
           )}
         </div>
       </section>
+
+      {showSettings && (
+        <div className="settings-overlay" onClick={(e) => { if (e.target === e.currentTarget) setShowSettings(false); }}>
+          <div className="settings-modal">
+            <div className="settings-header">
+              <h2>应用设置</h2>
+              <button className="secondary" onClick={() => setShowSettings(false)}>✕</button>
+            </div>
+            <div className="settings-body">
+              <div className="setting-row">
+                <label className="setting-label">
+                  <input
+                    type="checkbox"
+                    checked={settingsDraft.commit_mark_enabled}
+                    onChange={(e) => setSettingsDraft((prev) => ({ ...prev, commit_mark_enabled: e.target.checked }))}
+                  />
+                  <span>启用 AI 提交印记</span>
+                </label>
+                <p className="muted setting-desc">
+                  开启后，AI 提交代码时会在 commit message 尾部自动追加可配置的印记文本，便于工具统计 AI 生成的代码量。
+                </p>
+              </div>
+              <div className="setting-row">
+                <label className="setting-field-label">Commit 印记文本</label>
+                <input
+                  type="text"
+                  className="setting-input"
+                  value={settingsDraft.commit_mark}
+                  disabled={!settingsDraft.commit_mark_enabled}
+                  onChange={(e) => setSettingsDraft((prev) => ({ ...prev, commit_mark: e.target.value }))}
+                  placeholder="Generated-by: AI Coder"
+                />
+                <p className="muted setting-desc">
+                  作为 git trailer 追加到 commit message 尾部，与正文之间用一个空行分隔。留空则不追加。常用格式：<code>Generated-by: AI Coder</code> 或 <code>Co-authored-by: AI Coder &lt;ai@coder.local&gt;</code>
+                </p>
+              </div>
+            </div>
+            <div className="settings-footer">
+              <span className="muted">当前生效：{appSettings && appSettings.commit_mark_enabled ? appSettings.commit_mark || "（空）" : "已关闭"}</span>
+              <div className="settings-actions">
+                <button className="secondary" onClick={() => setShowSettings(false)}>取消</button>
+                <button disabled={settingsSaving} onClick={() => void saveSettings()}>{settingsSaving ? "保存中..." : "保存"}</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </main>
   );
 }

@@ -36,13 +36,15 @@ export function buildHierarchicalRoleSpec(
   workflow: WorkflowTemplate,
   operation: Extract<HierarchicalNextOperation, {
     kind: "run_alignment_batch" | "run_planner" | "run_phase" | "run_integrator"
-  }>
+  }>,
+  /** 当前生效的 commit 印记文本；空字符串表示不追加。仅 implement 阶段使用。 */
+  commitMark = ""
 ): HierarchicalRoleSpec {
   const state = requireState(session);
   if (operation.kind === "run_alignment_batch") return buildAlignmentBatchSpec(session, state, operation);
   if (operation.kind === "run_planner") return buildPlannerSpec(session, workflow, state);
   if (operation.kind === "run_integrator") return buildIntegratorSpec(session, workflow, state);
-  return buildPhaseSpec(session, workflow, state, operation);
+  return buildPhaseSpec(session, workflow, state, operation, commitMark);
 }
 
 export function parseHierarchicalRoleResult(
@@ -202,7 +204,8 @@ function buildPhaseSpec(
   session: AgentSession,
   workflow: WorkflowTemplate,
   state: HierarchicalExecutionState,
-  operation: Extract<HierarchicalNextOperation, { kind: "run_phase" }>
+  operation: Extract<HierarchicalNextOperation, { kind: "run_phase" }>,
+  commitMark = ""
 ): HierarchicalRoleSpec {
   const requirement = requireRequirement(state, operation.requirement_id);
   const workUnit = state.active_work_unit!;
@@ -282,6 +285,15 @@ function buildPhaseSpec(
       "fresh 交接物是带工作区版本证明的观察复用，不是无条件缓存；historical 交接物只能作为修改前基线。",
       "## 本阶段职责与出口",
       phaseSpecific,
+      ...(commitMark && operation.phase === "implement"
+        ? [
+            "## Git 提交印记",
+            `当本阶段改动需要提交 git commit 时，必须在 commit message 尾部追加以下印记文本（作为 git trailer，与正文之间用一个空行分隔）：`,
+            commitMark,
+            "示例：git commit -m \"fix: 修复登录验证\" -m \"" + commitMark + "\"",
+            "该印记用于工具统计 AI 生成的代码量，不得省略或修改其内容。"
+          ]
+        : []),
       "如果本阶段发现了原账本未覆盖、但完成 Goal 必需的独立可验证结果，只在 discovered_requirements 中追加新的稳定 R-ID；不要捎带执行。",
       "代码事实、文件/组件存在、调用契约前置条件和当前 R-ID 的验收细节都不是新需求，必须写入 summary/knowledge_delta，不得创建形如当前 R-ID-A1 的 discovered_requirement。dependencies 只能填写账本中的 R-ID，严禁填写自然语言事实或文件路径。",
       "只完成当前叶子工作，不修改总体目标、不处理其他 R-ID、不自行宣布整体完成。"

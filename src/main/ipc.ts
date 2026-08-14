@@ -4,12 +4,13 @@ import { join, resolve, relative, extname, basename, sep } from "node:path";
 import { pdfToImages } from "./pdfToImages.js";
 import { BrowserWindow, clipboard, dialog, ipcMain } from "electron";
 import type { OpenDialogOptions } from "electron";
-import type { AgentSession, Attachment, ProjectOnboardingStatus, ResolveWorkflowInput, SessionOnboardingSnapshot, SessionRoutingSnapshot, StartSessionInput } from "../shared/types.js";
+import type { AgentSession, AppSettings, Attachment, ProjectOnboardingStatus, ResolveWorkflowInput, SessionOnboardingSnapshot, SessionRoutingSnapshot, StartSessionInput } from "../shared/types.js";
 import { ClaudeAgentRunner } from "./agent/claudeAgentRunner.js";
 import { getClaudeRuntimeStatus } from "./agent/claudeRuntime.js";
 import { OnboardingStore } from "./onboarding/onboardingStore.js";
 import { AuthorizedProjects } from "./security/authorizedProjects.js";
 import { SessionStore } from "./sessions/sessionStore.js";
+import { SettingsStore } from "./settings/settingsStore.js";
 import { WorkflowEngine } from "./workflows/workflowEngine.js";
 import { WorkflowRegistry } from "./workflows/workflowRegistry.js";
 import { WorkflowRouter } from "./workflows/workflowRouter.js";
@@ -17,7 +18,7 @@ import { PtyManager } from "./ptyManager.js";
 
 const backgroundSessionRuns = new Map<string, Promise<void>>();
 
-export function registerIpcHandlers(registry: WorkflowRegistry, sessions: SessionStore, runner: ClaudeAgentRunner): void {
+export function registerIpcHandlers(registry: WorkflowRegistry, sessions: SessionStore, settingsStore: SettingsStore, runner: ClaudeAgentRunner): void {
   const authorizedProjects = new AuthorizedProjects();
   const workflowEngine = new WorkflowEngine();
   const onboardingStore = new OnboardingStore();
@@ -28,6 +29,14 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
   ipcMain.handle("app:copy-text", async (_event, text: string) => {
     if (typeof text !== "string") throw new Error("Clipboard content must be text.");
     clipboard.writeText(text);
+  });
+
+  ipcMain.handle("settings:get", async () => {
+    return settingsStore.get();
+  });
+
+  ipcMain.handle("settings:update", async (_event, partial: Partial<AppSettings>) => {
+    return settingsStore.update(partial ?? {});
   });
 
   // 应用启动时，从会话历史中恢复已授权的项目路径

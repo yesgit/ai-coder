@@ -872,4 +872,73 @@ describe("hierarchicalRoleProtocol", () => {
       work_unit_id: "R1:investigate"
     })]);
   });
+
+  it("injects commit mark into implement phase prompt when configured", () => {
+    const session = plannedSession();
+    const state = session.hierarchical_state!;
+    state.requirements[0]!.current_phase = "implement";
+    state.active_work_unit = {
+      id: "R1:implement",
+      requirement_id: "R1",
+      phase: "implement",
+      status: "ready",
+      assigned_role: "task-executor",
+      attempt: 1,
+      baseline_knowledge_revision: 0,
+      allowed_files: ["src/target.ts"]
+    };
+
+    const spec = buildHierarchicalRoleSpec(session, workflow, {
+      kind: "run_phase",
+      requirement_id: "R1",
+      work_unit_id: "R1:implement",
+      phase: "implement",
+      role: "task-executor"
+    }, "Generated-by: AI Coder");
+
+    expect(spec.prompt).toContain("## Git 提交印记");
+    expect(spec.prompt).toContain("Generated-by: AI Coder");
+    expect(spec.prompt).toContain("git commit -m");
+    expect(spec.prompt).toContain("不得省略");
+  });
+
+  it("omits commit mark section when commitMark is empty", () => {
+    const session = plannedSession();
+    const state = session.hierarchical_state!;
+    state.requirements[0]!.current_phase = "implement";
+    state.active_work_unit = {
+      id: "R1:implement",
+      requirement_id: "R1",
+      phase: "implement",
+      status: "ready",
+      assigned_role: "task-executor",
+      attempt: 1,
+      baseline_knowledge_revision: 0,
+      allowed_files: ["src/target.ts"]
+    };
+
+    const spec = buildHierarchicalRoleSpec(session, workflow, {
+      kind: "run_phase",
+      requirement_id: "R1",
+      work_unit_id: "R1:implement",
+      phase: "implement",
+      role: "task-executor"
+    });
+
+    expect(spec.prompt).not.toContain("## Git 提交印记");
+    expect(spec.prompt).not.toContain("commit message");
+  });
+
+  it("does not inject commit mark into non-implement phases", () => {
+    const session = plannedSession();
+    const spec = buildHierarchicalRoleSpec(session, workflow, {
+      kind: "run_phase",
+      requirement_id: "R1",
+      work_unit_id: "R1:investigate",
+      phase: "investigate",
+      role: "code-investigator"
+    }, "Generated-by: AI Coder");
+
+    expect(spec.prompt).not.toContain("## Git 提交印记");
+  });
 });

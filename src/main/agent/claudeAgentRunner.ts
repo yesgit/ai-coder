@@ -66,6 +66,8 @@ export interface ClaudeAgentRunnerOptions {
   pluginPaths?: string[];
   /** 连续服务不可用时，各次自动重试前的等待时间；数组长度同时决定最大重试次数。 */
   serviceUnavailableRetryDelaysMs?: number[];
+  /** 返回当前生效的 commit 印记文本；空字符串表示不追加。 */
+  getCommitMark?: () => Promise<string>;
 }
 
 interface ProfileQueryResult {
@@ -603,7 +605,8 @@ export class ClaudeAgentRunner {
     }>,
     abortController: AbortController
   ): Promise<HierarchicalRoleQueryResult> {
-    const spec = buildHierarchicalRoleSpec(input.session, input.workflow, operation);
+    const commitMark = await this.resolveCommitMark();
+    const spec = buildHierarchicalRoleSpec(input.session, input.workflow, operation, commitMark);
     const skillStage: WorkflowStage = {
       id: `hierarchical-${spec.phaseLabel}`,
       name: spec.phaseLabel,
@@ -1339,11 +1342,13 @@ export class ClaudeAgentRunner {
       }
 
       const simpleProfileLoop = input.workflow.simple_profile_loop === true;
+      const commitMark = await this.resolveCommitMark();
       const carefulCoderInstructions = this.buildProfileSystemPrompt(
         profileSkills,
         input.workflow.system_prompt,
         isLlmRetry ? effectiveModel : undefined,
-        simpleProfileLoop
+        simpleProfileLoop,
+        commitMark
       );
 
       const taskPrompt = input.session.task_prompt ?? "";
@@ -2010,12 +2015,25 @@ export class ClaudeAgentRunner {
     }
   }
 
+  /**
+   * 从运行时配置解析当前生效的 commit 印记文本。
+   * 返回空字符串表示不追加印记（功能关闭或未配置）。
+   */
+  private async resolveCommitMark(): Promise<string> {
+    try {
+      return await this.options.getCommitMark?.() ?? "";
+    } catch {
+      return "";
+    }
+  }
+
 /** 构建 Profile 模式的系统提示词 */
   private buildProfileSystemPrompt(
     profileSkills: Array<{ id: string; content: string }>,
     workflowSystemPrompt?: string,
     effectiveModel?: string,
-    simpleProfileLoop = false
+    simpleProfileLoop = false,
+    commitMark = ""
   ): string {
     const modelSupportsImages = isModelMultimodal(effectiveModel ?? null);
     const languageGuidance = [
@@ -2030,6 +2048,16 @@ export class ClaudeAgentRunner {
           "## 宿主按当前阶段注入的 Skills（执行契约）",
           "以下内容不是可选参考。先用这些契约判断当前缺口和行动方式；无需再次调用 Skill 工具加载同名 Skill，但必须在实际委托、执行和证据中体现契约。",
           ...profileSkills.map((skill) => `\n### ${skill.id}\n${skill.content}`)
+        ].join("\n")
+      : "";
+
+    const commitMarkGuidance = commitMark
+      ? [
+          "## Git 提交印记",
+          `提交代码时（git commit），必须在 commit message 尾部追加以下印记文本作为 git trailer，与正文之间用一个空行分隔：`,
+          commitMark,
+          `示例：git commit -m "fix: 修复登录验证" -m "${commitMark}"`,
+          "该印记用于工具统计 AI 生成的代码量；不得省略、修改或自创印记内容。"
         ].join("\n")
       : "";
 
@@ -2049,7 +2077,8 @@ export class ClaudeAgentRunner {
         "当前阶段已经注入的核心 Skill 不得再次调用 Skill 工具；应直接落实其契约。只有能力目录里未注入且确实需要的额外 Skill 才调用 Skill 工具。",
         "功能定位硬规则：目标以业务功能、用户行为、页面、事件或协议值描述且没有唯一精确符号时，必须真实调用 mcp__ai_coder__locate_feature_implementation；宿主只自动排除明确负向证据，不会按词面强弱确认或排除正向候选。逐批裁决报告返回的 unknown，累计 adjudications 并重跑到 complete，不能用 Read/Grep 自述代替。普查只生成 yes 目标的受限调用图摘要；最终复用目标的完整调用契约由 prepare 调查。",
         "调用契约硬规则：拟议实现只要会调用、复用或修改已有函数、方法、Hook 或组件，第一次相关修改前必须通过 Task 使用 call-contract-investigator；该调查者必须真实调用 mcp__ai_coder__investigate_symbol_contract 完整调查脚本，再把结果归并进知识雪球。主线程自行 Read/Grep/Bash、零散符号分析或文字声明不能替代。只有纯文案、静态数据或样式且不涉及任何既有函数/组件时才可判定不适用，并记录依据。",
-        "只调用工具列表中展示的精确工具名，并使用标准 tool_use 格式。"
+        "只调用工具列表中展示的精确工具名，并使用标准 tool_use 格式。",
+        commitMarkGuidance
       ].filter(Boolean).join("\n\n");
     }
 
@@ -2113,6 +2142,7 @@ export class ClaudeAgentRunner {
 
     return [
       languageGuidance,
+      commitMarkGuidance,
       modelSupportsImages
         ? [
             "## 文件读取规则",
