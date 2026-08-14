@@ -451,6 +451,212 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       .not.toThrow();
   });
 
+  it("skips code-change validation for verify when prepare declared already_satisfied", () => {
+    // Simulate a session where a PREVIOUS requirement made code changes,
+    // but the CURRENT requirement (R2) was declared already_satisfied.
+    const session = createSession();
+    const state = createHierarchicalExecutionState(session.task_prompt);
+    // Persist a prepare artifact with change_disposition=already_satisfied for R2
+    const prepareHandoff = handoffFor("prepare");
+    (prepareHandoff as Record<string, unknown>).change_disposition = "already_satisfied";
+    state.phase_artifacts.push({
+      id: "R2:prepare:artifact",
+      work_unit_id: "R2:prepare",
+      requirement_id: "R2",
+      phase: "prepare",
+      attempt: 1,
+      summary: "already satisfied",
+      handoff: prepareHandoff,
+      evidence_refs: ["target.ts:1"],
+      knowledge_revision: 0,
+      workspace_revision: 0,
+      created_at: new Date().toISOString()
+    });
+    session.hierarchical_state = state;
+    // A previous requirement's Edit leaves file_changes dirty in the same session
+    session.file_changes = [{ path: "target.ts", operation: "update", approved: true, created_at: new Date().toISOString() }];
+    session.tool_calls = [{
+      id: "prev-edit",
+      stage_id: "hierarchical:R1/implement",
+      tool: "Edit",
+      input: { file_path: "target.ts" },
+      status: "completed",
+      created_at: new Date().toISOString()
+    }];
+
+    const operation = {
+      kind: "run_phase" as const,
+      requirement_id: "R2",
+      work_unit_id: "R2:verify",
+      phase: "verify" as const,
+      role: "independent-verifier"
+    };
+    const events = [{
+      type: "phase_passed" as const,
+      work_unit_id: "R2:verify",
+      summary: "verified by reading",
+      handoff: handoffFor("verify"),
+      evidence_refs: ["target.ts:1"]
+    }];
+    const stageId = "hierarchical:R2/verify";
+
+    // Should NOT throw: already_satisfied means no code change for this requirement
+    expect(() => validateHierarchicalContractToolEvidence(session, operation, events, stageId))
+      .not.toThrow();
+  });
+
+  it("counts a Bash validation command as successful even when SDK did not report exit_code", () => {
+    const session = createSession();
+    const operation = {
+      kind: "run_phase" as const,
+      requirement_id: "R1",
+      work_unit_id: "R1:verify",
+      phase: "verify" as const,
+      role: "independent-verifier"
+    };
+    const events = [{
+      type: "phase_passed" as const,
+      work_unit_id: "R1:verify",
+      summary: "verified",
+      handoff: handoffFor("verify"),
+      evidence_refs: ["target.ts:1"]
+    }];
+    const stageId = "hierarchical:R1/verify";
+    session.tool_calls = [
+      {
+        id: "edit-target",
+        stage_id: "hierarchical:R1/implement",
+        tool: "Edit",
+        input: { file_path: "target.ts" },
+        status: "completed",
+        created_at: new Date().toISOString()
+      },
+      {
+        id: "git-diff-check-no-exit",
+        stage_id: stageId,
+        tool: "Bash",
+        input: { command: "git diff --check" },
+        status: "completed",
+        // exit_code deliberately omitted: SDK did not report it
+        output_summary: "",
+        created_at: new Date().toISOString()
+      }
+    ];
+
+    // Should NOT throw: exit_code=undefined is acceptable when status=completed
+    // and output has no error markers
+    expect(() => validateHierarchicalContractToolEvidence(session, operation, events, stageId))
+      .not.toThrow();
+  });
+
+  it("rejects a validation command when SDK omitted exit_code but the output reports failure", () => {
+    const session = createSession();
+    const operation = {
+      kind: "run_phase" as const,
+      requirement_id: "R1",
+      work_unit_id: "R1:verify",
+      phase: "verify" as const,
+      role: "independent-verifier"
+    };
+    const events = [{
+      type: "phase_passed" as const,
+      work_unit_id: "R1:verify",
+      summary: "verified",
+      handoff: handoffFor("verify"),
+      evidence_refs: ["target.ts:1"]
+    }];
+    const stageId = "hierarchical:R1/verify";
+    session.tool_calls = [
+      {
+        id: "edit-target",
+        stage_id: "hierarchical:R1/implement",
+        tool: "Edit",
+        input: { file_path: "target.ts" },
+        status: "completed",
+        created_at: new Date().toISOString()
+      },
+      {
+        id: "tsc-failed-no-exit",
+        stage_id: stageId,
+        tool: "Bash",
+        input: { command: "npx tsc --noEmit" },
+        status: "completed",
+        // exit_code deliberately omitted: SDK did not report it
+        output_summary: "src/target.ts(3,7): error TS2322: Type 'string' is not assignable to type 'number'.",
+        created_at: new Date().toISOString()
+      }
+    ];
+
+    let error: string | undefined;
+    try {
+      validateHierarchicalContractToolEvidence(session, operation, events, stageId);
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
+    expect(error).toContain("成功验证命令");
+    expect(error).toContain("失败标记");
+  });
+
+  it("includes specific diagnostic reasons when validation commands are rejected", () => {
+    const session = createSession();
+    const operation = {
+      kind: "run_phase" as const,
+      requirement_id: "R1",
+      work_unit_id: "R1:verify",
+      phase: "verify" as const,
+      role: "independent-verifier"
+    };
+    const events = [{
+      type: "phase_passed" as const,
+      work_unit_id: "R1:verify",
+      summary: "verified",
+      handoff: handoffFor("verify"),
+      evidence_refs: ["target.ts:1"]
+    }];
+    const stageId = "hierarchical:R1/verify";
+    session.tool_calls = [
+      {
+        id: "edit-target",
+        stage_id: "hierarchical:R1/implement",
+        tool: "Edit",
+        input: { file_path: "target.ts" },
+        status: "completed",
+        created_at: new Date().toISOString()
+      },
+      {
+        id: "pipe-masked",
+        stage_id: stageId,
+        tool: "Bash",
+        input: { command: "node --check target.ts || echo ok" },
+        status: "completed",
+        exit_code: 0,
+        output_summary: "ok",
+        created_at: new Date().toISOString()
+      },
+      {
+        id: "missing-node",
+        stage_id: stageId,
+        tool: "Bash",
+        input: { command: "node --check target.ts" },
+        status: "completed",
+        exit_code: 0,
+        output_summary: "/bin/bash: node：未找到命令",
+        created_at: new Date().toISOString()
+      }
+    ];
+
+    let error: string | undefined;
+    try {
+      validateHierarchicalContractToolEvidence(session, operation, events, stageId);
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
+    expect(error).toContain("成功验证命令");
+    // The diagnostic should name the specific rejection reasons
+    expect(error).toContain("管道符");
+    expect(error).toContain("未找到命令");
+  });
+
   it("merges the selected callable contract and dynamic reference anchors from trusted reports", async () => {
     const projectPath = await mkdtemp(path.join(os.tmpdir(), "ai-coder-prepare-reconcile-"));
     try {

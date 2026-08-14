@@ -1043,7 +1043,9 @@ function phaseInstructions(
         "只读独立核对，不信任 executor 自述。",
         `必须返回 ${requirement.acceptance.length} 条 acceptance_results，逐项 PASS/FAIL 并附证据。`,
         "还必须逐项核对 prepare 冻结的全部 behavior_obligations，contract_results 的 ID 必须完整一致，并用 observed_behavior + path:line 证据描述最终代码实际行为；文字不要求与 required_behavior 逐字一致。若目标、参数、guard、上下文或副作用实质不符，必须把对应 status 标为 fail；verifier 不得现场发明‘备选方案’或新的 intentional-difference。",
-        "任何一项无法确认都返回 failed，并选择回 implement、prepare 或 investigate。"
+        "任何一项无法确认都返回 failed，并选择回 implement、prepare 或 investigate。",
+        "已读过的文件不要重复 Read，使用 Grep 精确定位行号即可；避免对同一文件发起多次 Read。",
+        "验证命令用不含管道符 `|` 或 `||` 的纯命令（如 `git diff --check`、`node --check file.js`）；如果环境中没有 node/npm，直接用 `git diff --check` 作为最小验证，不要反复尝试已确认不存在的工具。"
       ].join("\n");
   }
 }

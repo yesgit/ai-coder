@@ -476,10 +476,20 @@ export class ClaudeAgentRunner {
               roleOperation.work_unit_id,
               fingerprint
             ) + 1;
-            const selfHealRoute = hierarchicalPhaseSelfHealRoute(
+            let selfHealRoute = hierarchicalPhaseSelfHealRoute(
               roleOperation.phase,
               message
             );
+            // prepare 判定 already_satisfied 时，verify 退回 implement 毫无意义（无代码可改），
+            // 改为原地重试，避免 implement → verify 空转循环。
+            if (selfHealRoute === "implement" && roleOperation.phase === "verify") {
+              const prepareArtifact = input.session.hierarchical_state
+                ? latestHierarchicalArtifact(input.session.hierarchical_state, roleOperation.requirement_id, "prepare")
+                : undefined;
+              if (prepareArtifact?.handoff?.change_disposition === "already_satisfied") {
+                selfHealRoute = "retry";
+              }
+            }
             const sameFailureLimit = selfHealRoute === "retry" && roleOperation.phase !== "investigate"
               ? 6
               : 3;
@@ -3488,10 +3498,19 @@ export function validateHierarchicalContractToolEvidence(
     return;
   }
   if (operation.phase === "verify") {
-    if (hasCodeChangeActivity(session) && !hasSuccessfulValidationAfterLastCodeChange(session)) {
+    // prepare 判定 already_satisfied 时跳过 implement，当前需求无代码变更，
+    // 不应要求"修改后的成功验证命令"——否则会与前序需求遗留的 file_changes 误触。
+    const prepareArtifact = session.hierarchical_state
+      ? latestHierarchicalArtifact(session.hierarchical_state, operation.requirement_id, "prepare")
+      : undefined;
+    const isAlreadySatisfied = prepareArtifact?.handoff?.change_disposition === "already_satisfied";
+    if (!isAlreadySatisfied
+      && hasCodeChangeActivity(session)
+      && !hasSuccessfulValidationAfterLastCodeChange(session)) {
       throw new Error(
         "verify 前没有观察到修改后的成功验证命令；Read/Grep 只能证明文本存在，"
         + "必须实际运行并成功完成 test/check/lint/typecheck/build、node --check 或 git diff --check"
+        + diagnoseValidationGap(session)
       );
     }
     return;
@@ -5472,7 +5491,10 @@ export function hierarchicalValidationCorrection(
     return "保留当前实现，但不要把本轮或前序需求刚新增/改写的分支当同功能参考；恢复使用任务基线中的独立用户入口，并把该入口与目标分支都追到共同的最终页面组件/业务函数。只有确实找不到独立入口时，才在对应 target_selection 写 no_reference_reason。";
   }
   if (/成功验证命令|Read\/Grep 只能证明文本存在/.test(reason)) {
-    return "保留现有实现和调查；运行项目可用的最小真实验证（优先现有 test/lint/typecheck/build，其次语法检查与 git diff --check），确认工具成功后再原样提交 verify，不能把 Read/Grep 或命令文字当执行证据。";
+    return [
+      "保留现有实现和调查；运行项目可用的最小真实验证（优先现有 test/lint/typecheck/build，其次语法检查与 git diff --check），确认工具成功后再原样提交 verify，不能把 Read/Grep 或命令文字当执行证据。",
+      "如果上方列出了前次验证命令被判无效的具体原因，请逐条修正：含 `||` 或 `|` 的命令改为纯命令；输出含“未找到命令”的换用 git diff --check；exit_code 非零或输出含失败标记的，先修复失败原因再重新运行。"
+    ].join("\n");
   }
   if (/manual-static-analysis/.test(reason)) {
     return "不要重做整轮调查：真实函数/组件调用一次 investigate_symbol_contract 完整调查脚本并声明 investigation-script；纯常量、路由表或静态配置从 analyzed_targets 删除，仍保留在 allowed_files/patch_plan。";
@@ -6112,11 +6134,22 @@ function hasMergedTaskVerifierAfterLastCodeChange(session: AgentSession): boolea
   );
 }
 
+/**
+ * SDK 未回传 exit_code 时用于兜底识别失败输出的通用标记。
+ * 宁可误伤含 "0 failed" 字样的成功输出（代价是多跑一次验证），也不能放过真失败。
+ */
+const FAILURE_OUTPUT_MARKER = /\bFAIL(?:ED)?\b|AssertionError|\berror TS\d+|\bERR!\b|panic:/i;
+
 function lastSuccessfulValidationIndexAfterLastCodeChange(session: AgentSession): number {
   const lastChange = lastCodeChangeToolIndex(session);
   let lastValidation = -1;
   (session.tool_calls ?? []).forEach((toolCall, index) => {
-    if (index <= lastChange || toolCall.tool !== "Bash" || toolCall.status !== "completed" || toolCall.exit_code !== 0) {
+    if (index <= lastChange || toolCall.tool !== "Bash" || toolCall.status !== "completed") {
+      return;
+    }
+    // exit_code=0 是显式成功；undefined 表示 SDK 未回传 exit_code（Claude Agent SDK
+    // 的 Bash 成功结果通常只有 stdout/stderr），此时依赖后续 output 检查过滤失败。
+    if (toolCall.exit_code !== undefined && toolCall.exit_code !== 0) {
       return;
     }
     const command = isPlainObject(toolCall.input) ? optionalString(toolCall.input.command) ?? "" : "";
@@ -6124,15 +6157,49 @@ function lastSuccessfulValidationIndexAfterLastCodeChange(session: AgentSession)
     const masksFailure = /\|\||(?<!\|)\|(?!\|)/.test(command);
     const reportsMissingExecutable = /command not found|未找到命令|找不到命令|not recognized as an internal or external command|no such file or directory/i
       .test(output);
+    // exit_code 缺失时无法区分成功与失败，只能靠输出里的通用失败标记兜底
+    const reportsFailureMarker = toolCall.exit_code === undefined && FAILURE_OUTPUT_MARKER.test(output);
     if (
       !masksFailure
       && !reportsMissingExecutable
+      && !reportsFailureMarker
       && /(?:^|\s)(?:test|check|lint|typecheck|build)(?:\s|$)|\b(?:vitest|jest|pytest|mocha|eslint|tsc|cargo\s+test|go\s+test|gradle\w*\s+test|mvn\s+test|node\s+--check)\b|git\s+diff\s+--check/i.test(command)
     ) {
       lastValidation = index;
     }
   });
   return lastValidation;
+}
+
+/**
+ * 分析 session 中"看起来像验证但被判为无效"的 Bash 调用，生成具体诊断提示。
+ * 让模型在重试时知道前次为什么不算数，而不是只看到泛化错误信息。
+ */
+function diagnoseValidationGap(session: AgentSession): string {
+  const lastChange = lastCodeChangeToolIndex(session);
+  const candidates: string[] = [];
+  for (const [index, toolCall] of (session.tool_calls ?? []).entries()) {
+    if (index <= lastChange || toolCall.tool !== "Bash" || toolCall.status !== "completed") continue;
+    const command = isPlainObject(toolCall.input) ? optionalString(toolCall.input.command) ?? "" : "";
+    const output = toolCall.output_summary ?? "";
+    if (!/(?:^|\s)(?:test|check|lint|typecheck|build)(?:\s|$)|\b(?:vitest|jest|pytest|mocha|eslint|tsc|cargo\s+test|go\s+test|gradle\w*\s+test|mvn\s+test|node\s+--check)\b|git\s+diff\s+--check/i.test(command)) {
+      continue;
+    }
+    // 该命令看起来像验证，但被判无效——指出具体原因
+    if (/\|\||(?<!\|)\|(?!\|)/.test(command)) {
+      candidates.push(`- \`${command.slice(0, 80)}\` 含管道符 \`|\` 或 \`||\`，被判定为掩盖失败；请用不含管道的纯命令`);
+    } else if (/command not found|未找到命令|找不到命令|not recognized as an internal or external command|no such file or directory/i.test(output)) {
+      candidates.push(`- \`${command.slice(0, 80)}\` 输出含“未找到命令”，说明该工具未安装；请换用 git diff --check 或其他可用工具`);
+    } else if (toolCall.exit_code !== undefined && toolCall.exit_code !== 0) {
+      candidates.push(`- \`${command.slice(0, 80)}\` exit_code=${toolCall.exit_code}（非零）；请修正命令使其成功退出`);
+    } else if (toolCall.exit_code === undefined && FAILURE_OUTPUT_MARKER.test(output)) {
+      candidates.push(`- \`${command.slice(0, 80)}\` 的 exit_code 未被 SDK 回传且输出含失败标记；请修复失败原因后用纯命令重新运行`);
+    }
+  }
+  if (candidates.length === 0) {
+    return "";
+  }
+  return `\n前次验证命令被判无效的具体原因：\n${candidates.slice(0, 5).join("\n")}`;
 }
 
 function hasFinalAuditAfterLastCodeChange(session: AgentSession): boolean {
