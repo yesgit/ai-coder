@@ -1,5 +1,6 @@
 import { useTaskAutomationStore } from "./taskAutomationStore.js";
-import type { UnifiedTask } from "../../shared/types.js";
+import type { UnifiedTask, AppSettings } from "../../shared/types.js";
+import { useState, useEffect } from "react";
 import "./styles.css";
 
 /**
@@ -16,6 +17,29 @@ export default function TaskAutomationPanel() {
     handleRelease
   } = useTaskAutomationStore();
 
+  const [reviewEnabled, setReviewEnabled] = useState(false);
+
+  useEffect(() => {
+    window.aiCoder.getSettings().then((settings: AppSettings) => {
+      setReviewEnabled(settings.task_automation.review_handling.enabled);
+    });
+  }, []);
+
+  const toggleReviewHandling = async (enabled: boolean) => {
+    setReviewEnabled(enabled);
+    // 先读取当前配置，仅更新 review_handling，避免覆盖其他任务自动化设置
+    const current: AppSettings = await window.aiCoder.getSettings();
+    await window.aiCoder.updateSettings({
+      task_automation: {
+        ...current.task_automation,
+        review_handling: {
+          ...current.task_automation.review_handling,
+          enabled
+        }
+      }
+    } as any);
+  };
+
   return (
     <div className="task-automation-panel">
       <header className="task-automation-header">
@@ -26,6 +50,24 @@ export default function TaskAutomationPanel() {
       </header>
 
       {error && <div className="error-banner">{error}</div>}
+
+      {/* Review 自动处理配置 */}
+      <section className="review-handling-settings">
+        <h3>MR Review 自动处理</h3>
+        <div className="settings-row">
+          <label>
+            <input
+              type="checkbox"
+              checked={reviewEnabled}
+              onChange={(e) => toggleReviewHandling(e.target.checked)}
+            />
+            启用自动处理 MR 评论
+          </label>
+          <span className="muted">
+            {reviewEnabled ? "已启用（每 2 分钟轮询）" : "已关闭"}
+          </span>
+        </div>
+      </section>
 
       {/* 已认领队列 */}
       <section>
@@ -67,8 +109,13 @@ export default function TaskAutomationPanel() {
                     )}
                     {record.pr_url && (
                       <a href={record.pr_url} target="_blank" rel="noopener noreferrer">
-                        PR
+                        MR
                       </a>
+                    )}
+                    {record.review_round > 0 && (
+                      <span className="muted" title={`Review 轮次`}>
+                        R{record.review_round}
+                      </span>
                     )}
                   </td>
                 </tr>
@@ -136,6 +183,7 @@ function formatStatus(status: string): string {
     case "claimed": return "待执行";
     case "executing": return "执行中";
     case "pr_submitted": return "待审核";
+    case "reviewing": return "处理意见中";
     case "merged": return "已合并";
     case "released": return "已释放";
     case "failed": return "失败";

@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { DEFAULT_APP_SETTINGS, type AppSettings } from "../../shared/types.js";
+import { DEFAULT_APP_SETTINGS, DEFAULT_REVIEW_HANDLING, type AppSettings } from "../../shared/types.js";
 
 /**
  * 应用级设置持久化存储。文件位于 ~/.ai-coder/settings.json。
@@ -110,6 +110,28 @@ function sanitizeTaskAutomation(input: unknown): AppSettings["task_automation"] 
       token_stored: typeof input.git_host.token_stored === "boolean" ? input.git_host.token_stored : false
     } : defaults.git_host,
     auto_run_tests: typeof input.auto_run_tests === "boolean" ? input.auto_run_tests : defaults.auto_run_tests,
-    difficulty_filter: Array.isArray(input.difficulty_filter) ? input.difficulty_filter : defaults.difficulty_filter
+    difficulty_filter: Array.isArray(input.difficulty_filter) ? input.difficulty_filter : defaults.difficulty_filter,
+    review_handling: isPlainObject(input.review_handling)
+      ? sanitizeReviewHandling(input.review_handling)
+      : defaults.review_handling
+  };
+}
+
+function sanitizeReviewHandling(input: unknown): AppSettings["task_automation"]["review_handling"] {
+  const defaults = DEFAULT_REVIEW_HANDLING;
+  if (!isPlainObject(input)) return { ...defaults };
+
+  return {
+    enabled: typeof input.enabled === "boolean" ? input.enabled : defaults.enabled,
+    polling_interval_seconds: typeof input.polling_interval_seconds === "number" && input.polling_interval_seconds >= 30
+      ? input.polling_interval_seconds
+      : defaults.polling_interval_seconds,
+    auto_reply_text_comments: typeof input.auto_reply_text_comments === "boolean"
+      ? input.auto_reply_text_comments
+      : defaults.auto_reply_text_comments,
+    max_review_rounds: typeof input.max_review_rounds === "number" && input.max_review_rounds >= 1
+      ? input.max_review_rounds
+      : defaults.max_review_rounds,
+    ignore_authors: Array.isArray(input.ignore_authors) ? input.ignore_authors : defaults.ignore_authors
   };
 }

@@ -78,6 +78,13 @@ export class BranchManager {
     await this.execGit(repoPath, ["branch", "-d", branch]);
   }
 
+  /** 切换到指定分支并拉取最新代码。 */
+  async checkoutAndPull(repoPath: string, branch: string): Promise<void> {
+    await this.execGit(repoPath, ["fetch", "origin"]);
+    await this.execGit(repoPath, ["checkout", branch]);
+    await this.execGit(repoPath, ["pull", "--ff-only"]);
+  }
+
   /** 获取远程仓库 URL。 */
   async getRemoteUrl(repoPath: string, remote = "origin"): Promise<string> {
     const result = await this.execGit(repoPath, ["remote", "get-url", remote]);

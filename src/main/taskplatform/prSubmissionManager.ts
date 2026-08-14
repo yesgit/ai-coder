@@ -60,7 +60,7 @@ export class PRSubmissionManager {
         throw new Error(`Unsupported git host: ${remoteUrl}`);
       }
 
-      const prUrl = await gitHost.createPullRequest({
+      const prResult = await gitHost.createPullRequest({
         repo_path: record.repo_path,
         head: record.branch,
         base: record.base_branch,
@@ -72,11 +72,20 @@ export class PRSubmissionManager {
       // 5. 回写平台状态
       const adapter = this.platformRegistry.get(record.platform);
       if (adapter) {
-        await adapter.transitionToReview(record.task_id, prUrl);
+        await adapter.transitionToReview(record.task_id, prResult.url);
       }
 
-      // 6. 更新认领记录
-      await this.claimedTaskStore.markPRSubmitted(record.task_id, prUrl);
+      // 6. 回写 MR 元数据（GitLab 特有字段，用于后续 review 轮询）
+      if (prResult.mr_iid !== undefined && prResult.project_id !== undefined) {
+        await this.claimedTaskStore.updateMRInfo(
+          record.task_id,
+          prResult.mr_iid,
+          prResult.project_id
+        );
+      }
+
+      // 7. 更新认领记录
+      await this.claimedTaskStore.markPRSubmitted(record.task_id, prResult.url);
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       await this.claimedTaskStore.markFailed(record.task_id, `PR submission failed: ${errorMsg}`);

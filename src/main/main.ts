@@ -17,7 +17,11 @@ import { WorkflowRegistry } from "./workflows/workflowRegistry.js";
 import { AuthorizedProjects } from "./security/authorizedProjects.js";
 import { BranchManager } from "./taskplatform/branchManager.js";
 import { ClaimedTaskStore } from "./taskplatform/claimedTaskStore.js";
+import { detectGitHost } from "./taskplatform/gitHostAdapter.js";
 import { PRSubmissionManager } from "./taskplatform/prSubmissionManager.js";
+import { ReviewHandler } from "./taskplatform/reviewHandler.js";
+import { ReviewSessionOrchestrator } from "./taskplatform/reviewSessionOrchestrator.js";
+import { ReviewWatcher } from "./taskplatform/reviewWatcher.js";
 import { SessionOrchestrator } from "./taskplatform/sessionOrchestrator.js";
 import { TaskClaimManager } from "./taskplatform/taskClaimManager.js";
 import { TaskPlatformRegistry } from "./taskplatform/taskPlatformRegistry.js";
@@ -197,6 +201,45 @@ const taskScout = new TaskScout(
   (kind) => credentials.get(kind)
 );
 
+// Review 自动处理模块
+const getGitHostAdapter = async (repoPath: string) => {
+  const gitHostToken = await credentials.get("git_host");
+  if (!gitHostToken) return null;
+  const remoteUrl = await branchManager.getRemoteUrl(repoPath);
+  return detectGitHost(remoteUrl, gitHostToken);
+};
+
+const reviewSessionOrchestrator = new ReviewSessionOrchestrator(
+  sessions,
+  workflowRegistry,
+  new ClaudeAgentRunner({
+    pluginPaths: [carefulCoderPluginPath],
+    getCommitMark: () => settings.getCommitMark()
+  }),
+  branchManager,
+  claimedTaskStore,
+  authorizedProjects,
+  getGitHostAdapter
+);
+
+const reviewHandler = new ReviewHandler(
+  reviewSessionOrchestrator,
+  claimedTaskStore,
+  settings,
+  getGitHostAdapter
+);
+
+const reviewWatcher = new ReviewWatcher(
+  claimedTaskStore,
+  settings,
+  getGitHostAdapter
+);
+
+// 绑定回调
+reviewWatcher.onReviewNeeded = async (record, comments) => {
+  await reviewHandler.handleReview(record, comments);
+};
+
 registerIpcHandlers(
   workflowRegistry,
   sessions,
@@ -250,6 +293,11 @@ app.whenReady().then(async () => {
   if (taskSettings.enabled) {
     taskPlatformRegistry.updateConfigs(taskSettings.platforms);
     await taskScout.start();
+
+    // Review 自动处理：若已启用则启动评论轮询
+    if (taskSettings.review_handling.enabled) {
+      await reviewWatcher.start();
+    }
   }
 });
 

@@ -97,6 +97,54 @@ export class ClaimedTaskStore {
     });
   }
 
+  /** 查询多个状态的记录。 */
+  async listByStatuses(statuses: ClaimedTaskStatus[]): Promise<ClaimedTaskRecord[]> {
+    const all = await this.list();
+    const statusSet = new Set(statuses);
+    return all.filter((r) => statusSet.has(r.status));
+  }
+
+  /** 标记为 reviewing 状态。 */
+  async markReviewing(taskId: string): Promise<void> {
+    await this.enqueueWrite(async () => {
+      const all = await this.readRaw() ?? [];
+      const record = all.find((r) => r.task_id === taskId);
+      if (record) {
+        record.status = "reviewing";
+        record.updated_at = new Date().toISOString();
+        await this.writeRaw(all);
+      }
+    });
+  }
+
+  /** 更新 review 元数据（最后处理时间、轮次）。 */
+  async updateReviewMeta(taskId: string, reviewedAt: string, round: number): Promise<void> {
+    await this.enqueueWrite(async () => {
+      const all = await this.readRaw() ?? [];
+      const record = all.find((r) => r.task_id === taskId);
+      if (record) {
+        record.last_reviewed_at = reviewedAt;
+        record.review_round = round;
+        record.updated_at = new Date().toISOString();
+        await this.writeRaw(all);
+      }
+    });
+  }
+
+  /** 更新 MR 相关信息（从 GitLab 创建 MR 后回写）。 */
+  async updateMRInfo(taskId: string, mrIid: number, gitlabProjectId: string): Promise<void> {
+    await this.enqueueWrite(async () => {
+      const all = await this.readRaw() ?? [];
+      const record = all.find((r) => r.task_id === taskId);
+      if (record) {
+        record.mr_iid = mrIid;
+        record.gitlab_project_id = gitlabProjectId;
+        record.updated_at = new Date().toISOString();
+        await this.writeRaw(all);
+      }
+    });
+  }
+
   private async readRaw(): Promise<ClaimedTaskRecord[] | null> {
     try {
       const raw = await fs.readFile(this.filePath, "utf8");

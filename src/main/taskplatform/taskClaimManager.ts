@@ -91,7 +91,11 @@ export class TaskClaimManager {
         updated_at: now,
         pr_url: null,
         failure_count: 0,
-        last_error: null
+        last_error: null,
+        mr_iid: null,
+        gitlab_project_id: null,
+        last_reviewed_at: null,
+        review_round: 0
       };
       await this.claimedTaskStore.record(record);
 

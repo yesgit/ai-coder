@@ -967,6 +967,7 @@ export type ClaimedTaskStatus =
   | "claimed"
   | "executing"
   | "pr_submitted"
+  | "reviewing"
   | "merged"
   | "released"
   | "failed";
@@ -984,9 +985,21 @@ export interface ClaimedTaskRecord {
   pr_url: string | null;
   failure_count: number;
   last_error: string | null;
+  mr_iid: number | null;
+  gitlab_project_id: string | null;
+  last_reviewed_at: string | null;
+  review_round: number;
 }
 
 export type GitHostKind = "github" | "gitlab" | "auto";
+
+export interface ReviewHandlingSettings {
+  enabled: boolean;
+  polling_interval_seconds: number;
+  auto_reply_text_comments: boolean;
+  max_review_rounds: number;
+  ignore_authors: string[];
+}
 
 export interface TaskAutomationSettings {
   enabled: boolean;
@@ -997,6 +1010,61 @@ export interface TaskAutomationSettings {
   git_host: { kind: GitHostKind; token_stored: boolean };
   auto_run_tests: boolean;
   difficulty_filter: DifficultyLevel[];
+  review_handling: ReviewHandlingSettings;
+}
+
+// ─── MR Review 评论类型 ──────────────────────────────────────────────────────────
+
+export interface MRCommentPosition {
+  new_path: string;
+  new_line: number;
+}
+
+export interface MRComment {
+  id: number;
+  author: string;
+  body: string;
+  created_at: string;
+  position?: MRCommentPosition;
+  resolvable: boolean;
+  resolved: boolean;
+}
+
+export interface MRCommentQuery {
+  repo_path: string;
+  mr_iid: number;
+  project_id: string;
+  since?: string;
+}
+
+export interface MRCommentReply {
+  repo_path: string;
+  mr_iid: number;
+  project_id: string;
+  body: string;
+  in_reply_to_id?: number;
+}
+
+export interface MRQuery {
+  repo_path: string;
+  mr_iid: number;
+  project_id: string;
+}
+
+export interface MRDiffNote {
+  old_path: string;
+  new_path: string;
+  diff: string;
+  new_file: boolean;
+  renamed_file: boolean;
+  deleted_file: boolean;
+}
+
+export interface ReviewAction {
+  type: "code_change" | "text_reply";
+  comment: MRComment;
+  context: string;
+  suggested_reply?: string;
 }
 
 /**
@@ -1016,6 +1084,14 @@ export interface AppSettings {
   task_automation: TaskAutomationSettings;
 }
 
+export const DEFAULT_REVIEW_HANDLING: ReviewHandlingSettings = {
+  enabled: false,
+  polling_interval_seconds: 120,
+  auto_reply_text_comments: true,
+  max_review_rounds: 5,
+  ignore_authors: ["dependabot", "renovate", "github-actions"]
+};
+
 export const DEFAULT_APP_SETTINGS: AppSettings = {
   commit_mark: "Generated-by: AI Coder",
   commit_mark_enabled: true,
@@ -1027,7 +1103,8 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
     platforms: [],
     git_host: { kind: "auto", token_stored: false },
     auto_run_tests: true,
-    difficulty_filter: ["trivial", "low"]
+    difficulty_filter: ["trivial", "low"],
+    review_handling: { ...DEFAULT_REVIEW_HANDLING }
   }
 };
 
