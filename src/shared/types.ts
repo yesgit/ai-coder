@@ -52,9 +52,42 @@ export interface PreToolUseHookRule {
     shell_must_have_run?: string[];
     /** 本阶段必须发起过 ask_human（pending_human_questions 中至少一条 stage_id 匹配的记录）。 */
     ask_human_consent?: boolean;
+    /** 本会话内必须成功调用过这些工具（全名匹配，status=approved/completed）。 */
+    tool_must_have_run?: string[];
   };
   /** 拦截时回传给模型的中文人话提示。 */
   on_fail: string;
+}
+
+/**
+ * 单条调用方命中结果。
+ */
+export interface CallsiteHit {
+  file: string;
+  line: number;
+  kind: "call" | "jsx" | "reference" | "reexport" | "definition";
+  /** 命中行内容，截断到 120 字，供模型快速判断语义。 */
+  snippet: string;
+}
+
+/**
+ * find_callsites 的一次确定性扫描结果。这是宿主侧的 ground truth：
+ * 同一项目同一符号任意时刻返回同一下限清单，模型无法篹改。
+ */
+export interface CallsiteInventory {
+  symbol: string;
+  total: number;
+  hits: CallsiteHit[];
+  /** 覆盖边界由工具诚实声明（动态 import/默认导出/同名歧义等），不靠模型自觉。 */
+  blind_spots: string[];
+  scanned_files: number;
+  /** 命中超上限时为 true——数量锚定不可信，断言应降级而非让模型为宿主截断背锅。 */
+  truncated: boolean;
+}
+
+/** 落盘到 session 的清单记录，附带调用时间供阶段时间窗过滤。 */
+export interface CallsiteInventoryRecord extends CallsiteInventory {
+  created_at: string;
 }
 
 /**
@@ -813,6 +846,8 @@ export interface AgentSession {
   task_tree?: TaskTree;
   /** 文本化探索工作记忆；最后一项是当前有效认知，前序项用于恢复与审计。 */
   exploration_checkpoints?: ExplorationCheckpoint[];
+  /** 调用方清单存储：键为符号名，保留每个 find_callsites 调用中最新的一条。 */
+  callsite_inventories?: Record<string, CallsiteInventoryRecord>;
   created_at: string;
   updated_at: string;
   error?: string;

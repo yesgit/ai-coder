@@ -1,5 +1,8 @@
-import { describe, expect, it } from "vitest";
-import { evaluateHook, checkCommandSafety } from "./stageHookEnforcer.js";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { evaluateHook, checkCommandSafety, checkCallsiteInvestigationGate } from "./stageHookEnforcer.js";
 import type { HookDecision } from "./stageHookEnforcer.js";
 import type { AgentSession, ToolCallRecord, WorkflowStage, HumanQuestion } from "../../shared/types.js";
 
@@ -298,6 +301,96 @@ describe("stageHookEnforcer.evaluateHook", () => {
     });
     expect(decision.allow).toBe(true);
   });
+
+  it("tool_must_have_run: 未调用 find_callsites → 拦截 Edit", () => {
+    const stage = makeStage({
+      pre_tool_use: [
+        {
+          when: { tool: ["Edit", "Write"] },
+          require: { tool_must_have_run: ["mcp__ai_coder_tools__find_callsites"] },
+          on_fail: "改动前必须先调用 find_callsites"
+        }
+      ]
+    });
+    const decision = evaluateHook(stage, makeSession(), "Edit", { file_path: "/tmp/proj/src/a.ts" });
+    expectDenied(decision);
+    expect(decision.message).toContain("mcp__ai_coder_tools__find_callsites");
+  });
+
+  it("tool_must_have_run: 已调用过（completed）→ 放行", () => {
+    const stage = makeStage({
+      pre_tool_use: [
+        {
+          when: { tool: ["Edit", "Write"] },
+          require: { tool_must_have_run: ["mcp__ai_coder_tools__find_callsites"] },
+          on_fail: "x"
+        }
+      ]
+    });
+    const session = makeSession([
+      {
+        id: "mcp-1",
+        stage_id: "implement",
+        tool: "mcp__ai_coder_tools__find_callsites",
+        input: { symbol: "parseConfig" },
+        status: "completed",
+        created_at: ""
+      }
+    ]);
+    const decision = evaluateHook(stage, session, "Edit", { file_path: "/tmp/proj/src/a.ts" });
+    expect(decision.allow).toBe(true);
+  });
+
+  it("tool_must_have_run: denied 状态的调用记录不计入", () => {
+    const stage = makeStage({
+      pre_tool_use: [
+        {
+          when: { tool: "Edit" },
+          require: { tool_must_have_run: ["mcp__ai_coder_tools__find_callsites"] },
+          on_fail: "x"
+        }
+      ]
+    });
+    const session = makeSession([
+      {
+        id: "mcp-2",
+        stage_id: "implement",
+        tool: "mcp__ai_coder_tools__find_callsites",
+        input: { symbol: "parseConfig" },
+        status: "denied",
+        created_at: ""
+      }
+    ]);
+    const decision = evaluateHook(stage, session, "Edit", { file_path: "/tmp/proj/src/a.ts" });
+    expect(decision.allow).toBe(false);
+  });
+
+  it("tool_must_have_run: 多条要求缺其中一条 → 仍拦截", () => {
+    const stage = makeStage({
+      pre_tool_use: [
+        {
+          when: { tool: "Edit" },
+          require: {
+            tool_must_have_run: ["mcp__ai_coder_tools__find_callsites", "mcp__ai_coder__ask_human"]
+          },
+          on_fail: "x"
+        }
+      ]
+    });
+    const session = makeSession([
+      {
+        id: "mcp-3",
+        stage_id: "implement",
+        tool: "mcp__ai_coder_tools__find_callsites",
+        input: { symbol: "parseConfig" },
+        status: "approved",
+        created_at: ""
+      }
+    ]);
+    const decision = evaluateHook(stage, session, "Edit", { file_path: "/tmp/proj/src/a.ts" });
+    expectDenied(decision);
+    expect(decision.message).toContain("mcp__ai_coder__ask_human");
+  });
 });
 
 describe("stageHookEnforcer.checkCommandSafety", () => {
@@ -457,5 +550,83 @@ describe("stageHookEnforcer.checkCommandSafety", () => {
       command: "git diff > changes.patch"
     });
     expect(result.allow).toBe(false);
+  });
+});
+
+describe("stageHookEnforcer.checkCallsiteInvestigationGate", () => {
+  let fixtureRoot = "";
+
+  beforeAll(() => {
+    fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "gate-fixture-"));
+    fs.mkdirSync(path.join(fixtureRoot, "src"), { recursive: true });
+    fs.writeFileSync(path.join(fixtureRoot, "src", "existing.ts"), "export const x = 1;\n");
+  });
+
+  afterAll(() => {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  });
+
+  function gateSession(toolCalls: ToolCallRecord[] = []): AgentSession {
+    return { ...makeSession(toolCalls), project_path: fixtureRoot };
+  }
+
+  function investigatedCall(): ToolCallRecord {
+    return {
+      id: "mcp-gate",
+      stage_id: "profile",
+      tool: "mcp__ai_coder_tools__find_callsites",
+      input: { symbol: "parseConfig" },
+      status: "completed",
+      created_at: ""
+    };
+  }
+
+  it("未调查 + Edit 已存在文件 → 拦截（绝对/相对路径同等生效）", () => {
+    const absolute = checkCallsiteInvestigationGate(gateSession(), "Edit", {
+      file_path: path.join(fixtureRoot, "src", "existing.ts")
+    });
+    expectDenied(absolute);
+    expect(absolute.message).toContain("find_callsites");
+    const relative = checkCallsiteInvestigationGate(gateSession(), "Edit", { file_path: "src/existing.ts" });
+    expect(relative.allow).toBe(false);
+  });
+
+  it("已调查（find_callsites completed）→ 放行", () => {
+    const decision = checkCallsiteInvestigationGate(gateSession([investigatedCall()]), "Edit", {
+      file_path: path.join(fixtureRoot, "src", "existing.ts")
+    });
+    expect(decision.allow).toBe(true);
+  });
+
+  it("Write 不存在的新文件 → 放行（纯新建豁免）", () => {
+    const decision = checkCallsiteInvestigationGate(gateSession(), "Write", {
+      file_path: path.join(fixtureRoot, "src", "brand-new.ts"),
+      content: "export const y = 2;"
+    });
+    expect(decision.allow).toBe(true);
+  });
+
+  it("Write 已存在文件 + 未调查 → 拦截", () => {
+    const decision = checkCallsiteInvestigationGate(gateSession(), "Write", {
+      file_path: path.join(fixtureRoot, "src", "existing.ts"),
+      content: "overwrite"
+    });
+    expect(decision.allow).toBe(false);
+  });
+
+  it("非写工具（Read / Bash）→ 放行", () => {
+    expect(
+      checkCallsiteInvestigationGate(gateSession(), "Read", {
+        file_path: path.join(fixtureRoot, "src", "existing.ts")
+      }).allow
+    ).toBe(true);
+    expect(checkCallsiteInvestigationGate(gateSession(), "Bash", { command: "echo hi" }).allow).toBe(true);
+  });
+
+  it("MultiEdit edits[] 指向已存在文件 + 未调查 → 拦截", () => {
+    const decision = checkCallsiteInvestigationGate(gateSession(), "MultiEdit", {
+      edits: [{ file_path: path.join(fixtureRoot, "src", "existing.ts"), old_string: "x", new_string: "y" }]
+    });
+    expect(decision.allow).toBe(false);
   });
 });

@@ -39,7 +39,7 @@ import {
 } from "../workflows/hierarchicalPlannerCoverage.js";
 import { buildStageInstructions } from "./workflowPrompt.js";
 import { buildStageOutputFormat } from "./stageOutputFormat.js";
-import { evaluateHook, checkCommandSafety } from "./stageHookEnforcer.js";
+import { evaluateHook, checkCommandSafety, checkCallsiteInvestigationGate } from "./stageHookEnforcer.js";
 import { buildStageAgentInput, createMockStageAgentResult, parseStageAgentResult } from "./stageAgentProtocol.js";
 import { extractClaudeStageOutput, formatClaudeTranscript } from "./claudeMessageAdapter.js";
 import { resolveBundledClaudeCodeExecutable, shouldUseClaudeSdk } from "./claudeRuntime.js";
@@ -1828,6 +1828,13 @@ export class ClaudeAgentRunner {
             if (!safety.allow) {
               await this.recordProgress(input, "tool_policy", `安全拦截：${safety.message}`, "milestone");
               return { behavior: "deny", message: safety.message, interrupt: false };
+            }
+            // 引擎层硬闸门：profile 模式无阶段管线，等价于阶段 hooks 的 tool_must_have_run。
+            // interrupt:false——模型读到原因后自行补调 find_callsites，不打断会话。
+            const investigationGate = checkCallsiteInvestigationGate(input.session, toolName, toolInput);
+            if (!investigationGate.allow) {
+              await this.recordProgress(input, "tool_policy", `调用调查闸门：${investigationGate.message}`, "milestone");
+              return { behavior: "deny", message: investigationGate.message, interrupt: false };
             }
             const decision = await approveOrDenyToolUse(
               input.session,

@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import path from "node:path";
 import type {
   AgentSession,
@@ -17,7 +18,7 @@ import { isReadOnlyShellCommand } from "../security/projectPolicy.js";
  * - 已成功的工具调用以 status=approved/completed 留在 session.tool_calls（projectPolicy 维护）
  * - ask_human 不入 tool_calls，但会落到 session.pending_human_questions（runner 维护）
  *
- * 评估器自身**无副作用**：只读，无网络/IO。
+ * 评估器自身**无副作用**：只读（含写入目标的存在性 stat），无网络/写 IO。
  */
 export type HookDecision = { allow: true } | { allow: false; message: string };
 
@@ -130,6 +131,32 @@ export function checkCommandSafety(
   return { allow: true };
 }
 
+const WRITE_TOOLS = new Set(["Edit", "MultiEdit", "Write", "NotebookEdit"]);
+const FIND_CALLSITES_TOOL = "mcp__ai_coder_tools__find_callsites";
+
+/**
+ * 引擎层硬闸门（仅 profile 模式调用）：修改已存在文件前必须已完成调用方调查。
+ * 与阶段 hooks 的 tool_must_have_run 等价，但不依赖 YAML——内置工作流无阶段管线。
+ * 会话级粒度：一次 find_callsites 解锁后续写入；纯新建文件（全部目标不存在）放行，
+ * 与 same_file_reads_min 不拦 Write 新建的先例一致。
+ */
+export function checkCallsiteInvestigationGate(
+  session: AgentSession,
+  toolName: string,
+  toolInput: Record<string, unknown>
+): HookDecision {
+  if (!WRITE_TOOLS.has(toolName)) return { allow: true };
+  if (hasToolRun(session.tool_calls, FIND_CALLSITES_TOOL)) return { allow: true };
+  const targets = extractTargetPaths(toolInput);
+  if (targets.length === 0) return { allow: true }; // 异常输入交策略层裁决
+  const touchesExisting = targets.some((target) => existsSync(path.resolve(session.project_path, target)));
+  if (!touchesExisting) return { allow: true }; // 纯新建：无已有调用可调查
+  return {
+    allow: false,
+    message: "引擎安全拦截：修改已存在文件前，必须先调用 mcp__ai_coder_tools__find_callsites 完成目标符号的调用方调查（内置工作流硬约束）。请对将要改动的函数/组件调用 find_callsites，拿到确定性调用清单并逐处核对后再动手；若确为纯新增，请用 Write 创建新文件。"
+  };
+}
+
 export function evaluateHook(
   stage: WorkflowStage,
   session: AgentSession,
@@ -173,7 +200,7 @@ function checkRequire(
   toolInput: Record<string, unknown>,
   stageId: string
 ): string | null {
-  const { same_file_reads_min, shell_must_have_run, ask_human_consent } = rule.require;
+  const { same_file_reads_min, shell_must_have_run, ask_human_consent, tool_must_have_run } = rule.require;
 
   if (same_file_reads_min !== undefined) {
     const targets = extractTargetPaths(toolInput);
@@ -192,6 +219,13 @@ function checkRequire(
     const missing = shell_must_have_run.filter((needle) => !hasShellRun(session.tool_calls, needle));
     if (missing.length > 0) {
       return `本会话尚未执行：${missing.join(" / ")}`;
+    }
+  }
+
+  if (tool_must_have_run && tool_must_have_run.length > 0) {
+    const missing = tool_must_have_run.filter((name) => !hasToolRun(session.tool_calls, name));
+    if (missing.length > 0) {
+      return `本会话尚未调用工具：${missing.join(" / ")}`;
     }
   }
 
@@ -255,6 +289,17 @@ export function countReadHits(toolCalls: ToolCallRecord[], target: string, proje
     }
   }
   return count;
+}
+
+/**
+ * 本会话是否已成功调用过指定工具（全名匹配，如 mcp__ai_coder_tools__find_callsites）。
+ * 与 hasShellRun 同语义但面向任意工具——供 pre_tool_use 的 tool_must_have_run 闸门与 profile 硬闸门共用。
+ */
+export function hasToolRun(toolCalls: ToolCallRecord[], toolName: string): boolean {
+  return toolCalls.some((call) => {
+    if (call.tool !== toolName) return false;
+    return call.status === "approved" || call.status === "completed";
+  });
 }
 
 export function hasShellRun(toolCalls: ToolCallRecord[], needle: string): boolean {

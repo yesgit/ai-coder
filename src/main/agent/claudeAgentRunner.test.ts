@@ -4713,3 +4713,111 @@ describe("extractSdkTerminalError", () => {
     ])).toBe(false);
   });
 });
+
+describe("ClaudeAgentRunner.profile callsite investigation gate", () => {
+  // 普通 profile（不带 simple_profile_loop），避免 delegationGuard 在 investigationGate 之前
+  // 拦截所有 Write/Edit，让测试能专注于 checkCallsiteInvestigationGate 的行为。
+  const profileWorkflow: WorkflowTemplate = {
+    id: "careful-coder-profile",
+    name: "Software Engineering",
+    version: "1.0.0",
+    description: "Test",
+    source: { type: "builtin" as const, id: "software-engineering", version: "1.0.0" },
+    permissions: { filesystem: { mode: "project-only" as const }, shell: { approval_required: true } },
+    rework: { enabled: false, allowed_targets: [], approval_required: true, invalidate_downstream: true },
+    stages: []
+  };
+
+  function makeProfileSession(projectRoot: string, toolCalls: AgentSession["tool_calls"] = []): AgentSession {
+    const now = new Date().toISOString();
+    return {
+      id: "00000000-0000-4000-8000-000000000080",
+      project_path: projectRoot,
+      workflow_id: profileWorkflow.id,
+      task_prompt: "Modify the module",
+      status: "running",
+      current_stage: "profile",
+      messages: [],
+      tool_calls: toolCalls,
+      file_changes: [],
+      approvals: [],
+      stage_runs: [],
+      rework_requests: [],
+      progress_events: [],
+      auto_approve: true,
+      // 非 host-goal 任务树让 profileNeedsPlanning 返回 false，避免 PLAN 阶段守卫拦截写操作
+      task_tree: {
+        goal_restated: "Modify the module",
+        strategy: "直接实施",
+        current_focus: "impl-1",
+        focus_reason: "单一目标",
+        tasks: [{ id: "impl-1", description: "修改模块", dependencies: [], status: "in_progress" as const }],
+        created_at: now,
+        updated_at: now
+      },
+      // fresh checkpoint 让 knowledge-boundary guard 放行，使测试能专注于 investigationGate 的行为
+      exploration_checkpoints: [{
+        revision: 1,
+        text: "已确认目标函数调用方调查结束",
+        disposition: "working" as const,
+        phase: "implement" as const,
+        next_action: "开始实施",
+        source: "agent" as const,
+        observed_tool_call_count: toolCalls.length
+      }],
+      created_at: now,
+      updated_at: now
+    } as unknown as AgentSession;
+  }
+
+  it("未调查时 Edit 已存在文件被 deny，Write 新文件放行", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "gate-runner-"));
+    await mkdir(path.join(root, "src"), { recursive: true });
+    await writeFile(path.join(root, "src", "app.ts"), "export const x = 1;");
+    const deniedTools: string[] = [];
+    const allowedTools: string[] = [];
+    async function* query(params: unknown) {
+      const options = (params as { options?: { canUseTool?: (name: string, input: Record<string, unknown>, opts: { toolUseID: string }) => Promise<unknown> } }).options;
+      const canUseTool = options?.canUseTool;
+      if (canUseTool) {
+        const editResult = await canUseTool("Edit", { file_path: path.join(root, "src", "app.ts"), old_string: "x", new_string: "y" }, { toolUseID: "t-edit-1" });
+        const writeResult = await canUseTool("Write", { file_path: path.join(root, "src", "brand-new.ts"), content: "export const z = 3;" }, { toolUseID: "t-write-1" });
+        if ((editResult as { behavior?: string }).behavior === "deny") deniedTools.push("Edit");
+        else allowedTools.push("Edit");
+        if ((writeResult as { behavior?: string }).behavior === "deny") deniedTools.push("Write");
+        else allowedTools.push("Write");
+      }
+      yield { type: "result", subtype: "success", is_error: false, result: "done" };
+    }
+    await new ClaudeAgentRunner(query).run({ session: makeProfileSession(root), workflow: profileWorkflow });
+    expect(deniedTools).toContain("Edit");
+    expect(deniedTools).not.toContain("Write");
+    expect(allowedTools).toContain("Write");
+  });
+
+  it("预置 find_callsites completed 后 Edit 已存在文件放行", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "gate-runner-"));
+    await mkdir(path.join(root, "src"), { recursive: true });
+    await writeFile(path.join(root, "src", "app.ts"), "export const x = 1;");
+    const investigatedCall: AgentSession["tool_calls"][0] = {
+      id: "mcp-pre",
+      stage_id: "profile",
+      tool: "mcp__ai_coder_tools__find_callsites",
+      input: { symbol: "x" },
+      status: "completed",
+      created_at: new Date().toISOString()
+    };
+    let editBehavior: string | undefined;
+    async function* query(params: unknown) {
+      const options = (params as { options?: { canUseTool?: (name: string, input: Record<string, unknown>, opts: { toolUseID: string }) => Promise<unknown> } }).options;
+      const canUseTool = options?.canUseTool;
+      if (canUseTool) {
+        const result = await canUseTool("Edit", { file_path: path.join(root, "src", "app.ts"), old_string: "x", new_string: "y" }, { toolUseID: "t-edit-2" });
+        editBehavior = (result as { behavior?: string }).behavior;
+      }
+      yield { type: "result", subtype: "success", is_error: false, result: "done" };
+    }
+    await new ClaudeAgentRunner(query).run({ session: makeProfileSession(root, [investigatedCall]), workflow: profileWorkflow });
+    expect(editBehavior).toBe("allow");
+  });
+});
