@@ -255,7 +255,9 @@ registerTaskIpcHandlers(
   orchestrator,
   credentials,
   taskPlatformRegistry,
-  claimedTaskStore
+  claimedTaskStore,
+  settings,
+  reviewWatcher
 );
 
 /**

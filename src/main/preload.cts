@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type { IpcRendererEvent } from "electron";
-import type { AgentSession, AppApi, AppSettings, Attachment, ClaimedTaskRecord, ResolveWorkflowInput, StartSessionInput, TaskClaimResult, UnifiedTask } from "../shared/types.js";
+import type { AgentSession, AppApi, AppSettings, Attachment, ClaimedTaskRecord, ResolveWorkflowInput, StartSessionInput, TaskAutomationSettings, TaskClaimResult, UnifiedTask } from "../shared/types.js";
 
 const api: AppApi = {
   copyText: (text: string) => ipcRenderer.invoke("app:copy-text", text),
@@ -75,6 +75,8 @@ const api: AppApi = {
     ipcRenderer.invoke("credentials:set", platform, token),
   testPlatformConnection: (platform: string) =>
     ipcRenderer.invoke("credentials:test", platform) as Promise<{ ok: boolean; error?: string }>,
+  updateTaskAutomationSettings: (settings: TaskAutomationSettings) =>
+    ipcRenderer.invoke("task:update-automation-settings", settings) as Promise<TaskAutomationSettings>,
   onTaskQueueUpdated: (cb: (tasks: UnifiedTask[]) => void) => {
     const handler = (_event: IpcRendererEvent, tasks: UnifiedTask[]) => cb(tasks);
     ipcRenderer.on("task:queue-updated", handler);

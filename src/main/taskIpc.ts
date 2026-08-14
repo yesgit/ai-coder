@@ -1,10 +1,12 @@
 import { BrowserWindow, ipcMain } from "electron";
-import type { TaskPlatformKind, UnifiedTask } from "../shared/types.js";
+import type { TaskAutomationSettings, TaskPlatformKind, UnifiedTask } from "../shared/types.js";
 import type { CredentialsStore } from "./settings/credentialsStore.js";
+import type { SettingsStore } from "./settings/settingsStore.js";
 import type { ClaimedTaskStore } from "./taskplatform/claimedTaskStore.js";
 import type { TaskClaimManager } from "./taskplatform/taskClaimManager.js";
 import type { TaskPlatformRegistry } from "./taskplatform/taskPlatformRegistry.js";
 import type { TaskScout } from "./taskplatform/taskScout.js";
+import type { ReviewWatcher } from "./taskplatform/reviewWatcher.js";
 import type { SessionOrchestrator } from "./taskplatform/sessionOrchestrator.js";
 
 /**
@@ -16,7 +18,9 @@ export function registerTaskIpcHandlers(
   orchestrator: SessionOrchestrator,
   credentials: CredentialsStore,
   registry: TaskPlatformRegistry,
-  claimedTaskStore: ClaimedTaskStore
+  claimedTaskStore: ClaimedTaskStore,
+  settingsStore: SettingsStore,
+  reviewWatcher: ReviewWatcher
 ): void {
   // 设置侦察完成回调 → 自动编排会话
   scout.onTaskClaimed = async (task: UnifiedTask) => {
@@ -79,9 +83,27 @@ export function registerTaskIpcHandlers(
     }
     const adapter = registry.get(platform as TaskPlatformKind, token);
     if (!adapter) {
-      return { ok: false, error: "平台适配器不可用" };
+      return { ok: false, error: "平台适配器不可用：请先在平台配置中启用该平台并填写地址" };
     }
     return adapter.ping();
+  });
+
+  // 任务自动化配置：保存后立即生效（刷新适配器、重启侦察与 Review 轮询）
+  ipcMain.handle("task:update-automation-settings", async (_event, input: TaskAutomationSettings) => {
+    await settingsStore.update({ task_automation: input });
+    // update 的 partial 不经 sanitize，重新读取拿到净化后的完整配置再驱动联动
+    const clean = (await settingsStore.get()).task_automation;
+    registry.updateConfigs(clean.platforms);
+    scout.stop();
+    reviewWatcher.stop();
+    // allSettled 保证一个启动失败不妨碍另一个被尝试
+    const results = await Promise.allSettled([scout.start(), reviewWatcher.start()]);
+    const rejected = results.find((r): r is PromiseRejectedResult => r.status === "rejected");
+    if (rejected) {
+      const reason = rejected.reason instanceof Error ? rejected.reason.message : String(rejected.reason);
+      throw new Error(`配置已保存，但重启自动轮询失败：${reason}`);
+    }
+    return clean;
   });
 }
 

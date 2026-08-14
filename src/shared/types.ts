@@ -1185,6 +1185,8 @@ export interface AppApi {
   setPlatformCredentials(platform: string, token: string): Promise<void>;
   /** 测试平台连接。 */
   testPlatformConnection(platform: string): Promise<{ ok: boolean; error?: string }>;
+  /** 保存任务自动化配置并立即生效（刷新适配器、重启侦察与 Review 轮询）。 */
+  updateTaskAutomationSettings(settings: TaskAutomationSettings): Promise<TaskAutomationSettings>;
   /** 订阅任务队列变更推送。返回取消订阅函数。 */
   onTaskQueueUpdated(cb: (tasks: UnifiedTask[]) => void): () => void;
 }

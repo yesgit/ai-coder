@@ -1,22 +1,31 @@
 import { useState } from "react";
 import "./styles.css";
 
+interface TaskPlatformSettingsProps {
+  /** 平台标识（jira_cloud / jira_server / pingcode / git_host）。 */
+  platform: string;
+  /** 展示用平台名。 */
+  platformLabel: string;
+}
+
 /**
- * 平台设置面板：凭证配置 + 连接测试。
+ * 单平台凭证配置：Token 输入 + 保存 + 连接测试。
  */
-export default function TaskPlatformSettings() {
-  const [platform, setPlatform] = useState("jira_cloud");
+export default function TaskPlatformSettings({ platform, platformLabel }: TaskPlatformSettingsProps) {
   const [token, setToken] = useState("");
   const [testResult, setTestResult] = useState<{ ok: boolean; error?: string } | null>(null);
   const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
 
   const handleSave = async () => {
     if (!token.trim()) return;
     setSaving(true);
     setTestResult(null);
+    setSaved(false);
     try {
       await window.aiCoder.setPlatformCredentials(platform, token.trim());
       setToken("");
+      setSaved(true);
     } catch (e) {
       setTestResult({ ok: false, error: e instanceof Error ? e.message : String(e) });
     } finally {
@@ -26,6 +35,7 @@ export default function TaskPlatformSettings() {
 
   const handleTest = async () => {
     setTestResult(null);
+    setSaved(false);
     try {
       const result = await window.aiCoder.testPlatformConnection(platform);
       setTestResult(result);
@@ -36,24 +46,15 @@ export default function TaskPlatformSettings() {
 
   return (
     <div className="task-platform-settings">
-      <h3>平台凭证配置</h3>
-
       <div className="settings-row">
-        <label>平台</label>
-        <select value={platform} onChange={(e) => setPlatform(e.target.value)}>
-          <option value="jira_cloud">Jira Cloud</option>
-          <option value="jira_server">Jira Server</option>
-          <option value="pingcode">PingCode</option>
-          <option value="git_host">Git Host (GitHub PAT)</option>
-        </select>
-      </div>
-
-      <div className="settings-row">
-        <label>Token / API Key</label>
+        <label>{platformLabel} 凭证</label>
         <input
           type="password"
           value={token}
-          onChange={(e) => setToken(e.target.value)}
+          onChange={(e) => {
+            setToken(e.target.value);
+            setSaved(false);
+          }}
           placeholder={platform === "jira_cloud" ? "email:api_token" : "API Token"}
         />
       </div>
@@ -65,6 +66,7 @@ export default function TaskPlatformSettings() {
         <button onClick={handleTest} className="secondary">
           测试连接
         </button>
+        {saved && <span className="save-feedback ok">凭证已保存</span>}
       </div>
 
       {testResult && (

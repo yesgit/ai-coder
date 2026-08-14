@@ -2503,3 +2503,699 @@ pre {
   display: flex;
   gap: 8px;
 }
+
+/* ===== 任务自动化面板 ===== */
+
+/* 顶栏按钮激活态（与 terminal-active 一致） */
+.secondary.task-auto-active {
+  background: #146c5f;
+  color: #ffffff;
+}
+
+/* 小尺寸与危险按钮变体 */
+.primary.small,
+.secondary.small,
+.danger.small {
+  min-height: 28px;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.danger {
+  min-height: 38px;
+  border: 1px solid #f6c5bd;
+  border-radius: 8px;
+  background: #fff4f2;
+  padding: 8px 14px;
+  color: #b42318;
+  font-weight: 700;
+}
+
+.danger:hover:not(:disabled) {
+  border-color: #f0a199;
+  background: #fee4e2;
+}
+
+.mono {
+  font-family: "SF Mono", ui-monospace, monospace;
+  font-size: 0.92em;
+}
+
+.task-automation-panel {
+  display: grid;
+  gap: 14px;
+  border: 1px solid #dde2e8;
+  border-radius: 10px;
+  background: #ffffff;
+  padding: 14px;
+}
+
+.task-automation-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.task-automation-title {
+  display: grid;
+  gap: 4px;
+}
+
+.task-automation-title h2 {
+  margin: 0;
+  font-size: 15px;
+  color: #182026;
+}
+
+.task-automation-title p {
+  margin: 0;
+  font-size: 12px;
+  color: #667085;
+}
+
+.scan-button {
+  flex: 0 0 auto;
+}
+
+.error-banner {
+  border: 1px solid #f6c5bd;
+  border-radius: 8px;
+  background: #fff4f2;
+  padding: 8px 12px;
+  color: #b42318;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+/* 状态概览条 */
+.task-summary-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  border: 1px solid #e7ebf0;
+  border-radius: 8px;
+  background: #f8fafc;
+  padding: 8px 10px;
+}
+
+/* 分区与标题 */
+.task-automation-section {
+  display: grid;
+  gap: 10px;
+}
+
+.task-section-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.task-section-heading h3 {
+  margin: 0;
+  font-size: 13px;
+  color: #344054;
+  font-weight: 600;
+}
+
+.task-count-badge {
+  min-width: 20px;
+  border-radius: 999px;
+  background: #edf1f7;
+  padding: 2px 7px;
+  color: #475467;
+  font-size: 11px;
+  font-weight: 600;
+  text-align: center;
+}
+
+/* 空状态 */
+.task-empty {
+  display: grid;
+  gap: 5px;
+  border: 1px dashed #cbd5e1;
+  border-radius: 8px;
+  background: #f8fafc;
+  padding: 14px;
+}
+
+.task-empty strong {
+  color: #344054;
+  font-size: 12px;
+}
+
+.task-empty small {
+  color: #667085;
+  line-height: 1.45;
+}
+
+/* 徽章：平台 / 状态 / 难度 / 标签 */
+.platform-badge {
+  flex: 0 0 auto;
+  border: 1px solid #d3e0dc;
+  border-radius: 999px;
+  background: #eef4f0;
+  padding: 1px 7px;
+  color: #25603f;
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.status-badge {
+  border: 1px solid #d8dee8;
+  border-radius: 999px;
+  background: #f7f9fc;
+  padding: 2px 8px;
+  color: #475467;
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.status-badge.status-claimed {
+  border-color: #d8dee8;
+  background: #f7f9fc;
+  color: #475467;
+}
+
+.status-badge.status-executing {
+  border-color: #b7dfd5;
+  background: #eef8f6;
+  color: #146c5f;
+}
+
+.status-badge.status-pr_submitted,
+.status-badge.status-reviewing {
+  border-color: #f3d18b;
+  background: #fffaf0;
+  color: #7a4b00;
+}
+
+.status-badge.status-merged {
+  border-color: #b7dfd5;
+  background: #eef8f6;
+  color: #146c5f;
+}
+
+.status-badge.status-released {
+  border-color: #d8dee8;
+  background: #f7f9fc;
+  color: #98a2b3;
+}
+
+.status-badge.status-failed {
+  border-color: #f6c5bd;
+  background: #fff4f2;
+  color: #b42318;
+}
+
+.difficulty-badge {
+  border: 1px solid #d8dee8;
+  border-radius: 999px;
+  background: #f7f9fc;
+  padding: 1px 7px;
+  color: #475467;
+  font-size: 10px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.difficulty-badge.difficulty-trivial,
+.difficulty-badge.difficulty-low {
+  border-color: #b7dfd5;
+  background: #eef8f6;
+  color: #146c5f;
+}
+
+.difficulty-badge.difficulty-medium {
+  border-color: #f3d18b;
+  background: #fffaf0;
+  color: #7a4b00;
+}
+
+.difficulty-badge.difficulty-high {
+  border-color: #f6c5bd;
+  background: #fff4f2;
+  color: #b42318;
+}
+
+.label-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.label-chip {
+  border-radius: 4px;
+  background: #f2f4f7;
+  padding: 1px 6px;
+  color: #667085;
+  font-size: 10px;
+}
+
+.review-round-badge {
+  border-radius: 999px;
+  background: #eff4ff;
+  padding: 1px 7px;
+  color: #3538cd;
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* 已认领任务卡片 */
+.claimed-list,
+.scanned-list {
+  display: grid;
+  gap: 8px;
+}
+
+.claimed-card,
+.scanned-card {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid #e1e7ef;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 10px 12px;
+}
+
+.claimed-card.status-executing {
+  border-color: #146c5f;
+  background: #f2fbf8;
+}
+
+.claimed-card.status-failed {
+  border-color: #f6c5bd;
+  background: #fffafa;
+}
+
+.claimed-card-main,
+.scanned-card-main {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+}
+
+.claimed-card-top,
+.scanned-card-top {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.claimed-task-id {
+  color: #182026;
+  font-size: 13px;
+}
+
+.claimed-card-meta {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  color: #667085;
+  font-size: 11px;
+}
+
+.claimed-card-meta .mono {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 220px;
+}
+
+.claimed-card-error {
+  overflow: hidden;
+  border-left: 3px solid #b42318;
+  border-radius: 0 6px 6px 0;
+  background: #fef3f2;
+  padding: 5px 8px;
+  color: #912018;
+  font-size: 11px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.claimed-card-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.mr-link {
+  color: #146c5f;
+  font-size: 12px;
+  font-weight: 700;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.mr-link:hover {
+  text-decoration: underline;
+}
+
+/* 扫描结果卡片 */
+.scanned-task-id {
+  color: #146c5f;
+  font-size: 12px;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.scanned-task-id:hover {
+  text-decoration: underline;
+}
+
+.scanned-title {
+  margin: 0;
+  overflow: hidden;
+  color: #344054;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 420px;
+}
+
+.scanned-card .primary.small {
+  flex: 0 0 auto;
+}
+
+/* 自动化设置区 */
+.review-toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid #e7ebf0;
+  border-radius: 8px;
+  background: #f8fafc;
+  padding: 10px 12px;
+}
+
+.review-toggle-text {
+  display: grid;
+  gap: 2px;
+}
+
+.review-toggle-text strong {
+  color: #344054;
+  font-size: 13px;
+}
+
+.review-toggle-text small {
+  color: #667085;
+  font-size: 11px;
+}
+
+/* 开关 */
+.toggle-switch {
+  position: relative;
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 36px;
+  height: 20px;
+  cursor: pointer;
+}
+
+.toggle-switch input {
+  width: 0;
+  height: 0;
+  opacity: 0;
+}
+
+.toggle-track {
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  background: #d0d5dd;
+  transition: background 0.15s;
+}
+
+.toggle-track::after {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.2);
+  transition: transform 0.15s;
+  content: "";
+}
+
+.toggle-switch input:checked + .toggle-track {
+  background: #146c5f;
+}
+
+.toggle-switch input:checked + .toggle-track::after {
+  transform: translateX(16px);
+}
+
+/* 配置编辑器 */
+.automation-settings-editor {
+  display: grid;
+  gap: 10px;
+}
+
+.polling-interval-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.polling-interval-field label {
+  color: #475467;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.polling-interval-field input {
+  width: 90px;
+  min-height: 30px;
+  border: 1px solid #d0d5dd;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 4px 8px;
+  color: #182026;
+  font-size: 13px;
+}
+
+.polling-interval-field input:focus {
+  outline: none;
+  border-color: #146c5f;
+  box-shadow: 0 0 0 3px rgba(20, 108, 95, 0.1);
+}
+
+/* 平台配置卡片 */
+.platform-card {
+  display: grid;
+  gap: 0;
+  border: 1px solid #e7ebf0;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.platform-card.enabled {
+  border-color: #d3e0dc;
+}
+
+.platform-card-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+}
+
+.platform-card-header strong {
+  color: #344054;
+  font-size: 13px;
+}
+
+.platform-card-body {
+  display: grid;
+  gap: 12px;
+  border-top: 1px solid #eef1f5;
+  padding: 12px;
+}
+
+/* 项目映射 */
+.mapping-section {
+  display: grid;
+  gap: 8px;
+}
+
+.mapping-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.mapping-section-header > label {
+  color: #475467;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.mapping-card {
+  display: grid;
+  gap: 8px;
+  border: 1px solid #e1e7ef;
+  border-radius: 8px;
+  background: #f8fafc;
+  padding: 10px;
+}
+
+.mapping-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.mapping-card-header strong {
+  color: #344054;
+  font-size: 12px;
+}
+
+.mapping-remove {
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  padding: 2px 6px;
+  color: #98a2b3;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.mapping-remove:hover {
+  background: #fff4f2;
+  color: #b42318;
+}
+
+.mapping-grid {
+  display: grid;
+  gap: 8px;
+}
+
+.repo-path-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.repo-path-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.repo-path-row .secondary.small {
+  flex: 0 0 auto;
+}
+
+/* 保存行与反馈 */
+.settings-save-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.save-feedback {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.save-feedback.ok {
+  color: #146c5f;
+}
+
+.save-feedback.error {
+  color: #b42318;
+}
+
+.task-platform-settings {
+  display: grid;
+  gap: 10px;
+}
+
+.task-platform-settings h3 {
+  display: none;
+}
+
+.settings-row {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+}
+
+.settings-row label {
+  color: #475467;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.settings-row select,
+.settings-row input {
+  width: 100%;
+  min-height: 34px;
+  border: 1px solid #d0d5dd;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 6px 10px;
+  color: #182026;
+  font-size: 13px;
+}
+
+.settings-row input:focus,
+.settings-row select:focus {
+  outline: none;
+  border-color: #146c5f;
+  box-shadow: 0 0 0 3px rgba(20, 108, 95, 0.1);
+}
+
+.task-platform-settings .settings-actions {
+  justify-content: flex-end;
+}
+
+.task-platform-settings .settings-actions .primary,
+.task-platform-settings .settings-actions .secondary {
+  min-height: 32px;
+  padding: 6px 12px;
+  font-size: 12px;
+}
+
+.test-result {
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.test-result.success {
+  border: 1px solid #b7dfd5;
+  background: #eef8f6;
+  color: #146c5f;
+}
+
+.test-result.error {
+  border: 1px solid #f6c5bd;
+  background: #fff4f2;
+  color: #b42318;
+}
