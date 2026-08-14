@@ -30,6 +30,7 @@ import {
   validateHierarchicalPlannerEnumeratedCoverage
 } from "./claudeAgentRunner.js";
 import { createHierarchicalExecutionState } from "../workflows/hierarchicalWorkflowEngine.js";
+import { parseHierarchicalRoleResult } from "./hierarchicalRoleProtocol.js";
 
 const workflow: WorkflowTemplate = {
   id: "hierarchical-test",
@@ -1200,6 +1201,160 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     } finally {
       await rm(projectPath, { recursive: true, force: true });
     }
+  });
+
+  it("backfills truthful host census facts from a partial receipt instead of dead-ending omitted fields", async () => {
+    const projectPath = await mkdtemp(path.join(os.tmpdir(), "ai-coder-census-partial-"));
+    try {
+      await writeFile(path.join(projectPath, "feature.ts"), [
+        "export function LQBInvest() {",
+        "  return '零钱宝主页';",
+        "}"
+      ].join("\n"));
+      const report = censusFeatureImplementations({
+        projectPath,
+        feature: "零钱宝主页",
+        aliases: ["LQBInvest"]
+      });
+      expect(report.status).toBe("partial");
+      const stageId = "hierarchical:R33/investigate";
+      const session = { ...createSession(), project_path: projectPath };
+      const censusInput = { feature: "零钱宝主页", aliases: ["LQBInvest"] };
+      session.tool_calls = [{
+        id: "feature-census",
+        stage_id: stageId,
+        tool: "mcp__ai_coder__locate_feature_implementation",
+        input: censusInput,
+        status: "completed",
+        created_at: new Date().toISOString()
+      }];
+      recordFeatureCensusReceipt(session, stageId, censusInput, report);
+      // Mirrors the prompt-guided draft: only applicability + reason are
+      // model-supplied; every other census field is host-owned. A partial
+      // receipt must still be backfilled truthfully instead of leaving the
+      // draft to fail on fields the model was told to omit.
+      const structured = {
+        status: "passed",
+        summary: "investigated",
+        evidence_refs: ["feature.ts:1"],
+        handoff: {
+          feature_census: {
+            applicability: "required",
+            reason: "业务功能需要普查"
+          }
+        }
+      };
+
+      reconcileHierarchicalFeatureCensusHandoff(session, {
+        kind: "run_phase",
+        requirement_id: "R33",
+        work_unit_id: "R33:investigate",
+        phase: "investigate",
+        role: "code-investigator"
+      }, structured, stageId);
+
+      expect(structured.handoff.feature_census).toMatchObject({
+        status: "partial",
+        report_digest: report.report_digest,
+        candidate_accounting: report.candidate_accounting,
+        selected_candidate_ids: report.selected_targets.map((target) => target.candidate_id)
+      });
+    } finally {
+      await rm(projectPath, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a partial-backfilled census draft with the actionable census-incomplete error", async () => {
+    const projectPath = await mkdtemp(path.join(os.tmpdir(), "ai-coder-census-partial-parse-"));
+    try {
+      await writeFile(path.join(projectPath, "feature.ts"), [
+        "export function LQBInvest() {",
+        "  return '零钱宝主页';",
+        "}"
+      ].join("\n"));
+      const report = censusFeatureImplementations({
+        projectPath,
+        feature: "零钱宝主页",
+        aliases: ["LQBInvest"]
+      });
+      expect(report.status).toBe("partial");
+      const stageId = "hierarchical:R33/investigate";
+      const session = { ...createSession(), project_path: projectPath };
+      const censusInput = { feature: "零钱宝主页", aliases: ["LQBInvest"] };
+      session.tool_calls = [{
+        id: "feature-census",
+        stage_id: stageId,
+        tool: "mcp__ai_coder__locate_feature_implementation",
+        input: censusInput,
+        status: "completed",
+        created_at: new Date().toISOString()
+      }];
+      recordFeatureCensusReceipt(session, stageId, censusInput, report);
+      const handoff = handoffFor("investigate", "feature.ts", "reference.ts", true) as Record<string, unknown>;
+      // Prompt-guided drafts omit the host-owned census fields entirely.
+      handoff.feature_census = { applicability: "required", reason: "业务功能需要普查" };
+      const structured = {
+        status: "passed",
+        summary: "investigated",
+        evidence_refs: ["feature.ts:1"],
+        handoff
+      };
+      const operation = {
+        kind: "run_phase" as const,
+        requirement_id: "R33",
+        work_unit_id: "R33:investigate",
+        phase: "investigate" as const,
+        role: "code-investigator"
+      };
+
+      reconcileHierarchicalFeatureCensusHandoff(session, operation, structured, stageId);
+
+      expect(() => parseHierarchicalRoleResult(operation, structured)).toThrow(
+        "功能实现候选普查未 complete，不能结束 investigate"
+      );
+    } finally {
+      await rm(projectPath, { recursive: true, force: true });
+    }
+  });
+
+  it("corrects census digest rejections based on the real receipt status", () => {
+    const operation = {
+      kind: "run_phase" as const,
+      requirement_id: "R33",
+      work_unit_id: "R33:investigate",
+      phase: "investigate" as const,
+      role: "code-investigator"
+    };
+    const digestReason = "handoff.feature_census.report_digest 必须是非空字符串";
+
+    const withComplete = hierarchicalValidationCorrection(operation, digestReason, {
+      status: "complete",
+      candidate_accounting: { total: 1, yes: 1, no: 0, unknown: 0, accounted: true }
+    });
+    expect(withComplete).toContain("宿主会从真实报告自动回填 report_digest");
+
+    // The previously unconditional "host will backfill" message was a lie for
+    // partial receipts and looped the session into a blocked escalation.
+    const withPartial = hierarchicalValidationCorrection(operation, digestReason, {
+      status: "partial",
+      candidate_accounting: { total: 180, yes: 1, no: 20, unknown: 159, accounted: true }
+    });
+    expect(withPartial).toContain("partial");
+    expect(withPartial).toContain("unknown=159");
+    expect(withPartial).toContain("重跑 locate_feature_implementation");
+    expect(withPartial).not.toContain("沿用最后一次 complete");
+
+    const withoutReceipt = hierarchicalValidationCorrection(operation, digestReason, null);
+    expect(withoutReceipt).toContain("没有 complete 回执");
+    expect(withoutReceipt).toContain("重跑 locate_feature_implementation");
+
+    const accountingReason = "feature_census.selected_candidate_ids 必须逐项对应全部 yes 候选：yes=2，selected=1";
+    const accountingPartial = hierarchicalValidationCorrection(operation, accountingReason, {
+      status: "partial",
+      candidate_accounting: { total: 180, yes: 1, no: 20, unknown: 159, accounted: true }
+    });
+    expect(accountingPartial).toContain("没有 complete 普查报告可回填");
+    expect(accountingPartial).toContain("重跑 locate_feature_implementation");
   });
 
   it("reconciles dispatcher branch contracts to one census-owned destination component", async () => {

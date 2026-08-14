@@ -898,7 +898,13 @@ export class ClaudeAgentRunner {
       }
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      const correction = hierarchicalValidationCorrection(operation, reason);
+      const correction = hierarchicalValidationCorrection(
+        operation,
+        reason,
+        operation.kind === "run_phase" && operation.phase === "investigate"
+          ? getLatestHierarchicalFeatureCensusEvidence(input.session, stageId)?.receipt ?? null
+          : null
+      );
       throw new HierarchicalRoleValidationError(
         `${reason}\n可原地修正：${correction}`,
         formatRejectedHierarchicalOutput(structured)
@@ -3645,11 +3651,20 @@ export function validateHierarchicalContractToolEvidence(
 }
 
 /**
- * Census digests, counts and selected ids are host-owned facts. Once the last
- * real tool call is complete, copy those facts into the model draft before
- * schema validation instead of forcing the model to transcribe a 64-byte hash
- * and derived counters. The semantic evidence gate below still recomputes and
+ * Census digests, counts and selected ids are host-owned facts. Once a real
+ * tool call exists, copy those facts into the model draft before schema
+ * validation instead of forcing the model to transcribe a 64-byte hash and
+ * derived counters. The semantic evidence gate below still recomputes and
  * verifies the report from the recorded tool input.
+ *
+ * The backfill must also run for partial reports. The investigate prompt and
+ * schema tell the model to submit only applicability + reason and leave these
+ * fields to the host, so skipping the backfill for a partial receipt makes the
+ * draft fail protocol validation on fields the model was told to omit -- a
+ * dead end that previously looped until the bounded-recovery cap blocked the
+ * session. Overwriting with the truthful report status turns the dead end
+ * into the actionable "普查未 complete" rejection, which routes the model back
+ * to re-running the census with accumulated adjudications.
  */
 export function reconcileHierarchicalFeatureCensusHandoff(
   session: AgentSession,
@@ -3671,8 +3686,11 @@ export function reconcileHierarchicalFeatureCensusHandoff(
   if (!census || census.applicability !== "required") return;
   const evidence = getLatestHierarchicalFeatureCensusEvidence(session, stageId);
   const report = evidence?.receipt;
-  if (!report || report.status !== "complete") return;
-  census.status = "complete";
+  if (!report) return;
+  // Host-owned facts are always overwritten, including a truthful "partial"
+  // status; a model-claimed "complete" over a partial report is a forgery the
+  // protocol gate must not accept as an honest draft.
+  census.status = report.status;
   census.report_digest = report.report_digest;
   census.candidate_accounting = { ...report.candidate_accounting };
   census.selected_candidate_ids = report.selected_targets.map(
@@ -5464,13 +5482,25 @@ export function hierarchicalValidationCorrection(
   operation: Extract<HierarchicalNextOperation, {
     kind: "run_alignment_batch" | "run_planner" | "run_phase" | "run_integrator"
   }>,
-  reason: string
+  reason: string,
+  featureCensusReceipt?: Pick<FeatureCensusReceipt, "status" | "candidate_accounting"> | null
 ): string {
   if (/feature_census\.report_digest/.test(reason)) {
-    return "不要重跑普查或手工计算哈希；沿用最后一次 complete 的 locate_feature_implementation 调用并重新提交草稿，宿主会从真实报告自动回填 report_digest。";
+    if (featureCensusReceipt?.status === "complete") {
+      return "不要重跑普查或手工计算哈希；沿用最后一次 complete 的 locate_feature_implementation 调用并重新提交草稿，宿主会从真实报告自动回填 report_digest。";
+    }
+    // 没有 complete 回执时承诺“宿主回填”是谎言：模型按此原样重交只会以同一
+    // 原因再次被拒，最终升级为阻塞。如实说明现状并指引重跑普查至 complete。
+    const censusState = featureCensusReceipt
+      ? `最后一次普查仍为 partial（unknown=${featureCensusReceipt.candidate_accounting.unknown}）`
+      : "本阶段最后一次普查没有 complete 回执";
+    return `${censusState}，宿主没有可回填的 complete 报告，也不要手工填写 report_digest：沿用相同 feature、aliases、clues 与 scope 重跑 locate_feature_implementation，逐项裁决剩余 unknown 并累计 adjudications，直到 status=complete 后重新提交；status/report_digest/计数/selected ids 一律由宿主从真实报告回填。`;
   }
   if (/feature_census\.(?:candidate_accounting|selected_candidate_ids)/.test(reason)) {
-    return "不要重跑普查；沿用最后一次 complete 报告重新提交草稿，宿主会从真实报告自动回填候选计数和全部 yes candidate id。";
+    if (featureCensusReceipt?.status === "complete") {
+      return "不要重跑普查；沿用最后一次 complete 报告重新提交草稿，宿主会从真实报告自动回填候选计数和全部 yes candidate id。";
+    }
+    return "宿主没有 complete 普查报告可回填候选计数与 selected ids，不要手工编造：沿用相同 feature、aliases、clues 与 scope 重跑 locate_feature_implementation 并累计 adjudications，直到 status=complete 后重新提交，相关字段由宿主从真实报告回填。";
   }
   if (/功能实现候选普查|feature_census|locate_feature_implementation/.test(reason)) {
     return "沿用上次完全相同的 feature、aliases、clues 与 scope 调用 locate_feature_implementation；对每个 unknown 逐项读取代码，若 unresolved 指向自动判为 yes 但实际无关的动态包装器也应以 no 覆盖，并把此前及本次全部 yes/no、reason、path:line adjudications 累计提交。只有 status=complete 且最终 yes 集合完整记账后才能提交 investigate；最终复用目标的完整调用契约由 prepare 调查。";
