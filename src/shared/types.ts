@@ -906,6 +906,99 @@ export interface StartSessionResult {
   session: AgentSession;
 }
 
+// ─── 任务自动化类型 ───────────────────────────────────────────────────────────
+
+export type TaskPlatformKind = "jira_cloud" | "jira_server" | "pingcode";
+export type DifficultyLevel = "trivial" | "low" | "medium" | "high" | "unknown";
+
+export interface TaskProjectMapping {
+  platform_project_id: string;
+  local_repo_path: string;
+  workflow_id: string;
+  default_base_branch: string;
+  branch_prefix: string;
+  target_labels: string[];
+  exclude_statuses: string[];
+  /** Jira 专用：状态名 → transition ID 映射 */
+  transition_ids?: Record<string, string>;
+}
+
+export interface TaskPlatformConfig {
+  kind: TaskPlatformKind;
+  enabled: boolean;
+  base_url: string;
+  credentials: { stored: boolean };
+  project_mappings: TaskProjectMapping[];
+}
+
+export interface UnifiedTask {
+  platform: TaskPlatformKind;
+  task_id: string;
+  title: string;
+  description: string;
+  status: string;
+  assignee: string | null;
+  labels: string[];
+  priority: string | null;
+  difficulty_estimate: DifficultyLevel;
+  project_mapping: TaskProjectMapping;
+  raw_url: string;
+  fetched_at: string;
+}
+
+export interface TaskSearchQuery {
+  project_ids: string[];
+  labels: string[];
+  exclude_statuses: string[];
+  unassigned_only: boolean;
+  max_results: number;
+}
+
+export interface TaskClaimResult {
+  success: boolean;
+  task: UnifiedTask;
+  branch: string;
+  claimed_at: string;
+  session_id?: string;
+  error?: string;
+}
+
+export type ClaimedTaskStatus =
+  | "claimed"
+  | "executing"
+  | "pr_submitted"
+  | "merged"
+  | "released"
+  | "failed";
+
+export interface ClaimedTaskRecord {
+  task_id: string;
+  platform: TaskPlatformKind;
+  branch: string;
+  base_branch: string;
+  repo_path: string;
+  session_id: string | null;
+  status: ClaimedTaskStatus;
+  claimed_at: string;
+  updated_at: string;
+  pr_url: string | null;
+  failure_count: number;
+  last_error: string | null;
+}
+
+export type GitHostKind = "github" | "gitlab" | "auto";
+
+export interface TaskAutomationSettings {
+  enabled: boolean;
+  polling_interval_seconds: number;
+  concurrent_task_limit: number;
+  max_failure_count_before_pause: number;
+  platforms: TaskPlatformConfig[];
+  git_host: { kind: GitHostKind; token_stored: boolean };
+  auto_run_tests: boolean;
+  difficulty_filter: DifficultyLevel[];
+}
+
 /**
  * 应用级可配置设置。持久化在 ~/.ai-coder/settings.json，启动时读取并合并默认值。
  * 新增字段时必须在 DEFAULT_APP_SETTINGS 中提供默认值。
@@ -919,11 +1012,23 @@ export interface AppSettings {
   commit_mark: string;
   /** 是否启用 commit 印记功能。false 时即使 commit_mark 非空也不追加。 */
   commit_mark_enabled: boolean;
+  /** 任务自动化配置（Jira / PingCode 自动认领）。默认关闭。 */
+  task_automation: TaskAutomationSettings;
 }
 
 export const DEFAULT_APP_SETTINGS: AppSettings = {
   commit_mark: "Generated-by: AI Coder",
-  commit_mark_enabled: true
+  commit_mark_enabled: true,
+  task_automation: {
+    enabled: false,
+    polling_interval_seconds: 300,
+    concurrent_task_limit: 1,
+    max_failure_count_before_pause: 3,
+    platforms: [],
+    git_host: { kind: "auto", token_stored: false },
+    auto_run_tests: true,
+    difficulty_filter: ["trivial", "low"]
+  }
 };
 
 export interface AgentRuntimeStatus {
@@ -989,4 +1094,20 @@ export interface AppApi {
   terminalDestroy(terminalId: string): void;
   /** 终端：订阅终端输出。返回取消订阅函数。 */
   onTerminalData(terminalId: string, cb: (data: string) => void): () => void;
+
+  // ─── 任务自动化 ─────────────────────────────────────────────────────────
+  /** 获取已认领任务队列。 */
+  getTaskQueue(): Promise<ClaimedTaskRecord[]>;
+  /** 手动触发一次任务侦察扫描。 */
+  triggerTaskScan(): Promise<UnifiedTask[]>;
+  /** 手动认领指定任务。 */
+  claimTask(task: UnifiedTask): Promise<TaskClaimResult>;
+  /** 释放（取消认领）指定任务。 */
+  releaseTask(taskId: string, reason: string): Promise<void>;
+  /** 设置平台凭证（经 safeStorage 加密存储）。 */
+  setPlatformCredentials(platform: string, token: string): Promise<void>;
+  /** 测试平台连接。 */
+  testPlatformConnection(platform: string): Promise<{ ok: boolean; error?: string }>;
+  /** 订阅任务队列变更推送。返回取消订阅函数。 */
+  onTaskQueueUpdated(cb: (tasks: UnifiedTask[]) => void): () => void;
 }

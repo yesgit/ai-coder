@@ -34,7 +34,8 @@ describe("SettingsStore", () => {
     const updated = await store.update({ commit_mark_enabled: false });
     expect(updated).toEqual({
       commit_mark: "Custom Mark",
-      commit_mark_enabled: false
+      commit_mark_enabled: false,
+      task_automation: DEFAULT_APP_SETTINGS.task_automation
     });
   });
 

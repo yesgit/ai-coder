@@ -71,10 +71,45 @@ export class SettingsStore {
     if (typeof input.commit_mark_enabled === "boolean") {
       result.commit_mark_enabled = input.commit_mark_enabled;
     }
+    // 任务自动化配置
+    if (isPlainObject(input.task_automation)) {
+      result.task_automation = sanitizeTaskAutomation(input.task_automation);
+    }
     return result;
   }
 }
 
 function isMissingPathError(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function sanitizeTaskAutomation(input: unknown): AppSettings["task_automation"] {
+  const defaults = DEFAULT_APP_SETTINGS.task_automation;
+  if (!isPlainObject(input)) return { ...defaults };
+
+  return {
+    enabled: typeof input.enabled === "boolean" ? input.enabled : defaults.enabled,
+    polling_interval_seconds: typeof input.polling_interval_seconds === "number" && input.polling_interval_seconds >= 30
+      ? input.polling_interval_seconds
+      : defaults.polling_interval_seconds,
+    concurrent_task_limit: typeof input.concurrent_task_limit === "number" && input.concurrent_task_limit >= 1
+      ? input.concurrent_task_limit
+      : defaults.concurrent_task_limit,
+    max_failure_count_before_pause: typeof input.max_failure_count_before_pause === "number" && input.max_failure_count_before_pause >= 1
+      ? input.max_failure_count_before_pause
+      : defaults.max_failure_count_before_pause,
+    platforms: Array.isArray(input.platforms) ? input.platforms : defaults.platforms,
+    git_host: isPlainObject(input.git_host) ? {
+      kind: input.git_host.kind === "github" || input.git_host.kind === "gitlab" || input.git_host.kind === "auto"
+        ? input.git_host.kind
+        : defaults.git_host.kind,
+      token_stored: typeof input.git_host.token_stored === "boolean" ? input.git_host.token_stored : false
+    } : defaults.git_host,
+    auto_run_tests: typeof input.auto_run_tests === "boolean" ? input.auto_run_tests : defaults.auto_run_tests,
+    difficulty_filter: Array.isArray(input.difficulty_filter) ? input.difficulty_filter : defaults.difficulty_filter
+  };
 }

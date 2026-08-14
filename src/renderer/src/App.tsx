@@ -38,6 +38,7 @@ import {
   formatWorkflowName
 } from "./labels.js";
 import TerminalPanel from "./TerminalPanel.js";
+import TaskAutomationPanel from "./TaskAutomationPanel.js";
 import "./styles.css";
 
 // 单选/多选时 UI 自动追加的"其他"虚拟选项值——选中后提交前会被替换成用户输入的自定义文本，
@@ -66,6 +67,7 @@ export default function App() {
   const [mentionTarget, setMentionTarget] = useState<"task" | "chat">("task");
   const [dragOverTarget, setDragOverTarget] = useState<"task" | "chat" | null>(null);
   const [showTerminal, setShowTerminal] = useState(false);
+  const [showTaskAutomation, setShowTaskAutomation] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
   const [settingsDraft, setSettingsDraft] = useState<{ commit_mark: string; commit_mark_enabled: boolean }>({
@@ -943,6 +945,7 @@ export default function App() {
             </div>}
             <button className="secondary" disabled={busy} onClick={chooseProject}>{busy ? "选择中..." : "选择项目"}</button>
             <button className={`secondary${showTerminal ? " terminal-active" : ""}`} disabled={!projectPath} onClick={() => setShowTerminal((s) => !s)} title="Claude 终端">{">_"}</button>
+            <button className={`secondary${showTaskAutomation ? " task-auto-active" : ""}`} onClick={() => setShowTaskAutomation((s) => !s)} title="任务自动化">📋</button>
             <button className="secondary" onClick={() => { void refreshSettings(); setShowSettings(true); }} title="应用设置">⚙</button>
           </div>
         </header>
@@ -1471,6 +1474,9 @@ export default function App() {
                 projectPath={projectPath}
                 onClose={() => setShowTerminal(false)}
               />
+            )}
+            {showTaskAutomation && (
+              <TaskAutomationPanel />
             )}
           </div>
 

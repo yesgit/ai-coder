@@ -9,9 +9,19 @@ import { ClaudeAgentRunner } from "./agent/claudeAgentRunner.js";
 import { resolveCarefulCoderPluginPath } from "./agent/carefulCoderPlugin.js";
 import { normalizeAnthropicBaseUrl, selectClaudeProviderEnvironment } from "./agent/claudeRuntime.js";
 import { registerIpcHandlers } from "./ipc.js";
+import { registerTaskIpcHandlers } from "./taskIpc.js";
 import { SessionStore } from "./sessions/sessionStore.js";
 import { SettingsStore } from "./settings/settingsStore.js";
+import { CredentialsStore } from "./settings/credentialsStore.js";
 import { WorkflowRegistry } from "./workflows/workflowRegistry.js";
+import { AuthorizedProjects } from "./security/authorizedProjects.js";
+import { BranchManager } from "./taskplatform/branchManager.js";
+import { ClaimedTaskStore } from "./taskplatform/claimedTaskStore.js";
+import { PRSubmissionManager } from "./taskplatform/prSubmissionManager.js";
+import { SessionOrchestrator } from "./taskplatform/sessionOrchestrator.js";
+import { TaskClaimManager } from "./taskplatform/taskClaimManager.js";
+import { TaskPlatformRegistry } from "./taskplatform/taskPlatformRegistry.js";
+import { TaskScout } from "./taskplatform/taskScout.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -147,15 +157,62 @@ const carefulCoderPluginPath = resolveCarefulCoderPluginPath({
 
 const sessions = new SessionStore();
 const settings = new SettingsStore();
+const credentials = new CredentialsStore();
+const authorizedProjects = new AuthorizedProjects();
+const workflowRegistry = new WorkflowRegistry(builtinWorkflowDir);
+const branchManager = new BranchManager();
+const claimedTaskStore = new ClaimedTaskStore();
+
+// 任务自动化模块
+const taskPlatformRegistry = new TaskPlatformRegistry([]);
+const claimManager = new TaskClaimManager(
+  taskPlatformRegistry,
+  branchManager,
+  claimedTaskStore,
+  authorizedProjects,
+  settings
+);
+const prManager = new PRSubmissionManager(
+  branchManager,
+  taskPlatformRegistry,
+  claimedTaskStore,
+  settings,
+  () => credentials.get("git_host")
+);
+const orchestrator = new SessionOrchestrator(
+  sessions,
+  workflowRegistry,
+  new ClaudeAgentRunner({
+    pluginPaths: [carefulCoderPluginPath],
+    getCommitMark: () => settings.getCommitMark()
+  }),
+  authorizedProjects,
+  claimedTaskStore,
+  prManager
+);
+const taskScout = new TaskScout(
+  taskPlatformRegistry,
+  claimManager,
+  settings,
+  (kind) => credentials.get(kind)
+);
 
 registerIpcHandlers(
-  new WorkflowRegistry(builtinWorkflowDir),
+  workflowRegistry,
   sessions,
   settings,
   new ClaudeAgentRunner({
     pluginPaths: [carefulCoderPluginPath],
     getCommitMark: () => settings.getCommitMark()
   })
+);
+registerTaskIpcHandlers(
+  taskScout,
+  claimManager,
+  orchestrator,
+  credentials,
+  taskPlatformRegistry,
+  claimedTaskStore
 );
 
 /**
@@ -187,6 +244,13 @@ app.whenReady().then(async () => {
   await applyClaudeSettingsEnvironment();
   await reconcileInterruptedSessions(sessions);
   await createWindow();
+
+  // 任务自动化：若已启用则启动侦察服务
+  const taskSettings = (await settings.get()).task_automation;
+  if (taskSettings.enabled) {
+    taskPlatformRegistry.updateConfigs(taskSettings.platforms);
+    await taskScout.start();
+  }
 });
 
 app.on("activate", () => {

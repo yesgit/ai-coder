@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type { IpcRendererEvent } from "electron";
-import type { AgentSession, AppApi, AppSettings, Attachment, ResolveWorkflowInput, StartSessionInput } from "../shared/types.js";
+import type { AgentSession, AppApi, AppSettings, Attachment, ClaimedTaskRecord, ResolveWorkflowInput, StartSessionInput, TaskClaimResult, UnifiedTask } from "../shared/types.js";
 
 const api: AppApi = {
   copyText: (text: string) => ipcRenderer.invoke("app:copy-text", text),
@@ -63,6 +63,23 @@ const api: AppApi = {
     ipcRenderer.on("terminal:data", handler);
     return () => {
       ipcRenderer.removeListener("terminal:data", handler);
+    };
+  },
+
+  // ─── 任务自动化 ─────────────────────────────────────────────────────────
+  getTaskQueue: () => ipcRenderer.invoke("task:get-queue") as Promise<ClaimedTaskRecord[]>,
+  triggerTaskScan: () => ipcRenderer.invoke("task:scan") as Promise<UnifiedTask[]>,
+  claimTask: (task: UnifiedTask) => ipcRenderer.invoke("task:claim", task) as Promise<TaskClaimResult>,
+  releaseTask: (taskId: string, reason: string) => ipcRenderer.invoke("task:release", taskId, reason),
+  setPlatformCredentials: (platform: string, token: string) =>
+    ipcRenderer.invoke("credentials:set", platform, token),
+  testPlatformConnection: (platform: string) =>
+    ipcRenderer.invoke("credentials:test", platform) as Promise<{ ok: boolean; error?: string }>,
+  onTaskQueueUpdated: (cb: (tasks: UnifiedTask[]) => void) => {
+    const handler = (_event: IpcRendererEvent, tasks: UnifiedTask[]) => cb(tasks);
+    ipcRenderer.on("task:queue-updated", handler);
+    return () => {
+      ipcRenderer.removeListener("task:queue-updated", handler);
     };
   }
 };

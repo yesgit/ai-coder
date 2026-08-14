@@ -14,9 +14,8 @@ import { SettingsStore } from "./settings/settingsStore.js";
 import { WorkflowEngine } from "./workflows/workflowEngine.js";
 import { WorkflowRegistry } from "./workflows/workflowRegistry.js";
 import { WorkflowRouter } from "./workflows/workflowRouter.js";
+import { runSessionInBackground, stopBackgroundSession } from "./sessions/sessionRunner.js";
 import { PtyManager } from "./ptyManager.js";
-
-const backgroundSessionRuns = new Map<string, Promise<void>>();
 
 export function registerIpcHandlers(registry: WorkflowRegistry, sessions: SessionStore, settingsStore: SettingsStore, runner: ClaudeAgentRunner): void {
   const authorizedProjects = new AuthorizedProjects();
@@ -132,7 +131,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     workflowEngine.approveStage(session, workflow, stageId);
     session.status = "running";
     await sessions.save(session);
-    runSessionInBackground(runner, sessions, session, workflow, queuedUserMessages);
+    runSessionInBackground({ runner, sessions, session, workflow, queuedUserMessages, workflowEngine });
     return session;
   });
 
@@ -149,7 +148,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     workflowEngine.approveRework(session, workflow, requestId);
     session.status = "running";
     await sessions.save(session);
-    runSessionInBackground(runner, sessions, session, workflow, queuedUserMessages);
+    runSessionInBackground({ runner, sessions, session, workflow, queuedUserMessages, workflowEngine });
     return session;
   });
 
@@ -163,7 +162,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     if (session.status === "running") {
       const workflow = await registry.get(session.workflow_id, session.project_path);
       if (workflow) {
-        runSessionInBackground(runner, sessions, session, workflow, queuedUserMessages);
+        runSessionInBackground({ runner, sessions, session, workflow, queuedUserMessages, workflowEngine });
       }
     }
     return session;
@@ -195,7 +194,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     workflowEngine.ensureState(session, workflow);
     session.status = "running";
     await sessions.save(session);
-    runSessionInBackground(runner, sessions, session, workflow, queuedUserMessages);
+    runSessionInBackground({ runner, sessions, session, workflow, queuedUserMessages, workflowEngine });
     return session;
   });
 
@@ -214,7 +213,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     }
     workflowEngine.resumeFromFailedStage(session, workflow);
     await sessions.save(session);
-    runSessionInBackground(runner, sessions, session, workflow, queuedUserMessages);
+    runSessionInBackground({ runner, sessions, session, workflow, queuedUserMessages, workflowEngine });
     return session;
   });
 
@@ -275,7 +274,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
       session.onboarding.project_profile_enabled = options?.includeProjectProfile !== false;
     }
     await sessions.save(session);
-    runSessionInBackground(runner, sessions, session, workflow, queuedUserMessages);
+    runSessionInBackground({ runner, sessions, session, workflow, queuedUserMessages, workflowEngine });
     return session;
   });
 
@@ -297,7 +296,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     }
     await sessions.save(session);
     queuedUserMessages.delete(session.id);
-    runSessionInBackground(runner, sessions, session, workflow, queuedUserMessages);
+    runSessionInBackground({ runner, sessions, session, workflow, queuedUserMessages, workflowEngine });
     return session;
   });
 
@@ -350,7 +349,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     if (!stillPendingQuestion && !hasPendingToolApproval && !hasPendingStageApproval) {
       session.status = "running";
       await sessions.save(session);
-      runSessionInBackground(runner, sessions, session, workflow, queuedUserMessages);
+      runSessionInBackground({ runner, sessions, session, workflow, queuedUserMessages, workflowEngine });
     } else {
       await sessions.save(session);
     }
@@ -396,7 +395,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
     }
     session.status = "running";
     await sessions.save(session);
-    runSessionInBackground(runner, sessions, session, workflow, queuedUserMessages);
+    runSessionInBackground({ runner, sessions, session, workflow, queuedUserMessages, workflowEngine });
     return { session };
   });
 
@@ -515,7 +514,7 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
       session.status = "running";
     }
     await sessions.save(session);
-    runSessionInBackground(runner, sessions, session, workflow, queuedUserMessages);
+    runSessionInBackground({ runner, sessions, session, workflow, queuedUserMessages, workflowEngine });
     return session;
   });
 
@@ -566,128 +565,6 @@ export function registerIpcHandlers(registry: WorkflowRegistry, sessions: Sessio
   ipcMain.on("terminal:destroy", (_event, terminalId: string) => {
     ptyManager.destroy(terminalId);
   });
-}
-
-function runSessionInBackground(
-  runner: ClaudeAgentRunner,
-  sessions: SessionStore,
-  session: Awaited<ReturnType<SessionStore["create"]>>,
-  workflow: NonNullable<Awaited<ReturnType<WorkflowRegistry["get"]>>>,
-  queuedUserMessages: Map<string, AgentSession["messages"]>
-): void {
-  const backgroundRun = runner
-    .run({
-      session,
-      workflow,
-      onProgress: async (updated) => {
-        await sessions.save(updated);
-        broadcastSessionProgress(updated);
-      },
-      takeQueuedUserMessages: () => {
-        const queued = queuedUserMessages.get(session.id) ?? [];
-        if (queued.length > 0) {
-          queuedUserMessages.delete(session.id);
-        }
-        return queued;
-      }
-    })
-    .then(async (updated) => {
-      const queued = queuedUserMessages.get(updated.id) ?? [];
-      if (queued.length > 0) {
-        queuedUserMessages.delete(updated.id);
-        appendMissingMessages(updated, queued);
-        updated.progress_events ??= [];
-        updated.progress_events.push({
-          id: randomUUID(),
-          type: "status",
-          message: `继续处理 ${queued.length} 条运行期间收到的用户消息。`,
-          visibility: "milestone",
-          created_at: new Date().toISOString()
-        });
-        if (updated.status !== "waiting_approval") {
-          const workflowEngine = new WorkflowEngine();
-          if (!workflowEngine.getActiveStageRun(updated)) {
-            workflowEngine.startFollowUp(updated, workflow, queued.at(-1)?.content || "Follow-up user message");
-          } else {
-            updated.status = "running";
-          }
-        }
-        await sessions.save(updated);
-        broadcastSessionProgress(updated);
-        if (updated.status === "running") {
-          runSessionInBackground(runner, sessions, updated, workflow, queuedUserMessages);
-        }
-        return;
-      }
-      await sessions.save(updated);
-      broadcastSessionProgress(updated);
-    })
-    .catch(async (error) => {
-      const queued = queuedUserMessages.get(session.id) ?? [];
-      if (queued.length > 0) {
-        queuedUserMessages.delete(session.id);
-        appendMissingMessages(session, queued);
-      }
-      session.status = "failed";
-      session.error = error instanceof Error ? error.message : String(error);
-      await sessions.save(session);
-      broadcastSessionProgress(session);
-    });
-  backgroundSessionRuns.set(session.id, backgroundRun);
-  void backgroundRun.finally(() => {
-    if (backgroundSessionRuns.get(session.id) === backgroundRun) {
-      backgroundSessionRuns.delete(session.id);
-    }
-  }).catch(() => {
-    // 主链已经负责记录错误；这里只防止 finally 派生 Promise 产生未处理拒绝。
-  });
-}
-
-async function stopBackgroundSession(
-  runner: ClaudeAgentRunner,
-  sessionId: string,
-  queuedUserMessages: Map<string, AgentSession["messages"]>
-): Promise<void> {
-  while (true) {
-    queuedUserMessages.delete(sessionId);
-    runner.abort(sessionId);
-    const active = backgroundSessionRuns.get(sessionId);
-    if (!active) break;
-    await active;
-    if (backgroundSessionRuns.get(sessionId) === active) {
-      backgroundSessionRuns.delete(sessionId);
-    }
-  }
-  queuedUserMessages.delete(sessionId);
-}
-
-function appendMissingMessages(session: AgentSession, messages: AgentSession["messages"]): void {
-  for (const message of messages) {
-    const exists = session.messages.some(
-      (item) =>
-        item.role === message.role &&
-        item.created_at === message.created_at &&
-        item.content === message.content
-    );
-    if (!exists) {
-      session.messages.push(message);
-    }
-  }
-}
-
-/**
- * 把会话进度推送给所有渲染窗口。后台 runner 脱离 IPC handler 上下文（拿不到 event.sender），
- * 故用 BrowserWindow.getAllWindows() 广播——单窗口 app 等价于直送，多窗口也正确。
- *
- * 渲染端收到后按 sessionId 匹配更新对应会话，避免依赖 3s 轮询才能看到"在跑"。
- * 推送整个 session 对象：onProgress 频率中等（每个 SDK 消息/工具决策/状态变化一次），
- * 渲染端直接更新对应 session 条目（React 自动 batch，timeline rebuild 开销可控）。
- * 若后续 session 体积变大或频率升高导致 IPC 压力，可改为增量 payload + 渲染端 debounce。
- */
-function broadcastSessionProgress(session: AgentSession): void {
-  for (const win of BrowserWindow.getAllWindows()) {
-    win.webContents.send("session:progress", session);
-  }
 }
 
 function normalizeRoutingSnapshot(input: StartSessionInput): SessionRoutingSnapshot {
