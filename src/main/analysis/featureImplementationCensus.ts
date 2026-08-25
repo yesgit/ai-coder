@@ -59,6 +59,11 @@ export interface FeatureImplementationCandidate {
   kind: "function" | "method" | "class" | "component";
   role: "entry" | "dispatcher-or-wrapper" | "component" | "implementation" | "service";
   definition: SourceLocation;
+  source_span: {
+    start_line: number;
+    end_line: number;
+  };
+  retrieval_score: number;
   why_possible: string[];
   evidence_for: FeatureEvidence[];
   evidence_against: FeatureEvidence[];
@@ -201,6 +206,18 @@ const SEARCH_CHANNELS = [
 ] as const;
 const MAX_GRAPH_HOPS = 2;
 const MAX_ADJUDICATION_BATCH = 24;
+const MAX_TOOL_RESULT_BYTES = 16_000;
+const MAX_TOOL_RESULT_TEXT = 240;
+const MAX_AUTO_FULL_DEFINITIONS = 2;
+const MAX_AUTO_FULL_DEFINITION_BYTES = 5_000;
+const MAX_INLINE_SNIPPET_BYTES = 1_800;
+const MAX_INLINE_SNIPPET_LINES = 16;
+const READ_CONTEXT_PAGE_LINES = 160;
+
+export interface FeatureCensusToolResultOptions {
+  projectPath?: string;
+  autoFullDefinitionCount?: number;
+}
 
 /**
  * Host-owned feature implementation census.
@@ -263,7 +280,10 @@ export function censusFeatureImplementations(
         (term.polarity === "negative" ? candidate.evidenceAgainst : candidate.evidence).push(item);
         directCandidateIds.add(candidate.id);
       }
-      if (matchesValue(candidate.definition.file, term)) {
+      // A filename match describes the file's public/top-level role, not each
+      // method nested inside it. Promoting every nested method is what turned a
+      // single component into dozens of manual adjudications.
+      if (!candidate.nested && matchesValue(candidate.definition.file, term)) {
         const item = evidence(
           term.polarity === "negative" ? "negative-clue" : "file-path",
           candidate.definition,
@@ -441,19 +461,53 @@ export function censusFeatureImplementations(
  * Actionable adjudication projection returned to the model-facing MCP tool.
  *
  * The full report can be hundreds of kilobytes because graph paths repeat
- * evidence for every candidate. Unknown candidates are returned in bounded
- * batches; the host still retains the full report and rejected candidates stay
- * auditable instead of disappearing behind a count. Keeping the digest near
- * the beginning also prevents it from disappearing when an SDK externalizes
- * oversized results.
+ * evidence for every candidate. Unknown candidates are returned in bounded,
+ * size-capped batches; rejected decisions remain auditable in the cumulative
+ * tool input and host digest, but are not echoed on every later call. Keeping
+ * the digest and actionable ids inline prevents the SDK from externalizing the
+ * result to a tool-results directory outside the project sandbox.
  */
 export function formatFeatureImplementationCensusToolResult(
-  report: FeatureImplementationCensusReport
+  report: FeatureImplementationCensusReport,
+  options: FeatureCensusToolResultOptions = {}
 ): string {
-  const unresolved = report.unresolved.filter(
+  const unresolvedItems = report.unresolved.filter(
     (item) => !item.startsWith("候选尚未逐项判定：")
   );
-  return JSON.stringify({
+  const unknownCandidates = report.candidates
+    .filter((candidate) => candidate.verdict === "unknown")
+    .sort(comparePublicCandidateRelevance)
+    .slice(0, MAX_ADJUDICATION_BATCH)
+    .map((candidate, index) => ({
+      // Match the adjudications input field exactly. Returning this as `id`
+      // previously encouraged models to guess/rename the value and caused
+      // "candidate does not exist" retries.
+      candidate_id: candidate.id,
+      symbol: compactToolResultText(candidate.symbol),
+      kind: candidate.kind,
+      role: candidate.role,
+      retrieval_score: candidate.retrieval_score,
+      definition: {
+        file: candidate.definition.file,
+        line: candidate.definition.line,
+        column: candidate.definition.column
+      },
+      verdict: candidate.verdict,
+      verdict_reason: compactToolResultText(candidate.verdict_reason),
+      // The definition is always valid candidate-scoped evidence. The model
+      // reads this location before deciding and can submit the same path:line.
+      evidence_ref: `${candidate.definition.file}:${candidate.definition.line}`,
+      clue: compactToolResultText(candidate.why_possible[0] ?? ""),
+      source: options.projectPath
+        ? buildCandidateSourceContext(
+            options.projectPath,
+            candidate,
+            index < (options.autoFullDefinitionCount ?? MAX_AUTO_FULL_DEFINITIONS)
+          )
+        : undefined
+    }));
+  const selectedTargets = report.selected_targets.slice(0, MAX_ADJUDICATION_BATCH);
+  const base = {
     schema_version: report.schema_version,
     script: report.script,
     report_digest: report.report_digest,
@@ -463,35 +517,29 @@ export function formatFeatureImplementationCensusToolResult(
     next_action: report.status === "complete"
       ? "将 selected_targets 用于后续调查并提交 investigate handoff；report_digest 与候选计数由宿主按最后一次真实调用自动回填。"
       : report.candidate_accounting.unknown > 0
-        ? "仅逐项读取 candidates 中 verdict=unknown 的定义位置；下一次调用复用相同 query 并提交这些候选的 adjudications。"
+        ? "按 retrieval_score 检查本批 candidates。source.mode=full-definition 可直接分析完整定义；source.truncated=true 时，若判断依赖完整分支、状态或副作用，必须按 read_hint 在项目内读到 definition_end_line。把 candidate_id 原样填入 adjudications，并用 evidence_ref 提交 yes/no；下一次调用复用相同 query 且累计此前全部 adjudications。"
         : "候选已记账但 unresolved 仍有静态分析边界；按 unresolved 补充范围或人工证据，不要重复提交相同输入。",
-    candidates: report.candidates
-      .filter((candidate) => candidate.verdict === "unknown")
-      .slice(0, MAX_ADJUDICATION_BATCH)
-      .map((candidate) => ({
-      id: candidate.id,
-      symbol: candidate.symbol,
-      kind: candidate.kind,
-      role: candidate.role,
-      definition: candidate.definition,
-      verdict: candidate.verdict,
-      verdict_reason: candidate.verdict_reason,
-      adjudicated: candidate.adjudicated,
-      why_possible: candidate.why_possible,
-      evidence_for: candidate.evidence_for.map(compactFeatureEvidence),
-      evidence_against: candidate.evidence_against.map(compactFeatureEvidence),
-      trace_summary: candidate.trace_summary
-    })),
-    selected_targets: report.selected_targets,
-    rejected_candidates: report.rejected_candidates,
-    adjudication_batch: {
-      returned: Math.min(report.candidate_accounting.unknown, MAX_ADJUDICATION_BATCH),
-      remaining_after_batch: Math.max(
-        0,
-        report.candidate_accounting.unknown - MAX_ADJUDICATION_BATCH
-      )
+    selected_targets: selectedTargets,
+    selected_targets_projection: {
+      returned: selectedTargets.length,
+      total: report.selected_targets.length
     },
-    unresolved,
+    rejected_candidates_projection: {
+      // Full rejection evidence remains auditable in the cumulative tool input
+      // and host digest. Re-emitting every rejected row made later
+      // batches grow until the SDK externalized the result outside the repo.
+      returned: 0,
+      total: report.rejected_candidates.length
+    },
+    adjudication_batch: {
+      returned: 0,
+      remaining_after_batch: report.candidate_accounting.unknown
+    },
+    unresolved: unresolvedItems.slice(0, 8).map(compactToolResultText),
+    unresolved_projection: {
+      returned: Math.min(unresolvedItems.length, 8),
+      total: unresolvedItems.length
+    },
     closure: report.closure,
     coverage: {
       language: report.coverage.language,
@@ -499,26 +547,156 @@ export function formatFeatureImplementationCensusToolResult(
       files_scanned: report.coverage.files_scanned,
       symbols_indexed: report.coverage.symbols_indexed,
       graph_edges: report.coverage.graph_edges,
-      unsupported_matching_files: report.coverage.unsupported_matching_files,
-      warnings: report.coverage.warnings,
+      unsupported_matching_files: report.coverage.unsupported_matching_files
+        .slice(0, 8)
+        .map(compactToolResultText),
+      warnings: report.coverage.warnings.slice(0, 6).map(compactToolResultText),
       all_supported_files_scanned: report.coverage.all_supported_files_scanned,
       graph_traversal_complete: report.coverage.graph_traversal_complete
+    }
+  };
+  const candidates: typeof unknownCandidates = [];
+  for (const candidate of unknownCandidates) {
+    const projected = {
+      ...base,
+      candidates: [...candidates, candidate],
+      adjudication_batch: {
+        returned: candidates.length + 1,
+        remaining_after_batch: Math.max(
+          0,
+          report.candidate_accounting.unknown - candidates.length - 1
+        )
+      }
+    };
+    if (
+      candidates.length > 0
+      && Buffer.byteLength(JSON.stringify(projected), "utf8") > MAX_TOOL_RESULT_BYTES
+    ) break;
+    candidates.push(candidate);
+  }
+  return JSON.stringify({
+    ...base,
+    candidates,
+    adjudication_batch: {
+      returned: candidates.length,
+      remaining_after_batch: Math.max(
+        0,
+        report.candidate_accounting.unknown - candidates.length
+      )
     }
   });
 }
 
-function compactFeatureEvidence(item: FeatureEvidence): {
-  kind: FeatureEvidence["kind"];
-  ref: string;
-  detail: string;
-  term: string | null;
-} {
-  return {
-    kind: item.kind,
-    ref: `${item.location.file}:${item.location.line}`,
-    detail: item.detail,
-    term: item.term
+function compactToolResultText(value: string): string {
+  return value.length <= MAX_TOOL_RESULT_TEXT
+    ? value
+    : `${value.slice(0, MAX_TOOL_RESULT_TEXT - 1)}…`;
+}
+
+function comparePublicCandidateRelevance(
+  left: FeatureImplementationCandidate,
+  right: FeatureImplementationCandidate
+): number {
+  return right.retrieval_score - left.retrieval_score
+    || left.definition.file.localeCompare(right.definition.file)
+    || left.definition.line - right.definition.line
+    || left.symbol.localeCompare(right.symbol);
+}
+
+function buildCandidateSourceContext(
+  projectPath: string,
+  candidate: FeatureImplementationCandidate,
+  preferFullDefinition: boolean
+): {
+  mode: "full-definition" | "snippet" | "unavailable";
+  path: string;
+  start_line: number;
+  end_line: number;
+  definition_start_line: number;
+  definition_end_line: number;
+  truncated: boolean;
+  digest: string | null;
+  text: string;
+  read_hint?: {
+    path: string;
+    offset: number;
+    limit: number;
+    continue_until_line: number;
   };
+} {
+  const relativeFile = candidate.definition.file;
+  const absoluteFile = path.resolve(projectPath, relativeFile);
+  if (!isInsideProject(projectPath, absoluteFile) || !existsSync(absoluteFile)) {
+    return {
+      mode: "unavailable",
+      path: relativeFile,
+      start_line: candidate.source_span.start_line,
+      end_line: candidate.source_span.start_line,
+      definition_start_line: candidate.source_span.start_line,
+      definition_end_line: candidate.source_span.end_line,
+      truncated: true,
+      digest: null,
+      text: ""
+    };
+  }
+  const lines = readFileSync(absoluteFile, "utf8").split(/\r?\n/);
+  const definitionStart = Math.max(1, candidate.source_span.start_line);
+  const definitionEnd = Math.max(
+    definitionStart,
+    Math.min(lines.length, candidate.source_span.end_line)
+  );
+  const fullText = lines.slice(definitionStart - 1, definitionEnd).join("\n");
+  const fullBytes = Buffer.byteLength(fullText, "utf8");
+  const definitionLines = definitionEnd - definitionStart + 1;
+  const returnFullDefinition = (
+    fullBytes <= MAX_INLINE_SNIPPET_BYTES
+    && definitionLines <= MAX_INLINE_SNIPPET_LINES
+  ) || (
+    preferFullDefinition
+    && fullBytes <= MAX_AUTO_FULL_DEFINITION_BYTES
+  );
+  const snippetEnd = returnFullDefinition
+    ? definitionEnd
+    : Math.min(definitionEnd, definitionStart + MAX_INLINE_SNIPPET_LINES - 1);
+  const rawText = returnFullDefinition
+    ? fullText
+    : lines.slice(definitionStart - 1, snippetEnd).join("\n");
+  const text = returnFullDefinition
+    ? rawText
+    : truncateUtf8(rawText, MAX_INLINE_SNIPPET_BYTES);
+  const truncated = !returnFullDefinition;
+  return {
+    mode: returnFullDefinition ? "full-definition" : "snippet",
+    path: relativeFile,
+    start_line: definitionStart,
+    end_line: returnFullDefinition ? definitionEnd : snippetEnd,
+    definition_start_line: definitionStart,
+    definition_end_line: definitionEnd,
+    truncated,
+    digest: createHash("sha256").update(fullText).digest("hex"),
+    text,
+    ...(truncated ? {
+      read_hint: {
+        path: relativeFile,
+        offset: definitionStart,
+        limit: Math.min(READ_CONTEXT_PAGE_LINES, definitionLines),
+        continue_until_line: definitionEnd
+      }
+    } : {})
+  };
+}
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  let result = "";
+  let bytes = 0;
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + characterBytes > Math.max(0, maxBytes - 3)) break;
+    result += character;
+    bytes += characterBytes;
+  }
+  return `${result}…`;
 }
 
 function discoverSources(projectPath: string): string[] {
@@ -532,9 +710,6 @@ function selectEvidenceBearingSources(
   terms: SearchTerm[]
 ): string[] {
   const positiveTerms = terms.filter((term) => term.polarity === "positive");
-  const distinctiveTerms = new Set(positiveTerms
-    .filter((term) => [...term.normalized].length >= 4)
-    .map((term) => term.normalized));
   const exactFileScopes = new Set(scopePaths.filter((scope) => (
     SOURCE_EXTENSIONS.some((extension) => scope.toLowerCase().endsWith(extension))
   )));
@@ -561,11 +736,27 @@ function selectEvidenceBearingSources(
     };
   });
   const matched = matches.filter((item) => item.exactScope || item.terms.length > 0);
-  const distinctiveMatches = matched.filter((item) => (
-    item.exactScope || item.terms.some((term) => distinctiveTerms.has(term))
+  const termFileFrequency = new Map<string, number>();
+  for (const item of matched) {
+    for (const term of new Set(item.terms)) {
+      termFileFrequency.set(term, (termFileFrequency.get(term) ?? 0) + 1);
+    }
+  }
+  // Infer discriminative clues from this repository instead of maintaining a
+  // domain vocabulary. A term present in a large share of the scoped files is
+  // likely framework/plumbing language; when rarer positive evidence exists,
+  // use that evidence to choose semantic-analysis roots. If every matching
+  // term is common, retain all matches so broad-but-legitimate features still
+  // receive a complete census.
+  const commonTermThreshold = Math.max(8, Math.ceil(sources.length * 0.2));
+  const discriminativeTerms = new Set([...termFileFrequency]
+    .filter(([, frequency]) => frequency <= commonTermThreshold)
+    .map(([term]) => term));
+  const discriminativeMatches = matched.filter((item) => (
+    item.exactScope || item.terms.some((term) => discriminativeTerms.has(term))
   ));
   const selected = (
-    distinctiveMatches.length > 0 ? distinctiveMatches : matched
+    discriminativeMatches.length > 0 ? discriminativeMatches : matched
   ).map((item) => item.file);
   // An explicit file scope is authoritative even when the requested feature
   // describes code that has not been added yet and therefore has no token hit.
@@ -700,8 +891,20 @@ function collectAnchorsAndAdjacentCandidates(
         anchors.push({ term: term.value, location, text: text.slice(0, 240) });
         const container = containingStatementOrProperty(node);
         const related = new Map<string, InternalCandidate>();
-        if (container) {
+        const anchorSymbol = checker.getSymbolAtLocation(node);
+        if (anchorSymbol) {
+          for (const candidate of candidatesForSymbol(anchorSymbol, checker, bySymbol)) {
+            related.set(candidate.id, candidate);
+          }
+        }
+        // When the anchor itself is a function/class declaration name, walking
+        // the whole declaration would incorrectly attach every nested method
+        // and referenced helper. Direct symbol evidence plus the enclosing
+        // callable is sufficient; only ordinary statements/config properties
+        // need local identifier adjacency expansion.
+        if (container && !candidateDescriptorWithoutChecker(container)) {
           const collect = (child: ts.Node): void => {
+            if (child !== container && candidateDescriptorWithoutChecker(child)) return;
             if (ts.isIdentifier(child) || ts.isPropertyAccessExpression(child)) {
               const symbol = checker.getSymbolAtLocation(child);
               if (symbol) {
@@ -912,12 +1115,27 @@ function materializeCandidate(
       unresolved_dynamic_references: traceBase.unresolved_dynamic_references
     };
   }
+  const sourceFile = candidate.declaration.getSourceFile();
+  const declarationEnd = sourceFile.getLineAndCharacterOfPosition(
+    candidate.declaration.getEnd()
+  ).line + 1;
   return {
     id: candidate.id,
     symbol: candidate.symbol,
     kind: candidate.kind,
     role: inferRole(candidate, upstreamPath, downstreamPath),
     definition: candidate.definition,
+    source_span: {
+      start_line: candidate.definition.line,
+      end_line: Math.max(candidate.definition.line, declarationEnd)
+    },
+    retrieval_score: scoreFeatureCandidate(
+      candidate,
+      evidenceFor,
+      evidenceAgainst,
+      upstreamPath,
+      downstreamPath
+    ),
     why_possible: evidenceFor.map((item) => item.detail),
     evidence_for: dedupeBy(evidenceFor, (item) => item.id),
     evidence_against: dedupeBy(evidenceAgainst, (item) => item.id),
@@ -929,6 +1147,38 @@ function materializeCandidate(
     adjudicated,
     trace_summary: traceSummary
   };
+}
+
+function scoreFeatureCandidate(
+  candidate: InternalCandidate,
+  evidenceFor: FeatureEvidence[],
+  evidenceAgainst: FeatureEvidence[],
+  upstreamPath: GraphEdge[] | undefined,
+  downstreamPath: GraphEdge[] | undefined
+): number {
+  const weights: Partial<Record<FeatureEvidence["kind"], number>> = {
+    "human-adjudication": 180,
+    "symbol-name": 120,
+    "declaration-text": 70,
+    "adjacent-anchor": 60,
+    "file-path": 35,
+    "upstream-path": 28,
+    "downstream-path": 28
+  };
+  const byKind = new Map<FeatureEvidence["kind"], number>();
+  for (const item of evidenceFor) {
+    byKind.set(item.kind, (byKind.get(item.kind) ?? 0) + 1);
+  }
+  let score = 0;
+  for (const [kind, count] of byKind) {
+    score += (weights[kind] ?? 0) * Math.min(count, 3);
+  }
+  if (candidate.kind === "component" || candidate.kind === "class") score += 8;
+  if (candidate.nested && byKind.size === 1 && byKind.has("file-path")) score -= 30;
+  score -= evidenceAgainst.length * 160;
+  score -= Math.max(0, (upstreamPath?.length ?? 0) - 1) * 4;
+  score -= Math.max(0, (downstreamPath?.length ?? 0) - 1) * 4;
+  return Math.max(0, score);
 }
 
 function validateAdjudications(

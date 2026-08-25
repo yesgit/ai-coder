@@ -2091,7 +2091,7 @@ export class ClaudeAgentRunner {
         "复杂入口硬规则：多附件、多需求点、跨文件或指定基线的请求在进入实现前必须委托 task-planner。planner 尚未成功启动时，根 Agent 可以做最小只读取证以解除阻塞，但不得一次性读取全部附件或重复撞同一门禁。根 Agent 只负责编排和知识归并，任何工作区修改必须委托 task-executor，并在完成后委托 task-verifier。",
         "Task 调用必须显式填写 subagent_type。复杂入口的正确格式是 `Task({ subagent_type: \"task-planner\", description: \"拆分需求\", prompt: \"只读分析并返回 R-ID 与证据\" })`；不要省略 subagent_type，也不要用 Skill 调用替代 Task。",
         "当前阶段已经注入的核心 Skill 不得再次调用 Skill 工具；应直接落实其契约。只有能力目录里未注入且确实需要的额外 Skill 才调用 Skill 工具。",
-        "功能定位硬规则：目标以业务功能、用户行为、页面、事件或协议值描述且没有唯一精确符号时，必须真实调用 mcp__ai_coder__locate_feature_implementation；宿主只自动排除明确负向证据，不会按词面强弱确认或排除正向候选。逐批裁决报告返回的 unknown，累计 adjudications 并重跑到 complete，不能用 Read/Grep 自述代替。普查只生成 yes 目标的受限调用图摘要；最终复用目标的完整调用契约由 prepare 调查。",
+        "功能定位硬规则：目标以业务功能、用户行为、页面、事件或协议值描述且没有唯一精确符号时，必须真实调用 mcp__ai_coder__locate_feature_implementation。按 retrieval_score 检查返回的 unknown：source.mode=full-definition 可直接分析；source.truncated=true 且裁决依赖完整分支、状态或副作用时，按 read_hint 在项目内读到 definition_end_line。累计 adjudications 并重跑到 complete，不能用排名或自述代替语义裁决。普查只生成 yes 目标的受限调用图摘要；最终复用目标的完整调用契约由 prepare 调查。",
         "调用契约硬规则：拟议实现只要会调用、复用或修改已有函数、方法、Hook 或组件，第一次相关修改前必须通过 Task 使用 call-contract-investigator；该调查者必须真实调用 mcp__ai_coder__investigate_symbol_contract 完整调查脚本，再把结果归并进知识雪球。主线程自行 Read/Grep/Bash、零散符号分析或文字声明不能替代。只有纯文案、静态数据或样式且不涉及任何既有函数/组件时才可判定不适用，并记录依据。",
         "只调用工具列表中展示的精确工具名，并使用标准 tool_use 格式。",
         commitMarkGuidance
@@ -2857,7 +2857,7 @@ export class ClaudeAgentRunner {
       ? [
           ["mcp__ai_coder__checkpoint_exploration", "归并知识、声明 phase 与 next_action"],
           ["mcp__ai_coder__update_task_tree", "维护传统全局任务树；简单模式通常无需调用"],
-          ["mcp__ai_coder__locate_feature_implementation", "完整普查功能实现候选并逐项提交是/不是证据"],
+          ["mcp__ai_coder__locate_feature_implementation", "搜索功能候选，返回排序后的代码上下文并逐项提交是/不是证据"],
           ["mcp__ai_coder__investigate_symbol_contract", "运行宿主持有的完整函数/组件调查脚本"],
           ["mcp__ai_coder__analyze_symbol_contract", "只读分析函数/组件及静态调用契约"],
           ["mcp__ai_coder__ask_human", "仅在外部信息确实阻塞时询问用户"]
@@ -2866,7 +2866,7 @@ export class ClaudeAgentRunner {
     return [
       "## 当前可用能力（与知识雪球、阶段任务同时生效）",
       "先根据当前缺失信息明确选择 Skill、Sub-agent 或直接工具，并把选择理由写回知识雪球。跨多文件追踪、独立验证或完整性审查与某个 Sub-agent 职责匹配时优先委托；简单单点事实直接用工具。只选能推进当前阶段任务的最小能力。",
-      "功能定位硬规则：目标以业务功能、用户行为、页面、事件或协议值描述且没有唯一精确符号时，必须调用 locate_feature_implementation；宿主只自动排除明确负向证据，不会按词面强弱确认或排除正向候选。逐批裁决 unknown、累计 adjudications 并调用到 complete，候选排名或普通搜索不能替代。普查提供受限调用图摘要，最终复用目标的完整调用契约留给 prepare。",
+      "功能定位硬规则：目标以业务功能、用户行为、页面、事件或协议值描述且没有唯一精确符号时，必须调用 locate_feature_implementation；工具按搜索证据排序并返回候选代码上下文。source.mode=full-definition 时直接分析完整定义；source.truncated=true 且结论依赖完整分支、状态或副作用时，按 read_hint 在项目内读到 definition_end_line。逐批裁决 unknown、累计 adjudications 并调用到 complete；排名只决定阅读顺序，不能替代语义裁决。最终复用目标的完整调用契约留给 prepare。",
       "调用契约硬规则：凡拟议实现会调用、复用或修改已有函数、方法、Hook 或组件，第一次相关修改前必须通过 Task 使用 call-contract-investigator，且调查者必须真实调用 investigate_symbol_contract 完整调查脚本；主线程搜索、零散 analyze_symbol_contract 或文字声明不能替代。纯文案、静态数据或样式且不涉及既有函数/组件时才可记录依据后判定不适用。",
       "",
       "### Skills（工作流核心项已由宿主加载；目录中的其他项可用 Skill 加载）",
@@ -3341,7 +3341,8 @@ export class ClaudeAgentRunner {
         [
           "运行宿主持有的功能实现候选普查脚本。脚本先快速扫描范围内全部 TypeScript/JavaScript/React 文件，",
           "再对独特证据命中文件执行受限语义分析，合并符号名、路径、定义正文、配置邻接以及两跳调用图候选；",
-          "宿主只自动排除测试路径或明确 negative clue；所有正向候选无论词面强弱都先记为 unknown。每次逐项读取返回批次并累计 adjudications 再调用，",
+          "候选按多通道证据排序并携带宿主提取的定义上下文：短定义直接完整返回，大定义返回有摘要指纹的片段、完整行范围和项目内 Read 分页提示。",
+          "宿主只自动排除测试路径或明确 negative clue；所有正向候选无论词面强弱都先记为 unknown。语义结论依赖完整实现时必须读完整定义，再累计 adjudications 调用，",
           "直到 status=complete；yes 目标只附带受限调用图摘要，最终复用目标由 prepare 执行完整调用契约调查。普通 Read/Grep、模型排名或只选一个最像的目标不能替代。"
         ].join(""),
         {
@@ -3376,6 +3377,7 @@ export class ClaudeAgentRunner {
             }>;
           };
           try {
+            const censusStartedAt = Date.now();
             for (const scope of toolInput.scope_paths ?? []) {
               await assertPathInsideProject(input.session.project_path, scope);
             }
@@ -3427,7 +3429,7 @@ export class ClaudeAgentRunner {
             await this.recordProgress(
               input,
               "runner",
-              `普查结果就绪：扫描 ${report.coverage.files_scanned} 个文件，候选 ${report.candidate_accounting.total} 个，状态 ${report.status}。`,
+              `普查结果就绪：扫描 ${report.coverage.files_scanned} 个文件，候选 ${report.candidate_accounting.total} 个，状态 ${report.status}，耗时 ${Date.now() - censusStartedAt}ms。`,
               "milestone"
             );
             return {
@@ -4421,13 +4423,24 @@ function getLatestHierarchicalFeatureCensusEvidence(
     && isPlainObject(call.input)
   ));
   if (calls.length === 0) return null;
-  const lastInput = calls[calls.length - 1]!.input as Record<string, unknown>;
-  const digest = featureCensusInputDigest(lastInput);
-  const receipt = [...(session.feature_census_receipts ?? [])]
-    .reverse()
-    .find((item) => item.stage_id === stageId && item.input_digest === digest)
-    ?? null;
-  return { input: lastInput, receipt };
+  const receipts = session.feature_census_receipts ?? [];
+  const evidence = calls.map((call) => {
+    const toolInput = call.input as Record<string, unknown>;
+    const digest = featureCensusInputDigest(toolInput);
+    const receipt = [...receipts]
+      .reverse()
+      .find((item) => item.stage_id === stageId && item.input_digest === digest)
+      ?? null;
+    return { input: toolInput, receipt };
+  });
+  // A complete census is monotonic evidence for the current investigate
+  // stage. If the model unnecessarily restarts the tool with a broader or
+  // incomplete query while fixing an unrelated handoff field, that later
+  // partial call must not erase the already-closed report. The downstream
+  // target-definition gate still requires the chosen complete report to have
+  // selected the exact callable/component declared in the handoff.
+  return [...evidence].reverse().find((item) => item.receipt?.status === "complete")
+    ?? evidence[evidence.length - 1]!;
 }
 
 function currentFeatureCensusStageId(session: AgentSession): string {
@@ -5515,7 +5528,11 @@ export function hierarchicalValidationCorrection(
     return "删除按 Rxx-A1 验收项、jumpLinkWX、dynamicPathToJSON、linkType 等字段拆出的 target_mappings 和对应 selections；每个需求原始 pageName/协议值只保留一条映射。验收项仍由 acceptance_results 逐项验证，不属于代码目标。";
   }
   if (/未追到.*同一最终函数\/组件/.test(reason)) {
-    return "先修正最终契约，不要只改 candidate 来迎合错误映射：dispatcher_location 单独填写 redirectActionPush 等公共分发器；target_mappings 与 reference candidate 的 contract_symbol@contract_location 都必须沿各自入口追到共同的最终页面组件/业务函数（例如 ChangePassword）。candidate.location 保留独立的任务基线入口，并确保 selection 的 target_key+selected_location 精确对应该 candidate。";
+    const censusReminder = featureCensusReceipt?.status === "complete"
+      ? " 本阶段已有 complete 功能普查回执；不要重跑普查或更改 query，只修正当前交接物。"
+      : "";
+    return "先修正最终契约，不要只改 candidate 来迎合错误映射：dispatcher_location 单独填写 redirectActionPush 等公共分发器；target_mappings 与 reference candidate 的 contract_symbol@contract_location 都必须沿各自入口追到共同的最终页面组件/业务函数（例如 ChangePassword）。candidate.location 保留独立的任务基线入口，并确保 selection 的 target_key+selected_location 精确对应该 candidate。"
+      + censusReminder;
   }
   if (/任务基线|当前工作区新增|反向证明/.test(reason)) {
     return "保留当前实现，但不要把本轮或前序需求刚新增/改写的分支当同功能参考；恢复使用任务基线中的独立用户入口，并把该入口与目标分支都追到共同的最终页面组件/业务函数。只有确实找不到独立入口时，才在对应 target_selection 写 no_reference_reason。";

@@ -60,7 +60,7 @@ system_prompt: |
 
   核心 Skills 由宿主按知识雪球的当前阶段选择相关契约注入；委托 Sub-agent 时再绑定该职责必须落实的 Skill。不要把“已注入”当作完成，必须在执行和证据中体现契约。每轮都要依据当前缺口明确选择 Skill、一个匹配的 Sub-agent 或直接工具，并把选择、理由及产生的结论写回知识雪球。跨多文件追踪、独立验证或完整性审查与已注册 Sub-agent 职责匹配时必须委托；简单单点事实才直接使用工具。
 
-  **功能实现普查硬规则**：只要用户用业务功能、用户行为、页面、事件或协议标识描述目标，而没有直接给出唯一精确函数/组件，就必须真实调用 `mcp__ai_coder__locate_feature_implementation`。脚本会扫描完整项目索引，合并名称、路径、定义正文、配置邻接及上下游调用图候选。首次报告中的每个 unknown 都必须逐项读取并通过 adjudications 提交 yes/no、原因和 path:line 证据，再次调用直到 status=complete；不能只选择最像的一个，也不能静默丢弃反例候选。
+  **功能实现普查硬规则**：只要用户用业务功能、用户行为、页面、事件或协议标识描述目标，而没有直接给出唯一精确函数/组件，就必须真实调用 `mcp__ai_coder__locate_feature_implementation`。脚本会扫描完整项目索引，合并名称、路径、定义正文、配置邻接及上下游调用图候选，并按证据排序返回代码上下文。`source.mode=full-definition` 可直接分析完整定义；`source.truncated=true` 且裁决依赖完整分支、状态或副作用时，必须按 `read_hint` 在项目内读到 `definition_end_line`。首次报告中的每个 unknown 都必须逐项提交 adjudications 的 yes/no、原因和 path:line 证据，再次调用直到 status=complete；不能只选择最像的一个，也不能静默丢弃反例候选。
 
   **调用契约硬规则**：功能普查为每个 yes 函数/组件生成受限调用图指纹；只要拟议实现会调用、复用或修改仓库中已有的函数、方法、Hook 或组件，仍必须在第一次相关修改前通过 Task 委托 `call-contract-investigator`。调查者必须真实调用 `mcp__ai_coder__investigate_symbol_contract` 完整调查脚本，调查调用方、公共封装、参数组合、前置条件、输入输出与兼容义务，并把结论归并进知识雪球。主线程自行 Read、Grep、Bash、零散符号分析或凭相似代码推断不能替代该 Sub-agent 和调查脚本。只有能够证明改动仅涉及纯文案、静态数据或样式，且不调用、复用、修改任何既有函数或组件时才可判定不适用；不适用依据也必须写入知识雪球。
 

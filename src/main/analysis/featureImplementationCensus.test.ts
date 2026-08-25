@@ -280,7 +280,7 @@ export function unrelatedDynamicLqbWrapper(
       feature: "语音跳转至零钱宝页面",
       aliases: ["零钱宝", "LQB", "LQBInvest", "LQBTR"]
     });
-    const formatted = formatFeatureImplementationCensusToolResult(report);
+    const formatted = formatFeatureImplementationCensusToolResult(report, { projectPath: root });
     const parsed = JSON.parse(formatted) as Record<string, unknown>;
 
     expect(formatted.indexOf("\"report_digest\"")).toBeLessThan(
@@ -292,10 +292,166 @@ export function unrelatedDynamicLqbWrapper(
       status: report.status,
       candidate_accounting: report.candidate_accounting
     });
+    expect(Buffer.byteLength(formatted, "utf8")).toBeLessThanOrEqual(16_000);
+    expect(parsed.candidates).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        candidate_id: expect.any(String),
+        evidence_ref: expect.stringMatching(/:\d+$/)
+      })
+    ]));
+    const firstProjected = (parsed.candidates as Array<{
+      candidate_id: string;
+      retrieval_score: number;
+      symbol: string;
+      source: { mode: string; truncated: boolean; text: string };
+    }>)[0]!;
+    const firstCandidate = report.candidates.find(
+      (candidate) => candidate.id === firstProjected.candidate_id
+    )!;
+    expect(firstProjected.retrieval_score).toBe(firstCandidate.retrieval_score);
+    expect(firstProjected.retrieval_score).toBe(Math.max(
+      ...report.candidates
+        .filter((candidate) => candidate.verdict === "unknown")
+        .map((candidate) => candidate.retrieval_score)
+    ));
+    expect(firstProjected.source).toMatchObject({
+      mode: "full-definition",
+      truncated: false
+    });
+    expect(firstProjected.source.text).toContain(firstProjected.symbol);
     expect((parsed.candidates as unknown[]).length).toBeLessThanOrEqual(24);
     expect(parsed.selected_targets).toEqual(report.selected_targets);
-    expect(parsed.rejected_candidates).toEqual(report.rejected_candidates);
+    expect(parsed.rejected_candidates_projection).toEqual({
+      returned: 0,
+      total: report.rejected_candidates.length
+    });
     expect(parsed.closure).toEqual(report.closure);
+  });
+
+  it("keeps candidate ids inline after many cumulative rejections", async () => {
+    const root = await createNavigationFixture();
+    await writeFile(path.join(root, "many.ts"), Array.from({ length: 80 }, (_, index) => (
+      `export function ExactInlineCandidate${index}() { return "ExactInlineFeature"; }`
+    )).join("\n"));
+    const initial = censusFeatureImplementations({
+      projectPath: root,
+      feature: "ExactInlineFeature",
+      aliases: ["ExactInlineFeature"]
+    });
+    const adjudications: FeatureCandidateAdjudication[] = initial.candidates
+      .slice(0, 48)
+      .map((candidate) => ({
+        candidate_id: candidate.id,
+        verdict: "no",
+        reason: "不是目标功能实现",
+        evidence_refs: [`${candidate.definition.file}:${candidate.definition.line}`]
+      }));
+    const report = censusFeatureImplementations({
+      projectPath: root,
+      feature: "ExactInlineFeature",
+      aliases: ["ExactInlineFeature"],
+      adjudications
+    });
+    const formatted = formatFeatureImplementationCensusToolResult(report);
+    const parsed = JSON.parse(formatted) as {
+      candidates: Array<{ candidate_id: string; evidence_ref: string }>;
+      rejected_candidates_projection: { returned: number; total: number };
+      adjudication_batch: { returned: number; remaining_after_batch: number };
+    };
+
+    expect(Buffer.byteLength(formatted, "utf8")).toBeLessThanOrEqual(16_000);
+    expect(parsed.candidates.length).toBeGreaterThan(0);
+    expect(parsed.candidates.every((candidate) => (
+      candidate.candidate_id.length > 0 && /:\d+$/.test(candidate.evidence_ref)
+    ))).toBe(true);
+    expect(parsed.rejected_candidates_projection).toEqual({ returned: 0, total: 48 });
+    expect(parsed.adjudication_batch.returned).toBe(parsed.candidates.length);
+    expect(parsed.adjudication_batch.remaining_after_batch).toBe(
+      report.candidate_accounting.unknown - parsed.candidates.length
+    );
+  });
+
+  it("returns a bounded snippet and exact continuation hint for an oversized definition", async () => {
+    const root = await createNavigationFixture();
+    await writeFile(path.join(root, "huge.ts"), [
+      "export function RareHugeFeature() {",
+      ...Array.from({ length: 240 }, (_, index) => (
+        `  const value${index} = \"RareHugeFeature-${index}\";`
+      )),
+      "  return value239;",
+      "}"
+    ].join("\n"));
+    const report = censusFeatureImplementations({
+      projectPath: root,
+      feature: "RareHugeFeature",
+      aliases: ["RareHugeFeature"]
+    });
+    const candidate = report.candidates.find((item) => item.symbol === "RareHugeFeature")!;
+    const formatted = formatFeatureImplementationCensusToolResult(report, { projectPath: root });
+    const parsed = JSON.parse(formatted) as {
+      candidates: Array<{
+        candidate_id: string;
+        source: {
+          mode: string;
+          truncated: boolean;
+          definition_start_line: number;
+          definition_end_line: number;
+          text: string;
+          read_hint: {
+            path: string;
+            offset: number;
+            limit: number;
+            continue_until_line: number;
+          };
+        };
+      }>;
+    };
+    const projected = parsed.candidates.find((item) => item.candidate_id === candidate.id)!;
+
+    expect(candidate.source_span.end_line).toBeGreaterThan(candidate.source_span.start_line + 200);
+    expect(projected.source).toMatchObject({
+      mode: "snippet",
+      truncated: true,
+      definition_start_line: candidate.source_span.start_line,
+      definition_end_line: candidate.source_span.end_line,
+      read_hint: {
+        path: "huge.ts",
+        offset: candidate.source_span.start_line,
+        continue_until_line: candidate.source_span.end_line
+      }
+    });
+    expect(Buffer.byteLength(projected.source.text, "utf8")).toBeLessThanOrEqual(1_800);
+    expect(Buffer.byteLength(formatted, "utf8")).toBeLessThanOrEqual(16_000);
+  });
+
+  it("promotes a file-matched component without turning its internal methods into candidates", async () => {
+    const root = await createNavigationFixture();
+    await writeFile(path.join(root, "AccountPanel.ts"), [
+      "export class AccountPanel {",
+      "  private loadState() { return 'ready'; }",
+      "  render() { return this.loadState(); }",
+      "}"
+    ].join("\n"));
+    const report = censusFeatureImplementations({
+      projectPath: root,
+      feature: "AccountPanel",
+      aliases: ["AccountPanel"]
+    });
+    const component = report.candidates.find((candidate) => candidate.symbol === "AccountPanel")!;
+    const formatted = formatFeatureImplementationCensusToolResult(report, { projectPath: root });
+    const parsed = JSON.parse(formatted) as {
+      candidates: Array<{
+        candidate_id: string;
+        source: { mode: string; truncated: boolean; text: string };
+      }>;
+    };
+    const projected = parsed.candidates.find((candidate) => candidate.candidate_id === component.id)!;
+
+    expect(report.candidates.some((candidate) => candidate.symbol === "loadState")).toBe(false);
+    expect(report.candidates.some((candidate) => candidate.symbol === "render")).toBe(false);
+    expect(projected.source).toMatchObject({ mode: "full-definition", truncated: false });
+    expect(projected.source.text).toContain("private loadState()");
+    expect(projected.source.text).toContain("render()");
   });
 
   it("does not let a short legacy alias expand semantic analysis across unrelated files", async () => {
@@ -319,6 +475,36 @@ export function legacyLqbHelper${index}() {
     expect(report.candidate_accounting.unknown).toBeGreaterThan(0);
     expect(report.selected_targets).toEqual([]);
     expect(report.status).toBe("partial");
+  });
+
+  it("uses repository term frequency to suppress common plumbing without a domain vocabulary", async () => {
+    const root = await createNavigationFixture();
+    await writeFile(path.join(root, "rare-protocol.ts"), `
+export function rareProtocolHandler() {
+  return "RareProtocol";
+}
+`);
+    await Promise.all(Array.from({ length: 40 }, (_, index) => (
+      writeFile(path.join(root, `shared-wrapper-${index}.ts`), `
+export function sharedWrapper${index}(sharedContext: unknown) {
+  return sharedContext;
+}
+`)
+    )));
+
+    const report = censusFeatureImplementations({
+      projectPath: root,
+      feature: "Activate RareProtocol through SharedContext",
+      aliases: ["RareProtocol"],
+      acceptanceClues: ["RareProtocol", "SharedContext"]
+    });
+
+    expect(report.coverage.files_discovered).toBeGreaterThan(40);
+    expect(report.coverage.files_scanned).toBeLessThan(10);
+    expect(report.candidates.some((candidate) => candidate.symbol === "rareProtocolHandler"))
+      .toBe(true);
+    expect(report.candidates.some((candidate) => candidate.symbol.startsWith("sharedWrapper")))
+      .toBe(false);
   });
 
   it("returns unknown candidates in bounded adjudication batches without losing host accounting", async () => {

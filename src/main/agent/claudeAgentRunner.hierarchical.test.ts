@@ -1264,6 +1264,93 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     }
   });
 
+  it("does not let a later accidental partial census erase a complete stage receipt", async () => {
+    const projectPath = await mkdtemp(path.join(os.tmpdir(), "ai-coder-census-complete-monotonic-"));
+    try {
+      await writeFile(path.join(projectPath, "feature.ts"), [
+        "export function LQBInvest() {",
+        "  return '零钱宝主页';",
+        "}"
+      ].join("\n"));
+      const partialReport = censusFeatureImplementations({
+        projectPath,
+        feature: "零钱宝主页",
+        aliases: ["LQBInvest"]
+      });
+      const candidate = partialReport.candidates.find((item) => item.symbol === "LQBInvest")!;
+      const adjudications = [{
+        candidate_id: candidate.id,
+        verdict: "yes" as const,
+        reason: "目标页面组件定义",
+        evidence_refs: ["feature.ts:1"]
+      }];
+      const completeReport = censusFeatureImplementations({
+        projectPath,
+        feature: "零钱宝主页",
+        aliases: ["LQBInvest"],
+        adjudications
+      });
+      expect(completeReport.status).toBe("complete");
+      const stageId = "hierarchical:R33/investigate";
+      const session = { ...createSession(), project_path: projectPath };
+      const completeInput = {
+        feature: "零钱宝主页",
+        aliases: ["LQBInvest"],
+        adjudications
+      };
+      const accidentalPartialInput = {
+        feature: "零钱宝主页导航",
+        aliases: ["LQBInvest", "pageName", "nativeLink"]
+      };
+      session.tool_calls = [
+        {
+          id: "feature-census-complete",
+          stage_id: stageId,
+          tool: "mcp__ai_coder__locate_feature_implementation",
+          input: completeInput,
+          status: "completed" as const,
+          created_at: new Date(1).toISOString()
+        },
+        {
+          id: "feature-census-accidental-partial",
+          stage_id: stageId,
+          tool: "mcp__ai_coder__locate_feature_implementation",
+          input: accidentalPartialInput,
+          status: "completed" as const,
+          created_at: new Date(2).toISOString()
+        }
+      ];
+      recordFeatureCensusReceipt(session, stageId, completeInput, completeReport);
+      recordFeatureCensusReceipt(session, stageId, accidentalPartialInput, partialReport);
+      const structured = {
+        status: "passed",
+        handoff: {
+          feature_census: {
+            applicability: "required",
+            reason: "业务功能需要普查"
+          }
+        }
+      };
+
+      reconcileHierarchicalFeatureCensusHandoff(session, {
+        kind: "run_phase",
+        requirement_id: "R33",
+        work_unit_id: "R33:investigate",
+        phase: "investigate",
+        role: "code-investigator"
+      }, structured, stageId);
+
+      expect(structured.handoff.feature_census).toMatchObject({
+        status: "complete",
+        report_digest: completeReport.report_digest,
+        candidate_accounting: completeReport.candidate_accounting,
+        selected_candidate_ids: completeReport.selected_targets.map((target) => target.candidate_id)
+      });
+    } finally {
+      await rm(projectPath, { recursive: true, force: true });
+    }
+  });
+
   it("rejects a partial-backfilled census draft with the actionable census-incomplete error", async () => {
     const projectPath = await mkdtemp(path.join(os.tmpdir(), "ai-coder-census-partial-parse-"));
     try {
@@ -1355,6 +1442,17 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     });
     expect(accountingPartial).toContain("没有 complete 普查报告可回填");
     expect(accountingPartial).toContain("重跑 locate_feature_implementation");
+
+    const contractCorrection = hierarchicalValidationCorrection(
+      operation,
+      "candidate Setting 未追到 LQBInvest 已确认的同一最终函数/组件",
+      {
+        status: "complete",
+        candidate_accounting: { total: 16, yes: 1, no: 15, unknown: 0, accounted: true }
+      }
+    );
+    expect(contractCorrection).toContain("已有 complete 功能普查回执");
+    expect(contractCorrection).toContain("不要重跑普查");
   });
 
   it("reconciles dispatcher branch contracts to one census-owned destination component", async () => {

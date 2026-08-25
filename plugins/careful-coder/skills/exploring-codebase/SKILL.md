@@ -10,7 +10,8 @@ Trace from observable behavior to the code that produces it. Do not stop at a sy
 When the target is described as a feature, user behavior, page, event, route token, or protocol value rather than one exact symbol, call `mcp__ai_coder__locate_feature_implementation`. Treat it as a census, not a ranking:
 
 - preserve every candidate returned by symbol, path, declaration text, configuration adjacency, and upstream/downstream call-graph discovery;
-- inspect every returned `unknown` batch, then rerun with the cumulative `yes` or `no` adjudications, reasons, and candidate-scoped `path:line` evidence; do not submit only the latest batch;
+- inspect every returned `unknown` batch in `retrieval_score` order; analyze `source.mode=full-definition` directly, and when `source.truncated=true` plus the verdict depends on complete branches, state, or side effects, follow `read_hint` inside the project through `definition_end_line` before adjudicating;
+- rerun with the cumulative `yes` or `no` adjudications, reasons, and candidate-scoped `path:line` evidence; do not submit only the latest batch;
 - never convert strong lexical similarity directly into `yes`, or weak similarity directly into `no`; only explicit negative evidence may be rejected mechanically;
 - do not claim discovery is complete until the report says `status=complete`, candidate accounting has `unknown=0`, at least one selected `yes` target exists, and every selected target has a bounded trace-summary digest;
 - distinguish `closure.semantic_complete` from `closure.closeable`; a runtime boundary may permit code-location work to continue while still requiring a later runtime verification;

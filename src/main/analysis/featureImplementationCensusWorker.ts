@@ -16,7 +16,9 @@ try {
   parentPort.postMessage({
     ok: true,
     result: {
-      tool_result: formatFeatureImplementationCensusToolResult(report),
+      tool_result: formatFeatureImplementationCensusToolResult(report, {
+        projectPath: (workerData as FeatureImplementationCensusInput).projectPath
+      }),
       report: {
         status: report.status,
         report_digest: report.report_digest,
