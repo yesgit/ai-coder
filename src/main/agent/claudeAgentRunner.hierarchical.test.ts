@@ -23,6 +23,7 @@ import {
   reconcileHierarchicalFeatureCensusHandoff,
   reconcileHierarchicalInvestigateFinalContracts,
   reconcileHierarchicalInvestigateMappingScope,
+  reconcileHierarchicalInvestigateReferenceContracts,
   reconcileHierarchicalInvestigateReferenceHandoff,
   reconcileHierarchicalPrepareContractHandoff,
   reconcileHierarchicalPrepareObligationEvidence,
@@ -1916,6 +1917,138 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     expect(referenceAnalysis.candidates).not.toContainEqual(expect.objectContaining({
       target_key: "different-contract"
     }));
+  });
+
+  it("removes a stale reference candidate after the complete census confirms a different final contract", () => {
+    const session = createSession();
+    const stageId = "hierarchical:R34/investigate";
+    const censusInput = {
+      feature: "托管转入与我的投资顾问页面跳转",
+      aliases: ["ESCTR", "MIA", "H5Page"]
+    };
+    session.tool_calls = [{
+      id: "feature-census",
+      stage_id: stageId,
+      tool: "mcp__ai_coder__locate_feature_implementation",
+      input: censusInput,
+      status: "completed" as const,
+      created_at: new Date().toISOString()
+    }];
+    recordFeatureCensusReceipt(session, stageId, censusInput, {
+      status: "complete",
+      report_digest: "b".repeat(64),
+      candidate_accounting: { total: 1, yes: 1, no: 0, unknown: 0, accounted: true },
+      selected_targets: [{
+        candidate_id: "H5Page.js:33#H5Page",
+        symbol: "H5Page",
+        kind: "class",
+        definition: {
+          file: "lib/views/product/H5Page.js",
+          line: 33,
+          column: 14
+        },
+        role: "implementation",
+        trace_summary_digest: "trace"
+      }],
+      unresolved: []
+    } as unknown as ReturnType<typeof censusFeatureImplementations>);
+
+    const handoff = handoffFor("investigate", "target.ts", "reference.ts", true) as Record<string, unknown>;
+    const mapping = (handoff.target_mappings as Array<Record<string, unknown>>)[0]!;
+    Object.assign(mapping, {
+      target_key: "ESCTR",
+      requested_token: "TGCBTZ",
+      canonical_token: "ESCTR",
+      dispatcher_location: "lib/views/homepage/utils/homepageRedirection.js:702",
+      contract_symbol: "H5Page",
+      contract_location: "lib/views/product/H5Page.js:33"
+    });
+    const referenceAnalysis = handoff.reference_analysis as {
+      candidates: Array<Record<string, unknown>>;
+      target_selections: Array<Record<string, unknown>>;
+    };
+    Object.assign(referenceAnalysis.candidates[0]!, {
+      target_key: "ESCTR",
+      location: "lib/views/myAssets/LQBInvest.js:29",
+      contract_symbol: "LQBInvest",
+      contract_location: "lib/views/myAssets/LQBInvest.js:29"
+    });
+    Object.assign(referenceAnalysis.target_selections[0]!, {
+      target_key: "ESCTR",
+      selected_location: "lib/views/myAssets/LQBInvest.js:29",
+      selection_reason: "同属首页 nativeLink 跳转",
+      no_reference_reason: ""
+    });
+    const structured = { status: "passed", handoff };
+
+    expect(reconcileHierarchicalInvestigateReferenceContracts(
+      session,
+      {
+        kind: "run_phase",
+        requirement_id: "R34",
+        work_unit_id: "R34:investigate",
+        phase: "investigate",
+        role: "code-investigator"
+      },
+      structured,
+      stageId
+    )).toEqual([
+      "ESCTR: lib/views/myAssets/LQBInvest.js:29 (LQBInvest@lib/views/myAssets/LQBInvest.js:29)"
+    ]);
+    expect(referenceAnalysis.candidates).toEqual([]);
+    expect(referenceAnalysis.target_selections[0]).toMatchObject({
+      target_key: "ESCTR",
+      selected_location: "",
+      selection_reason: "",
+      no_reference_reason: expect.stringContaining("未提供其他可验证的同功能入口")
+    });
+  });
+
+  it("keeps a mismatched reference candidate when the census has not confirmed the target mapping", () => {
+    const session = createSession();
+    const stageId = "hierarchical:R34/investigate";
+    const censusInput = { feature: "托管转入", aliases: ["ESCTR"] };
+    session.tool_calls = [{
+      id: "feature-census",
+      stage_id: stageId,
+      tool: "mcp__ai_coder__locate_feature_implementation",
+      input: censusInput,
+      status: "completed" as const,
+      created_at: new Date().toISOString()
+    }];
+    recordFeatureCensusReceipt(session, stageId, censusInput, {
+      status: "complete",
+      report_digest: "c".repeat(64),
+      candidate_accounting: { total: 1, yes: 1, no: 0, unknown: 0, accounted: true },
+      selected_targets: [{
+        candidate_id: "Other.js:1#Other",
+        symbol: "Other",
+        kind: "function",
+        definition: { file: "Other.js", line: 1, column: 1 },
+        role: "implementation",
+        trace_summary_digest: "trace"
+      }],
+      unresolved: []
+    } as unknown as ReturnType<typeof censusFeatureImplementations>);
+    const handoff = handoffFor("investigate", "target.ts", "reference.ts", true) as Record<string, unknown>;
+    const referenceAnalysis = handoff.reference_analysis as {
+      candidates: Array<Record<string, unknown>>;
+    };
+    const before = structuredClone(referenceAnalysis.candidates);
+
+    expect(reconcileHierarchicalInvestigateReferenceContracts(
+      session,
+      {
+        kind: "run_phase",
+        requirement_id: "R34",
+        work_unit_id: "R34:investigate",
+        phase: "investigate",
+        role: "code-investigator"
+      },
+      { status: "passed", handoff },
+      stageId
+    )).toEqual([]);
+    expect(referenceAnalysis.candidates).toEqual(before);
   });
 
   it("fills a missing alias selection when both tokens share one exact final contract", () => {

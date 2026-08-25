@@ -884,6 +884,21 @@ export class ClaudeAgentRunner {
         "milestone"
       );
     }
+    const removedReferenceContracts = reconcileHierarchicalInvestigateReferenceContracts(
+      input.session,
+      operation,
+      structured,
+      stageId
+    );
+    if (removedReferenceContracts.length > 0) {
+      await this.recordProgress(
+        input,
+        "tool_policy",
+        "宿主已依据完整功能普查移除未到达目标最终函数/组件的陈旧同功能候选，并同步修正逐目标选择："
+          + removedReferenceContracts.join(", "),
+        "milestone"
+      );
+    }
     reconcileHierarchicalInvestigateReferenceHandoff(operation, structured);
     reconcileHierarchicalPrepareContractHandoff(
       input.session,
@@ -4034,6 +4049,143 @@ export function reconcileHierarchicalInvestigateFinalContracts(
   return reconciled;
 }
 
+/**
+ * Remove stale same-feature candidates after the host census has independently
+ * confirmed the target mapping's exact final callable/component.
+ *
+ * A common retry failure is to keep a visually similar route (for example a
+ * native LQBInvest page) under a target whose verified destination is H5Page.
+ * The protocol correctly rejects that row, but asking a smaller model to edit
+ * three coupled arrays often reproduces the same mismatch until the phase is
+ * blocked. Once the target contract is host-confirmed, deleting a candidate
+ * that declares a different contract is mechanical cleanup, not a semantic
+ * choice. Selections are repaired conservatively: select the sole remaining
+ * valid submitted candidate, or record that no valid submitted reference
+ * remains. Ambiguous sets are left for normal validation.
+ */
+export function reconcileHierarchicalInvestigateReferenceContracts(
+  session: AgentSession,
+  operation: Extract<HierarchicalNextOperation, {
+    kind: "run_phase" | "run_alignment_batch" | "run_planner" | "run_integrator"
+  }>,
+  structured: unknown,
+  stageId: string
+): string[] {
+  if (
+    operation.kind !== "run_phase"
+    || operation.phase !== "investigate"
+    || !isPlainObject(structured)
+  ) return [];
+  const handoff = isPlainObject(structured.handoff) ? structured.handoff : null;
+  const mappings = handoff && Array.isArray(handoff.target_mappings)
+    ? handoff.target_mappings.filter(isPlainObject)
+    : [];
+  const referenceAnalysis = handoff && isPlainObject(handoff.reference_analysis)
+    ? handoff.reference_analysis
+    : null;
+  const candidateItems = referenceAnalysis && Array.isArray(referenceAnalysis.candidates)
+    ? referenceAnalysis.candidates
+    : null;
+  const selections = referenceAnalysis && Array.isArray(referenceAnalysis.target_selections)
+    ? referenceAnalysis.target_selections.filter(isPlainObject)
+    : [];
+  if (!referenceAnalysis || !candidateItems || mappings.length === 0) return [];
+
+  const receipt = getLatestHierarchicalFeatureCensusEvidence(session, stageId)?.receipt;
+  if (!receipt || receipt.status !== "complete") return [];
+  const mappingByTarget = new Map(mappings.flatMap((mapping) => {
+    const targetKey = optionalString(mapping.target_key);
+    return targetKey ? [[targetKey, mapping] as const] : [];
+  }));
+  const confirmedTargetKeys = new Set(mappings.flatMap((mapping) => {
+    const targetKey = optionalString(mapping.target_key);
+    const symbol = optionalString(mapping.contract_symbol);
+    const anchor = evidenceLocationAnchor(
+      optionalString(mapping.contract_location) ?? "",
+      session.project_path
+    );
+    if (!targetKey || !symbol || !anchor) return [];
+    return receipt.selected_targets.some((target) => (
+      target.symbol === symbol
+      && evidenceLocationAnchor(
+        `${target.definition.file}:${target.definition.line}`,
+        session.project_path
+      ) === anchor
+    )) ? [targetKey] : [];
+  }));
+  if (confirmedTargetKeys.size === 0) return [];
+
+  const removedByTarget = new Map<string, string[]>();
+  referenceAnalysis.candidates = candidateItems.filter((item) => {
+    if (!isPlainObject(item)) return true;
+    const targetKey = optionalString(item.target_key);
+    if (!targetKey || !confirmedTargetKeys.has(targetKey)) return true;
+    const mapping = mappingByTarget.get(targetKey);
+    const mappingSymbol = optionalString(mapping?.contract_symbol);
+    const mappingAnchor = evidenceLocationAnchor(
+      optionalString(mapping?.contract_location) ?? "",
+      session.project_path
+    );
+    const candidateSymbol = optionalString(item.contract_symbol);
+    const candidateAnchor = evidenceLocationAnchor(
+      optionalString(item.contract_location) ?? "",
+      session.project_path
+    );
+    if (
+      !mappingSymbol
+      || !mappingAnchor
+      || !candidateSymbol
+      || !candidateAnchor
+      || (candidateSymbol === mappingSymbol && candidateAnchor === mappingAnchor)
+    ) return true;
+    const removed = removedByTarget.get(targetKey) ?? [];
+    removed.push(
+      `${optionalString(item.location) ?? "<unknown>"}`
+      + ` (${candidateSymbol}@${optionalString(item.contract_location) ?? "<unknown>"})`
+    );
+    removedByTarget.set(targetKey, removed);
+    return false;
+  });
+  if (removedByTarget.size === 0) return [];
+
+  const retainedCandidates = (referenceAnalysis.candidates as unknown[]).filter(isPlainObject);
+  for (const [targetKey, removed] of removedByTarget) {
+    const validCandidates = retainedCandidates.filter((candidate) => (
+      optionalString(candidate.target_key) === targetKey
+    ));
+    let selection = selections.find((item) => optionalString(item.target_key) === targetKey);
+    const selectedLocation = optionalString(selection?.selected_location);
+    const selectedWasRemoved = Boolean(selectedLocation && removed.some((description) => (
+      description.startsWith(`${selectedLocation} (`)
+    )));
+    if (!selection) {
+      selection = { target_key: targetKey };
+      (referenceAnalysis.target_selections as unknown[]).push(selection);
+      selections.push(selection);
+    }
+    if (validCandidates.length === 1 && (!selectedLocation || selectedWasRemoved)) {
+      const candidateLocation = optionalString(validCandidates[0]!.location);
+      if (candidateLocation) {
+        selection.selected_location = candidateLocation;
+        selection.selection_reason = "宿主移除契约不一致候选后，仅剩这一条已提交且到达相同最终契约的入口";
+        selection.no_reference_reason = "";
+      }
+      continue;
+    }
+    if (validCandidates.length === 0) {
+      selection.selected_location = "";
+      selection.selection_reason = "";
+      selection.no_reference_reason = (
+        "完整功能普查确认已提交候选均未到达该目标的最终函数/组件，"
+        + "当前参考分析未提供其他可验证的同功能入口"
+      );
+    }
+  }
+  return [...removedByTarget].map(([targetKey, removed]) => (
+    `${targetKey}: ${removed.join("、")}`
+  ));
+}
+
 function investigateCandidateProvesDestination(
   projectPath: string,
   candidate: Record<string, unknown>,
@@ -5820,7 +5972,7 @@ export function hierarchicalValidationCorrection(
     const censusReminder = featureCensusReceipt?.status === "complete"
       ? " 本阶段已有 complete 功能普查回执；不要重跑普查或更改 query，只修正当前交接物。"
       : "";
-    return "先修正最终契约，不要只改 candidate 来迎合错误映射：dispatcher_location 单独填写 redirectActionPush 等公共分发器；target_mappings 与 reference candidate 的 contract_symbol@contract_location 都必须沿各自入口追到共同的最终页面组件/业务函数（例如 ChangePassword）。candidate.location 保留独立的任务基线入口，并确保 selection 的 target_key+selected_location 精确对应该 candidate。"
+    return "分别核实 target_mappings 与 candidate 的最终契约，不要把一侧强改成另一侧来凑相等：dispatcher_location 单独填写 redirectActionPush 等公共分发器；两侧必须沿各自入口追到共同的最终页面组件/业务函数。若 target_mappings 已正确指向最终页面组件（例如 H5Page），就删除仍落到其他组件（例如 LQBInvest）的错误 candidate，改选真正到达同一最终组件的独立入口；确实没有时删除该 candidate，并将对应 selection 的 selected_location/selection_reason 置空、填写 no_reference_reason。candidate.location 保留独立的任务基线入口，selection 的 target_key+selected_location 必须精确对应该 candidate。"
       + censusReminder;
   }
   if (/任务基线|当前工作区新增|反向证明/.test(reason)) {
