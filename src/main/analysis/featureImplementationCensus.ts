@@ -157,6 +157,7 @@ interface SearchTerm {
   value: string;
   normalized: string;
   exactOnly: boolean;
+  explicit: boolean;
   polarity: "positive" | "negative";
 }
 
@@ -168,6 +169,7 @@ interface InternalCandidate {
   declaration: ts.Declaration;
   symbolObject?: ts.Symbol;
   nested: boolean;
+  enclosingCandidateId?: string;
   evidence: FeatureEvidence[];
   evidenceAgainst: FeatureEvidence[];
 }
@@ -223,10 +225,11 @@ export interface FeatureCensusToolResultOptions {
  * Host-owned feature implementation census.
  *
  * The script lexically visits every in-scope source, then performs bounded
- * semantic analysis on files with distinctive evidence. The host may safely
- * reject explicit exclusions, but it never promotes or rejects a positive
- * candidate from lexical strength alone. Positive candidates remain unknown
- * until an evidence-backed semantic adjudication is supplied.
+ * semantic analysis on files with distinctive evidence. Corpus and symbol
+ * frequency remove plumbing terms from the semantic review frontier. Only
+ * symbols with direct lexical/configuration evidence become candidates; the
+ * call graph enriches those candidates instead of turning every reachable
+ * wrapper/helper into another manual decision.
  */
 export function censusFeatureImplementations(
   input: FeatureImplementationCensusInput
@@ -263,13 +266,15 @@ export function censusFeatureImplementations(
   const candidates = collectCandidates(projectPath, sourceFiles, checker);
   const bySymbol = indexCandidatesBySymbol(candidates, checker);
   const byId = new Map(candidates.map((candidate) => [candidate.id, candidate]));
+  const candidateTermSelection = selectCandidateEvidenceTerms(candidates, terms);
+  const evidenceTerms = candidateTermSelection.terms;
   const anchors: FeatureImplementationCensusReport["anchors"] = [];
   const directCandidateIds = new Set<string>();
 
   for (const candidate of candidates) {
     const sourceFile = candidate.declaration.getSourceFile();
     const declarationText = candidate.declaration.getText(sourceFile);
-    for (const term of terms) {
+    for (const term of evidenceTerms) {
       if (matchesValue(candidate.symbol, term)) {
         const item = evidence(
           term.polarity === "negative" ? "negative-clue" : "symbol-name",
@@ -310,7 +315,7 @@ export function censusFeatureImplementations(
     collectAnchorsAndAdjacentCandidates(
       projectPath,
       sourceFile,
-      terms,
+      evidenceTerms,
       checker,
       bySymbol,
       byId,
@@ -319,15 +324,16 @@ export function censusFeatureImplementations(
     );
   }
 
+  collapseAggregateMemberCandidates(directCandidateIds, byId);
+
   const edges = collectGraphEdges(projectPath, sourceFiles, checker, bySymbol, byId);
   const graph = buildGraph(edges);
   const upstream = traverseGraph(directCandidateIds, graph.incoming, "upstream-path");
   const downstream = traverseGraph(directCandidateIds, graph.outgoing, "downstream-path");
-  const possibleIds = new Set<string>([
-    ...directCandidateIds,
-    ...upstream.keys(),
-    ...downstream.keys()
-  ]);
+  // Call hierarchy is context for a search hit, not another search result.
+  // Promoting all reachable symbols made a single dispatcher fan out into
+  // hundreds of unrelated manual adjudications.
+  const possibleIds = new Set<string>(directCandidateIds);
   const adjudications = validateAdjudications(
     projectPath,
     input.adjudications ?? [],
@@ -436,7 +442,10 @@ export function censusFeatureImplementations(
       warnings: [
         ...programBuild.warnings,
         `已对范围内 ${scopedSources.length} 个源码文件完成词面普查，并对其中 ${sourceFiles.length} 个证据命中文件执行受限语义分析。`,
-        `调用图候选限制在直接证据上下游 ${MAX_GRAPH_HOPS} 跳内，避免通用包装器扩散为无关候选。`
+        candidateTermSelection.suppressed.length > 0
+          ? `已用符号频率排除高频管道词：${candidateTermSelection.suppressed.join(", ")}。`
+          : "未发现需要排除的高频管道词。",
+        `调用图仅为直接检索候选补充 ${MAX_GRAPH_HOPS} 跳上下文，不将无直接证据的可达包装器升级为待裁决候选。`
       ],
       all_supported_files_scanned: true as const,
       graph_traversal_complete: true as const
@@ -514,10 +523,17 @@ export function formatFeatureImplementationCensusToolResult(
     status: report.status,
     candidate_accounting: report.candidate_accounting,
     query: report.query,
+    continuation_query: {
+      feature: report.query.feature,
+      aliases: report.query.aliases,
+      acceptance_clues: report.query.acceptance_clues,
+      negative_clues: report.query.negative_clues,
+      scope_paths: report.query.scope_paths
+    },
     next_action: report.status === "complete"
       ? "将 selected_targets 用于后续调查并提交 investigate handoff；report_digest 与候选计数由宿主按最后一次真实调用自动回填。"
       : report.candidate_accounting.unknown > 0
-        ? "按 retrieval_score 检查本批 candidates。source.mode=full-definition 可直接分析完整定义；source.truncated=true 时，若判断依赖完整分支、状态或副作用，必须按 read_hint 在项目内读到 definition_end_line。把 candidate_id 原样填入 adjudications，并用 evidence_ref 提交 yes/no；下一次调用复用相同 query 且累计此前全部 adjudications。"
+        ? "按 retrieval_score 检查本批 candidates。source.mode=full-definition 可直接分析完整定义；source.truncated=true 时，若判断依赖完整分支、状态或副作用，必须按 read_hint 在项目内读到 definition_end_line。把 candidate_id 原样填入 adjudications，并用 evidence_ref 提交本批 yes/no；下一次调用逐字复用 continuation_query，历史裁决由宿主自动累计，不必重传。"
         : "候选已记账但 unresolved 仍有静态分析边界；按 unresolved 补充范围或人工证据，不要重复提交相同输入。",
     selected_targets: selectedTargets,
     selected_targets_projection: {
@@ -748,7 +764,7 @@ function selectEvidenceBearingSources(
   // use that evidence to choose semantic-analysis roots. If every matching
   // term is common, retain all matches so broad-but-legitimate features still
   // receive a complete census.
-  const commonTermThreshold = Math.max(8, Math.ceil(sources.length * 0.2));
+  const commonTermThreshold = Math.max(8, Math.ceil(sources.length * 0.05));
   const discriminativeTerms = new Set([...termFileFrequency]
     .filter(([, frequency]) => frequency <= commonTermThreshold)
     .map(([term]) => term));
@@ -765,6 +781,60 @@ function selectEvidenceBearingSources(
     if (existsSync(file) && !selected.includes(file)) selected.push(file);
   }
   return selected.length > 0 ? selected : [sources[0]!];
+}
+
+function selectCandidateEvidenceTerms(
+  candidates: InternalCandidate[],
+  terms: SearchTerm[]
+): {
+  terms: SearchTerm[];
+  suppressed: string[];
+} {
+  const positiveTerms = terms.filter((term) => term.polarity === "positive");
+  const negativeTerms = terms.filter((term) => term.polarity === "negative");
+  const frequencies = new Map<SearchTerm, number>();
+  for (const term of positiveTerms) {
+    frequencies.set(term, candidates.filter((candidate) => (
+      candidateMatchesSearchTerm(candidate, term)
+    )).length);
+  }
+  const commonTermThreshold = Math.max(8, Math.ceil(candidates.length * 0.05));
+  const matchedTerms = positiveTerms.filter((term) => (frequencies.get(term) ?? 0) > 0);
+  const discriminativeTerms = matchedTerms.filter((term) => (
+    (frequencies.get(term) ?? 0) <= commonTermThreshold
+  ));
+  // Suppression is only safe when the query contains at least one rarer clue.
+  // If the user supplied only a broad term, keep all its hits and let the AI
+  // resolve the real ambiguity instead of silently inventing precision.
+  const selectedPositiveTerms = discriminativeTerms.length > 0
+    ? discriminativeTerms
+    : matchedTerms;
+  const selectedSet = new Set(selectedPositiveTerms);
+  const suppressed = discriminativeTerms.length > 0
+    ? matchedTerms
+        .filter((term) => !selectedSet.has(term))
+        .sort((left, right) => (
+          (frequencies.get(right) ?? 0) - (frequencies.get(left) ?? 0)
+          || Number(right.explicit) - Number(left.explicit)
+          || left.value.localeCompare(right.value)
+        ))
+        .slice(0, 12)
+        .map((term) => `${term.value}(${frequencies.get(term) ?? 0})`)
+    : [];
+  return {
+    terms: [...selectedPositiveTerms, ...negativeTerms],
+    suppressed
+  };
+}
+
+function candidateMatchesSearchTerm(
+  candidate: InternalCandidate,
+  term: SearchTerm
+): boolean {
+  const sourceFile = candidate.declaration.getSourceFile();
+  return matchesValue(candidate.symbol, term)
+    || (!candidate.nested && matchesValue(candidate.definition.file, term))
+    || matchesValue(candidate.declaration.getText(sourceFile), term);
 }
 
 function collectCandidates(
@@ -794,7 +864,51 @@ function collectCandidates(
     };
     visit(sourceFile);
   }
-  return dedupeBy(result, (candidate) => candidate.id);
+  const deduped = dedupeBy(result, (candidate) => candidate.id);
+  const byId = new Map(deduped.map((candidate) => [candidate.id, candidate]));
+  for (const candidate of deduped) {
+    let current: ts.Node | undefined = candidate.declaration.parent;
+    while (current) {
+      const descriptor = candidateDescriptorWithoutChecker(current);
+      if (descriptor) {
+        const location = locationOf(current, projectPath);
+        const enclosing = byId.get(candidateId(location.file, descriptor.symbol, location.line));
+        if (enclosing) {
+          candidate.enclosingCandidateId = enclosing.id;
+          break;
+        }
+      }
+      current = current.parent;
+    }
+  }
+  return deduped;
+}
+
+function collapseAggregateMemberCandidates(
+  directIds: Set<string>,
+  candidates: Map<string, InternalCandidate>
+): void {
+  for (const id of [...directIds]) {
+    const candidate = candidates.get(id);
+    if (!candidate?.nested) continue;
+    // An explicitly named method remains a first-class search result. Other
+    // members are already covered by reading the enclosing class/component's
+    // complete definition and must not become dozens of duplicate decisions.
+    if (candidate.evidence.some((item) => item.kind === "symbol-name")) continue;
+    let enclosingId = candidate.enclosingCandidateId;
+    while (enclosingId) {
+      const enclosing = candidates.get(enclosingId);
+      if (!enclosing) break;
+      if (
+        directIds.has(enclosing.id)
+        && (enclosing.kind === "class" || enclosing.kind === "component")
+      ) {
+        directIds.delete(candidate.id);
+        break;
+      }
+      enclosingId = enclosing.enclosingCandidateId;
+    }
+  }
 }
 
 function candidateDescriptor(
@@ -1329,6 +1443,7 @@ function buildSearchTerms(input: FeatureImplementationCensusInput): SearchTerm[]
         value: value.trim(),
         normalized: normalize(value),
         exactOnly: normalize(value).length < 2,
+        explicit,
         polarity
       }))
       .filter((term) => (

@@ -84,8 +84,7 @@ describe("censusFeatureImplementations", () => {
       "CurrencyFundExplain",
       "TransactionRecordLQB",
       "goLqbInvest",
-      "redirectActionPush",
-      "autoPushPage"
+      "redirectActionPush"
     ]));
     expect(report.candidate_accounting.total).toBe(
       report.candidate_accounting.yes
@@ -118,7 +117,7 @@ describe("censusFeatureImplementations", () => {
       acceptanceClues: ["零钱宝主页"],
       negativeClues: ["零钱宝说明页", "零钱宝交易记录"]
     });
-    const yesSymbols = new Set(["LQBInvest", "goLqbInvest", "redirectActionPush", "autoPushPage"]);
+    const yesSymbols = new Set(["LQBInvest", "goLqbInvest", "redirectActionPush"]);
     const adjudications: FeatureCandidateAdjudication[] = initial.candidates.map((candidate) => ({
       candidate_id: candidate.id,
       verdict: yesSymbols.has(candidate.symbol) ? "yes" : "no",
@@ -140,15 +139,14 @@ describe("censusFeatureImplementations", () => {
     expect(report.status).toBe("complete");
     expect(report.candidate_accounting).toMatchObject({
       total: initial.candidates.length,
-      yes: 4,
+      yes: 3,
       unknown: 0,
       accounted: true
     });
     expect(report.selected_targets.map((target) => target.symbol)).toEqual(expect.arrayContaining([
       "LQBInvest",
       "goLqbInvest",
-      "redirectActionPush",
-      "autoPushPage"
+      "redirectActionPush"
     ]));
     expect(report.selected_targets.every((target) => /^[a-f0-9]{64}$/.test(target.trace_summary_digest)))
       .toBe(true);
@@ -290,7 +288,14 @@ export function unrelatedDynamicLqbWrapper(
     expect(parsed).toMatchObject({
       report_digest: report.report_digest,
       status: report.status,
-      candidate_accounting: report.candidate_accounting
+      candidate_accounting: report.candidate_accounting,
+      continuation_query: {
+        feature: report.query.feature,
+        aliases: report.query.aliases,
+        acceptance_clues: report.query.acceptance_clues,
+        negative_clues: report.query.negative_clues,
+        scope_paths: report.query.scope_paths
+      }
     });
     expect(Buffer.byteLength(formatted, "utf8")).toBeLessThanOrEqual(16_000);
     expect(parsed.candidates).toEqual(expect.arrayContaining([
@@ -428,8 +433,8 @@ export function unrelatedDynamicLqbWrapper(
     const root = await createNavigationFixture();
     await writeFile(path.join(root, "AccountPanel.ts"), [
       "export class AccountPanel {",
-      "  private loadState() { return 'ready'; }",
-      "  render() { return this.loadState(); }",
+      "  private loadState() { return 'AccountPanel-ready'; }",
+      "  render() { return this.loadState() || 'AccountPanel'; }",
       "}"
     ].join("\n"));
     const report = censusFeatureImplementations({
@@ -505,6 +510,37 @@ export function sharedWrapper${index}(sharedContext: unknown) {
       .toBe(true);
     expect(report.candidates.some((candidate) => candidate.symbol.startsWith("sharedWrapper")))
       .toBe(false);
+  });
+
+  it("uses symbol frequency to keep protocol targets while pruning same-file plumbing", async () => {
+    const root = await createNavigationFixture();
+    await writeFile(path.join(root, "large-router.ts"), [
+      "export function RareTarget() { return 'RareRouteToken'; }",
+      "export function routeRare(pageName: string, linkType: string) {",
+      "  return pageName === 'RareRouteToken' && linkType === 'nativeLink' ? RareTarget() : null;",
+      "}",
+      "export function genericEntry() { return routeRare('other', 'nativeLink'); }",
+      ...Array.from({ length: 80 }, (_, index) => (
+        `export function genericWrapper${index}(pageName: string, linkType: string) { return linkType === 'nativeLink' ? pageName : ''; }`
+      ))
+    ].join("\n"));
+
+    const report = censusFeatureImplementations({
+      projectPath: root,
+      feature: "open RareRouteToken through nativeLink",
+      aliases: ["RareRouteToken", "RareTarget", "pageName", "linkType", "nativeLink"]
+    });
+
+    expect(report.candidates.map((candidate) => candidate.symbol)).toEqual([
+      "RareTarget",
+      "routeRare"
+    ]);
+    expect(report.candidates.some((candidate) => candidate.symbol === "genericEntry"))
+      .toBe(false);
+    expect(report.candidates.some((candidate) => candidate.symbol.startsWith("genericWrapper")))
+      .toBe(false);
+    expect(report.coverage.warnings.join("\n")).toContain("高频管道词");
+    expect(report.coverage.graph_edges).toBeGreaterThan(0);
   });
 
   it("returns unknown candidates in bounded adjudication batches without losing host accounting", async () => {

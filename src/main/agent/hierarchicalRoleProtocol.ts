@@ -1005,9 +1005,9 @@ function phaseInstructions(
     case "investigate":
       return [
         "只读取证：定位目标代码、最相似既有实现、真实调用方和关键未知。",
-        "只要需求以业务功能、用户行为、页面或协议标识描述，而不是用户已经给出唯一精确符号，就必须调用 locate_feature_implementation 做完整候选普查。按 retrieval_score 阅读返回批次，但排名只决定阅读顺序：source.mode=full-definition 时分析完整定义；source.truncated=true 且结论依赖完整分支、状态或副作用时，按 read_hint 在项目内读到 definition_end_line。累计提交 yes/no adjudications，直到 status=complete。普通搜索、只报最像候选或模型自述不能替代。",
-        "功能普查必须对范围内源码完成词面普查，并对独特证据命中文件覆盖符号名、路径、定义正文、配置邻接和直接证据上下游两跳调用图；每个进入语义候选集的目标都要保留 evidence_for、evidence_against 与 yes/no 结论。弱证据只能保持 unknown，不能静默排除；强词面证据也必须经语义裁决才能成为 yes。",
-        "feature_census 只需提交 applicability 与 reason；status、report_digest、candidate_accounting、selected_candidate_ids 和 runtime_verification_required 全部由宿主从最后一次真实普查回填，不要手抄。最后一次普查仍为 partial 时不要提交 passed：沿用相同 feature、aliases、clues 与 scope 累计 adjudications 重跑普查，直到 status=complete 后宿主回填并通过校验。",
+        "只要需求以业务功能、用户行为、页面或协议标识描述，而不是用户已经给出唯一精确符号，就必须调用 locate_feature_implementation。aliases 只放业务同义名和 token 值，不放 pageName/linkType 等通用字段。按 retrieval_score 阅读返回批次；只提交当前批次 yes/no adjudications，并以完全相同查询继续到 status=complete，历史批次由宿主自动累计。",
+        "功能普查对范围内源码完成词面扫描，用项目/符号频率排除高频管道词，再对直接命中符号做语义裁决。调用图仅补充候选上下文，不将所有可达包装器扩张为候选；最终调用契约由 prepare 调查。",
+        "feature_census 只需提交 applicability 与 reason；status、report_digest、candidate_accounting、selected_candidate_ids 和 runtime_verification_required 由宿主回填。最后一次普查仍为 partial 时，沿用完全相同查询提交当前批次 adjudications，直到 complete。",
         "目标函数/组件必须逐项调查定义、输入、输出、内部调用、guard、状态/副作用和调用方；某项不存在也要用证据明确写‘无’，不得省略。",
         "同类实现不是外形相似的路由分支。必须优先找到应用内进入同一业务功能的既有用户入口，沿该入口追到最终组件/函数，并记录目标、调用方式、完整参数、guard、上下文透传和副作用。",
         "每个原始页面/协议 token 都必须在 target_mappings 中单独记录 target_key、原词、canonical token、公共 dispatcher 位置，以及最终 contract_symbol@contract_location；公共 dispatcher 不能冒充最终页面组件。",

@@ -17,6 +17,7 @@ import {
   hierarchicalValidationCorrection,
   isLineAddedByGitDiff,
   isWorkingTreeAddedEvidenceLocation,
+  mergeFeatureCensusAdjudications,
   reconcileHierarchicalFeatureCensusHandoff,
   reconcileHierarchicalInvestigateFinalContracts,
   reconcileHierarchicalInvestigateMappingScope,
@@ -224,6 +225,40 @@ function integrationContractResults(requirementIds: string[], evidence: string) 
 }
 
 describe("ClaudeAgentRunner hierarchical mode", () => {
+  it("accumulates feature census batches and lets the latest verdict replace a prior one", () => {
+    const merged = mergeFeatureCensusAdjudications(
+      [{
+        candidate_id: "first",
+        verdict: "no",
+        reason: "initial exclusion",
+        evidence_refs: ["first.ts:1"]
+      }],
+      [{
+        candidate_id: "second",
+        verdict: "yes",
+        reason: "target implementation",
+        evidence_refs: ["second.ts:2"]
+      }, {
+        candidate_id: "first",
+        verdict: "yes",
+        reason: "corrected after full read",
+        evidence_refs: ["first.ts:3"]
+      }]
+    );
+
+    expect(merged).toEqual([{
+      candidate_id: "first",
+      verdict: "yes",
+      reason: "corrected after full read",
+      evidence_refs: ["first.ts:3"]
+    }, {
+      candidate_id: "second",
+      verdict: "yes",
+      reason: "target implementation",
+      evidence_refs: ["second.ts:2"]
+    }]);
+  });
+
   it("keeps guarded write tools visible and redirects legacy MCP tools without involving the user", () => {
     expect(buildHierarchicalSdkToolSurface(["Read", "Bash"])).toEqual([
       "Read",

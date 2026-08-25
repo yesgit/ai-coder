@@ -5,7 +5,10 @@ import { access, chmod, readFile, readdir, stat, unlink, writeFile } from "node:
 import path from "node:path";
 import type { AgentMessage, AgentSession, Attachment, ExplorationCheckpoint, ExplorationDisposition, ExplorationPhase, FeatureCensusReceipt, HierarchicalBlockerKind, HierarchicalExecutionState, HierarchicalWorkPhase, HumanQuestion, HumanQuestionOption, SessionProgressEvent, StageAgentResult, TaskTree, WorkflowStage, WorkflowTemplate } from "../../shared/types.js";
 import { isMeaningfulAgentText } from "../../shared/agentMessages.js";
-import type { FeatureImplementationCensusReport } from "../analysis/featureImplementationCensus.js";
+import type {
+  FeatureCandidateAdjudication,
+  FeatureImplementationCensusReport
+} from "../analysis/featureImplementationCensus.js";
 import {
   censusFeatureImplementationsInWorker,
   type FeatureCensusWorkerResult
@@ -142,6 +145,7 @@ export class ClaudeAgentRunner {
   private readonly pendingToolApprovals = new Map<string, Map<string, PendingToolApproval>>();
   private readonly lastTransientProgressNotificationAt = new Map<string, number>();
   private readonly featureCensusResultCache = new Map<string, FeatureCensusWorkerResult>();
+  private readonly featureCensusAdjudicationCache = new Map<string, FeatureCandidateAdjudication[]>();
   private readonly mcpServerCache = new WeakMap<AgentRunInput, { server: unknown | null }>();
   private readonly options: ClaudeAgentRunnerOptions;
   private resolvedEffectiveModel: string | null = null;
@@ -2091,7 +2095,7 @@ export class ClaudeAgentRunner {
         "复杂入口硬规则：多附件、多需求点、跨文件或指定基线的请求在进入实现前必须委托 task-planner。planner 尚未成功启动时，根 Agent 可以做最小只读取证以解除阻塞，但不得一次性读取全部附件或重复撞同一门禁。根 Agent 只负责编排和知识归并，任何工作区修改必须委托 task-executor，并在完成后委托 task-verifier。",
         "Task 调用必须显式填写 subagent_type。复杂入口的正确格式是 `Task({ subagent_type: \"task-planner\", description: \"拆分需求\", prompt: \"只读分析并返回 R-ID 与证据\" })`；不要省略 subagent_type，也不要用 Skill 调用替代 Task。",
         "当前阶段已经注入的核心 Skill 不得再次调用 Skill 工具；应直接落实其契约。只有能力目录里未注入且确实需要的额外 Skill 才调用 Skill 工具。",
-        "功能定位硬规则：目标以业务功能、用户行为、页面、事件或协议值描述且没有唯一精确符号时，必须真实调用 mcp__ai_coder__locate_feature_implementation。按 retrieval_score 检查返回的 unknown：source.mode=full-definition 可直接分析；source.truncated=true 且裁决依赖完整分支、状态或副作用时，按 read_hint 在项目内读到 definition_end_line。累计 adjudications 并重跑到 complete，不能用排名或自述代替语义裁决。普查只生成 yes 目标的受限调用图摘要；最终复用目标的完整调用契约由 prepare 调查。",
+        "功能定位硬规则：目标以业务功能、用户行为、页面、事件或协议值描述且没有唯一精确符号时，必须真实调用 mcp__ai_coder__locate_feature_implementation。aliases 只放业务同义名和 token 值，不放 pageName/linkType 等通用字段。按 retrieval_score 检查返回的 unknown：source.mode=full-definition 可直接分析；source.truncated=true 且裁决依赖完整分支、状态或副作用时，按 read_hint 在项目内读到 definition_end_line。只提交当前批次 adjudications，宿主按相同查询自动累计并重跑到 complete。普查只生成 yes 目标的受限调用图摘要；最终复用目标的完整调用契约由 prepare 调查。",
         "调用契约硬规则：拟议实现只要会调用、复用或修改已有函数、方法、Hook 或组件，第一次相关修改前必须通过 Task 使用 call-contract-investigator；该调查者必须真实调用 mcp__ai_coder__investigate_symbol_contract 完整调查脚本，再把结果归并进知识雪球。主线程自行 Read/Grep/Bash、零散符号分析或文字声明不能替代。只有纯文案、静态数据或样式且不涉及任何既有函数/组件时才可判定不适用，并记录依据。",
         "只调用工具列表中展示的精确工具名，并使用标准 tool_use 格式。",
         commitMarkGuidance
@@ -2866,7 +2870,7 @@ export class ClaudeAgentRunner {
     return [
       "## 当前可用能力（与知识雪球、阶段任务同时生效）",
       "先根据当前缺失信息明确选择 Skill、Sub-agent 或直接工具，并把选择理由写回知识雪球。跨多文件追踪、独立验证或完整性审查与某个 Sub-agent 职责匹配时优先委托；简单单点事实直接用工具。只选能推进当前阶段任务的最小能力。",
-      "功能定位硬规则：目标以业务功能、用户行为、页面、事件或协议值描述且没有唯一精确符号时，必须调用 locate_feature_implementation；工具按搜索证据排序并返回候选代码上下文。source.mode=full-definition 时直接分析完整定义；source.truncated=true 且结论依赖完整分支、状态或副作用时，按 read_hint 在项目内读到 definition_end_line。逐批裁决 unknown、累计 adjudications 并调用到 complete；排名只决定阅读顺序，不能替代语义裁决。最终复用目标的完整调用契约留给 prepare。",
+      "功能定位硬规则：目标以业务功能、用户行为、页面、事件或协议值描述且没有唯一精确符号时，必须调用 locate_feature_implementation；aliases 不要加入 pageName/linkType 等通用字段。工具按搜索证据排序并返回候选代码上下文。source.mode=full-definition 时直接分析完整定义；source.truncated=true 且结论依赖完整分支、状态或副作用时，按 read_hint 在项目内读到 definition_end_line。逐批裁决 unknown，每轮只提交当前批次，宿主按相同查询自动累计到 complete。最终复用目标的完整调用契约留给 prepare。",
       "调用契约硬规则：凡拟议实现会调用、复用或修改已有函数、方法、Hook 或组件，第一次相关修改前必须通过 Task 使用 call-contract-investigator，且调查者必须真实调用 investigate_symbol_contract 完整调查脚本；主线程搜索、零散 analyze_symbol_contract 或文字声明不能替代。纯文案、静态数据或样式且不涉及既有函数/组件时才可记录依据后判定不适用。",
       "",
       "### Skills（工作流核心项已由宿主加载；目录中的其他项可用 Skill 加载）",
@@ -3340,15 +3344,15 @@ export class ClaudeAgentRunner {
         "locate_feature_implementation",
         [
           "运行宿主持有的功能实现候选普查脚本。脚本先快速扫描范围内全部 TypeScript/JavaScript/React 文件，",
-          "再对独特证据命中文件执行受限语义分析，合并符号名、路径、定义正文、配置邻接以及两跳调用图候选；",
+          "再对独特证据命中文件执行受限语义分析，合并符号名、路径、定义正文和配置邻接候选，并以两跳调用图补充上下文；",
           "候选按多通道证据排序并携带宿主提取的定义上下文：短定义直接完整返回，大定义返回有摘要指纹的片段、完整行范围和项目内 Read 分页提示。",
-          "宿主只自动排除测试路径或明确 negative clue；所有正向候选无论词面强弱都先记为 unknown。语义结论依赖完整实现时必须读完整定义，再累计 adjudications 调用，",
-          "直到 status=complete；yes 目标只附带受限调用图摘要，最终复用目标由 prepare 执行完整调用契约调查。普通 Read/Grep、模型排名或只选一个最像的目标不能替代。"
+          "宿主以项目和符号频率排除 pageName/linkType 等高频管道词，只把具有直接检索或配置邻接证据的符号列为候选；调用图用于补充上下文，不把所有可达包装器扩张成候选。",
+          "语义结论依赖完整实现时必须读完整定义；每次只需提交当前返回批次的 adjudications，宿主会在相同查询内自动累计，直到 status=complete。yes 目标只附带受限调用图摘要，最终复用目标由 prepare 执行完整调用契约调查。"
         ].join(""),
         {
           feature: z.string().min(1).describe("完整的用户可观察功能描述，不要只传某个猜测符号名"),
           aliases: z.array(z.string().min(1)).optional()
-            .describe("从需求、代码和历史命名提取的全部别名、缩写、错拼及协议 token"),
+            .describe("同一业务目标的别名、缩写、错拼及协议 token 值；不要加入 pageName、linkType 等通用字段名"),
           acceptance_clues: z.array(z.string().min(1)).optional()
             .describe("验收标准中的页面名、动作、路由值、文案、埋点或其他正向线索"),
           negative_clues: z.array(z.string().min(1)).optional()
@@ -3360,7 +3364,7 @@ export class ClaudeAgentRunner {
             verdict: z.enum(["yes", "no"]),
             reason: z.string().min(1),
             evidence_refs: z.array(z.string().min(1)).min(1)
-          })).optional().describe("累计提交此前所有已裁决候选的是/不是结论及候选声明或已发现证据的 path:line；不要只提交当前批次")
+          })).optional().describe("提交当前返回批次的是/不是结论及候选声明或已发现证据的 path:line；相同查询的历史裁决由宿主自动累计")
         },
         async (args) => {
           const toolInput = args as {
@@ -3381,10 +3385,35 @@ export class ClaudeAgentRunner {
             for (const scope of toolInput.scope_paths ?? []) {
               await assertPathInsideProject(input.session.project_path, scope);
             }
+            const censusStageId = currentFeatureCensusStageId(input.session);
+            const adjudicationStateKey = [
+              input.session.id,
+              censusStageId,
+              input.session.project_path,
+              String(input.session.file_changes.length),
+              featureCensusQueryDigest(toolInput as Record<string, unknown>)
+            ].join("\n");
+            const persistedAdjudications = collectPriorFeatureCensusAdjudications(
+              input.session,
+              censusStageId,
+              featureCensusQueryDigest(toolInput as Record<string, unknown>)
+            );
+            const previousAdjudications = mergeFeatureCensusAdjudications(
+              persistedAdjudications,
+              this.featureCensusAdjudicationCache.get(adjudicationStateKey) ?? []
+            );
+            const effectiveAdjudications = mergeFeatureCensusAdjudications(
+              previousAdjudications,
+              toolInput.adjudications ?? []
+            );
+            const effectiveToolInput = {
+              ...toolInput,
+              adjudications: effectiveAdjudications
+            };
             const cacheKey = [
               input.session.project_path,
               String(input.session.file_changes.length),
-              featureCensusInputDigest(toolInput as Record<string, unknown>)
+              featureCensusInputDigest(effectiveToolInput as Record<string, unknown>)
             ].join("\n");
             let workerResult = this.featureCensusResultCache.get(cacheKey);
             if (workerResult) {
@@ -3410,7 +3439,7 @@ export class ClaudeAgentRunner {
                 acceptanceClues: toolInput.acceptance_clues,
                 negativeClues: toolInput.negative_clues,
                 scopePaths: toolInput.scope_paths,
-                adjudications: toolInput.adjudications
+                adjudications: effectiveAdjudications
               }, this.abortControllers.get(input.session.id)?.signal);
               this.featureCensusResultCache.set(cacheKey, workerResult);
               while (this.featureCensusResultCache.size > 8) {
@@ -3419,17 +3448,26 @@ export class ClaudeAgentRunner {
                 this.featureCensusResultCache.delete(oldestKey);
               }
             }
+            this.featureCensusAdjudicationCache.set(
+              adjudicationStateKey,
+              effectiveAdjudications
+            );
+            while (this.featureCensusAdjudicationCache.size > 32) {
+              const oldestKey = this.featureCensusAdjudicationCache.keys().next().value;
+              if (typeof oldestKey !== "string") break;
+              this.featureCensusAdjudicationCache.delete(oldestKey);
+            }
             const report = workerResult.report;
             recordFeatureCensusReceipt(
               input.session,
-              currentFeatureCensusStageId(input.session),
+              censusStageId,
               toolInput,
               report
             );
             await this.recordProgress(
               input,
               "runner",
-              `普查结果就绪：扫描 ${report.coverage.files_scanned} 个文件，候选 ${report.candidate_accounting.total} 个，状态 ${report.status}，耗时 ${Date.now() - censusStartedAt}ms。`,
+              `普查结果就绪：扫描 ${report.coverage.files_scanned} 个文件，候选 ${report.candidate_accounting.total} 个，已累计裁决 ${effectiveAdjudications.length} 个，状态 ${report.status}，耗时 ${Date.now() - censusStartedAt}ms。`,
               "milestone"
             );
             return {
@@ -4471,6 +4509,67 @@ function featureCensusInputDigest(input: Record<string, unknown>): string {
     .digest("hex");
 }
 
+function featureCensusQueryDigest(input: Record<string, unknown>): string {
+  return featureCensusInputDigest({
+    ...input,
+    adjudications: []
+  });
+}
+
+export function mergeFeatureCensusAdjudications(
+  previous: FeatureCandidateAdjudication[],
+  incoming: FeatureCandidateAdjudication[]
+): FeatureCandidateAdjudication[] {
+  const merged = new Map<string, FeatureCandidateAdjudication>();
+  for (const adjudication of [...previous, ...incoming]) {
+    merged.set(adjudication.candidate_id, {
+      candidate_id: adjudication.candidate_id,
+      verdict: adjudication.verdict,
+      reason: adjudication.reason,
+      evidence_refs: [...adjudication.evidence_refs]
+    });
+  }
+  return [...merged.values()];
+}
+
+function collectPriorFeatureCensusAdjudications(
+  session: AgentSession,
+  stageId: string,
+  queryDigest: string
+): FeatureCandidateAdjudication[] {
+  const batches = session.tool_calls.flatMap((call) => {
+    if (
+      call.stage_id !== stageId
+      || call.tool !== "mcp__ai_coder__locate_feature_implementation"
+      || call.status !== "completed"
+      || !isPlainObject(call.input)
+      || featureCensusQueryDigest(call.input) !== queryDigest
+      || !Array.isArray(call.input.adjudications)
+    ) return [];
+    return call.input.adjudications.flatMap((item) => {
+      if (!isPlainObject(item)) return [];
+      const candidateId = optionalString(item.candidate_id);
+      const verdict = optionalString(item.verdict);
+      const reason = optionalString(item.reason);
+      const evidenceRefs = optionalStringArray(item.evidence_refs);
+      if (
+        !candidateId
+        || (verdict !== "yes" && verdict !== "no")
+        || !reason
+        || !evidenceRefs
+        || evidenceRefs.length === 0
+      ) return [];
+      return [{
+        candidate_id: candidateId,
+        verdict,
+        reason,
+        evidence_refs: evidenceRefs
+      } satisfies FeatureCandidateAdjudication];
+    });
+  });
+  return mergeFeatureCensusAdjudications([], batches);
+}
+
 function validateHierarchicalFeatureCensusEvidence(
   session: AgentSession,
   passed: Extract<HierarchicalEvent, { type: "phase_passed" }>,
@@ -5507,16 +5606,16 @@ export function hierarchicalValidationCorrection(
     const censusState = featureCensusReceipt
       ? `最后一次普查仍为 partial（unknown=${featureCensusReceipt.candidate_accounting.unknown}）`
       : "本阶段最后一次普查没有 complete 回执";
-    return `${censusState}，宿主没有可回填的 complete 报告，也不要手工填写 report_digest：沿用相同 feature、aliases、clues 与 scope 重跑 locate_feature_implementation，逐项裁决剩余 unknown 并累计 adjudications，直到 status=complete 后重新提交；status/report_digest/计数/selected ids 一律由宿主从真实报告回填。`;
+    return `${censusState}，宿主没有可回填的 complete 报告，也不要手工填写 report_digest：沿用完全相同的 feature、aliases、clues 与 scope 重跑 locate_feature_implementation，逐项裁决当前批次 unknown；历史 adjudications 由宿主自动累计，直到 status=complete 后重新提交。`;
   }
   if (/feature_census\.(?:candidate_accounting|selected_candidate_ids)/.test(reason)) {
     if (featureCensusReceipt?.status === "complete") {
       return "不要重跑普查；沿用最后一次 complete 报告重新提交草稿，宿主会从真实报告自动回填候选计数和全部 yes candidate id。";
     }
-    return "宿主没有 complete 普查报告可回填候选计数与 selected ids，不要手工编造：沿用相同 feature、aliases、clues 与 scope 重跑 locate_feature_implementation 并累计 adjudications，直到 status=complete 后重新提交，相关字段由宿主从真实报告回填。";
+    return "宿主没有 complete 普查报告可回填候选计数与 selected ids：沿用完全相同的 feature、aliases、clues 与 scope 重跑 locate_feature_implementation，只提交当前批次 adjudications，宿主会自动累计到 status=complete。";
   }
   if (/功能实现候选普查|feature_census|locate_feature_implementation/.test(reason)) {
-    return "沿用上次完全相同的 feature、aliases、clues 与 scope 调用 locate_feature_implementation；对每个 unknown 逐项读取代码，若 unresolved 指向自动判为 yes 但实际无关的动态包装器也应以 no 覆盖，并把此前及本次全部 yes/no、reason、path:line adjudications 累计提交。只有 status=complete 且最终 yes 集合完整记账后才能提交 investigate；最终复用目标的完整调用契约由 prepare 调查。";
+    return "沿用上次完全相同的 feature、aliases、clues 与 scope 调用 locate_feature_implementation；只对工具当前返回的 unknown 逐项读取代码并提交 yes/no、reason、path:line，宿主会自动累计历史批次。不要重传旧裁决，也不要扩大 aliases 或改变 scope。只有 status=complete 且最终 yes 集合完整记账后才能提交 investigate。";
   }
   if (/open_unknowns/.test(reason)) {
     return "不能删除或改写尚未解决的未知来强行通过：继续读取定义、消费者、调用点和基线同功能入口；仓库证据能裁决时补齐逐目标 target_mappings，确实会改变用户可观察行为且无法静态裁决时返回 blocked + user_decision。";
