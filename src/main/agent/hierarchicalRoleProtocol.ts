@@ -864,6 +864,10 @@ function validatePhaseHandoffSemantics(
   if (disposition !== "changes_required" && disposition !== "already_satisfied") {
     throw new Error(`handoff.change_disposition 非法：${disposition}`);
   }
+  const patchPlan = stringArray(handoff.patch_plan, "handoff.patch_plan");
+  if (disposition === "changes_required" && patchPlan.length === 0) {
+    throw new Error("prepare 判定 changes_required 时 patch_plan 必须至少包含一项");
+  }
   requireNonEmptyStringArray(handoff.satisfaction_evidence, "handoff.satisfaction_evidence");
   validateBehaviorObligations(handoff.behavior_obligations, "handoff.behavior_obligations");
 }
@@ -1066,7 +1070,7 @@ function phaseInstructions(
         "必须把 investigate 的每个 target_key 逐项落实为 reference_application；六类 behavior_obligations 仍按 destination、invocation、arguments、preconditions、context、side_effects 冻结，但每项 target_keys 必须完整覆盖全部目标。",
         "changes_required 的 behavior_obligations 是尚待实现的未来契约：每项引用同功能既有入口证据，不得虚构尚不存在的新分支 path:line。目标现状和插入上下文沿用 investigate 已验证证据，实际目标代码证据由 implement、verify 逐项提交；只有 already_satisfied 才必须在 prepare 为每项同时给出当前目标代码证据。",
         "默认逐维度复用同功能入口。任何 intentional-difference 都必须引用用户要求或既有架构证据；不能以‘当前代码已经这样写’作为差异依据。",
-        "若六类义务已全部满足，返回 change_disposition=already_satisfied、空 allowed_files 和逐项 satisfaction_evidence，宿主将跳过 implement 直接独立验证；否则返回 changes_required 和非空 allowed_files。",
+        "若六类义务已全部满足，返回 change_disposition=already_satisfied、空 allowed_files、空 patch_plan 和逐项 satisfaction_evidence，宿主将跳过 implement 直接独立验证；否则返回 changes_required、非空 patch_plan 和非空 allowed_files。",
         "prepare 是只读阶段，不需要 Edit。提交合格 handoff 后宿主会自动进入 implement 并授予 allowed_files 的 Edit 权限；不得改用 Bash 写文件，也不得要求用户启用内部工具。"
       ].join("\n");
     case "implement":
@@ -1354,7 +1358,7 @@ function phaseHandoffSchema(
         satisfaction_evidence: stringList(1),
         pre_behavior: stringList(1),
         preserve_invariants: stringList(1),
-        patch_plan: stringList(1),
+        patch_plan: stringList(),
         verification_plan: stringList(1)
       });
     case "implement":

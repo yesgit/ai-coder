@@ -18,6 +18,7 @@ import {
   isLineAddedByGitDiff,
   isWorkingTreeAddedEvidenceLocation,
   mergeFeatureCensusAdjudications,
+  normalizeHierarchicalStructuredContainers,
   reconcileHierarchicalFeatureCensusHandoff,
   reconcileHierarchicalInvestigateFinalContracts,
   reconcileHierarchicalInvestigateMappingScope,
@@ -343,6 +344,45 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       handoff: {
         confirmed_facts: ["附件要求 pageName=LQBHomeV3", "基线已有 LQBInvest 入口"],
         open_unknowns: []
+      }
+    });
+  });
+
+  it("decodes JSON containers nested inside tagged or tool-owned fields", () => {
+    expect(extractRecoverableStructuredOutputToolInput([{
+      type: "assistant",
+      message: {
+        content: [{
+          type: "text",
+          text: [
+            "<StructuredOutput>",
+            "<status>passed</status>",
+            "<evidence_refs>[\"src/route.ts:1\"]</evidence_refs>",
+            "<discovered_requirements>[]</discovered_requirements>",
+            "<handoff>{\"open_unknowns\":[]}</handoff>",
+            "</StructuredOutput>"
+          ].join("\n")
+        }]
+      }
+    }])).toEqual({
+      status: "passed",
+      evidence_refs: ["src/route.ts:1"],
+      discovered_requirements: [],
+      handoff: { open_unknowns: [] }
+    });
+
+    expect(normalizeHierarchicalStructuredContainers({
+      status: "passed",
+      summary: "{keep this prose unchanged}",
+      evidence_refs: "[\"src/route.ts:1\"]",
+      handoff: "{\"open_unknowns\":[],\"feature_census\":\"{\\\"applicability\\\":\\\"required\\\"}\"}"
+    })).toEqual({
+      status: "passed",
+      summary: "{keep this prose unchanged}",
+      evidence_refs: ["src/route.ts:1"],
+      handoff: {
+        open_unknowns: [],
+        feature_census: { applicability: "required" }
       }
     });
   });
@@ -788,7 +828,10 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       session.hierarchical_state = state;
 
       const prepareHandoff = handoffFor("prepare") as Record<string, unknown>;
-      (prepareHandoff.call_contract as { analyzed_targets: unknown[] }).analyzed_targets = [];
+      (prepareHandoff.call_contract as { analyzed_targets: unknown[] }).analyzed_targets = [{
+        target_file: "reference.ts",
+        symbol: "ConnectedReference"
+      }];
       const structured = {
         status: "passed",
         summary: "prepared",
@@ -1540,6 +1583,21 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     expect(correction).toContain("prepare 判定 changes_required");
   });
 
+  it("reopens only a census candidate that was wrongly adjudicated no", () => {
+    const correction = hierarchicalValidationCorrection({
+      kind: "run_phase",
+      requirement_id: "R33",
+      work_unit_id: "R33:investigate",
+      phase: "investigate",
+      role: "code-investigator"
+    }, "目标定义 lib/views/myAssets/LQBInvest.js:29 在 complete 功能普查中被误裁为 no（candidate_id=LQBInvest_LQBInvest_js_29）");
+
+    expect(correction).toContain("完全相同的 feature、aliases、clues 与 scope");
+    expect(correction).toContain("candidate_id=LQBInvest_LQBInvest_js_29");
+    expect(correction).toContain("yes adjudication");
+    expect(correction).not.toContain("不要重跑普查");
+  });
+
   it("reconciles dispatcher branch contracts to one census-owned destination component", async () => {
     const projectPath = await mkdtemp(path.join(os.tmpdir(), "ai-coder-final-contract-reconcile-"));
     try {
@@ -1814,6 +1872,41 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     });
     expect(referenceAnalysis.candidates).not.toContainEqual(expect.objectContaining({
       target_key: "different-contract"
+    }));
+  });
+
+  it("fills a missing alias selection when both tokens share one exact final contract", () => {
+    const handoff = handoffFor("investigate", "target.ts", "reference.ts", true) as Record<string, unknown>;
+    const mappings = handoff.target_mappings as Array<Record<string, unknown>>;
+    mappings.push({
+      ...mappings[0],
+      target_key: "route-alias",
+      requested_token: "LQBInvest",
+      canonical_token: "LQBInvest"
+    });
+    const referenceAnalysis = handoff.reference_analysis as {
+      candidates: Array<Record<string, unknown>>;
+      target_selections: Array<Record<string, unknown>>;
+    };
+    const structured = { status: "passed", handoff };
+
+    reconcileHierarchicalInvestigateReferenceHandoff({
+      kind: "run_phase",
+      requirement_id: "R1",
+      work_unit_id: "R1:investigate",
+      phase: "investigate",
+      role: "code-investigator"
+    }, structured);
+
+    expect(referenceAnalysis.target_selections).toContainEqual(expect.objectContaining({
+      target_key: "route-alias",
+      selected_location: "reference.ts:5",
+      no_reference_reason: ""
+    }));
+    expect(referenceAnalysis.candidates).toContainEqual(expect.objectContaining({
+      target_key: "route-alias",
+      location: "reference.ts:5",
+      contract_symbol: "reference"
     }));
   });
 
@@ -3266,6 +3359,13 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
         { candidate_id: "cand-1", symbol: "target", kind: "function" as const, definition: { file: "target.ts", line: 1, column: 0 }, role: "entry" as const, trace_summary_digest: "d1" },
         { candidate_id: "cand-2", symbol: "reference", kind: "function" as const, definition: { file: "reference.ts", line: 5, column: 0 }, role: "entry" as const, trace_summary_digest: "d2" }
       ],
+      rejected_candidates: [{
+        candidate_id: "cand-rejected-target",
+        symbol: "other",
+        definition: { file: "other.ts", line: 99, column: 0 },
+        reason: "incorrect model adjudication",
+        evidence_refs: ["other.ts:99"]
+      }],
       unresolved: [] as string[]
     };
     const stageId = "hierarchical:R1/investigate";
@@ -3318,7 +3418,7 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     // thrown one-at-a-time).
     expect(thrown!.message).toContain("investigate 阶段交接物未通过校验，共");
     expect(thrown!.message).toContain("feature_census.selected_candidate_ids 未完整对应所有 yes 候选");
-    expect(thrown!.message).toContain("未被功能普查以 yes 证据选中");
+    expect(thrown!.message).toContain("被误裁为 no（candidate_id=cand-rejected-target）");
   });
 
   it("classifies repeated planner failures as a system fault instead of asking the user", async () => {

@@ -824,9 +824,11 @@ export class ClaudeAgentRunner {
         "milestone"
       );
     }
-    const structured = output.structuredOutput !== undefined
+    const structured = normalizeHierarchicalStructuredContainers(
+      output.structuredOutput !== undefined
       ? output.structuredOutput
-      : recoveredStructuredOutput ?? (output.resultText || output.assistantText);
+      : recoveredStructuredOutput ?? (output.resultText || output.assistantText)
+    );
     const removedInvestigateMappings = reconcileHierarchicalInvestigateMappingScope(
       input.session,
       operation,
@@ -3789,6 +3791,58 @@ export function reconcileHierarchicalInvestigateReferenceHandoff(
       return targetKey ? [[targetKey, mapping] as const] : [];
     })
   );
+  // Alias tokens that resolve to the exact same final contract share the same
+  // baseline entry. Once the model has explicitly selected that entry for one
+  // alias, duplicating the selection row for every other alias is mechanical
+  // transcription rather than a new semantic decision. Fill those rows before
+  // cloning the corresponding candidate below.
+  for (const mapping of targetMappings) {
+    const targetKey = optionalString(mapping.target_key);
+    if (!targetKey || selections.some((selection) => (
+      optionalString(selection.target_key) === targetKey
+    ))) continue;
+    const contractSymbol = optionalString(mapping.contract_symbol);
+    const contractAnchor = firstPathLineToken(optionalString(mapping.contract_location) ?? "");
+    if (!contractSymbol || !contractAnchor) continue;
+    const sourceMapping = targetMappings.find((candidateMapping) => (
+      optionalString(candidateMapping.target_key) !== targetKey
+      && optionalString(candidateMapping.contract_symbol) === contractSymbol
+      && firstPathLineToken(optionalString(candidateMapping.contract_location) ?? "") === contractAnchor
+    ));
+    const sourceTargetKey = optionalString(sourceMapping?.target_key);
+    if (!sourceTargetKey) continue;
+    const sourceSelection = selections.find((selection) => (
+      optionalString(selection.target_key) === sourceTargetKey
+      && Boolean(optionalString(selection.selected_location))
+      && Boolean(optionalString(selection.selection_reason))
+      && !optionalString(selection.no_reference_reason)
+    ));
+    const selectedLocation = optionalString(sourceSelection?.selected_location);
+    if (!selectedLocation) continue;
+    const selectedAnchor = looseSubmittedPathLineAnchor(selectedLocation);
+    const sourceCandidate = candidates.find((candidate) => (
+      optionalString(candidate.target_key) === sourceTargetKey
+      && (
+        optionalString(candidate.location) === selectedLocation
+        || (
+          selectedAnchor
+          && looseSubmittedPathLineAnchor(optionalString(candidate.location) ?? "") === selectedAnchor
+        )
+      )
+      && optionalString(candidate.contract_symbol) === contractSymbol
+      && firstPathLineToken(optionalString(candidate.contract_location) ?? "") === contractAnchor
+    ));
+    if (!sourceCandidate) continue;
+    const canonicalSelectedLocation = optionalString(sourceCandidate.location) ?? selectedLocation;
+    const clonedSelection = {
+      target_key: targetKey,
+      selected_location: canonicalSelectedLocation,
+      selection_reason: `与 ${sourceTargetKey} 共享同一最终契约 ${contractSymbol}@${contractAnchor}`,
+      no_reference_reason: ""
+    };
+    (referenceAnalysis.target_selections as unknown[]).push(clonedSelection);
+    selections.push(clonedSelection);
+  }
   for (const selection of selections) {
     const targetKey = optionalString(selection.target_key);
     const selectedLocation = optionalString(selection.selected_location);
@@ -4156,6 +4210,43 @@ export function reconcileHierarchicalPrepareContractHandoff(
       analyzedTargetFromInvestigationReport(selectedReport.report)
     );
   }
+
+  // A provider may emit both the host-backed symbol and a second shorthand for
+  // the same file (for example a connected/exported component name) while
+  // leaving the shorthand contract empty. Keep every independently completed
+  // report, but remove only methodless same-file aliases and exact duplicates;
+  // otherwise the strict parser asks the model to invent analysis metadata the
+  // host already owns.
+  const hostBackedFiles = new Set(
+    callContract.analyzed_targets.flatMap((item) => {
+      if (!isPlainObject(item) || item.analysis_method !== "investigation-script") return [];
+      const targetFile = optionalString(item.target_file);
+      return targetFile ? [path.resolve(session.project_path, targetFile)] : [];
+    })
+  );
+  const requestedContractKeys = new Set(requestedContracts.flatMap((request) => {
+    const contractFile = evidenceLocationFile(request.location, session.project_path);
+    return contractFile && request.symbol ? [`${contractFile}\0${request.symbol}`] : [];
+  }));
+  const seenHostTargets = new Set<string>();
+  callContract.analyzed_targets = callContract.analyzed_targets.filter((item) => {
+    if (!isPlainObject(item)) return true;
+    const targetFile = optionalString(item.target_file);
+    const symbol = optionalString(item.symbol);
+    const method = optionalString(item.analysis_method);
+    if (!targetFile) return true;
+    const absoluteFile = path.resolve(session.project_path, targetFile);
+    if (
+      !method
+      && hostBackedFiles.has(absoluteFile)
+      && (!symbol || !requestedContractKeys.has(`${absoluteFile}\0${symbol}`))
+    ) return false;
+    if (method !== "investigation-script" || !symbol) return true;
+    const key = `${absoluteFile}\0${symbol}`;
+    if (seenHostTargets.has(key)) return false;
+    seenHostTargets.add(key);
+    return true;
+  });
 }
 
 type HierarchicalInvestigateArtifact = ReturnType<typeof latestHierarchicalArtifact>;
@@ -4419,7 +4510,7 @@ export function recordFeatureCensusReceipt(
   report: Pick<
     FeatureImplementationCensusReport,
     "status" | "report_digest" | "candidate_accounting" | "selected_targets" | "unresolved"
-  > & Partial<Pick<FeatureImplementationCensusReport, "closure">>
+  > & Partial<Pick<FeatureImplementationCensusReport, "closure" | "rejected_candidates">>
 ): FeatureCensusReceipt {
   const receipt: FeatureCensusReceipt = {
     stage_id: stageId,
@@ -4432,6 +4523,15 @@ export function recordFeatureCensusReceipt(
       symbol: target.symbol,
       definition: { ...target.definition }
     })),
+    ...(report.rejected_candidates
+      ? {
+          rejected_targets: report.rejected_candidates.map((target) => ({
+            candidate_id: target.candidate_id,
+            symbol: target.symbol,
+            definition: { ...target.definition }
+          }))
+        }
+      : {}),
     unresolved: [...report.unresolved],
     ...(report.closure ? { closure: { ...report.closure } } : {}),
     created_at: new Date().toISOString()
@@ -4670,14 +4770,32 @@ function validateHierarchicalFeatureCensusEvidence(
     violations.push("feature_census.selected_candidate_ids 未完整对应所有 yes 候选");
   }
   const targetDefinition = firstPathLineToken(optionalString(target.definition) ?? "");
+  const targetDefinitionAnchor = targetDefinition
+    ? evidenceLocationAnchor(targetDefinition, session.project_path)
+    : null;
+  const selectedTargetMatchesDefinition = Boolean(
+    targetDefinitionAnchor
+    && report.selected_targets.some((targetItem) => (
+      evidenceLocationAnchor(
+        `${targetItem.definition.file}:${targetItem.definition.line}`,
+        session.project_path
+      ) === targetDefinitionAnchor
+    ))
+  );
   if (
     callableTarget
     && targetDefinition
-    && !report.selected_targets.some((targetItem) => (
-      `${targetItem.definition.file}:${targetItem.definition.line}` === targetDefinition
-    ))
+    && !selectedTargetMatchesDefinition
   ) {
-    violations.push(`目标定义 ${targetDefinition} 未被功能普查以 yes 证据选中（需将该候选加入 feature_census.selected_candidate_ids，或改用普查已选中的 candidate location）`);
+    const rejectedTarget = report.rejected_targets?.find((targetItem) => (
+      evidenceLocationAnchor(
+        `${targetItem.definition.file}:${targetItem.definition.line}`,
+        session.project_path
+      ) === targetDefinitionAnchor
+    ));
+    violations.push(rejectedTarget
+      ? `目标定义 ${targetDefinition} 在 complete 功能普查中被误裁为 no（candidate_id=${rejectedTarget.candidate_id}）；若完整代码证据确认其实现目标功能，必须沿用完全相同查询并用 yes adjudication 覆盖该候选后重新闭合普查`
+      : `目标定义 ${targetDefinition} 未进入功能普查的 yes 集合；沿用完全相同查询定位并裁决该定义，不能手工修改 feature_census.selected_candidate_ids`);
   }
 
   validateInvestigateTargetMappingEvidence(
@@ -5597,6 +5715,13 @@ export function hierarchicalValidationCorrection(
   reason: string,
   featureCensusReceipt?: Pick<FeatureCensusReceipt, "status" | "candidate_accounting"> | null
 ): string {
+  const rejectedTarget = /被误裁为 no（candidate_id=([^)）]+)[)）]/.exec(reason)?.[1];
+  if (rejectedTarget) {
+    return `沿用最后一次完全相同的 feature、aliases、clues 与 scope 重跑 locate_feature_implementation，并只提交 candidate_id=${rejectedTarget} 的 yes adjudication、真实 reason 和 path:line 证据以覆盖此前误裁；历史其他裁决由宿主自动累计。重新达到 complete 后直接提交 handoff，selected ids 由宿主回填。`;
+  }
+  if (/目标定义 .*未进入功能普查的 yes 集合/.test(reason)) {
+    return "沿用最后一次完全相同的 feature、aliases、clues 与 scope 调用 locate_feature_implementation，定位错误点名的目标定义并将当前返回的对应候选裁为 yes；不要改查询、扩大 scope 或手工填写 selected_candidate_ids。宿主会累计历史裁决并在 complete 后自动回填。";
+  }
   if (/feature_census\.report_digest/.test(reason)) {
     if (featureCensusReceipt?.status === "complete") {
       return "不要重跑普查或手工计算哈希；沿用最后一次 complete 的 locate_feature_implementation 调用并重新提交草稿，宿主会从真实报告自动回填 report_digest。";
@@ -7669,6 +7794,14 @@ function taggedOutputNodeValue(node: TaggedOutputNode): unknown {
 
 function taggedOutputLeafValue(fieldName: string, rawText: string): unknown {
   const text = rawText.trim();
+  if (text) {
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed) || isPlainObject(parsed)) return parsed;
+    } catch {
+      // Plain scalar/tag text continues through the existing typed fallback.
+    }
+  }
   const bulletValues = text
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -7680,6 +7813,53 @@ function taggedOutputLeafValue(fieldName: string, rawText: string): unknown {
   if (text === "false") return false;
   if (text === "null") return null;
   return text;
+}
+
+const HIERARCHICAL_STRINGIFIED_CONTAINER_FIELDS = new Set([
+  ...TAGGED_OUTPUT_ARRAY_FIELDS,
+  "handoff", "blocker", "knowledge_delta", "feature_census",
+  "candidate_accounting", "target_investigation", "reference_analysis",
+  "call_contract", "reference_accounting", "closure"
+]);
+
+/**
+ * Providers sometimes satisfy the outer StructuredOutput tool while encoding
+ * one nested object/array as a JSON string. Decode only schema-owned container
+ * fields, recursively, before host reconciliation and strict validation.
+ * Free-form prose such as summary/reason is intentionally never decoded.
+ */
+export function normalizeHierarchicalStructuredContainers(value: unknown): unknown {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return value;
+    try {
+      const parsed = JSON.parse(trimmed);
+      return normalizeHierarchicalStructuredContainers(parsed);
+    } catch {
+      return value;
+    }
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeHierarchicalStructuredContainers(item));
+  }
+  if (!isPlainObject(value)) return value;
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item === "string" && HIERARCHICAL_STRINGIFIED_CONTAINER_FIELDS.has(key)) {
+      const trimmed = item.trim();
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        try {
+          value[key] = normalizeHierarchicalStructuredContainers(JSON.parse(trimmed));
+          continue;
+        } catch {
+          // Leave malformed content intact for a precise schema rejection.
+        }
+      }
+    }
+    if (Array.isArray(item) || isPlainObject(item)) {
+      value[key] = normalizeHierarchicalStructuredContainers(item);
+    }
+  }
+  return value;
 }
 
 function extractCorruptedStructuredOutputToolUse(message: unknown): SdkToolUse | undefined {

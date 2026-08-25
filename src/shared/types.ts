@@ -525,6 +525,15 @@ export interface FeatureCensusReceipt {
       column: number;
     };
   }>;
+  rejected_targets?: Array<{
+    candidate_id: string;
+    symbol: string;
+    definition: {
+      file: string;
+      line: number;
+      column: number;
+    };
+  }>;
   unresolved: string[];
   closure?: {
     inventory_complete: boolean;

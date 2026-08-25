@@ -744,6 +744,7 @@ describe("hierarchicalRoleProtocol", () => {
   it("supports a proven no-op without issuing a write lease", () => {
     const handoff = handoffFor("prepare") as Record<string, unknown>;
     handoff.change_disposition = "already_satisfied";
+    handoff.patch_plan = [];
     handoff.satisfaction_evidence = behaviorObligations("src/reference.ts:5", "src/target.ts:1")
       .map((item) => `${item.dimension} satisfied at src/target.ts:1`);
 
@@ -766,6 +767,25 @@ describe("hierarchicalRoleProtocol", () => {
       allowed_files: [],
       handoff: { change_disposition: "already_satisfied" }
     });
+  });
+
+  it("requires a concrete patch plan only when prepare found missing behavior", () => {
+    const handoff = handoffFor("prepare") as Record<string, unknown>;
+    handoff.patch_plan = [];
+
+    expect(() => parseHierarchicalRoleResult({
+      kind: "run_phase",
+      requirement_id: "R1",
+      work_unit_id: "R1:prepare",
+      phase: "prepare",
+      role: "implementation-preparer"
+    }, {
+      status: "passed",
+      summary: "changes are still required",
+      evidence_refs: ["src/target.ts:1"],
+      handoff,
+      allowed_files: ["src/target.ts"]
+    })).toThrow("changes_required 时 patch_plan 必须至少包含一项");
   });
 
   it("rejects a role trying to disguise an internal fault as a human blocker", () => {
