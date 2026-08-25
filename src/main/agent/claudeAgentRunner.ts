@@ -373,6 +373,7 @@ export class ClaudeAgentRunner {
         }
 
         const roleOperation = operation;
+        let resumingRunningPhase = false;
         if (roleOperation.kind === "run_alignment_batch") {
           input.session.current_stage = `align/${roleOperation.batch_id}`;
           const batch = state.alignment_batches.find((item) => item.id === roleOperation.batch_id);
@@ -384,6 +385,8 @@ export class ClaudeAgentRunner {
           }
         } else if (roleOperation.kind === "run_phase") {
           input.session.current_stage = `${roleOperation.requirement_id}/${roleOperation.phase}`;
+          resumingRunningPhase = state.active_work_unit?.id === roleOperation.work_unit_id
+            && state.active_work_unit.status === "running";
           this.applyHierarchicalEvents(input.session, [{
             type: "phase_started",
             work_unit_id: roleOperation.work_unit_id
@@ -402,7 +405,12 @@ export class ClaudeAgentRunner {
           : roleOperation.kind === "run_phase"
             ? `${roleOperation.requirement_id}/${roleOperation.phase}`
             : roleOperation.kind === "run_planner" ? "align" : "integrate";
-        await this.recordProgress(input, "runner", `宿主启动专职角色：${label}`, "milestone");
+        await this.recordProgress(
+          input,
+          "runner",
+          `宿主${resumingRunningPhase ? "恢复" : "启动"}专职角色：${label}`,
+          "milestone"
+        );
 
         let workUnitSnapshot: HierarchicalWorkUnitSnapshot | undefined;
         let workUnitSnapshotRestored = false;

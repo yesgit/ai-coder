@@ -301,6 +301,45 @@ describe("hierarchical workflow engine", () => {
     expect(state.active_work_unit?.status).toBe("ready");
   });
 
+  it("idempotently adopts the same running phase attempt after process recovery", () => {
+    let state = activateR33();
+    const workUnitId = state.active_work_unit!.id;
+    state = applyHierarchicalEvent(state, {
+      type: "phase_started",
+      work_unit_id: workUnitId,
+      occurred_at: NOW
+    });
+
+    const resumed = applyHierarchicalEvent(state, {
+      type: "phase_started",
+      work_unit_id: workUnitId,
+      occurred_at: "2026-07-22T00:05:00.000Z"
+    });
+
+    expect(resumed.active_work_unit).toMatchObject({
+      id: workUnitId,
+      status: "running",
+      attempt: 1,
+      started_at: NOW
+    });
+    expect(resumed.phase_runs).toEqual([expect.objectContaining({
+      id: `${workUnitId}:attempt-1`,
+      status: "running",
+      started_at: NOW
+    })]);
+  });
+
+  it("rejects a running work unit whose phase-run audit record is missing", () => {
+    let state = activateR33();
+    state.active_work_unit!.status = "running";
+
+    expect(() => applyHierarchicalEvent(state, {
+      type: "phase_started",
+      work_unit_id: state.active_work_unit!.id,
+      occurred_at: NOW
+    })).toThrow("running 状态与 PhaseRun 不一致：0");
+  });
+
   it("reopens the named requirement when the global audit finds a gap", () => {
     let state = createHierarchicalExecutionState("完成 R1", { now: NOW });
     state = applyHierarchicalEvent(state, {

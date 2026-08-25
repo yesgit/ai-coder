@@ -673,6 +673,22 @@ function activateRequirement(state: HierarchicalExecutionState, requirementId: s
 
 function startPhase(state: HierarchicalExecutionState, workUnitId: string, now: string): void {
   const workUnit = requireWorkUnit(state, workUnitId);
+  if (workUnit.status === "running") {
+    const matchingRuns = state.phase_runs.filter((run) => (
+      run.work_unit_id === workUnit.id
+      && run.attempt === workUnit.attempt
+      && run.status === "running"
+    ));
+    if (matchingRuns.length !== 1) {
+      throw new Error(
+        `工作单元 ${workUnitId} 的 running 状态与 PhaseRun 不一致：${matchingRuns.length}`
+      );
+    }
+    // A persisted session can be resumed after its former process disappears.
+    // Replaying phase_started for the same attempt adopts that in-flight run;
+    // it must not create a duplicate run or reset its original start time.
+    return;
+  }
   if (workUnit.status !== "ready" && workUnit.status !== "failed") {
     throw new Error(`工作单元 ${workUnitId} 当前不能启动：${workUnit.status}`);
   }

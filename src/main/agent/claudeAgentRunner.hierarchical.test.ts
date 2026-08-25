@@ -32,7 +32,10 @@ import {
   validateHierarchicalInvestigateMappingScope,
   validateHierarchicalPlannerEnumeratedCoverage
 } from "./claudeAgentRunner.js";
-import { createHierarchicalExecutionState } from "../workflows/hierarchicalWorkflowEngine.js";
+import {
+  applyHierarchicalEvent,
+  createHierarchicalExecutionState
+} from "../workflows/hierarchicalWorkflowEngine.js";
 import { parseHierarchicalRoleResult } from "./hierarchicalRoleProtocol.js";
 
 const workflow: WorkflowTemplate = {
@@ -2827,6 +2830,70 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     } finally {
       await rm(projectPath, { recursive: true, force: true });
     }
+  });
+
+  it("resumes a persisted running phase without starting a duplicate attempt", async () => {
+    let state = createHierarchicalExecutionState("继续已中断的 R1 调查");
+    state = applyHierarchicalEvent(state, {
+      type: "plan_accepted",
+      requirements: [{
+        id: "R1",
+        source_anchor: "user:R1",
+        observable_result: "R1 的两个候选目标由用户选择",
+        acceptance: ["用户选择后继续"],
+        dependencies: []
+      }],
+      definition_of_done: ["R1 完成"]
+    });
+    state = applyHierarchicalEvent(state, {
+      type: "requirement_activated",
+      requirement_id: "R1"
+    });
+    state = applyHierarchicalEvent(state, {
+      type: "phase_started",
+      work_unit_id: "R1:investigate"
+    });
+    const originalRunId = state.phase_runs[0]!.id;
+    let calls = 0;
+    const query = async function* () {
+      calls += 1;
+      yield {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        structured_output: {
+          status: "blocked",
+          summary: "两个最终目标会产生不同用户可观察行为，需要用户选择",
+          evidence_refs: ["decision:pending"],
+          handoff: handoffFor("investigate"),
+          blocker: {
+            id: "R1-target-choice",
+            kind: "user_decision",
+            message: "请选择目标 A 或目标 B"
+          }
+        }
+      };
+    };
+    const session = createSession();
+    session.hierarchical_state = state;
+    session.current_stage = "R1/investigate";
+
+    const updated = await new ClaudeAgentRunner({
+      queryOverride: query,
+      pluginPaths: [path.resolve("plugins/careful-coder")]
+    }).run({ session, workflow });
+
+    expect(updated.status, updated.error).toBe("waiting_approval");
+    expect(calls).toBe(1);
+    expect(updated.hierarchical_state?.phase_runs).toHaveLength(1);
+    expect(updated.hierarchical_state?.phase_runs[0]).toMatchObject({
+      id: originalRunId,
+      attempt: 1,
+      status: "failed"
+    });
+    expect(updated.progress_events).toContainEqual(expect.objectContaining({
+      message: "宿主恢复专职角色：R1/investigate"
+    }));
   });
 
   it("drives one requirement vertically through all phases and global integration", async () => {
