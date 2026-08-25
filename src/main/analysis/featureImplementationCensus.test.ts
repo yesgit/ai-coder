@@ -369,7 +369,10 @@ export function unrelatedDynamicLqbWrapper(
     expect(parsed.candidates.every((candidate) => (
       candidate.candidate_id.length > 0 && /:\d+$/.test(candidate.evidence_ref)
     ))).toBe(true);
-    expect(parsed.rejected_candidates_projection).toEqual({ returned: 0, total: 48 });
+    expect(parsed.rejected_candidates_projection).toEqual({
+      returned: 0,
+      total: report.rejected_candidates.length
+    });
     expect(parsed.adjudication_batch.returned).toBe(parsed.candidates.length);
     expect(parsed.adjudication_batch.remaining_after_batch).toBe(
       report.candidate_accounting.unknown - parsed.candidates.length
@@ -564,11 +567,81 @@ export function sharedWrapper${index}(sharedContext: unknown) {
       };
     };
 
-    expect(report.candidate_accounting.unknown).toBeGreaterThan(24);
-    expect(parsed.candidates).toHaveLength(24);
+    expect(report.candidate_accounting).toMatchObject({
+      total: 30,
+      unknown: 8,
+      no: 22
+    });
+    expect(report.review_frontier).toEqual({
+      window_size: 8,
+      current_round: 1,
+      ai_review_required: 8,
+      retrieval_pruned: 22,
+      expands_when_all_rejected: true
+    });
+    expect(parsed.candidates).toHaveLength(8);
     expect(parsed.adjudication_batch).toEqual({
-      returned: 24,
-      remaining_after_batch: report.candidate_accounting.unknown - 24
+      returned: 8,
+      remaining_after_batch: report.candidate_accounting.unknown - 8
+    });
+  });
+
+  it("expands after an all-no frontier and closes after the next frontier finds a target", async () => {
+    const root = await createNavigationFixture();
+    await writeFile(path.join(root, "adaptive.ts"), Array.from({ length: 30 }, (_, index) => (
+      `export function AdaptiveCandidate${index}() { return "AdaptiveFeature"; }`
+    )).join("\n"));
+    const input = {
+      projectPath: root,
+      feature: "AdaptiveFeature",
+      aliases: ["AdaptiveFeature"]
+    };
+    const initial = censusFeatureImplementations(input);
+    const firstFrontier = initial.candidates.filter((candidate) => candidate.verdict === "unknown");
+    const firstAdjudications: FeatureCandidateAdjudication[] = firstFrontier.map((candidate) => ({
+      candidate_id: candidate.id,
+      verdict: "no",
+      reason: "not the requested implementation",
+      evidence_refs: [`${candidate.definition.file}:${candidate.definition.line}`]
+    }));
+    const expanded = censusFeatureImplementations({
+      ...input,
+      adjudications: firstAdjudications
+    });
+    const secondFrontier = expanded.candidates.filter((candidate) => candidate.verdict === "unknown");
+
+    expect(expanded.review_frontier).toMatchObject({
+      current_round: 2,
+      ai_review_required: 8
+    });
+    expect(secondFrontier).toHaveLength(8);
+    expect(secondFrontier.every((candidate) => (
+      !firstFrontier.some((first) => first.id === candidate.id)
+    ))).toBe(true);
+
+    const secondAdjudications: FeatureCandidateAdjudication[] = secondFrontier.map((candidate, index) => ({
+      candidate_id: candidate.id,
+      verdict: index === 0 ? "yes" : "no",
+      reason: index === 0 ? "confirmed implementation" : "not the requested implementation",
+      evidence_refs: [`${candidate.definition.file}:${candidate.definition.line}`]
+    }));
+    const complete = censusFeatureImplementations({
+      ...input,
+      adjudications: [...firstAdjudications, ...secondAdjudications]
+    });
+
+    expect(complete.status).toBe("complete");
+    expect(complete.candidate_accounting).toMatchObject({
+      total: 30,
+      yes: 1,
+      no: 29,
+      unknown: 0
+    });
+    expect(complete.selected_targets).toHaveLength(1);
+    expect(complete.review_frontier).toMatchObject({
+      current_round: 2,
+      ai_review_required: 0,
+      retrieval_pruned: 14
     });
   });
 

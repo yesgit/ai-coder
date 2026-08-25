@@ -8,7 +8,7 @@ export interface FeatureCensusWorkerResult {
   tool_result: string;
   report: Pick<
     FeatureImplementationCensusReport,
-    "status" | "report_digest" | "candidate_accounting" | "selected_targets" | "unresolved" | "closure"
+    "status" | "report_digest" | "candidate_accounting" | "review_frontier" | "selected_targets" | "unresolved" | "closure"
   > & {
     coverage: Pick<
       FeatureImplementationCensusReport["coverage"],

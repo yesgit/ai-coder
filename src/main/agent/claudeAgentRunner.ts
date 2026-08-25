@@ -3347,7 +3347,7 @@ export class ClaudeAgentRunner {
           "再对独特证据命中文件执行受限语义分析，合并符号名、路径、定义正文和配置邻接候选，并以两跳调用图补充上下文；",
           "候选按多通道证据排序并携带宿主提取的定义上下文：短定义直接完整返回，大定义返回有摘要指纹的片段、完整行范围和项目内 Read 分页提示。",
           "宿主以项目和符号频率排除 pageName/linkType 等高频管道词，只把具有直接检索或配置邻接证据的符号列为候选；调用图用于补充上下文，不把所有可达包装器扩张成候选。",
-          "语义结论依赖完整实现时必须读完整定义；每次只需提交当前返回批次的 adjudications，宿主会在相同查询内自动累计，直到 status=complete。yes 目标只附带受限调用图摘要，最终复用目标由 prepare 执行完整调用契约调查。"
+          "语义结论依赖完整实现时必须读完整定义；每次只需提交当前返回的高相关检索前沿 adjudications，宿主会在相同查询内自动累计。批次中出现 yes 后剪枝低排名尾部；若本批全部为 no，自动展开下一批，直到 status=complete。"
         ].join(""),
         {
           feature: z.string().min(1).describe("完整的用户可观察功能描述，不要只传某个猜测符号名"),
@@ -3467,7 +3467,7 @@ export class ClaudeAgentRunner {
             await this.recordProgress(
               input,
               "runner",
-              `普查结果就绪：扫描 ${report.coverage.files_scanned} 个文件，候选 ${report.candidate_accounting.total} 个，已累计裁决 ${effectiveAdjudications.length} 个，状态 ${report.status}，耗时 ${Date.now() - censusStartedAt}ms。`,
+              `普查结果就绪：扫描 ${report.coverage.files_scanned} 个文件，检索候选 ${report.candidate_accounting.total} 个，当前待 AI 裁决 ${report.review_frontier.ai_review_required} 个，已累计裁决 ${effectiveAdjudications.length} 个，状态 ${report.status}，耗时 ${Date.now() - censusStartedAt}ms。`,
               "milestone"
             );
             return {

@@ -23,6 +23,7 @@ try {
         status: report.status,
         report_digest: report.report_digest,
         candidate_accounting: report.candidate_accounting,
+        review_frontier: report.review_frontier,
         selected_targets: report.selected_targets,
         unresolved: report.unresolved,
         closure: report.closure,

@@ -40,6 +40,7 @@ export interface FeatureEvidence {
     | "downstream-path"
     | "negative-clue"
     | "test-only"
+    | "retrieval-pruned"
     | "human-adjudication";
   location: SourceLocation;
   detail: string;
@@ -127,6 +128,13 @@ export interface FeatureImplementationCensusReport {
     unknown: number;
     accounted: true;
   };
+  review_frontier: {
+    window_size: number;
+    current_round: number;
+    ai_review_required: number;
+    retrieval_pruned: number;
+    expands_when_all_rejected: true;
+  };
   selected_targets: Array<{
     candidate_id: string;
     symbol: string;
@@ -207,6 +215,7 @@ const SEARCH_CHANNELS = [
   "call-graph-downstream"
 ] as const;
 const MAX_GRAPH_HOPS = 2;
+const SEMANTIC_REVIEW_WINDOW = 8;
 const MAX_ADJUDICATION_BATCH = 24;
 const MAX_TOOL_RESULT_BYTES = 16_000;
 const MAX_TOOL_RESULT_TEXT = 240;
@@ -351,6 +360,7 @@ export function censusFeatureImplementations(
       downstream.get(candidate.id),
       adjudications.get(candidate.id)
     ));
+  const reviewFrontier = applySemanticReviewFrontier(materialized);
 
   const unsupportedMatchingFiles = findUnsupportedMatchingFiles(projectPath, scopePaths, terms);
   for (const file of unsupportedMatchingFiles) {
@@ -455,6 +465,7 @@ export function censusFeatureImplementations(
     )),
     candidates: materialized,
     candidate_accounting: counts,
+    review_frontier: reviewFrontier,
     selected_targets: selectedTargets,
     rejected_candidates: rejectedCandidates,
     unresolved: uniqueStrings(unresolved),
@@ -522,6 +533,7 @@ export function formatFeatureImplementationCensusToolResult(
     report_digest: report.report_digest,
     status: report.status,
     candidate_accounting: report.candidate_accounting,
+    review_frontier: report.review_frontier,
     query: report.query,
     continuation_query: {
       feature: report.query.feature,
@@ -1188,6 +1200,15 @@ function materializeCandidate(
         ? "候选仅位于有限调用图路径，必须检查其是否属于真实业务链"
         : "候选只有弱词面证据，必须检查后才能确认或排除";
   }
+  // Retrieval order must remain stable across adjudication rounds. Human yes
+  // evidence and no evidence are audit facts, not new search-ranking signals.
+  const retrievalScore = scoreFeatureCandidate(
+    candidate,
+    evidenceFor,
+    evidenceAgainst,
+    upstreamPath,
+    downstreamPath
+  );
   if (adjudication) {
     verdict = adjudication.verdict;
     verdictReason = adjudication.reason.trim();
@@ -1243,13 +1264,7 @@ function materializeCandidate(
       start_line: candidate.definition.line,
       end_line: Math.max(candidate.definition.line, declarationEnd)
     },
-    retrieval_score: scoreFeatureCandidate(
-      candidate,
-      evidenceFor,
-      evidenceAgainst,
-      upstreamPath,
-      downstreamPath
-    ),
+    retrieval_score: retrievalScore,
     why_possible: evidenceFor.map((item) => item.detail),
     evidence_for: dedupeBy(evidenceFor, (item) => item.id),
     evidence_against: dedupeBy(evidenceAgainst, (item) => item.id),
@@ -1260,6 +1275,68 @@ function materializeCandidate(
     verdict_reason: verdictReason,
     adjudicated,
     trace_summary: traceSummary
+  };
+}
+
+function applySemanticReviewFrontier(
+  candidates: FeatureImplementationCandidate[]
+): FeatureImplementationCensusReport["review_frontier"] {
+  const ranked = [...candidates].sort(comparePublicCandidateRelevance);
+  const reviewEligible = ranked.filter((candidate) => (
+    candidate.adjudicated || candidate.verdict === "unknown"
+  ));
+  const confirmedYes = reviewEligible.some((candidate) => (
+    candidate.adjudicated && candidate.verdict === "yes"
+  ));
+  const firstUnadjudicatedIndex = reviewEligible.findIndex((candidate) => (
+    !candidate.adjudicated && candidate.verdict === "unknown"
+  ));
+  const lastAdjudicatedIndex = reviewEligible.reduce((last, candidate, index) => (
+    candidate.adjudicated ? index : last
+  ), -1);
+  let activeEnd: number;
+  if (confirmedYes) {
+    // Finish the complete ranking window in which a positive was found. This
+    // prevents a partial tool payload from closing before all peers in the
+    // same relevance band have been reviewed.
+    activeEnd = Math.max(
+      SEMANTIC_REVIEW_WINDOW,
+      Math.ceil((lastAdjudicatedIndex + 1) / SEMANTIC_REVIEW_WINDOW)
+        * SEMANTIC_REVIEW_WINDOW
+    );
+  } else if (firstUnadjudicatedIndex >= 0) {
+    // If a full window was rejected, expose the next one. If only part of the
+    // current window was decided, keep its remaining candidates active.
+    activeEnd = Math.ceil(
+      (firstUnadjudicatedIndex + 1) / SEMANTIC_REVIEW_WINDOW
+    ) * SEMANTIC_REVIEW_WINDOW;
+  } else {
+    activeEnd = reviewEligible.length;
+  }
+  activeEnd = Math.min(reviewEligible.length, activeEnd);
+
+  let retrievalPruned = 0;
+  for (const candidate of reviewEligible.slice(activeEnd)) {
+    if (candidate.verdict !== "unknown") continue;
+    candidate.verdict = "no";
+    candidate.verdict_reason = "候选位于当前 AI 语义检索前沿之外；若高排名批次全部排除，宿主会在下一轮自动展开该候选";
+    candidate.evidence_against.push(evidence(
+      "retrieval-pruned",
+      candidate.definition,
+      candidate.verdict_reason,
+      null
+    ));
+    retrievalPruned += 1;
+  }
+
+  return {
+    window_size: SEMANTIC_REVIEW_WINDOW,
+    current_round: Math.max(1, Math.ceil(Math.max(1, activeEnd) / SEMANTIC_REVIEW_WINDOW)),
+    ai_review_required: reviewEligible
+      .slice(0, activeEnd)
+      .filter((candidate) => candidate.verdict === "unknown").length,
+    retrieval_pruned: retrievalPruned,
+    expands_when_all_rejected: true
   };
 }
 
