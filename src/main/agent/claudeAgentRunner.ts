@@ -818,7 +818,7 @@ export class ClaudeAgentRunner {
         input,
         "tool_policy",
         [
-          `宿主已从轻微损坏的 StructuredOutput 工具名恢复 ${spec.phaseLabel} 草稿，并继续执行同一套阶段校验。`,
+          `宿主已从轻微损坏的 StructuredOutput 工具名恢复 ${spec.phaseLabel} 草稿；文本标签形式使用同一恢复路径，并继续执行同一套阶段校验。`,
           ...(output.error ? [`SDK 原错误已降级为可修正协议噪声：${output.error.slice(0, 160)}`] : [])
         ].join(" "),
         "milestone"
@@ -5617,7 +5617,10 @@ export function hierarchicalValidationCorrection(
   if (/功能实现候选普查|feature_census|locate_feature_implementation/.test(reason)) {
     return "沿用上次完全相同的 feature、aliases、clues 与 scope 调用 locate_feature_implementation；只对工具当前返回的 unknown 逐项读取代码并提交 yes/no、reason、path:line，宿主会自动累计历史批次。不要重传旧裁决，也不要扩大 aliases 或改变 scope。只有 status=complete 且最终 yes 集合完整记账后才能提交 investigate。";
   }
-  if (/open_unknowns/.test(reason)) {
+  if (/open_unknowns|基线实现缺口|需求 token 在基线/.test(reason)) {
+    if (/基线实现缺口|需求 token 在基线/.test(reason)) {
+      return "这不是需要用户确认的命名冲突：需求/附件 token 在旧代码中缺失正是待实现差异。保留 requested_token，canonical_token 使用待新增 token；沿已确认的同功能入口把 contract_symbol@contract_location 指向唯一最终组件/业务函数，把旧 token 仅写为参考差异，并清空这条已裁决的 open_unknown。交给 prepare 判定 changes_required；只有多个目标会造成不同用户可观察行为且代码证据无法选择时才 blocked + user_decision。";
+    }
     return "不能删除或改写尚未解决的未知来强行通过：继续读取定义、消费者、调用点和基线同功能入口；仓库证据能裁决时补齐逐目标 target_mappings，确实会改变用户可观察行为且无法静态裁决时返回 blocked + user_decision。";
   }
   if (/target_mappings 未逐项覆盖|pageName 原词/.test(reason)) {
@@ -7563,7 +7566,120 @@ export function extractRecoverableStructuredOutputToolInput(
       }
     }
   }
+  return recovered ?? extractTaggedStructuredOutput(formatClaudeTranscript(messages));
+}
+
+interface TaggedOutputNode {
+  name: string;
+  text: string[];
+  children: TaggedOutputNode[];
+}
+
+const TAGGED_OUTPUT_ARRAY_FIELDS = new Set([
+  "evidence_refs", "confirmed_facts", "target_locations", "target_mappings",
+  "inputs", "outputs", "internal_calls", "guards", "state_and_side_effects",
+  "callers", "unresolved", "search_scope", "candidates", "target_selections",
+  "feature_equivalence", "similarity", "reusable_behavior", "differences",
+  "arguments", "preconditions", "context_forwarding", "side_effects",
+  "open_unknowns", "allowed_files", "acceptance_results", "discovered_requirements",
+  "analyzed_targets", "reference_application", "behavior_obligations",
+  "satisfaction_evidence", "pre_behavior", "preserve_invariants", "patch_plan",
+  "verification_plan", "changes", "checks_run", "preserved_invariants",
+  "obligation_results", "regression_checks", "unresolved_risks", "contract_results"
+]);
+
+/**
+ * Some Anthropic-compatible providers print a would-be tool call as ordinary
+ * assistant text (`<StructuredOutput>...</StructuredOutput>`). Recover only a
+ * complete wrapper, then feed the result through the normal strict phase
+ * parser. This is deliberately not a validator bypass: incomplete tagged
+ * drafts still receive the same field-level rejection and retry guidance.
+ */
+function extractTaggedStructuredOutput(transcript: string): Record<string, unknown> | undefined {
+  const wrappers = transcript.matchAll(
+    /<StructuredOutput\b[^>]*>([\s\S]*?)<\/StructuredOutput\s*>/gi
+  );
+  let recovered: Record<string, unknown> | undefined;
+  for (const wrapper of wrappers) {
+    const parsed = parseTaggedStructuredOutputPayload(wrapper[1] ?? "");
+    if (parsed) recovered = parsed;
+  }
   return recovered;
+}
+
+function parseTaggedStructuredOutputPayload(payload: string): Record<string, unknown> | undefined {
+  const trimmed = payload.trim();
+  if (!trimmed) return undefined;
+  const jsonText = trimmed
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "")
+    .trim();
+  try {
+    const parsed = JSON.parse(jsonText);
+    if (isPlainObject(parsed)) return parsed;
+  } catch {
+    // Fall through to the small, non-executing tagged-data parser below.
+  }
+
+  const root: TaggedOutputNode = { name: "root", text: [], children: [] };
+  const stack = [root];
+  const tagPattern = /<\/?([A-Za-z_][A-Za-z0-9_.-]*)\s*>/g;
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  while ((match = tagPattern.exec(trimmed)) !== null) {
+    stack[stack.length - 1].text.push(trimmed.slice(cursor, match.index));
+    const wholeTag = match[0];
+    const tagName = match[1];
+    if (wholeTag.startsWith("</")) {
+      if (stack.length === 1 || stack[stack.length - 1].name !== tagName) return undefined;
+      stack.pop();
+    } else {
+      const node: TaggedOutputNode = { name: tagName, text: [], children: [] };
+      stack[stack.length - 1].children.push(node);
+      stack.push(node);
+    }
+    cursor = tagPattern.lastIndex;
+  }
+  stack[stack.length - 1].text.push(trimmed.slice(cursor));
+  if (stack.length !== 1 || root.children.length === 0) return undefined;
+  const value = taggedOutputNodeValue(root);
+  return isPlainObject(value) ? value : undefined;
+}
+
+function taggedOutputNodeValue(node: TaggedOutputNode): unknown {
+  if (node.children.length === 0) {
+    return taggedOutputLeafValue(node.name, node.text.join(""));
+  }
+  const grouped = new Map<string, unknown[]>();
+  for (const child of node.children) {
+    const values = grouped.get(child.name) ?? [];
+    values.push(taggedOutputNodeValue(child));
+    grouped.set(child.name, values);
+  }
+  const object: Record<string, unknown> = {};
+  for (const [name, values] of grouped) {
+    object[name] = values.length === 1 ? values[0] : values;
+  }
+  if (!TAGGED_OUTPUT_ARRAY_FIELDS.has(node.name)) return object;
+  if (node.children.every((child) => /^(?:item|entry|candidate|mapping|result)$/i.test(child.name))) {
+    return node.children.map((child) => taggedOutputNodeValue(child));
+  }
+  return [object];
+}
+
+function taggedOutputLeafValue(fieldName: string, rawText: string): unknown {
+  const text = rawText.trim();
+  const bulletValues = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => line.replace(/^[-*]\s+/, "").trim())
+    .filter(Boolean);
+  if (TAGGED_OUTPUT_ARRAY_FIELDS.has(fieldName)) return bulletValues;
+  if (text === "true") return true;
+  if (text === "false") return false;
+  if (text === "null") return null;
+  return text;
 }
 
 function extractCorruptedStructuredOutputToolUse(message: unknown): SdkToolUse | undefined {

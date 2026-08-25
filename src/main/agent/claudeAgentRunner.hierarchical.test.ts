@@ -311,6 +311,42 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     }])).toBeUndefined();
   });
 
+  it("recovers a complete XML-style StructuredOutput draft emitted as assistant text", () => {
+    expect(extractRecoverableStructuredOutputToolInput([{
+      type: "assistant",
+      message: {
+        content: [{
+          type: "text",
+          text: [
+            "<StructuredOutput>",
+            "<status>blocked</status>",
+            "<summary>需求 token 尚未在基线实现</summary>",
+            "<evidence_refs>",
+            "- attachments/page-12.png",
+            "- lib/router.js:63",
+            "</evidence_refs>",
+            "<handoff>",
+            "<confirmed_facts>",
+            "- 附件要求 pageName=LQBHomeV3",
+            "- 基线已有 LQBInvest 入口",
+            "</confirmed_facts>",
+            "<open_unknowns></open_unknowns>",
+            "</handoff>",
+            "</StructuredOutput>"
+          ].join("\n")
+        }]
+      }
+    }])).toEqual({
+      status: "blocked",
+      summary: "需求 token 尚未在基线实现",
+      evidence_refs: ["attachments/page-12.png", "lib/router.js:63"],
+      handoff: {
+        confirmed_facts: ["附件要求 pageName=LQBHomeV3", "基线已有 LQBInvest 入口"],
+        open_unknowns: []
+      }
+    });
+  });
+
   it("requires every in-scope business sequence while ignoring earlier attachment context", () => {
     const session = createSession();
     session.task_prompt = "请从序号 33 开始实现所有页面跳转";
@@ -1488,6 +1524,20 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     );
     expect(contractCorrection).toContain("已有 complete 功能普查回执");
     expect(contractCorrection).toContain("不要重跑普查");
+  });
+
+  it("corrects a new requested token misclassified as a user decision", () => {
+    const correction = hierarchicalValidationCorrection({
+      kind: "run_phase",
+      requirement_id: "R33",
+      work_unit_id: "R33:investigate",
+      phase: "investigate",
+      role: "code-investigator"
+    }, "investigate 把需求 token 在基线中尚未实现的事实误记成 open_unknowns；这是待实现的基线实现缺口");
+
+    expect(correction).toContain("不是需要用户确认");
+    expect(correction).toContain("canonical_token 使用待新增 token");
+    expect(correction).toContain("prepare 判定 changes_required");
   });
 
   it("reconciles dispatcher branch contracts to one census-owned destination component", async () => {

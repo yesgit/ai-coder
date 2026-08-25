@@ -484,6 +484,44 @@ describe("hierarchicalRoleProtocol", () => {
     })).toThrow("open_unknowns");
   });
 
+  it("classifies a requested token missing from baseline as an implementation gap", () => {
+    const handoff = handoffFor("investigate") as Record<string, unknown>;
+    handoff.open_unknowns = [
+      "附件要求的 pageName='LQBHomeV3' 与现有代码 pageName='LQBInvest' 不一致，需要确认是否修改"
+    ];
+
+    expect(() => parseHierarchicalRoleResult({
+      kind: "run_phase",
+      requirement_id: "R1",
+      work_unit_id: "R1:investigate",
+      phase: "investigate",
+      role: "code-investigator"
+    }, {
+      status: "passed",
+      summary: "same destination was found but the new token was misclassified",
+      evidence_refs: ["src/target.ts:1"],
+      handoff
+    })).toThrow("基线实现缺口，不是用户决策");
+  });
+
+  it("does not accept a baseline token gap as a user-decision blocker", () => {
+    expect(() => parseHierarchicalRoleResult({
+      kind: "run_phase",
+      requirement_id: "R1",
+      work_unit_id: "R1:investigate",
+      phase: "investigate",
+      role: "code-investigator"
+    }, {
+      status: "blocked",
+      summary: "附件要求的 pageName=LQBHomeV3 与现有代码的 LQBInvest 不一致",
+      blocker: {
+        id: "choose-token",
+        kind: "user_decision",
+        message: "需要确认是否修改 pageName，还是继续使用现有代码标识"
+      }
+    })).toThrow("误报为 user_decision/open_unknowns");
+  });
+
   it("requires a reference decision for every independently mapped target", () => {
     const handoff = handoffFor("investigate") as Record<string, unknown>;
     const mappings = handoff.target_mappings as Array<Record<string, unknown>>;

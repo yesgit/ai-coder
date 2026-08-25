@@ -456,11 +456,27 @@ function parsePhaseResult(
   }
   if (status === "blocked") {
     const blocker = requiredRecord(result.blocker, "phase.blocker");
-    if (requiredString(blocker.kind, "phase.blocker.kind") === "evidence_blocked") {
+    const blockerKind = requiredString(blocker.kind, "phase.blocker.kind");
+    if (blockerKind === "evidence_blocked") {
       throw new Error([
         "当前阶段把可继续调查的证据冲突误报为 evidence_blocked。",
         "命名、大小写、缩写、附件 OCR、跨页编号或代码别名冲突必须保留原始 token，",
         "再用定义、消费者、调用点和同类实现建立映射；仍未闭合时返回 failed/retry 或写入 open_unknowns，不能终止 Goal。"
+      ].join(""));
+    }
+    if (
+      operation.phase === "investigate"
+      && blockerKind === "user_decision"
+      && looksLikeRequestedTokenImplementationGap([
+        typeof result.summary === "string" ? result.summary : "",
+        typeof blocker.message === "string" ? blocker.message : ""
+      ].join("；"))
+    ) {
+      throw new Error([
+        "investigate 把需求 token 在基线中的实现缺口误报为 user_decision/open_unknowns。",
+        "旧代码没有需求 token 本身不是需要用户确认的歧义；沿同功能入口定位唯一最终组件/函数，",
+        "建立 requested_token → 待新增 canonical_token → 最终 contract 映射并交给 prepare 判定 changes_required。",
+        "只有多个最终目标会改变用户可观察行为且代码证据无法选择时才能阻塞"
       ].join(""));
     }
     events.push(blockerEvent(result.blocker, now, operation.requirement_id, operation.work_unit_id));
@@ -536,6 +552,18 @@ function validatePhaseHandoffSemantics(
     const violations: string[] = [];
     const openUnknowns = stringArray(handoff.open_unknowns, "handoff.open_unknowns");
     if (openUnknowns.length > 0) {
+      const implementationGaps = openUnknowns.filter(looksLikeRequestedTokenImplementationGap);
+      if (implementationGaps.length > 0) {
+        throw new Error(
+          [
+            "investigate 把需求 token 在基线中尚未实现的事实误记成 open_unknowns；这是待实现的基线实现缺口，不是用户决策：",
+            implementationGaps.join("；"),
+            "。已找到同功能最终组件/函数时，保留 requested_token，canonical_token 可使用待新增 token，",
+            "contract_symbol@contract_location 指向既有最终实现，并把旧 token 仅作为参考入口差异；交给 prepare 判定 changes_required。",
+            "只有多个候选会产生不同用户可观察行为且仓库证据不能裁决时才允许 blocked + user_decision"
+          ].join("")
+        );
+      }
       throw new Error(
         [
           "investigate 仍有未闭合的 open_unknowns，不能以 passed 结束：",
@@ -908,6 +936,14 @@ function requirePathLineEvidence(value: unknown, label: string): void {
   }
 }
 
+function looksLikeRequestedTokenImplementationGap(value: string): boolean {
+  const mentionsProtocolToken = /(?:pageName|token|协议|路由|标识|字段)/i.test(value);
+  const comparesRequirementToBaseline = /(?:附件|需求|requested|原词)/i.test(value)
+    && /(?:代码|基线|现有|已有)/i.test(value);
+  const describesAbsenceOrMismatch = /(?:不存在|未找到|没有|尚未|不一致|差异|缺失)/i.test(value);
+  return mentionsProtocolToken && comparesRequirementToBaseline && describesAbsenceOrMismatch;
+}
+
 function requirePathLineString(value: string, label: string): void {
   if (!firstPathLineToken(value)) {
     throw new Error(`${label} 必须是 path:line 代码位置`);
@@ -1016,6 +1052,8 @@ function phaseInstructions(
         "每个候选都必须证明 feature_equivalence，并提交完整行为指纹；不得拿当前待实现分支、刚新增代码或仅同属导航模块的兄弟分支冒充同功能参考。",
         "同功能入口必须按 target_key 先列候选再在 target_selections 逐目标选择：记录搜索范围、相似依据、可复用行为和差异；某个目标确无同功能入口时，只能在该 target_key 的 selection 写明未找到原因。",
         "附件 token 与代码名称存在大小写、缩写、OCR、历史错拼或编号冲突时，保留附件原词并建立‘原词 → 候选 → 代码 canonical symbol’映射；定义、配置消费者、调用点和同类实现能够收敛时直接记录校正，不得要求用户确认命名差异。",
+        "需求/附件 requested_token 在任务基线中不存在、但已沿同功能入口找到唯一最终组件或业务函数时，这是正常的待实现缺口，不是命名未知或用户决策：requested_token 原样保留，canonical_token 使用待新增 token，contract 指向既有最终实现，旧 token 只记录为参考入口差异，并交给 prepare 判定 changes_required；不得询问用户是采用新 token 还是旧内部 token。",
+        "scope_paths 必须来自已经 Read/Glob/Grep 证实存在的项目相对目录；不得按习惯猜测 src、app 等目录。",
         "只有不同候选会产生不同的用户可观察行为且仓库证据无法裁决时，才允许 status=blocked + user_decision；外部必需资源确实缺失时可用 external_resource_missing。evidence_blocked 不属于允许的阶段出口，会被宿主退回自愈。",
         "通过时 open_unknowns 必须为空，target_investigation、每条 target_mappings 和每个参考候选都必须包含 path:line 证据。"
       ].join("\n");
