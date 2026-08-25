@@ -2949,11 +2949,14 @@ export class ClaudeAgentRunner {
   private recordSdkToolUses(session: AgentSession, stageId: string, message: unknown): void {
     for (const toolUse of extractSdkToolUses(message)) {
       if (session.tool_calls.some((item) => item.id === toolUse.id)) continue;
+      const recordedInput = toolUse.tool === "mcp__ai_coder__locate_feature_implementation"
+        ? reconcileFeatureCensusQueryForStage(session, stageId, toolUse.input).input
+        : toolUse.input;
       session.tool_calls.push({
         id: toolUse.id,
         stage_id: stageId,
         tool: toolUse.tool,
-        input: toolUse.input,
+        input: recordedInput,
         status: "requested",
         created_at: new Date().toISOString()
       });
@@ -3384,7 +3387,7 @@ export class ClaudeAgentRunner {
           "再对独特证据命中文件执行受限语义分析，合并符号名、路径、定义正文和配置邻接候选，并以两跳调用图补充上下文；",
           "候选按多通道证据排序并携带宿主提取的定义上下文：短定义直接完整返回，大定义返回有摘要指纹的片段、完整行范围和项目内 Read 分页提示。",
           "宿主以项目和符号频率排除 pageName/linkType 等高频管道词，只把具有直接检索或配置邻接证据的符号列为候选；调用图用于补充上下文，不把所有可达包装器扩张成候选。",
-          "语义结论依赖完整实现时必须读完整定义；每次只需提交当前返回的高相关检索前沿 adjudications，宿主会在相同查询内自动累计。批次中出现 yes 后剪枝低排名尾部；若本批全部为 no，自动展开下一批，直到 status=complete。"
+          "语义结论依赖完整实现时必须读完整定义；首次成功返回后宿主锁定 feature/aliases/clues/scope，每次只需提交当前返回的高相关检索前沿 adjudications，宿主会在锁定查询内自动累计。批次中出现 yes 后剪枝低排名尾部；若本批全部为 no，自动展开下一批，直到 status=complete。"
         ].join(""),
         {
           feature: z.string().min(1).describe("完整的用户可观察功能描述，不要只传某个猜测符号名"),
@@ -3404,7 +3407,7 @@ export class ClaudeAgentRunner {
           })).optional().describe("提交当前返回批次的是/不是结论及候选声明或已发现证据的 path:line；相同查询的历史裁决由宿主自动累计")
         },
         async (args) => {
-          const toolInput = args as {
+          const submittedToolInput = args as {
             feature: string;
             aliases?: string[];
             acceptance_clues?: string[];
@@ -3419,10 +3422,25 @@ export class ClaudeAgentRunner {
           };
           try {
             const censusStartedAt = Date.now();
+            const censusStageId = currentFeatureCensusStageId(input.session);
+            const queryReconciliation = reconcileFeatureCensusQueryForStage(
+              input.session,
+              censusStageId,
+              submittedToolInput as Record<string, unknown>
+            );
+            const toolInput = queryReconciliation.input as typeof submittedToolInput;
+            if (queryReconciliation.locked) {
+              await this.recordProgress(
+                input,
+                "tool_policy",
+                "宿主已锁定本 investigate 首次成功普查的 feature/aliases/clues/scope；"
+                  + "本轮仅合并新增 adjudications，忽略模型改写的查询字段。",
+                "milestone"
+              );
+            }
             for (const scope of toolInput.scope_paths ?? []) {
               await assertPathInsideProject(input.session.project_path, scope);
             }
-            const censusStageId = currentFeatureCensusStageId(input.session);
             const adjudicationStateKey = [
               input.session.id,
               censusStageId,
@@ -4781,6 +4799,55 @@ function featureCensusInputDigest(input: Record<string, unknown>): string {
     .digest("hex");
 }
 
+const FEATURE_CENSUS_QUERY_ARRAY_FIELDS = [
+  "aliases",
+  "acceptance_clues",
+  "negative_clues",
+  "scope_paths"
+] as const;
+
+/**
+ * Keep one stable feature-census universe for the lifetime of an investigate
+ * stage. The model is responsible only for adjudicating the next frontier; it
+ * must not accidentally reset prior decisions by paraphrasing feature, aliases,
+ * clues or scope on a retry.
+ *
+ * A query becomes host-owned only after it produced a receipt. Failed or
+ * cancelled first attempts therefore do not poison the stage. Incoming
+ * adjudications are deliberately preserved because they are the only fields
+ * expected to change between calls.
+ */
+export function reconcileFeatureCensusQueryForStage(
+  session: AgentSession,
+  stageId: string,
+  submittedInput: Record<string, unknown>
+): { input: Record<string, unknown>; locked: boolean } {
+  const receiptDigests = new Set((session.feature_census_receipts ?? [])
+    .filter((receipt) => receipt.stage_id === stageId)
+    .map((receipt) => receipt.input_digest));
+  if (receiptDigests.size === 0) return { input: submittedInput, locked: false };
+  const canonicalInput = session.tool_calls.find((call) => (
+    call.stage_id === stageId
+    && call.tool === "mcp__ai_coder__locate_feature_implementation"
+    && isPlainObject(call.input)
+    && receiptDigests.has(featureCensusInputDigest(call.input))
+  ))?.input;
+  if (!isPlainObject(canonicalInput)) return { input: submittedInput, locked: false };
+  if (featureCensusQueryDigest(canonicalInput) === featureCensusQueryDigest(submittedInput)) {
+    return { input: submittedInput, locked: false };
+  }
+
+  const reconciled: Record<string, unknown> = { ...submittedInput };
+  const feature = optionalString(canonicalInput.feature);
+  if (feature) reconciled.feature = feature;
+  for (const field of FEATURE_CENSUS_QUERY_ARRAY_FIELDS) {
+    const values = optionalStringArray(canonicalInput[field]);
+    if (values === undefined) delete reconciled[field];
+    else reconciled[field] = [...values];
+  }
+  return { input: reconciled, locked: true };
+}
+
 function featureCensusQueryDigest(input: Record<string, unknown>): string {
   return featureCensusInputDigest({
     ...input,
@@ -5954,7 +6021,7 @@ export function hierarchicalValidationCorrection(
     return "宿主没有 complete 普查报告可回填候选计数与 selected ids：沿用完全相同的 feature、aliases、clues 与 scope 重跑 locate_feature_implementation，只提交当前批次 adjudications，宿主会自动累计到 status=complete。";
   }
   if (/功能实现候选普查|feature_census|locate_feature_implementation/.test(reason)) {
-    return "沿用上次完全相同的 feature、aliases、clues 与 scope 调用 locate_feature_implementation；只对工具当前返回的 unknown 逐项读取代码并提交 yes/no、reason、path:line，宿主会自动累计历史批次。不要重传旧裁决，也不要扩大 aliases 或改变 scope。只有 status=complete 且最终 yes 集合完整记账后才能提交 investigate。";
+    return "继续调用 locate_feature_implementation，只对工具当前返回的 unknown 逐项读取代码并提交 yes/no、reason、path:line；首次成功查询的 feature、aliases、clues 与 scope 已由宿主锁定，后续即使草稿改写也不会重置历史裁决。不要重传旧裁决。只有 status=complete 且最终 yes 集合完整记账后才能提交 investigate。";
   }
   if (/open_unknowns|基线实现缺口|需求 token 在基线/.test(reason)) {
     if (/基线实现缺口|需求 token 在基线/.test(reason)) {

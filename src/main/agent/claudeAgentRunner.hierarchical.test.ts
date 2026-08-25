@@ -19,6 +19,7 @@ import {
   isWorkingTreeAddedEvidenceLocation,
   mergeFeatureCensusAdjudications,
   normalizeHierarchicalStructuredContainers,
+  reconcileFeatureCensusQueryForStage,
   reconcileHierarchicalPlannerRequirementIds,
   reconcileHierarchicalFeatureCensusHandoff,
   reconcileHierarchicalInvestigateFinalContracts,
@@ -263,6 +264,67 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       reason: "target implementation",
       evidence_refs: ["second.ts:2"]
     }]);
+  });
+
+  it("locks census query fields after the first successful receipt while preserving new adjudications", () => {
+    const session = createSession();
+    const stageId = "hierarchical:R33/investigate";
+    const canonicalInput = {
+      feature: "零钱宝页面跳转",
+      aliases: ["UQBHomeV", "LQBInvest"],
+      acceptance_clues: ["零钱宝主页"],
+      negative_clues: ["零钱宝交易记录"],
+      scope_paths: ["lib/views"]
+    };
+    session.tool_calls = [{
+      id: "feature-census-first",
+      stage_id: stageId,
+      tool: "mcp__ai_coder__locate_feature_implementation",
+      input: canonicalInput,
+      status: "completed",
+      created_at: new Date().toISOString()
+    }];
+    recordFeatureCensusReceipt(session, stageId, canonicalInput, {
+      status: "partial",
+      report_digest: "d".repeat(64),
+      candidate_accounting: { total: 12, yes: 0, no: 0, unknown: 12, accounted: true },
+      selected_targets: [],
+      unresolved: ["仍有候选待裁决"]
+    } as unknown as ReturnType<typeof censusFeatureImplementations>);
+    const adjudications = [{
+      candidate_id: "candidate-1",
+      verdict: "yes" as const,
+      reason: "零钱宝目标组件",
+      evidence_refs: ["lib/views/myAssets/LQBInvest.js:29"]
+    }];
+
+    const reconciled = reconcileFeatureCensusQueryForStage(session, stageId, {
+      feature: "转托管入和零钱宝导航",
+      aliases: ["ESCTR"],
+      acceptance_clues: ["nativeLink"],
+      scope_paths: ["lib/Const"],
+      adjudications
+    });
+
+    expect(reconciled.locked).toBe(true);
+    expect(reconciled.input).toEqual({
+      ...canonicalInput,
+      adjudications
+    });
+  });
+
+  it("does not lock a census query before any call has produced a receipt", () => {
+    const session = createSession();
+    const submitted = {
+      feature: "零钱宝页面跳转",
+      aliases: ["UQBHomeV"]
+    };
+
+    expect(reconcileFeatureCensusQueryForStage(
+      session,
+      "hierarchical:R33/investigate",
+      submitted
+    )).toEqual({ input: submitted, locked: false });
   });
 
   it("keeps guarded write tools visible and redirects legacy MCP tools without involving the user", () => {
