@@ -283,8 +283,11 @@ describe("hierarchicalRoleProtocol", () => {
     );
     expect(spec.prompt).toContain("第 1 页定义入口");
     expect(spec.prompt).toContain("禁止再次 Read 附件");
+    expect(spec.prompt).toContain("本阶段也不得探索项目代码");
     expect(spec.prompt).toContain("必须核对全部已归并批次");
     expect(spec.prompt).toContain("当前角色没有原始附件读取权限");
+    expect(spec.tools).toEqual([]);
+    expect(spec.requiredSkills).not.toContain("exploring-codebase");
   });
 
   it("publishes exact dynamic sequence coverage and prior rejection before planner execution", () => {
@@ -322,6 +325,7 @@ describe("hierarchicalRoleProtocol", () => {
     );
 
     expect(spec.prompt).toContain("requirements 必须分别覆盖这些业务序号：7, 9, 12");
+    expect(spec.prompt).toContain("例如 33 写成 R33");
     expect(spec.prompt).toContain("当前为第 2 次 planner 尝试");
     expect(spec.prompt).toContain("planner 需求账本遗漏用户范围内业务序号：12");
     expect(spec.prompt).toContain("同一序号在不同附件中解释冲突时，仍保留该序号的 R-ID");

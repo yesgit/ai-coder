@@ -19,6 +19,7 @@ import {
   isWorkingTreeAddedEvidenceLocation,
   mergeFeatureCensusAdjudications,
   normalizeHierarchicalStructuredContainers,
+  reconcileHierarchicalPlannerRequirementIds,
   reconcileHierarchicalFeatureCensusHandoff,
   reconcileHierarchicalInvestigateFinalContracts,
   reconcileHierarchicalInvestigateMappingScope,
@@ -267,6 +268,7 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       "Edit",
       "Write"
     ]);
+    expect(buildHierarchicalSdkToolSurface([])).toEqual([]);
 
     const session = createSession();
     session.hierarchical_state = createHierarchicalExecutionState(session.task_prompt);
@@ -416,6 +418,44 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       .toThrow("planner 需求账本遗漏用户范围内业务序号：44");
 
     structured.requirements.push({ id: "R44", source_anchor: "序号44" });
+    expect(() => validateHierarchicalPlannerEnumeratedCoverage(session, operation, structured)).not.toThrow();
+  });
+
+  it("normalizes dashed numeric planner ids and dependency references before validation", () => {
+    const session = createSession();
+    session.task_prompt = "请从序号 33 开始实现所有页面跳转";
+    session.hierarchical_state = {
+      ...session.hierarchical_state!,
+      alignment_batches: [{
+        id: "A1",
+        source_refs: ["page-12.png"],
+        status: "completed",
+        attempt: 1,
+        consecutive_failure_count: 0,
+        summary: "目标条目 33 和 34",
+        findings: [
+          { source_anchor: "序号33", observable_result: "零钱宝跳转", acceptance: ["33 passes"] },
+          { source_anchor: "序号34", observable_result: "托管转入跳转", acceptance: ["34 passes"] }
+        ],
+        evidence_refs: ["page-12.png"]
+      }]
+    };
+    const operation = { kind: "run_planner" as const };
+    const structured = {
+      requirements: [
+        { id: "R-33", source_anchor: "序号33", dependencies: [] },
+        { id: "R_034-entry", source_anchor: "序号34", dependencies: ["R-33"] }
+      ]
+    };
+
+    expect(reconcileHierarchicalPlannerRequirementIds(operation, structured)).toEqual([
+      "R-33→R33",
+      "R_034-entry→R34-entry"
+    ]);
+    expect(structured.requirements).toEqual([
+      { id: "R33", source_anchor: "序号33", dependencies: [] },
+      { id: "R34-entry", source_anchor: "序号34", dependencies: ["R33"] }
+    ]);
     expect(() => validateHierarchicalPlannerEnumeratedCoverage(session, operation, structured)).not.toThrow();
   });
 

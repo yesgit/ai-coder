@@ -128,8 +128,8 @@ function buildPlannerSpec(
   return {
     role,
     phaseLabel: "align",
-    tools: ["Read", "Grep", "Glob", "Bash"],
-    requiredSkills: ["clarifying-requirements", "exploring-codebase", "task-decomposition"],
+    tools: [],
+    requiredSkills: ["clarifying-requirements", "task-decomposition"],
     prompt: [
       baseRoleHeader(session, state, role),
       `## 谨慎程序员心智\n${workflow.description}`,
@@ -142,7 +142,7 @@ function buildPlannerSpec(
             "## 本轮输出契约（宿主在角色启动前公开，提交时将逐项校验）",
             `用户枚举范围起点：${coverageContract.scope_start}`,
             `requirements 必须分别覆盖这些业务序号：${coverageContract.required_sequences.join(", ")}`,
-            "每个上述业务序号必须有独立、稳定的 R-ID；不得合并、遗漏，也不得用 blocked 绕过。",
+            "每个上述业务序号必须有独立、稳定的 R-ID；数字业务序号必须严格写成 R<序号>（例如 33 写成 R33），不得写 R-33、R_33 或 R.33；不得合并、遗漏，也不得用 blocked 绕过。",
             "同一序号在不同附件中解释冲突时，仍保留该序号的 R-ID，在 source_anchor 中并列冲突来源，把最终目标映射留给该 R-ID 的 investigate。"
           ]
         : []),
@@ -156,8 +156,8 @@ function buildPlannerSpec(
           ]
         : []),
       "## 当前职责",
-      "根据用户原始目标、宿主已归并的附件证据和必要代码证据，建立一次性、稳定的需求账本。",
-      "附件摄取已经完成：禁止再次 Read 附件、禁止搜索附件替代路径；只可按需读取项目代码。",
+      "根据用户原始目标和宿主已归并的附件证据，建立一次性、稳定的需求账本。",
+      "附件摄取已经完成：禁止再次 Read 附件、禁止搜索附件替代路径。本阶段也不得探索项目代码；路径、符号和最终目标调查由每个 R-ID 的 investigate 阶段完成。",
       "先按文档中的业务序号跨批次拼接候选事实；附件页码和批次号不是业务序号。不得因早期批次尚未出现目标序号而提问，必须核对全部已归并批次。",
       "每个独立可验证结果必须拥有稳定 R-ID；不要创建‘读取需求’‘调用 planner’等过程任务。",
       "用户要求从某个序号开始时，逐项建立来源锚点；不得把全部页面压成一个笼统需求。",
@@ -181,7 +181,10 @@ function buildPlannerSpec(
             items: {
               type: "object",
               properties: {
-                id: { type: "string" },
+                id: {
+                  type: "string",
+                  description: "稳定 R-ID；数字业务序号必须写成 R<序号>，例如 R33，不得写 R-33/R_33/R.33"
+                },
                 source_anchor: { type: "string" },
                 observable_result: { type: "string" },
                 acceptance: { type: "array", items: { type: "string" } },

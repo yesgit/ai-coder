@@ -673,10 +673,10 @@ export class ClaudeAgentRunner {
         ...(this.options.pluginPaths?.length
           ? { plugins: this.options.pluginPaths.map((pluginPath) => ({ type: "local" as const, path: pluginPath })) }
           : {}),
-        // Keep guarded write tools visible even during read-only phases. If a model
-        // reaches for Edit too early, canUseTool can explain the phase transition;
-        // hiding it produces an unhelpful "No such tool" and often causes Bash or
-        // ask_human workarounds.
+        // Keep guarded write tools visible for code-aware read-only phases. If a
+        // model reaches for Edit too early, canUseTool can explain the transition;
+        // a deliberately tool-free planner remains tool-free so retries cannot
+        // drift into repository exploration or write workarounds.
         tools: buildHierarchicalSdkToolSurface(spec.tools),
         disallowedTools: buildDisallowedClaudeTools(input.workflow),
         permissionMode: "default",
@@ -829,6 +829,18 @@ export class ClaudeAgentRunner {
       ? output.structuredOutput
       : recoveredStructuredOutput ?? (output.resultText || output.assistantText)
     );
+    const normalizedPlannerRequirementIds = reconcileHierarchicalPlannerRequirementIds(
+      operation,
+      structured
+    );
+    if (normalizedPlannerRequirementIds.length > 0) {
+      await this.recordProgress(
+        input,
+        "tool_policy",
+        `宿主已将 planner 的数字需求 ID 规范为稳定 R-ID：${normalizedPlannerRequirementIds.join(", ")}`,
+        "milestone"
+      );
+    }
     const removedInvestigateMappings = reconcileHierarchicalInvestigateMappingScope(
       input.session,
       operation,
@@ -5614,7 +5626,7 @@ export function validateHierarchicalPlannerEnumeratedCoverage(
   for (const rawRequirement of requirements) {
     if (!isPlainObject(rawRequirement)) continue;
     const id = optionalString(rawRequirement.id) ?? "";
-    const numericId = /^R0*(\d+)$/i.exec(id)?.[1];
+    const numericId = /^R[-_.\s]*0*(\d+)(?:[-_.][A-Za-z0-9][A-Za-z0-9._-]*)?$/i.exec(id)?.[1];
     if (numericId) covered.add(Number(numericId));
     const evidenceText = [
       optionalString(rawRequirement.source_anchor),
@@ -5627,6 +5639,48 @@ export function validateHierarchicalPlannerEnumeratedCoverage(
   if (missing.length > 0) {
     throw new Error(`planner 需求账本遗漏用户范围内业务序号：${missing.join(", ")}`);
   }
+}
+
+/**
+ * Smaller providers frequently render a numeric requirement as `R-33` even
+ * when the planner prose says `R33`. This is a formatting difference with one
+ * deterministic interpretation, not a missing business requirement. Normalize
+ * the ID and its dependency references before coverage and protocol parsing;
+ * collisions remain visible to the normal duplicate-ID validator.
+ */
+export function reconcileHierarchicalPlannerRequirementIds(
+  operation: Extract<HierarchicalNextOperation, {
+    kind: "run_phase" | "run_alignment_batch" | "run_planner" | "run_integrator"
+  }>,
+  structured: unknown
+): string[] {
+  if (operation.kind !== "run_planner" || !isPlainObject(structured)) return [];
+  const requirements = Array.isArray(structured.requirements)
+    ? structured.requirements.filter(isPlainObject)
+    : [];
+  const normalized = new Map<string, string>();
+  for (const requirement of requirements) {
+    const id = optionalString(requirement.id);
+    if (!id) continue;
+    const canonical = canonicalNumericRequirementId(id);
+    if (!canonical || canonical === id) continue;
+    requirement.id = canonical;
+    normalized.set(id, canonical);
+  }
+  for (const requirement of requirements) {
+    if (!Array.isArray(requirement.dependencies)) continue;
+    requirement.dependencies = requirement.dependencies.map((dependency) => {
+      if (typeof dependency !== "string") return dependency;
+      return normalized.get(dependency) ?? canonicalNumericRequirementId(dependency) ?? dependency;
+    });
+  }
+  return [...normalized].map(([before, after]) => `${before}→${after}`);
+}
+
+function canonicalNumericRequirementId(value: string): string | null {
+  const match = /^R[-_.\s]*0*(\d+)((?:[-_.][A-Za-z0-9][A-Za-z0-9._-]*)?)$/i.exec(value.trim());
+  if (!match?.[1]) return null;
+  return `R${Number(match[1])}${match[2] ?? ""}`;
 }
 
 export function formatRejectedHierarchicalOutput(value: unknown): string | undefined {
@@ -5982,6 +6036,7 @@ async function assertHierarchicalWorkUnitIntegrity(snapshot: HierarchicalWorkUni
 }
 
 export function buildHierarchicalSdkToolSurface(declaredTools: string[]): string[] {
+  if (declaredTools.length === 0) return [];
   return [...new Set([...declaredTools, "Edit", "Write"])];
 }
 
