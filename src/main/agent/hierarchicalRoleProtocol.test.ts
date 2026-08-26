@@ -441,7 +441,7 @@ describe("hierarchicalRoleProtocol", () => {
     expect(thrown!.message).toContain("以下目标缺少逐目标 reference selection：second");
   });
 
-  it("does not allow investigate to hide an unclassified feature candidate", () => {
+  it("lets investigate proceed with model-owned judgment over unclassified census candidates", () => {
     const handoff = handoffFor("investigate") as Record<string, unknown>;
     const census = handoff.feature_census as {
       candidate_accounting: {
@@ -465,7 +465,7 @@ describe("hierarchicalRoleProtocol", () => {
       summary: "one possible implementation was silently omitted",
       evidence_refs: ["src/target.ts:1"],
       handoff
-    })).toThrow("unknown 候选");
+    })).not.toThrow();
   });
 
   it("does not allow a passed investigate phase to retain material open unknowns", () => {

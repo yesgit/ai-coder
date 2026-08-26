@@ -267,7 +267,7 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     }]);
   });
 
-  it("locks census query fields after the first successful receipt while preserving new adjudications", () => {
+  it("preserves the model's revised census query after an earlier receipt", () => {
     const session = createSession();
     const stageId = "hierarchical:R33/investigate";
     const canonicalInput = {
@@ -307,9 +307,12 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       adjudications
     });
 
-    expect(reconciled.locked).toBe(true);
+    expect(reconciled.locked).toBe(false);
     expect(reconciled.input).toEqual({
-      ...canonicalInput,
+      feature: "转托管入和零钱宝导航",
+      aliases: ["ESCTR"],
+      acceptance_clues: ["nativeLink"],
+      scope_paths: ["lib/Const"],
       adjudications
     });
   });
@@ -1485,7 +1488,7 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     }
   });
 
-  it("does not let a later accidental partial census erase a complete stage receipt", async () => {
+  it("uses the model's latest census query instead of pinning an older complete report", async () => {
     const projectPath = await mkdtemp(path.join(os.tmpdir(), "ai-coder-census-complete-monotonic-"));
     try {
       await writeFile(path.join(projectPath, "feature.ts"), [
@@ -1562,17 +1565,18 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       }, structured, stageId);
 
       expect(structured.handoff.feature_census).toMatchObject({
-        status: "complete",
-        report_digest: completeReport.report_digest,
-        candidate_accounting: completeReport.candidate_accounting,
-        selected_candidate_ids: completeReport.selected_targets.map((target) => target.candidate_id)
+        status: "partial",
+        report_digest: partialReport.report_digest,
+        candidate_accounting: partialReport.candidate_accounting,
+        selected_candidate_ids: partialReport.selected_targets.map((target) => target.candidate_id),
+        runtime_verification_required: true
       });
     } finally {
       await rm(projectPath, { recursive: true, force: true });
     }
   });
 
-  it("rejects a partial-backfilled census draft with the actionable census-incomplete error", async () => {
+  it("allows the model to conclude from a partial census and carries boundaries forward", async () => {
     const projectPath = await mkdtemp(path.join(os.tmpdir(), "ai-coder-census-partial-parse-"));
     try {
       await writeFile(path.join(projectPath, "feature.ts"), [
@@ -1617,9 +1621,13 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
 
       reconcileHierarchicalFeatureCensusHandoff(session, operation, structured, stageId);
 
-      expect(() => parseHierarchicalRoleResult(operation, structured)).toThrow(
-        "功能实现候选普查未 complete，不能结束 investigate"
-      );
+      expect(() => parseHierarchicalRoleResult(operation, structured)).not.toThrow();
+      expect((handoff.feature_census as Record<string, unknown>)).toMatchObject({
+        status: "partial",
+        runtime_verification_required: true
+      });
+      expect((handoff.target_investigation as Record<string, unknown>).unresolved)
+        .toEqual(expect.arrayContaining(report.unresolved));
     } finally {
       await rm(projectPath, { recursive: true, force: true });
     }
@@ -1648,21 +1656,22 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       candidate_accounting: { total: 180, yes: 1, no: 20, unknown: 159, accounted: true }
     });
     expect(withPartial).toContain("partial");
-    expect(withPartial).toContain("unknown=159");
-    expect(withPartial).toContain("重跑 locate_feature_implementation");
+    expect(withPartial).toContain("不要为了 partial 机械重跑");
+    expect(withPartial).toContain("自行调整查询或范围");
     expect(withPartial).not.toContain("沿用最后一次 complete");
 
     const withoutReceipt = hierarchicalValidationCorrection(operation, digestReason, null);
-    expect(withoutReceipt).toContain("没有 complete 回执");
-    expect(withoutReceipt).toContain("重跑 locate_feature_implementation");
+    expect(withoutReceipt).toContain("没有真实普查回执");
+    expect(withoutReceipt).toContain("若普查对当前判断有帮助");
+    expect(withoutReceipt).toContain("not-applicable");
 
     const accountingReason = "feature_census.selected_candidate_ids 必须逐项对应全部 yes 候选：yes=2，selected=1";
     const accountingPartial = hierarchicalValidationCorrection(operation, accountingReason, {
       status: "partial",
       candidate_accounting: { total: 180, yes: 1, no: 20, unknown: 159, accounted: true }
     });
-    expect(accountingPartial).toContain("没有 complete 普查报告可回填");
-    expect(accountingPartial).toContain("重跑 locate_feature_implementation");
+    expect(accountingPartial).toContain("不要为了 partial 机械重跑");
+    expect(accountingPartial).toContain("自行调整查询");
 
     const contractCorrection = hierarchicalValidationCorrection(
       operation,
@@ -3843,12 +3852,12 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     }
 
     expect(thrown).toBeDefined();
-    // Both census violations should appear in one composite message (along with
-    // any target_mappings violations -- the point is they are collected, not
-    // thrown one-at-a-time).
+    // Host-owned census transcription mismatches are still collected, while a
+    // model may supersede an earlier semantic no with independently verified
+    // target-contract evidence.
     expect(thrown!.message).toContain("investigate 阶段交接物未通过校验，共");
     expect(thrown!.message).toContain("feature_census.selected_candidate_ids 未完整对应所有 yes 候选");
-    expect(thrown!.message).toContain("被误裁为 no（candidate_id=cand-rejected-target）");
+    expect(thrown!.message).not.toContain("被误裁为 no（candidate_id=cand-rejected-target）");
   });
 
   it("classifies repeated planner failures as a system fault instead of asking the user", async () => {

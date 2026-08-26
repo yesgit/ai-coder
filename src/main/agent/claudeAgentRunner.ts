@@ -2921,7 +2921,7 @@ export class ClaudeAgentRunner {
     return [
       "## 当前可用能力（与知识雪球、阶段任务同时生效）",
       "先根据当前缺失信息明确选择 Skill、Sub-agent 或直接工具，并把选择理由写回知识雪球。跨多文件追踪、独立验证或完整性审查与某个 Sub-agent 职责匹配时优先委托；简单单点事实直接用工具。只选能推进当前阶段任务的最小能力。",
-      "功能定位硬规则：目标以业务功能、用户行为、页面、事件或协议值描述且没有唯一精确符号时，必须调用 locate_feature_implementation；aliases 不要加入 pageName/linkType 等通用字段。工具按搜索证据排序并返回候选代码上下文。source.mode=full-definition 时直接分析完整定义；source.truncated=true 且结论依赖完整分支、状态或副作用时，按 read_hint 在项目内读到 definition_end_line。逐批裁决 unknown，每轮只提交当前批次，宿主按相同查询自动累计到 complete。最终复用目标的完整调用契约留给 prepare。",
+      "功能定位：目标以业务功能、用户行为、页面、事件或协议值描述且没有唯一精确符号时，调用 locate_feature_implementation 辅助发现候选；aliases 不要加入 pageName/linkType 等通用字段。工具按搜索证据排序并返回候选代码上下文。source.mode=full-definition 时直接分析完整定义；source.truncated=true 且结论依赖完整分支、状态或副作用时，按 read_hint 在项目内读到 definition_end_line。是否继续展开、改写查询或基于已有证据收敛，由当前角色按任务风险决定；最终复用目标的完整调用契约留给 prepare。",
       "调用契约硬规则：凡拟议实现会调用、复用或修改已有函数、方法、Hook 或组件，第一次相关修改前必须通过 Task 使用 call-contract-investigator，且调查者必须真实调用 investigate_symbol_contract 完整调查脚本；主线程搜索、零散 analyze_symbol_contract 或文字声明不能替代。纯文案、静态数据或样式且不涉及既有函数/组件时才可记录依据后判定不适用。",
       "",
       "### Skills（工作流核心项已由宿主加载；目录中的其他项可用 Skill 加载）",
@@ -3797,8 +3797,8 @@ export function reconcileHierarchicalFeatureCensusHandoff(
   const report = evidence?.receipt;
   if (!report) return;
   // Host-owned facts are always overwritten, including a truthful "partial"
-  // status; a model-claimed "complete" over a partial report is a forgery the
-  // protocol gate must not accept as an honest draft.
+  // status. Partial evidence is preserved for the model and later verification;
+  // it is no longer treated as an automatic investigate failure.
   census.status = report.status;
   census.report_digest = report.report_digest;
   census.candidate_accounting = { ...report.candidate_accounting };
@@ -3806,8 +3806,18 @@ export function reconcileHierarchicalFeatureCensusHandoff(
     (target) => target.candidate_id
   );
   census.runtime_verification_required = (
-    report.closure?.runtime_verification_required ?? false
+    report.status === "partial"
+    || (report.closure?.runtime_verification_required ?? false)
   );
+  const target = handoff && isPlainObject(handoff.target_investigation)
+    ? handoff.target_investigation
+    : null;
+  if (target && report.status === "partial") {
+    target.unresolved = uniqueStrings([
+      ...(optionalStringArray(target.unresolved) ?? []),
+      ...report.unresolved
+    ]);
+  }
 }
 
 /**
@@ -4928,14 +4938,10 @@ function getLatestHierarchicalFeatureCensusEvidence(
       ?? null;
     return { input: toolInput, receipt };
   });
-  // A complete census is monotonic evidence for the current investigate
-  // stage. If the model unnecessarily restarts the tool with a broader or
-  // incomplete query while fixing an unrelated handoff field, that later
-  // partial call must not erase the already-closed report. The downstream
-  // target-definition gate still requires the chosen complete report to have
-  // selected the exact callable/component declared in the handoff.
-  return [...evidence].reverse().find((item) => item.receipt?.status === "complete")
-    ?? evidence[evidence.length - 1]!;
+  // The model owns its evidence-gathering strategy. A later query may
+  // intentionally broaden or redirect the search, so an older complete report
+  // must not silently override the latest evidence.
+  return evidence[evidence.length - 1]!;
 }
 
 function currentFeatureCensusStageId(session: AgentSession): string {
@@ -4966,53 +4972,19 @@ function featureCensusInputDigest(input: Record<string, unknown>): string {
     .digest("hex");
 }
 
-const FEATURE_CENSUS_QUERY_ARRAY_FIELDS = [
-  "aliases",
-  "acceptance_clues",
-  "negative_clues",
-  "scope_paths"
-] as const;
-
 /**
- * Keep one stable feature-census universe for the lifetime of an investigate
- * stage. The model is responsible only for adjudicating the next frontier; it
- * must not accidentally reset prior decisions by paraphrasing feature, aliases,
- * clues or scope on a retry.
- *
- * A query becomes host-owned only after it produced a receipt. Failed or
- * cancelled first attempts therefore do not poison the stage. Incoming
- * adjudications are deliberately preserved because they are the only fields
- * expected to change between calls.
+ * Preserve the model's census query verbatim. Earlier revisions made the first
+ * successful query host-owned, which could deadlock a partial report: the tool
+ * asked for broader scope while the host silently restored the old scope. The
+ * model now owns the evidence-gathering strategy and may continue, narrow or
+ * expand the query based on the returned boundaries.
  */
 export function reconcileFeatureCensusQueryForStage(
-  session: AgentSession,
-  stageId: string,
+  _session: AgentSession,
+  _stageId: string,
   submittedInput: Record<string, unknown>
 ): { input: Record<string, unknown>; locked: boolean } {
-  const receiptDigests = new Set((session.feature_census_receipts ?? [])
-    .filter((receipt) => receipt.stage_id === stageId)
-    .map((receipt) => receipt.input_digest));
-  if (receiptDigests.size === 0) return { input: submittedInput, locked: false };
-  const canonicalInput = session.tool_calls.find((call) => (
-    call.stage_id === stageId
-    && call.tool === "mcp__ai_coder__locate_feature_implementation"
-    && isPlainObject(call.input)
-    && receiptDigests.has(featureCensusInputDigest(call.input))
-  ))?.input;
-  if (!isPlainObject(canonicalInput)) return { input: submittedInput, locked: false };
-  if (featureCensusQueryDigest(canonicalInput) === featureCensusQueryDigest(submittedInput)) {
-    return { input: submittedInput, locked: false };
-  }
-
-  const reconciled: Record<string, unknown> = { ...submittedInput };
-  const feature = optionalString(canonicalInput.feature);
-  if (feature) reconciled.feature = feature;
-  for (const field of FEATURE_CENSUS_QUERY_ARRAY_FIELDS) {
-    const values = optionalStringArray(canonicalInput[field]);
-    if (values === undefined) delete reconciled[field];
-    else reconciled[field] = [...values];
-  }
-  return { input: reconciled, locked: true };
+  return { input: submittedInput, locked: false };
 }
 
 function featureCensusQueryDigest(input: Record<string, unknown>): string {
@@ -5082,8 +5054,6 @@ function validateHierarchicalFeatureCensusEvidence(
   stageId: string
 ): void {
   const handoff = isPlainObject(passed.handoff) ? passed.handoff : {};
-  const target = isPlainObject(handoff.target_investigation) ? handoff.target_investigation : {};
-  const targetKind = optionalString(target.target_kind)?.toLocaleLowerCase() ?? "";
   const referenceAnalysis = isPlainObject(handoff.reference_analysis) ? handoff.reference_analysis : {};
   const referenceCandidates = Array.isArray(referenceAnalysis.candidates)
     ? referenceAnalysis.candidates
@@ -5123,17 +5093,12 @@ function validateHierarchicalFeatureCensusEvidence(
       );
     }
   }
-  const callableTarget = /function|method|hook|component|class|callable/.test(targetKind);
-  const requiresCensus = callableTarget
-    || referenceCandidates.length > 0;
-  if (!requiresCensus) {
-    if (applicability === "required") {
-      throw new Error("静态配置目标不应伪造功能实现候选普查；请说明 not-applicable 依据");
-    }
-    return;
-  }
   if (applicability !== "required") {
-    throw new Error("函数/组件目标必须实际执行完整功能实现候选普查，不能声明 not-applicable");
+    // The model may decide census is not useful for a precise/static target.
+    // Other phase contracts still validate the submitted structure and later
+    // prepare/verify evidence; do not turn an optional discovery aid into a
+    // hidden exact-symbol gate here.
+    return;
   }
   const evidence = getLatestHierarchicalFeatureCensusEvidence(session, stageId);
   if (!evidence) {
@@ -5142,11 +5107,6 @@ function validateHierarchicalFeatureCensusEvidence(
   const report = evidence.receipt;
   if (!report) {
     throw new Error("当前 investigate 的最后一次功能普查缺少宿主 Worker 回执；为避免主进程复扫，请重新调用 locate_feature_implementation");
-  }
-  if (report.status !== "complete") {
-    throw new Error(
-      `功能实现候选普查未闭合：unknown=${report.candidate_accounting.unknown}；${report.unresolved.join("；")}`
-    );
   }
   const declaredDigest = optionalString(featureCensus.report_digest);
   if (declaredDigest !== report.report_digest) {
@@ -5160,7 +5120,8 @@ function validateHierarchicalFeatureCensusEvidence(
       throw new Error(`feature_census.candidate_accounting.${field} 与真实普查报告不一致`);
     }
   }
-  const expectedRuntimeVerification = report.closure?.runtime_verification_required ?? false;
+  const expectedRuntimeVerification = report.status === "partial"
+    || (report.closure?.runtime_verification_required ?? false);
   if (
     featureCensus.runtime_verification_required !== undefined
     && featureCensus.runtime_verification_required !== expectedRuntimeVerification
@@ -5175,35 +5136,6 @@ function validateHierarchicalFeatureCensusEvidence(
   ) {
     violations.push("feature_census.selected_candidate_ids 未完整对应所有 yes 候选");
   }
-  const targetDefinition = firstPathLineToken(optionalString(target.definition) ?? "");
-  const targetDefinitionAnchor = targetDefinition
-    ? evidenceLocationAnchor(targetDefinition, session.project_path)
-    : null;
-  const selectedTargetMatchesDefinition = Boolean(
-    targetDefinitionAnchor
-    && report.selected_targets.some((targetItem) => (
-      evidenceLocationAnchor(
-        `${targetItem.definition.file}:${targetItem.definition.line}`,
-        session.project_path
-      ) === targetDefinitionAnchor
-    ))
-  );
-  if (
-    callableTarget
-    && targetDefinition
-    && !selectedTargetMatchesDefinition
-  ) {
-    const rejectedTarget = report.rejected_targets?.find((targetItem) => (
-      evidenceLocationAnchor(
-        `${targetItem.definition.file}:${targetItem.definition.line}`,
-        session.project_path
-      ) === targetDefinitionAnchor
-    ));
-    violations.push(rejectedTarget
-      ? `目标定义 ${targetDefinition} 在 complete 功能普查中被误裁为 no（candidate_id=${rejectedTarget.candidate_id}）；若完整代码证据确认其实现目标功能，必须沿用完全相同查询并用 yes adjudication 覆盖该候选后重新闭合普查`
-      : `目标定义 ${targetDefinition} 未进入功能普查的 yes 集合；沿用完全相同查询定位并裁决该定义，不能手工修改 feature_census.selected_candidate_ids`);
-  }
-
   validateInvestigateTargetMappingEvidence(
     session,
     handoff,
@@ -6174,21 +6106,22 @@ export function hierarchicalValidationCorrection(
     if (featureCensusReceipt?.status === "complete") {
       return "不要重跑普查或手工计算哈希；沿用最后一次 complete 的 locate_feature_implementation 调用并重新提交草稿，宿主会从真实报告自动回填 report_digest。";
     }
-    // 没有 complete 回执时承诺“宿主回填”是谎言：模型按此原样重交只会以同一
-    // 原因再次被拒，最终升级为阻塞。如实说明现状并指引重跑普查至 complete。
-    const censusState = featureCensusReceipt
-      ? `最后一次普查仍为 partial（unknown=${featureCensusReceipt.candidate_accounting.unknown}）`
-      : "本阶段最后一次普查没有 complete 回执";
-    return `${censusState}，宿主没有可回填的 complete 报告，也不要手工填写 report_digest：沿用完全相同的 feature、aliases、clues 与 scope 重跑 locate_feature_implementation，逐项裁决当前批次 unknown；历史 adjudications 由宿主自动累计，直到 status=complete 后重新提交。`;
+    if (featureCensusReceipt?.status === "partial") {
+      return "不要手工填写 report_digest，也不要为了 partial 机械重跑相同查询；直接重新提交调查结论，宿主会回填真实报告并把静态边界带入后续验证。需要更多证据时由你自行调整查询或范围。";
+    }
+    return "本阶段没有真实普查回执，不能手工填写 report_digest。若普查对当前判断有帮助，自行调用 locate_feature_implementation；若已有其他充分代码证据，将 applicability 设为 not-applicable 并说明理由后提交。";
   }
   if (/feature_census\.(?:candidate_accounting|selected_candidate_ids)/.test(reason)) {
     if (featureCensusReceipt?.status === "complete") {
       return "不要重跑普查；沿用最后一次 complete 报告重新提交草稿，宿主会从真实报告自动回填候选计数和全部 yes candidate id。";
     }
-    return "宿主没有 complete 普查报告可回填候选计数与 selected ids：沿用完全相同的 feature、aliases、clues 与 scope 重跑 locate_feature_implementation，只提交当前批次 adjudications，宿主会自动累计到 status=complete。";
+    if (featureCensusReceipt?.status === "partial") {
+      return "不要为了 partial 机械重跑相同查询；直接重新提交调查结论，宿主会按真实报告回填候选计数和 selected ids，并把未闭合边界带入验证。需要更多证据时由你自行调整查询。";
+    }
+    return "本阶段没有真实普查回执可回填候选计数与 selected ids。若普查有帮助，自行调用 locate_feature_implementation；否则将 applicability 设为 not-applicable，并基于其他代码证据完成调查。";
   }
   if (/功能实现候选普查|feature_census|locate_feature_implementation/.test(reason)) {
-    return "继续调用 locate_feature_implementation，只对工具当前返回的 unknown 逐项读取代码并提交 yes/no、reason、path:line；首次成功查询的 feature、aliases、clues 与 scope 已由宿主锁定，后续即使草稿改写也不会重置历史裁决。不要重传旧裁决。只有 status=complete 且最终 yes 集合完整记账后才能提交 investigate。";
+    return "把功能普查作为辅助证据而不是审批门：若当前代码证据已足以支持目标映射和调用契约，直接提交 investigate；若仍不足，由你决定继续裁决、调整查询或扩大范围。不要机械重复相同 partial 查询。";
   }
   if (/open_unknowns|基线实现缺口|需求 token 在基线/.test(reason)) {
     if (/基线实现缺口|需求 token 在基线/.test(reason)) {

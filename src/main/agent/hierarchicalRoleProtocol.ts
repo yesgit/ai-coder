@@ -590,8 +590,9 @@ function validatePhaseHandoffSemantics(
     }
     requiredString(census.reason, "handoff.feature_census.reason");
     if (applicability === "required") {
-      if (requiredString(census.status, "handoff.feature_census.status") !== "complete") {
-        throw new Error("功能实现候选普查未 complete，不能结束 investigate");
+      const censusStatus = requiredString(census.status, "handoff.feature_census.status");
+      if (censusStatus !== "complete" && censusStatus !== "partial") {
+        throw new Error("feature_census.status 必须是 complete 或 partial");
       }
       if (!/^[a-f0-9]{64}$/.test(requiredString(
         census.report_digest,
@@ -624,9 +625,6 @@ function validatePhaseHandoffSemantics(
       }
       if (total !== yes + no + unknown) {
         throw new Error("feature_census 候选计数未完整记账");
-      }
-      if (unknown !== 0) {
-        throw new Error("feature_census 仍有 unknown 候选未逐项给出是/不是证据");
       }
       const selectedCandidateIds = stringArray(
         census.selected_candidate_ids,
@@ -1054,9 +1052,9 @@ function phaseInstructions(
     case "investigate":
       return [
         "只读取证：定位目标代码、最相似既有实现、真实调用方和关键未知。",
-        "只要需求以业务功能、用户行为、页面或协议标识描述，而不是用户已经给出唯一精确符号，就必须调用 locate_feature_implementation。aliases 只放业务同义名和 token 值，不放 pageName/linkType 等通用字段。按 retrieval_score 阅读返回批次；只提交当前批次 yes/no adjudications，并以完全相同查询继续到 status=complete，历史批次由宿主自动累计。",
+        "只要需求以业务功能、用户行为、页面或协议标识描述，而不是用户已经给出唯一精确符号，就调用 locate_feature_implementation 辅助发现候选。aliases 只放业务同义名和 token 值，不放 pageName/linkType 等通用字段。是否继续展开候选、调整查询或基于现有代码证据收敛，由你结合任务风险判断。",
         "功能普查对范围内源码完成词面扫描，用项目/符号频率排除高频管道词，每轮最多返回 8 个最高相关语义前沿。前沿出现 yes 后剪枝低排名尾部；若整批全部为 no，宿主自动展开下一批。调用图仅补充上下文，最终调用契约由 prepare 调查。",
-        "feature_census 只需提交 applicability 与 reason；status、report_digest、candidate_accounting、selected_candidate_ids 和 runtime_verification_required 由宿主回填。首次成功普查后 feature/aliases/clues/scope 由宿主锁定；最后一次普查仍为 partial 时只提交当前批次 adjudications，直到 complete，不要尝试改写查询。",
+        "feature_census 只需提交 applicability 与 reason；status、report_digest、candidate_accounting、selected_candidate_ids 和 runtime_verification_required 由宿主回填。partial 是证据边界，不是强制失败：若已取得足以支持目标映射和调用契约的证据，可以 passed 结束 investigate，宿主会把剩余边界带入后续验证；需要更多证据时可自行调整查询或范围。",
         "目标函数/组件必须逐项调查定义、输入、输出、内部调用、guard、状态/副作用和调用方；某项不存在也要用证据明确写‘无’，不得省略。",
         "同类实现不是外形相似的路由分支。必须优先找到应用内进入同一业务功能的既有用户入口，沿该入口追到最终组件/函数，并记录目标、调用方式、完整参数、guard、上下文透传和副作用。",
         "每个原始页面/协议 token 都必须在 target_mappings 中单独记录 target_key、原词、canonical token、公共 dispatcher 位置，以及最终 contract_symbol@contract_location；公共 dispatcher 不能冒充最终页面组件。",
