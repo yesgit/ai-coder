@@ -869,6 +869,20 @@ export class ClaudeAgentRunner {
       structured,
       stageId
     );
+    const canonicalizedContractLocations = reconcileHierarchicalInvestigateContractLocations(
+      input.session,
+      operation,
+      structured
+    );
+    if (canonicalizedContractLocations.length > 0) {
+      await this.recordProgress(
+        input,
+        "tool_policy",
+        "宿主已将模型提交的契约分支位置归一到真实符号定义："
+          + canonicalizedContractLocations.join(", "),
+        "milestone"
+      );
+    }
     const reconciledFinalContracts = reconcileHierarchicalInvestigateFinalContracts(
       input.session,
       operation,
@@ -3961,6 +3975,92 @@ function looseSubmittedPathLineAnchor(value: string): string | null {
   const match = /(?:^|[\s(（["'`])((?:[A-Za-z]:[\\/]|\/)?[^:\s,，;；)）\]"'`]+:\d+)(?::\d+)?(?:-\d+)?(?=$|[\s,，;；)）\]"'`])/u
     .exec(value);
   return match?.[1]?.replaceAll("\\", "/") ?? null;
+}
+
+/**
+ * contract_location is derived data once the model has named a symbol and a
+ * source location in that symbol's file. Smaller models frequently point at a
+ * route branch that uses the function instead of the function's definition.
+ * Resolve the symbol with the host analyzer and replace that transcription
+ * detail before exact-definition validation. The semantic symbol choice stays
+ * model-owned; only the mechanically discoverable definition line is changed.
+ */
+export function reconcileHierarchicalInvestigateContractLocations(
+  session: AgentSession,
+  operation: Extract<HierarchicalNextOperation, {
+    kind: "run_phase" | "run_alignment_batch" | "run_planner" | "run_integrator"
+  }>,
+  structured: unknown
+): string[] {
+  if (
+    operation.kind !== "run_phase"
+    || operation.phase !== "investigate"
+    || !isPlainObject(structured)
+  ) return [];
+  const handoff = isPlainObject(structured.handoff) ? structured.handoff : null;
+  const referenceAnalysis = handoff && isPlainObject(handoff.reference_analysis)
+    ? handoff.reference_analysis
+    : null;
+  const mappings = handoff && Array.isArray(handoff.target_mappings)
+    ? handoff.target_mappings.filter(isPlainObject)
+    : [];
+  const candidates = referenceAnalysis && Array.isArray(referenceAnalysis.candidates)
+    ? referenceAnalysis.candidates.filter(isPlainObject)
+    : [];
+  const rows = [...mappings, ...candidates];
+  const resolved = new Map<string, string | null>();
+  const changed: string[] = [];
+
+  for (const row of rows) {
+    const symbol = optionalString(row.contract_symbol);
+    const submittedLocation = optionalString(row.contract_location);
+    const submittedAnchor = submittedLocation
+      ? evidenceLocationAnchor(submittedLocation, session.project_path)
+      : null;
+    const absoluteFile = submittedLocation
+      ? evidenceLocationFile(submittedLocation, session.project_path)
+      : null;
+    if (!symbol || !submittedLocation || !submittedAnchor || !absoluteFile) continue;
+    const relativeFile = path.relative(session.project_path, absoluteFile);
+    if (
+      relativeFile.startsWith("..")
+      || path.isAbsolute(relativeFile)
+      || !existsSync(absoluteFile)
+      || !/\.[cm]?[jt]sx?$/i.test(relativeFile)
+    ) continue;
+
+    const cacheKey = `${symbol}\0${relativeFile}`;
+    let canonicalLocation = resolved.get(cacheKey);
+    if (canonicalLocation === undefined) {
+      const submittedLine = Number(submittedAnchor.slice(submittedAnchor.lastIndexOf(":") + 1));
+      try {
+        const report = analyzeSymbolContract({
+          projectPath: session.project_path,
+          targetFile: relativeFile,
+          symbol,
+          targetLine: submittedLine,
+          section: "contract"
+        });
+        const definitions = report.target.symbol === symbol
+          ? uniqueStrings(report.target.definitions.map(
+            (definition) => `${definition.file}:${definition.line}`
+          ))
+          : [];
+        canonicalLocation = definitions.length === 1 ? definitions[0]! : null;
+      } catch {
+        canonicalLocation = null;
+      }
+      resolved.set(cacheKey, canonicalLocation);
+    }
+    if (!canonicalLocation) continue;
+    const canonicalAnchor = evidenceLocationAnchor(canonicalLocation, session.project_path);
+    if (!canonicalAnchor || canonicalAnchor === submittedAnchor) continue;
+
+    row.contract_location = canonicalLocation;
+    appendInvestigateEvidence(row, canonicalLocation);
+    changed.push(`${symbol}@${submittedLocation} → ${canonicalLocation}`);
+  }
+  return uniqueStrings(changed);
 }
 
 /**

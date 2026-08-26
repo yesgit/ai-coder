@@ -1276,7 +1276,7 @@ function phaseHandoffSchema(
             contract_location: {
               type: "string",
               minLength: 1,
-              description: "contract_symbol 定义处的精确 path:line；不是 dispatcher 或待新增分支的位置"
+              description: "contract_symbol 所在文件中的 path:line；宿主会归一到真实定义行"
             },
             evidence_refs: evidenceList()
           })

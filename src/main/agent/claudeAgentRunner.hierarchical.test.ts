@@ -22,6 +22,7 @@ import {
   reconcileFeatureCensusQueryForStage,
   reconcileHierarchicalPlannerRequirementIds,
   reconcileHierarchicalFeatureCensusHandoff,
+  reconcileHierarchicalInvestigateContractLocations,
   reconcileHierarchicalInvestigateFinalContracts,
   reconcileHierarchicalInvestigateMappingScope,
   reconcileHierarchicalInvestigateReferenceContracts,
@@ -1827,6 +1828,60 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
         candidate.contract_symbol === "EscrowTransfer"
         && candidate.contract_location === "EscrowTransfer.js:1"
       ))).toBe(true);
+    } finally {
+      await rm(projectPath, { recursive: true, force: true });
+    }
+  });
+
+  it("canonicalizes submitted branch locations to the symbol definition on the host", async () => {
+    const projectPath = await mkdtemp(path.join(os.tmpdir(), "ai-coder-contract-location-"));
+    try {
+      await writeFile(path.join(projectPath, "routes.js"), [
+        "export const redirectActionPush = (pageName) => {",
+        "  if (pageName === 'MIA') return 'advisor';",
+        "  if (pageName === 'Setting') return 'settings';",
+        "};"
+      ].join("\n"));
+      const session = { ...createSession(), project_path: projectPath };
+      const handoff = handoffFor("investigate", "routes.js", "routes.js", true) as Record<string, unknown>;
+      const mappings = handoff.target_mappings as Array<Record<string, unknown>>;
+      Object.assign(mappings[0], {
+        target_key: "MIA",
+        dispatcher_location: "routes.js:1",
+        contract_symbol: "redirectActionPush",
+        contract_location: "routes.js:2",
+        evidence_refs: ["routes.js:2"]
+      });
+      const referenceAnalysis = handoff.reference_analysis as {
+        candidates: Array<Record<string, unknown>>;
+      };
+      Object.assign(referenceAnalysis.candidates[0], {
+        target_key: "MIA",
+        contract_symbol: "redirectActionPush",
+        contract_location: "routes.js:2",
+        evidence_refs: ["routes.js:2"]
+      });
+      const structured = { status: "passed", summary: "branch location", evidence_refs: [], handoff };
+
+      expect(reconcileHierarchicalInvestigateContractLocations(
+        session,
+        {
+          kind: "run_phase",
+          requirement_id: "R35",
+          work_unit_id: "R35:investigate",
+          phase: "investigate",
+          role: "code-investigator"
+        },
+        structured
+      )).toEqual(["redirectActionPush@routes.js:2 → routes.js:1"]);
+      expect(mappings[0]).toMatchObject({
+        contract_location: "routes.js:1",
+        evidence_refs: ["routes.js:2", "routes.js:1"]
+      });
+      expect(referenceAnalysis.candidates[0]).toMatchObject({
+        contract_location: "routes.js:1",
+        evidence_refs: ["routes.js:2", "routes.js:1"]
+      });
     } finally {
       await rm(projectPath, { recursive: true, force: true });
     }
