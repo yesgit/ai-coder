@@ -1693,11 +1693,58 @@ function parseResultObject(value: unknown): Record<string, unknown> {
   try {
     return requiredRecord(JSON.parse(trimmed), "role result");
   } catch {
-    const start = trimmed.indexOf("{");
-    const end = trimmed.lastIndexOf("}");
-    if (start < 0 || end <= start) throw new Error("阶段 Agent 返回无法解析的结构化结果");
-    return requiredRecord(JSON.parse(trimmed.slice(start, end + 1)), "role result");
+    // Third-party providers occasionally concatenate several corrected JSON
+    // drafts. Parsing from the first opening brace to the last closing brace
+    // joins those objects into invalid JSON. Use the last complete object,
+    // matching the semantics of the last StructuredOutput submission.
+    const candidates = extractTopLevelJsonObjects(trimmed);
+    for (let index = candidates.length - 1; index >= 0; index -= 1) {
+      try {
+        return requiredRecord(JSON.parse(candidates[index]!), "role result");
+      } catch {
+        // Try the preceding complete object. Normal phase validation still
+        // applies to whichever object is recovered here.
+      }
+    }
+    throw new Error("阶段 Agent 返回无法解析的结构化结果");
   }
+}
+
+function extractTopLevelJsonObjects(value: string): string[] {
+  const candidates: string[] = [];
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index]!;
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"' && depth > 0) {
+      inString = true;
+      continue;
+    }
+    if (char === "{") {
+      if (depth === 0) start = index;
+      depth += 1;
+      continue;
+    }
+    if (char !== "}" || depth === 0) continue;
+    depth -= 1;
+    if (depth === 0 && start >= 0) {
+      candidates.push(value.slice(start, index + 1));
+      start = -1;
+    }
+  }
+  return candidates;
 }
 
 function requiredRecord(value: unknown, name: string): Record<string, unknown> {

@@ -220,6 +220,42 @@ function behaviorObligationResults(status: string, evidence: string) {
 }
 
 describe("hierarchicalRoleProtocol", () => {
+  it("uses the last valid object when a provider concatenates StructuredOutput drafts", () => {
+    const operation = { kind: "run_planner" as const };
+    const first = {
+      status: "passed",
+      summary: "first draft",
+      definition_of_done: ["first done"],
+      requirements: [{
+        id: "R1",
+        source_anchor: "first",
+        observable_result: "first behavior",
+        acceptance: ["first acceptance"],
+        dependencies: []
+      }]
+    };
+    const corrected = {
+      status: "passed",
+      summary: "corrected draft with a brace in prose: {ok}",
+      definition_of_done: ["corrected done"],
+      requirements: [{
+        id: "R42",
+        source_anchor: "second",
+        observable_result: "corrected behavior",
+        acceptance: ["corrected acceptance"],
+        dependencies: []
+      }]
+    };
+
+    expect(parseHierarchicalRoleResult(
+      operation,
+      `${JSON.stringify(first)}\n${JSON.stringify(corrected)}`
+    )[0]).toMatchObject({
+      type: "plan_accepted",
+      requirements: [{ id: "R42" }],
+      definition_of_done: ["corrected done"]
+    });
+  });
   it("gives an attachment reader only its small exact batch and persists findings", () => {
     const state = applyHierarchicalEvent(createHierarchicalExecutionState("读取附件"), {
       type: "alignment_sources_registered",

@@ -2557,6 +2557,47 @@ describe("ClaudeAgentRunner", () => {
     })).toMatchObject({ toolUseId: "bash-4", executionSucceeded: false });
   });
 
+  it("settles every parallel tool result carried by one SDK message", () => {
+    const runner = new ClaudeAgentRunner(async function* () {});
+    const session = {
+      id: "parallel-tool-results", project_path: "/tmp/project", workflow_id: workflow.id, task_prompt: "inspect",
+      status: "running", current_stage: "R42/prepare", messages: [], tool_calls: [
+        { id: "contract-1", stage_id: "hierarchical:R42/prepare", tool: "mcp__ai_coder__investigate_symbol_contract", input: {}, status: "requested", created_at: "t" },
+        { id: "contract-2", stage_id: "hierarchical:R42/prepare", tool: "mcp__ai_coder__investigate_symbol_contract", input: {}, status: "requested", created_at: "t" },
+        { id: "contract-3", stage_id: "hierarchical:R42/prepare", tool: "mcp__ai_coder__investigate_symbol_contract", input: {}, status: "requested", created_at: "t" }
+      ], file_changes: [], approvals: [], stage_runs: [], rework_requests: [],
+      created_at: "t", updated_at: "t"
+    } as AgentSession;
+    const message = {
+      type: "user",
+      tool_use_result: [
+        { content: "first report" },
+        { content: "second report" },
+        { content: "third report" }
+      ],
+      message: {
+        content: [
+          { type: "tool_result", tool_use_id: "contract-1", content: "first report", is_error: false },
+          { type: "tool_result", tool_use_id: "contract-2", content: "second report", is_error: false },
+          { type: "tool_result", tool_use_id: "contract-3", content: "third report", is_error: false }
+        ]
+      }
+    };
+
+    (runner as unknown as {
+      recordToolExecutionResult(session: AgentSession, message: unknown): void;
+    }).recordToolExecutionResult(session, message);
+
+    expect(session.tool_calls.map((toolCall) => toolCall.status)).toEqual([
+      "completed", "completed", "completed"
+    ]);
+    expect(session.tool_calls.map((toolCall) => toolCall.output_summary)).toEqual([
+      expect.stringContaining("first report"),
+      expect.stringContaining("second report"),
+      expect.stringContaining("third report")
+    ]);
+  });
+
   it("shows the rejected command in safety progress", () => {
     expect(describeToolAttempt("Bash", { command: "python3 -c \"print(1)\"" })).toBe("Bash: python3 -c \"print(1)\"");
   });

@@ -3058,8 +3058,16 @@ export class ClaudeAgentRunner {
 
   /** 将 SDK 的工具执行反馈关联回审批或 tool_use 时创建的记录。 */
   private recordToolExecutionResult(session: AgentSession, message: unknown): void {
-    const result = extractToolExecutionResult(message);
-    if (!result) return;
+    for (const result of extractToolExecutionResults(message)) {
+      this.recordSingleToolExecutionResult(session, message, result);
+    }
+  }
+
+  private recordSingleToolExecutionResult(
+    session: AgentSession,
+    message: unknown,
+    result: ToolExecutionResult
+  ): void {
     const toolCall = session.tool_calls.find((item) => item.id === result.toolUseId);
     if (!toolCall) return;
     const taskFailedSemantically = toolCall.tool === "Task"
@@ -8268,28 +8276,69 @@ function looksLikeStructuredOutputTool(toolName: string): boolean {
  * 测试/SDK 版本也可能只提供标准 tool_result block，故同时兼容两种形态。
  */
 export function extractToolExecutionResult(message: unknown): ToolExecutionResult | null {
-  if (!isPlainObject(message)) return null;
+  return extractToolExecutionResults(message)[0] ?? null;
+}
+
+/**
+ * 一个 assistant turn 可以并行发起多个工具，SDK 会把对应的 tool_result blocks
+ * 合并进同一条 synthetic user message。必须逐块结算；只取第一个 block 会让其余
+ * 调用永久停在 requested，随后被阶段证据门禁误判为“未实际执行”。
+ */
+export function extractToolExecutionResults(message: unknown): ToolExecutionResult[] {
+  if (!isPlainObject(message)) return [];
   const content = isPlainObject(message.message) ? message.message.content : undefined;
-  const blocks = Array.isArray(content) ? content : [];
-  const block = blocks.find((item) => isPlainObject(item) && item.type === "tool_result");
-  const source = message.tool_use_result ?? block;
-  if (!source) return null;
-  const result = isPlainObject(source) ? source : {};
-  const toolUseId = String(
-    result.tool_use_id ?? result.toolUseId ?? (isPlainObject(block) ? block.tool_use_id ?? block.toolUseId : "") ?? ""
-  );
-  if (!toolUseId) return null;
-  const exitCode = findExitCode(source) ?? findExitCode(block);
-  const executionSucceeded = exitCode !== undefined
-    ? exitCode === 0
-    : inferToolExecutionSucceeded(message, source, block);
-  const outputSummary = summarizeToolResult(source);
-  return {
-    toolUseId,
-    ...(exitCode !== undefined ? { exitCode } : {}),
-    ...(executionSucceeded !== undefined ? { executionSucceeded } : {}),
-    ...(outputSummary ? { outputSummary } : {})
+  const blocks = (Array.isArray(content) ? content : [])
+    .filter((item): item is Record<string, unknown> => isPlainObject(item) && item.type === "tool_result");
+  const rawTopLevelResults = message.tool_use_result;
+  const topLevelResults = (Array.isArray(rawTopLevelResults)
+    ? rawTopLevelResults
+    : rawTopLevelResults === undefined
+      ? []
+      : [rawTopLevelResults]
+  ).filter(isPlainObject);
+  const consumedTopLevel = new Set<number>();
+  const results: ToolExecutionResult[] = [];
+  const seenIds = new Set<string>();
+
+  const appendResult = (block: Record<string, unknown> | undefined, blockIndex: number) => {
+    const blockId = optionalString(block?.tool_use_id) ?? optionalString(block?.toolUseId);
+    let sourceIndex = topLevelResults.findIndex((candidate, index) => (
+      !consumedTopLevel.has(index)
+      && Boolean(blockId)
+      && (optionalString(candidate.tool_use_id) ?? optionalString(candidate.toolUseId)) === blockId
+    ));
+    if (sourceIndex < 0 && topLevelResults.length === blocks.length && blockIndex < topLevelResults.length) {
+      sourceIndex = blockIndex;
+    }
+    if (sourceIndex < 0 && blocks.length === 1 && topLevelResults.length === 1) {
+      sourceIndex = 0;
+    }
+    const source = sourceIndex >= 0 ? topLevelResults[sourceIndex] : block;
+    if (sourceIndex >= 0) consumedTopLevel.add(sourceIndex);
+    if (!source) return;
+    const toolUseId = blockId
+      ?? optionalString(source.tool_use_id)
+      ?? optionalString(source.toolUseId);
+    if (!toolUseId || seenIds.has(toolUseId)) return;
+    seenIds.add(toolUseId);
+    const exitCode = findExitCode(source) ?? findExitCode(block);
+    const executionSucceeded = exitCode !== undefined
+      ? exitCode === 0
+      : inferToolExecutionSucceeded(message, source, block);
+    const outputSummary = summarizeToolResult(source);
+    results.push({
+      toolUseId,
+      ...(exitCode !== undefined ? { exitCode } : {}),
+      ...(executionSucceeded !== undefined ? { executionSucceeded } : {}),
+      ...(outputSummary ? { outputSummary } : {})
+    });
   };
+
+  blocks.forEach((block, index) => appendResult(block, index));
+  topLevelResults.forEach((source, index) => {
+    if (!consumedTopLevel.has(index)) appendResult(source, index);
+  });
+  return results;
 }
 
 function inferToolExecutionSucceeded(message: Record<string, unknown>, source: unknown, block: unknown): boolean | undefined {
