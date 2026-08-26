@@ -871,7 +871,13 @@ function validatePhaseHandoffSemantics(
   if (disposition === "changes_required" && patchPlan.length === 0) {
     throw new Error("prepare 判定 changes_required 时 patch_plan 必须至少包含一项");
   }
-  requireNonEmptyStringArray(handoff.satisfaction_evidence, "handoff.satisfaction_evidence");
+  const satisfactionEvidence = stringArray(
+    handoff.satisfaction_evidence,
+    "handoff.satisfaction_evidence"
+  );
+  if (disposition === "already_satisfied" && satisfactionEvidence.length === 0) {
+    throw new Error("already_satisfied 必须提供 satisfaction_evidence");
+  }
   validateBehaviorObligations(handoff.behavior_obligations, "handoff.behavior_obligations");
 }
 
@@ -1073,7 +1079,7 @@ function phaseInstructions(
         "必须把 investigate 的每个 target_key 逐项落实为 reference_application；六类 behavior_obligations 仍按 destination、invocation、arguments、preconditions、context、side_effects 冻结，但每项 target_keys 必须完整覆盖全部目标。",
         "changes_required 的 behavior_obligations 是尚待实现的未来契约：每项引用同功能既有入口证据，不得虚构尚不存在的新分支 path:line。目标现状和插入上下文沿用 investigate 已验证证据，实际目标代码证据由 implement、verify 逐项提交；只有 already_satisfied 才必须在 prepare 为每项同时给出当前目标代码证据。",
         "默认逐维度复用同功能入口。任何 intentional-difference 都必须引用用户要求或既有架构证据；不能以‘当前代码已经这样写’作为差异依据。",
-        "若六类义务已全部满足，返回 change_disposition=already_satisfied、空 allowed_files、空 patch_plan 和逐项 satisfaction_evidence，宿主将跳过 implement 直接独立验证；否则返回 changes_required、非空 patch_plan 和非空 allowed_files。",
+        "若六类义务已全部满足，返回 change_disposition=already_satisfied、空 allowed_files、空 patch_plan；satisfaction_evidence 提交空数组即可，宿主会从已确认的目标代码与六类义务逐项生成。否则返回 changes_required、非空 patch_plan 和非空 allowed_files。",
         "prepare 是只读阶段，不需要 Edit。提交合格 handoff 后宿主会自动进入 implement 并授予 allowed_files 的 Edit 权限；不得改用 Bash 写文件，也不得要求用户启用内部工具。"
       ].join("\n");
     case "implement":
@@ -1358,7 +1364,7 @@ function phaseHandoffSchema(
           type: "string",
           enum: ["changes_required", "already_satisfied"]
         },
-        satisfaction_evidence: stringList(1),
+        satisfaction_evidence: stringList(),
         pre_behavior: stringList(1),
         preserve_invariants: stringList(1),
         patch_plan: stringList(),
@@ -1406,7 +1412,7 @@ function phaseHandoffContract(
     case "investigate":
       return "必须提交 confirmed_facts、target_locations、逐 token 的 target_mappings、feature_census、target_investigation、reference_analysis、空的 open_unknowns；业务功能目标必须真实完成全候选普查并逐项给出 yes/no 正反证据，同类参考必须是同一业务功能的既有入口，分开记录入口 location 与最终 contract_symbol@contract_location，并覆盖目标、调用方式、参数、前置条件、上下文和副作用。";
     case "prepare":
-      return "必须提交结构化 call_contract、reference_application、六类 behavior_obligations、change_disposition、satisfaction_evidence、pre_behavior、preserve_invariants、patch_plan、verification_plan；changes_required 另行提交非空 allowed_files，already_satisfied 提交空数组。";
+      return "必须提交结构化 call_contract、reference_application、六类 behavior_obligations、change_disposition、pre_behavior、preserve_invariants、patch_plan、verification_plan；satisfaction_evidence 提交空数组并由宿主从目标证据生成。changes_required 另行提交非空 allowed_files，already_satisfied 提交空数组。";
     case "implement":
       return "必须提交 changes、diff_summary、checks_run、preserved_invariants、obligation_results；obligation ID 必须与 prepare 完全一致。现有文件只允许最小 Edit，不得整文件 Write。";
     case "verify":
@@ -1433,7 +1439,7 @@ function phaseOutputSkeleton(
         "{ status, summary, evidence_refs, allowed_files,",
         "  handoff: { call_contract: { analyzed_targets }, reference_application,",
         "    behavior_obligations: [恰好六项：每项含覆盖全部目标的 target_keys，维度为 destination/invocation/arguments/preconditions/context/side_effects],",
-        "    change_disposition: \"changes_required\" | \"already_satisfied\", satisfaction_evidence,",
+        "    change_disposition: \"changes_required\" | \"already_satisfied\", satisfaction_evidence: []（宿主生成）,",
         "    pre_behavior, preserve_invariants, patch_plan, verification_plan } }"
       ].join("\n");
     case "implement":

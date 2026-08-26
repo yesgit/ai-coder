@@ -2761,6 +2761,79 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     expect(after).toEqual(before);
   });
 
+  it("derives already-satisfied target evidence and satisfaction rows on the host", () => {
+    const session = createSession();
+    const state = createHierarchicalExecutionState(session.task_prompt);
+    const investigateHandoff = handoffFor("investigate", "target.ts", "reference.ts", true);
+    state.requirements = [{
+      id: "R1",
+      source_anchor: "user:R1",
+      observable_result: "route works",
+      acceptance: [{ id: "R1-A1", criterion: "route works", status: "pass", evidence_refs: ["target.ts:1"] }],
+      dependencies: [],
+      status: "completed",
+      evidence_refs: ["target.ts:1"]
+    }];
+    state.phase_artifacts = [{
+      id: "R1:investigate:artifact",
+      work_unit_id: "R1:investigate",
+      requirement_id: "R1",
+      phase: "investigate",
+      attempt: 1,
+      summary: "same-feature entry and current target confirmed",
+      handoff: investigateHandoff,
+      evidence_refs: ["target.ts:1", "reference.ts:5"],
+      knowledge_revision: 0,
+      workspace_revision: 0,
+      created_at: state.created_at
+    }];
+    session.hierarchical_state = state;
+    const prepareHandoff = handoffFor("prepare") as Record<string, unknown>;
+    prepareHandoff.change_disposition = "already_satisfied";
+    prepareHandoff.patch_plan = [];
+    prepareHandoff.satisfaction_evidence = [];
+    const obligations = prepareHandoff.behavior_obligations as Array<Record<string, unknown>>;
+    obligations.forEach((obligation) => {
+      // Mirrors the failing Qwen draft: it preserved the selected reference,
+      // but omitted duplicated current-target citations from every obligation.
+      obligation.evidence_refs = ["reference.ts:5"];
+    });
+    const structured = {
+      status: "passed",
+      summary: "existing behavior already satisfies the requirement",
+      evidence_refs: ["target.ts:1", "reference.ts:5"],
+      allowed_files: [],
+      handoff: prepareHandoff
+    };
+    const operation = {
+      kind: "run_phase" as const,
+      requirement_id: "R1",
+      work_unit_id: "R1:prepare",
+      phase: "prepare" as const,
+      role: "implementation-preparer"
+    };
+
+    reconcileHierarchicalPrepareObligationEvidence(session, operation, structured);
+
+    for (const obligation of obligations) {
+      expect(obligation.evidence_refs).toEqual(expect.arrayContaining([
+        "reference.ts:5",
+        "target.ts:1"
+      ]));
+    }
+    expect(prepareHandoff.satisfaction_evidence).toHaveLength(6);
+    expect(prepareHandoff.satisfaction_evidence).toEqual(expect.arrayContaining([
+      expect.stringContaining("B-destination destination 已由当前目标代码满足：target.ts:1"),
+      expect.stringContaining("B-context context 已由当前目标代码满足：target.ts:1")
+    ]));
+    const events = parseHierarchicalRoleResult(operation, structured);
+    expect(() => validateHierarchicalBehaviorObligationContinuity(
+      session,
+      operation,
+      events
+    )).not.toThrow();
+  });
+
   it("separates a static same-feature entry from its callable contract target", () => {
     const session = createSession();
     const state = createHierarchicalExecutionState(session.task_prompt);

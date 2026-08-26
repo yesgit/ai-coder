@@ -4464,10 +4464,60 @@ function prepareSelectedEntries(
   });
 }
 
+function prepareCurrentTargetEvidence(
+  investigate: HierarchicalInvestigateArtifact,
+  projectPath: string,
+  selectedEntries: Array<{ targetKey: string; location: string }>
+): string[] {
+  if (!investigate) return [];
+  const handoff = investigate.handoff;
+  const target = isPlainObject(handoff.target_investigation)
+    ? handoff.target_investigation
+    : null;
+  const mappings = Array.isArray(handoff.target_mappings)
+    ? handoff.target_mappings.filter(isPlainObject)
+    : [];
+  const rawEvidence: string[] = [];
+  const appendLocation = (value: unknown) => {
+    const direct = optionalString(value);
+    const location = direct ? firstEmbeddedEvidenceLocation(direct) ?? direct : undefined;
+    if (location && evidenceLocationFile(location, projectPath)) rawEvidence.push(location);
+  };
+  appendLocation(target?.definition);
+  for (const value of optionalStringArray(target?.evidence_refs) ?? []) appendLocation(value);
+  for (const value of optionalStringArray(handoff.target_locations) ?? []) appendLocation(value);
+  for (const mapping of mappings) {
+    appendLocation(mapping.dispatcher_location);
+    appendLocation(mapping.contract_location);
+    for (const value of optionalStringArray(mapping.evidence_refs) ?? []) appendLocation(value);
+  }
+  const selectedAnchors = new Set(selectedEntries.flatMap(({ location }) => {
+    const anchor = evidenceLocationAnchor(location, projectPath);
+    return anchor ? [anchor] : [];
+  }));
+  const targetDefinition = optionalString(target?.definition);
+  const targetDefinitionLocation = targetDefinition
+    ? firstEmbeddedEvidenceLocation(targetDefinition)
+    : null;
+  const targetFile = targetDefinitionLocation
+    ? evidenceLocationFile(targetDefinitionLocation, projectPath)
+    : null;
+  const independent = uniqueStrings(rawEvidence).filter((location) => {
+    const anchor = evidenceLocationAnchor(location, projectPath);
+    return Boolean(anchor && !selectedAnchors.has(anchor));
+  });
+  if (!targetFile) return independent;
+  const sameTargetFile = independent.filter(
+    (location) => evidenceLocationFile(location, projectPath) === targetFile
+  );
+  return sameTargetFile.length > 0 ? sameTargetFile : independent;
+}
+
 // Prefill (every prepare attempt, before validation) the same-feature entry
-// citation and target coverage the host already knows from investigate. The
-// validator's citation/coverage checks remain as safety nets for cases this
-// cannot cover (no selected entry, or a target the model must still resolve).
+// citation, target coverage and already-satisfied proof the host already knows
+// from investigate. The model decides the behavior and disposition; the host
+// owns duplicated transport fields such as per-obligation target citations and
+// satisfaction_evidence.
 export function reconcileHierarchicalPrepareObligationEvidence(
   session: AgentSession,
   operation: Extract<HierarchicalNextOperation, {
@@ -4486,7 +4536,12 @@ export function reconcileHierarchicalPrepareObligationEvidence(
     ? latestHierarchicalArtifact(state, operation.requirement_id, "investigate")
     : undefined;
   const selectedEntries = prepareSelectedEntries(investigate, session.project_path);
-  if (selectedEntries.length === 0) return;
+  const currentTargetEvidence = prepareCurrentTargetEvidence(
+    investigate,
+    session.project_path,
+    selectedEntries
+  );
+  const alreadySatisfied = optionalString(handoff?.change_disposition) === "already_satisfied";
   for (const obligation of obligations) {
     const targetKeys = new Set(optionalStringArray(obligation.target_keys) ?? []);
     for (const { targetKey } of selectedEntries) targetKeys.add(targetKey);
@@ -4500,7 +4555,19 @@ export function reconcileHierarchicalPrepareObligationEvidence(
         evidence.push(location);
       }
     }
+    if (alreadySatisfied) {
+      for (const location of currentTargetEvidence) {
+        if (!evidence.includes(location)) evidence.push(location);
+      }
+    }
     obligation.evidence_refs = evidence;
+  }
+  if (alreadySatisfied && currentTargetEvidence.length > 0) {
+    handoff!.satisfaction_evidence = obligations.map((obligation) => {
+      const id = optionalString(obligation.id) ?? "<unknown>";
+      const dimension = optionalString(obligation.dimension) ?? "behavior";
+      return `${id} ${dimension} 已由当前目标代码满足：${currentTargetEvidence[0]}`;
+    });
   }
 }
 

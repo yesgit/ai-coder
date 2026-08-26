@@ -792,6 +792,25 @@ describe("hierarchicalRoleProtocol", () => {
     })).toThrow("changes_required 时 patch_plan 必须至少包含一项");
   });
 
+  it("allows changes-required prepare to leave host-owned satisfaction evidence empty", () => {
+    const handoff = handoffFor("prepare") as Record<string, unknown>;
+    handoff.satisfaction_evidence = [];
+
+    expect(() => parseHierarchicalRoleResult({
+      kind: "run_phase",
+      requirement_id: "R1",
+      work_unit_id: "R1:prepare",
+      phase: "prepare",
+      role: "implementation-preparer"
+    }, {
+      status: "passed",
+      summary: "changes are still required",
+      evidence_refs: ["src/target.ts:1"],
+      handoff,
+      allowed_files: ["src/target.ts"]
+    })).not.toThrow();
+  });
+
   it("rejects a role trying to disguise an internal fault as a human blocker", () => {
     expect(() => parseHierarchicalRoleResult({
       kind: "run_phase",
