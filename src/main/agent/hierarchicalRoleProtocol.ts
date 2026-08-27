@@ -324,6 +324,7 @@ function buildIntegratorSpec(
       "任何 R-ID 或验收项缺少证据都必须返回 failed；不得用总体测试替代逐项核对。",
       "每个 R-ID 的 prepare 行为义务和 verify 契约结果也是 Definition of Done；目标、调用方式、参数、guard、上下文或副作用任一不一致都必须失败，不能临时解释成‘备选方式’。",
       "passed 时必须基于最终工作区重新提交 contract_results，逐项覆盖所有 R-ID 的全部行为义务；不能复用较早 workspace_revision 的 verify 结论。",
+      "contract_results.obligation_id 必须复制 prepare.behavior_obligations 中以 B 开头的 ID；Rxx-Ax 是验收项 ID，绝对不能填入 obligation_id。宿主会归一已知的 ID 外壳，但你仍必须基于最终工作区如实提交 pass/fail 和代码证据。",
       `Definition of Done：${state.goal.definition_of_done.join("；") || "以用户原始目标和逐项验收为准"}`,
       "failed 时必须指出一个应重开的已完成 R-ID，并选择 investigate 或 prepare；宿主会恢复该需求内循环。",
       "## 需求账本",
@@ -345,7 +346,10 @@ function buildIntegratorSpec(
               type: "object",
               properties: {
                 requirement_id: { type: "string" },
-                obligation_id: { type: "string" },
+                obligation_id: {
+                  type: "string",
+                  description: "复制 prepare.behavior_obligations[].id；不得填写 Rxx-Ax 验收项 ID"
+                },
                 status: { type: "string", enum: ["pass", "fail"] },
                 observed_behavior: { type: "string" },
                 evidence_refs: { type: "array", items: { type: "string" } }

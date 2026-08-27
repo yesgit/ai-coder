@@ -27,6 +27,7 @@ import {
   reconcileHierarchicalInvestigateMappingScope,
   reconcileHierarchicalInvestigateReferenceContracts,
   reconcileHierarchicalInvestigateReferenceHandoff,
+  reconcileHierarchicalIntegratorContractResults,
   reconcileHierarchicalPrepareContractHandoff,
   reconcileHierarchicalPrepareObligationEvidence,
   recordFeatureCensusReceipt,
@@ -2660,6 +2661,110 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
         contract_results: finalContractResults
       }]
     )).not.toThrow();
+  });
+
+  it("rebuilds integrator acceptance IDs from host-owned frozen obligations", () => {
+    const session = createSession();
+    const state = createHierarchicalExecutionState(session.task_prompt);
+    const prepareHandoff = handoffFor("prepare") as Record<string, unknown>;
+    const verifyHandoff = handoffFor("verify") as Record<string, unknown>;
+    state.requirements = [{
+      id: "R1",
+      source_anchor: "user:R1",
+      observable_result: "route works",
+      acceptance: [
+        { id: "R1-A1", criterion: "token exists", status: "pass", evidence_refs: ["final.ts:9"] },
+        { id: "R1-A2", criterion: "native link", status: "pass", evidence_refs: ["final.ts:9"] },
+        { id: "R1-A3", criterion: "navigation works", status: "pass", evidence_refs: ["final.ts:9"] }
+      ],
+      dependencies: [],
+      status: "completed",
+      evidence_refs: ["final.ts:9"]
+    }];
+    state.phase_artifacts = [
+      {
+        id: "R1:prepare:artifact",
+        work_unit_id: "R1:prepare",
+        requirement_id: "R1",
+        phase: "prepare",
+        attempt: 1,
+        summary: "contract frozen",
+        handoff: prepareHandoff,
+        evidence_refs: ["target.ts:1"],
+        knowledge_revision: 0,
+        workspace_revision: 0,
+        created_at: state.created_at
+      },
+      {
+        id: "R1:verify:artifact",
+        work_unit_id: "R1:verify",
+        requirement_id: "R1",
+        phase: "verify",
+        attempt: 1,
+        summary: "contract verified",
+        handoff: verifyHandoff,
+        evidence_refs: ["target.ts:1"],
+        knowledge_revision: 0,
+        workspace_revision: 0,
+        created_at: state.created_at
+      }
+    ];
+    session.hierarchical_state = state;
+    const structured = {
+      status: "passed",
+      summary: "final workspace audited",
+      evidence_refs: ["final.ts:9"],
+      contract_results: ["R1-A1", "R1-A2", "R1-A3"].map((obligation_id) => ({
+        requirement_id: "R1",
+        obligation_id,
+        status: "pass",
+        observed_behavior: `${obligation_id} passed in final workspace`,
+        evidence_refs: ["final.ts:9"]
+      }))
+    };
+
+    expect(reconcileHierarchicalIntegratorContractResults(
+      session,
+      { kind: "run_integrator" },
+      structured
+    )).toEqual(["R1"]);
+    expect(structured.contract_results.map((result) => result.obligation_id)).toEqual([
+      "B-destination",
+      "B-invocation",
+      "B-arguments",
+      "B-preconditions",
+      "B-context",
+      "B-side-effects"
+    ]);
+    expect(structured.contract_results.every((result) => (
+      result.evidence_refs.includes("final.ts:9")
+      && result.evidence_refs.includes("target.ts:1")
+    ))).toBe(true);
+    const events = parseHierarchicalRoleResult({ kind: "run_integrator" }, structured);
+    expect(() => validateHierarchicalBehaviorObligationContinuity(
+      session,
+      { kind: "run_integrator" },
+      events
+    )).not.toThrow();
+
+    const explicitFailure = {
+      status: "passed",
+      summary: "audit found a failure",
+      evidence_refs: ["final.ts:9"],
+      contract_results: [{
+        requirement_id: "R1",
+        obligation_id: "R1-A1",
+        status: "fail",
+        observed_behavior: "destination is wrong",
+        evidence_refs: ["final.ts:9"]
+      }]
+    };
+    expect(reconcileHierarchicalIntegratorContractResults(
+      session,
+      { kind: "run_integrator" },
+      explicitFailure
+    )).toEqual([]);
+    expect(explicitFailure.contract_results[0]!.obligation_id).toBe("R1-A1");
   });
 
   it("surfaces every missing obligation citation in one fail-collect rejection", () => {

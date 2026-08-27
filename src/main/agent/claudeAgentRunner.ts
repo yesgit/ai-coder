@@ -921,6 +921,20 @@ export class ClaudeAgentRunner {
       stageId
     );
     reconcileHierarchicalPrepareObligationEvidence(input.session, operation, structured);
+    const reconciledIntegratorContracts = reconcileHierarchicalIntegratorContractResults(
+      input.session,
+      operation,
+      structured
+    );
+    if (reconciledIntegratorContracts.length > 0) {
+      await this.recordProgress(
+        input,
+        "tool_policy",
+        "宿主已按 prepare 冻结义务与 verify 结果归一 integrate 的机械 ID 转录："
+          + reconciledIntegratorContracts.join(", "),
+        "milestone"
+      );
+    }
     const transcript = recoveredStructuredOutput
       ? formatStructuredOutput(recoveredStructuredOutput)
       : formatClaudeTranscript(sdkMessages) || formatStructuredOutput(structured);
@@ -4687,6 +4701,106 @@ export function reconcileHierarchicalPrepareObligationEvidence(
       return `${id} ${dimension} 已由当前目标代码满足：${currentTargetEvidence[0]}`;
     });
   }
+}
+
+// Integrate audits the final workspace, while the obligation ID set and the
+// last independently verified result rows are already host-owned artifacts.
+// Weak providers often relabel these rows with acceptance IDs (Rxx-Ax), or
+// serialize contract_results as an object. Preserve any explicit failure, but
+// for a passed global audit rebuild only the mechanical ID/result envelope from
+// the frozen prepare + verify artifacts and merge the integrator's fresh
+// per-requirement evidence into it.
+export function reconcileHierarchicalIntegratorContractResults(
+  session: AgentSession,
+  operation: Extract<HierarchicalNextOperation, {
+    kind: "run_phase" | "run_alignment_batch" | "run_planner" | "run_integrator"
+  }>,
+  structured: unknown
+): string[] {
+  if (
+    operation.kind !== "run_integrator"
+    || !isPlainObject(structured)
+    || optionalString(structured.status) !== "passed"
+  ) return [];
+  const state = session.hierarchical_state;
+  if (!state) return [];
+  const rawResults = Array.isArray(structured.contract_results)
+    ? structured.contract_results.filter(isPlainObject)
+    : [];
+  // A model-observed failure is semantic evidence, not transport noise. Leave
+  // it untouched so the normal integrator validator routes rework.
+  if (rawResults.some((result) => {
+    const status = optionalString(result.status);
+    return Boolean(status && status !== "pass");
+  })) return [];
+  const globalEvidence = optionalStringArray(structured.evidence_refs) ?? [];
+  const normalized: Array<Record<string, unknown>> = [];
+  const repairedRequirements: string[] = [];
+
+  for (const requirement of state.requirements) {
+    const prepare = latestHierarchicalArtifact(state, requirement.id, "prepare");
+    const verify = latestHierarchicalArtifact(state, requirement.id, "verify");
+    const obligations = Array.isArray(prepare?.handoff.behavior_obligations)
+      ? prepare.handoff.behavior_obligations.filter(isPlainObject)
+      : [];
+    const verifiedResults = isPlainObject(verify?.handoff)
+      && Array.isArray(verify.handoff.contract_results)
+      ? verify.handoff.contract_results.filter(isPlainObject)
+      : [];
+    const expectedIds = obligations
+      .map((obligation) => optionalString(obligation.id))
+      .filter((id): id is string => Boolean(id));
+    if (expectedIds.length === 0) return [];
+    const verifiedById = new Map(verifiedResults.flatMap((result) => {
+      const id = optionalString(result.obligation_id);
+      return id ? [[id, result] as const] : [];
+    }));
+    if (expectedIds.some((id) => optionalString(verifiedById.get(id)?.status) !== "pass")) return [];
+
+    const requirementResults = rawResults.filter(
+      (result) => optionalString(result.requirement_id) === requirement.id
+    );
+    const exactById = new Map(requirementResults.flatMap((result) => {
+      const id = optionalString(result.obligation_id);
+      return id && expectedIds.includes(id) ? [[id, result] as const] : [];
+    }));
+    const actualIds = requirementResults
+      .map((result) => optionalString(result.obligation_id))
+      .filter((id): id is string => Boolean(id));
+    if (
+      actualIds.length !== expectedIds.length
+      || expectedIds.some((id) => !actualIds.includes(id))
+      || actualIds.some((id) => !expectedIds.includes(id))
+    ) {
+      repairedRequirements.push(requirement.id);
+    }
+    const freshRequirementEvidence = uniqueStrings(requirementResults.flatMap((result) => (
+      optionalStringArray(result.evidence_refs) ?? []
+    )));
+
+    for (const obligationId of expectedIds) {
+      const exact = exactById.get(obligationId);
+      const verified = verifiedById.get(obligationId)!;
+      const observedBehavior = optionalString(exact?.observed_behavior)
+        ?? optionalString(verified.observed_behavior);
+      const evidence = uniqueStrings([
+        ...(optionalStringArray(exact?.evidence_refs) ?? []),
+        ...(optionalStringArray(verified.evidence_refs) ?? []),
+        ...(freshRequirementEvidence.length > 0 ? freshRequirementEvidence : globalEvidence)
+      ]);
+      if (!observedBehavior || evidence.length === 0) return [];
+      normalized.push({
+        requirement_id: requirement.id,
+        obligation_id: obligationId,
+        status: "pass",
+        observed_behavior: observedBehavior,
+        evidence_refs: evidence
+      });
+    }
+  }
+  if (normalized.length === 0) return [];
+  structured.contract_results = normalized;
+  return repairedRequirements;
 }
 
 function uniqueContractRequests(
