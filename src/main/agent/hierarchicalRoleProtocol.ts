@@ -833,7 +833,7 @@ function validatePhaseHandoffSemantics(
   const targets = requiredArray(callContract.analyzed_targets, "handoff.call_contract.analyzed_targets")
     .map((item, index) => requiredRecord(item, `handoff.call_contract.analyzed_targets[${index}]`));
   if (targets.length === 0) throw new Error("prepare 至少需要一个完整调查的目标函数或组件");
-  const requiredSections = new Set(["contract", "calls", "wrappers", "references"]);
+  const requiredSections = new Set(["contract", "calls", "wrappers", "references", "effects"]);
   targets.forEach((target, index) => {
     const prefix = `handoff.call_contract.analyzed_targets[${index}]`;
     const method = requiredString(target.analysis_method, `${prefix}.analysis_method`);
@@ -1062,7 +1062,7 @@ function phaseInstructions(
         "目标函数/组件必须逐项调查定义、输入、输出、内部调用、guard、状态/副作用和调用方；某项不存在也要用证据明确写‘无’，不得省略。",
         "同类实现不是外形相似的路由分支。必须优先找到应用内进入同一业务功能的既有用户入口，沿该入口追到最终组件/函数，并记录目标、调用方式、完整参数、guard、上下文透传和副作用。",
         "每个原始页面/协议 token 都必须在 target_mappings 中单独记录 target_key、原词、canonical token、公共 dispatcher 位置，以及最终 contract_symbol@contract_location；公共 dispatcher 不能冒充最终页面组件。",
-        "reference candidate 的 target_key 必须对应一条 target_mappings；location 记录用户入口或路由配置位置，contract_symbol@contract_location 必须精确记录沿入口追踪到的最终真实函数/组件定义；静态常量入口不得冒充调用契约目标。",
+        "reference candidate 的 target_key 必须对应一条 target_mappings；location 必须精确指向既有入口中承载真实调用、回调注册或配置消费的源码行（入口函数定义另放 evidence_refs），contract_symbol@contract_location 必须精确记录沿入口追踪到的最终真实函数/组件定义；静态常量入口不得冒充调用契约目标。",
         "不同既有入口可以合法汇聚到同一最终函数/组件，因此 candidate.contract_location 可以与 target definition 相同；禁止的是 candidate.location 直接指向当前待实现位置、刚新增代码或当前目标定义本身。",
         "每个候选都必须证明 feature_equivalence，并提交完整行为指纹；不得拿当前待实现分支、刚新增代码或仅同属导航模块的兄弟分支冒充同功能参考。",
         "同功能入口必须按 target_key 先列候选再在 target_selections 逐目标选择：记录搜索范围、相似依据、可复用行为和差异；某个目标确无同功能入口时，只能在该 target_key 的 selection 写明未找到原因。",
@@ -1075,7 +1075,7 @@ function phaseInstructions(
     case "prepare":
       return [
         "只读取证：建立调用契约、pre-behavior、修改处置和验证入口。需要修改时必须返回非空 allowed_files；完整契约已满足时走有证据的 no-op。",
-        "对每个将调用、复用或修改的既有函数/组件，必须调用 investigate_symbol_contract 完整调查脚本；脚本会自动覆盖 contract、calls、wrappers、references 全部分页并递归调查公共封装。analyzed_targets 对脚本支持的目标只需准确提交 target_file 与 symbol，宿主会回填定义、输入输出、调用点、包装层、guard、静态边界和证据；不要手抄报告。Read/Grep/Bash、零散 analyze_symbol_contract 或模型自述均不能替代。",
+        "对每个将调用、复用或修改的既有函数/组件，必须调用 investigate_symbol_contract 完整调查脚本；脚本会自动覆盖 contract、calls、wrappers、references、effects 全部分页，递归调查公共封装，并解析符号作为对象属性、回调或配置值进入外层调用的路径。analyzed_targets 对脚本支持的目标只需准确提交 target_file 与 symbol，宿主会回填定义、输入输出、入向/出向调用、包装层、guard、静态边界和证据；不要手抄报告。Read/Grep/Bash、零散 analyze_symbol_contract 或模型自述均不能替代。",
         "analyzed_targets 只登记函数、方法、类或组件等真实调用契约目标；常量表、路由配置对象、静态数据和样式文件即使列入 allowed_files，也不要为了凑文件覆盖伪造符号契约目标。",
         "调查脚本成功时 analysis_method 必须写 investigation-script，并把报告中的动态引用、递归封装截断或静态分析边界保留在 unresolved。只有真实调用契约目标不受脚本支持时，才改为 manual-static-analysis，说明原因并用 path:line 补齐同样的契约维度。纯静态配置改动直接写入 patch_plan、pre_behavior 和 allowed_files。",
         "必须把 investigate 的每个 target_key 逐项落实为 reference_application；六类 behavior_obligations 仍按 destination、invocation、arguments、preconditions、context、side_effects 冻结，但每项 target_keys 必须完整覆盖全部目标。",

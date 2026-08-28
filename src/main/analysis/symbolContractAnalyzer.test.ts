@@ -202,4 +202,131 @@ export function helper${index}(value: string) {
     expect(result.coverage.files_scanned).toBe(2);
     expect(result.coverage.total_call_sites).toBe(2);
   });
+
+  it("lifts a symbol carried through objects and aliases into a generic indirect invocation", async () => {
+    const root = await createFixture();
+    await writeFile(path.join(root, "indirect.ts"), `
+import { Action } from "./target.js";
+
+declare const executor: {
+  run(value: unknown): void;
+};
+
+export function openAction(enabled: boolean, title: string, navigator: unknown) {
+  if (!enabled) return;
+  const descriptor = {
+    destination: Action,
+    params: { label: title, mode: "fast" },
+    context: { navigator }
+  };
+  const alias = descriptor;
+  executor.run(alias);
+}
+`);
+
+    const result = analyzeSymbolContract({
+      projectPath: root,
+      targetFile: "target.tsx",
+      symbol: "Action"
+    });
+
+    const indirect = result.calls?.items.find((call) => call.kind === "indirect");
+    expect(indirect).toMatchObject({
+      enclosing_callable: "openAction",
+      invocation: "executor.run(alias)",
+      target_path: "destination"
+    });
+    expect(indirect?.payload_expression).toContain("params: { label: title, mode: \"fast\" }");
+    expect(indirect?.arguments).toEqual(expect.arrayContaining([
+      expect.objectContaining({ parameter: "payload.destination", expression: "Action" }),
+      expect.objectContaining({
+        parameter: "payload.params",
+        expression: "{ label: title, mode: \"fast\" }"
+      }),
+      expect.objectContaining({ parameter: "payload.context", expression: "{ navigator }" })
+    ]));
+    expect(indirect?.preconditions).toContain("after guard: NOT (!enabled)");
+    expect(result.references?.items).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "stored-as-property", expression: "Action" })
+    ]));
+  });
+
+  it("collects outgoing calls and their control-flow preconditions from an entry callable", async () => {
+    const root = await createFixture();
+    await writeFile(path.join(root, "entry.ts"), `
+declare function isAllowed(value: string): boolean;
+declare function perform(value: string, options: { mode: string }): void;
+
+export function enter(value: string) {
+  if (!isAllowed(value)) return;
+  perform(value, { mode: "safe" });
+}
+`);
+
+    const result = analyzeSymbolContract({
+      projectPath: root,
+      targetFile: "entry.ts",
+      symbol: "enter"
+    });
+
+    expect(result.effects?.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        callee: "isAllowed",
+        invocation: "isAllowed(value)"
+      }),
+      expect.objectContaining({
+        callee: "perform",
+        invocation: "perform(value, { mode: \"safe\" })",
+        preconditions: ["after guard: NOT (!isAllowed(value))"]
+      })
+    ]));
+    expect(result.coverage.total_outgoing_calls).toBe(2);
+
+    const effectsPage = analyzeSymbolContract({
+      projectPath: root,
+      targetFile: "entry.ts",
+      symbol: "enter",
+      section: "effects",
+      limit: 1
+    });
+    expect(effectsPage.effects?.items).toHaveLength(1);
+    expect(effectsPage.effects?.page).toMatchObject({ total: 2, next_offset: 1 });
+  });
+
+  it("follows an exported payload alias into a consumer module without loading unrelated files", async () => {
+    const root = await createFixture();
+    await writeFile(path.join(root, "config.ts"), `
+import { Action } from "./target.js";
+export const actionDescriptor = {
+  destination: Action,
+  params: { label: "cross-module" }
+};
+`);
+    await writeFile(path.join(root, "consumer.ts"), `
+import { actionDescriptor } from "./config.js";
+declare const executor: { run(value: unknown): void };
+export function consume() {
+  executor.run(actionDescriptor);
+}
+`);
+    await Promise.all(Array.from({ length: 20 }, (_, index) => (
+      writeFile(path.join(root, `noise-${index}.ts`), `export const noise${index} = ${index};\n`)
+    )));
+
+    const result = analyzeSymbolContract({
+      projectPath: root,
+      targetFile: "target.tsx",
+      symbol: "Action"
+    });
+
+    expect(result.calls?.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "indirect",
+        invocation: "executor.run(actionDescriptor)",
+        target_path: "destination",
+        payload_expression: expect.stringContaining("destination: Action")
+      })
+    ]));
+    expect(result.coverage.files_scanned).toBeLessThan(10);
+  });
 });

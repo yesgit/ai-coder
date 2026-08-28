@@ -15,6 +15,13 @@ import {
 } from "../analysis/featureImplementationCensusWorkerClient.js";
 import { analyzeSymbolContract } from "../analysis/symbolContractAnalyzer.js";
 import {
+  BEHAVIOR_DIMENSIONS,
+  behaviorDimensionValue,
+  canonicalBehaviorValue,
+  type BehaviorDimension,
+  type BehaviorFingerprint
+} from "../analysis/behaviorFingerprint.js";
+import {
   formatSymbolInvestigationToolResult,
   getCachedSymbolInvestigationReport,
   investigateSymbolContract,
@@ -915,6 +922,12 @@ export class ClaudeAgentRunner {
     }
     reconcileHierarchicalInvestigateReferenceHandoff(operation, structured);
     reconcileHierarchicalPrepareContractHandoff(
+      input.session,
+      operation,
+      structured,
+      stageId
+    );
+    reconcileHierarchicalPrepareBehaviorFingerprints(
       input.session,
       operation,
       structured,
@@ -3311,12 +3324,12 @@ export class ClaudeAgentRunner {
         handler: (...args: unknown[]) => Promise<unknown>
       ) => unknown)(
         "analyze_symbol_contract",
-        "只读分析 TypeScript/JavaScript/React 中已有函数、方法或组件的定义契约、全部静态调用点、参数组合、局部前置条件、公共封装函数和非直接调用引用。调用点按页返回，必须继续请求直到 next_offset 为 null。",
+        "只读分析 TypeScript/JavaScript/React 中已有函数、方法或组件的定义契约、全部静态调用点、参数组合、局部前置条件、公共封装、非直接调用引用和目标体内出向调用。调用点按页返回，必须继续请求直到 next_offset 为 null。",
         {
           target_file: z.string().min(1).describe("目标符号定义文件，相对于项目根目录"),
           symbol: z.string().min(1).describe("函数、方法、类或组件的精确符号名"),
           target_line: z.number().int().min(1).optional().describe("同一文件存在同名符号时，用定义所在行消歧"),
-          section: z.enum(["all", "contract", "calls", "wrappers", "references"]).optional()
+          section: z.enum(["all", "contract", "calls", "wrappers", "references", "effects"]).optional()
             .describe("返回部分；调用点很多时优先分部分请求"),
           offset: z.number().int().min(0).optional().describe("calls 分页起始位置"),
           limit: z.number().int().min(1).max(100).optional().describe("calls 每页数量，默认 50，最大 100")
@@ -3326,7 +3339,7 @@ export class ClaudeAgentRunner {
             target_file: string;
             symbol: string;
             target_line?: number;
-            section?: "all" | "contract" | "calls" | "wrappers" | "references";
+            section?: "all" | "contract" | "calls" | "wrappers" | "references" | "effects";
             offset?: number;
             limit?: number;
           };
@@ -3362,8 +3375,8 @@ export class ClaudeAgentRunner {
         "investigate_symbol_contract",
         [
           "运行宿主持有的完整函数/组件调查脚本。",
-          "脚本自动消费 contract、calls、wrappers、references 全部分页，并递归调查公共封装；",
-          "返回参数/Props 类型与说明、全部静态调用方式、前置条件、公共封装图，以及带稳定 reference_id 和数量守恒的逐引用账本；",
+          "脚本自动消费 contract、calls、wrappers、references、effects 全部分页，递归调查公共封装，并追踪符号作为对象属性、回调或配置值进入外层调用的路径；",
+          "返回参数/Props 类型与说明、入向及出向调用、前置条件、公共封装图、逐调用行为指纹，以及带稳定 reference_id 和数量守恒的逐引用账本；",
           "动态引用与语法回退会明确标记 runtime_verification_required。prepare 中只要会调用、复用或修改既有函数/组件，就必须为每个 analyzed_target 调用本工具；",
           "analyzed_targets 只需准确提交 target_file 与 symbol，宿主自动回填脚本事实；Read/Grep 或零散 analyze_symbol_contract 不能替代。"
         ].join(""),
@@ -3650,6 +3663,7 @@ export function validateHierarchicalContractToolEvidence(
         + diagnoseValidationGap(session)
       );
     }
+    assertVerifiedBehaviorFingerprints(session, operation);
     return;
   }
   if (operation.phase !== "prepare") return;
@@ -3777,6 +3791,275 @@ export function validateHierarchicalContractToolEvidence(
           "；已追踪结果写入 wrappers_and_indirect_references，尚不能闭合的边界写入 unresolved"
         ].join("")
       );
+    }
+  }
+  assertPrepareBehaviorFingerprints(session, operation, passed, stageId);
+}
+
+interface FrozenBehaviorEnvelope {
+  schema_version: 1;
+  dimension: BehaviorDimension;
+  targets: Record<string, unknown>;
+}
+
+function assertVerifiedBehaviorFingerprints(
+  session: AgentSession,
+  operation: Extract<HierarchicalNextOperation, { kind: "run_phase" }>,
+  reports = new Map<string, SymbolInvestigationReport>()
+): void {
+  const state = session.hierarchical_state;
+  if (!state) return;
+  const investigate = latestHierarchicalArtifact(state, operation.requirement_id, "investigate");
+  const prepare = latestHierarchicalArtifact(state, operation.requirement_id, "prepare");
+  if (!investigate || !prepare) return;
+  const obligations = Array.isArray(prepare.handoff.behavior_obligations)
+    ? prepare.handoff.behavior_obligations.filter(isPlainObject)
+    : [];
+  const frozen = new Map<BehaviorDimension, FrozenBehaviorEnvelope>();
+  for (const obligation of obligations) {
+    const envelope = parseFrozenBehaviorEnvelope(optionalString(obligation.required_behavior));
+    if (envelope) frozen.set(envelope.dimension, envelope);
+  }
+  // Persisted/legacy artifacts without host fingerprints keep their previous
+  // validation path. Every newly prepared same-feature contract is frozen.
+  if (frozen.size === 0) return;
+
+  const mappings = Array.isArray(investigate.handoff.target_mappings)
+    ? investigate.handoff.target_mappings.filter(isPlainObject)
+    : [];
+  const mismatches: string[] = [];
+  for (const mapping of mappings) {
+    const targetKey = optionalString(mapping.target_key);
+    const contractLocation = optionalString(mapping.contract_location);
+    const contractSymbol = optionalString(mapping.contract_symbol);
+    if (!targetKey || !contractLocation || !contractSymbol) continue;
+    if (![...frozen.values()].some((envelope) => targetKey in envelope.targets)) continue;
+    const contractFile = evidenceLocationFile(contractLocation, session.project_path);
+    if (!contractFile) {
+      mismatches.push(`${targetKey}: 最终契约文件无效`);
+      continue;
+    }
+    const relativeFile = path.relative(session.project_path, contractFile).split(path.sep).join("/");
+    const reportKey = `${relativeFile}\0${contractSymbol}`;
+    let report = reports.get(reportKey);
+    if (!report) {
+      try {
+        report = investigateSymbolContract({
+          projectPath: session.project_path,
+          targetFile: relativeFile,
+          symbol: contractSymbol
+        });
+        reports.set(reportKey, report);
+      } catch (error) {
+        mismatches.push(
+          `${targetKey}: 无法重新调查最终契约 ${contractSymbol}@${relativeFile}：`
+          + (error instanceof Error ? error.message : String(error))
+        );
+        continue;
+      }
+    }
+    const actual = selectImplementedBehaviorFingerprint(session, mapping, report);
+    if (!actual) {
+      mismatches.push(`${targetKey}: 最终工作区未找到与目标 token 对应的真实调用边`);
+      continue;
+    }
+    const selectorNames = dispatchSelectorNames(mapping, actual);
+    for (const [dimension, envelope] of frozen) {
+      if (!(targetKey in envelope.targets)) continue;
+      const expected = envelope.targets[targetKey];
+      const observed = behaviorDimensionValue(actual, dimension);
+      if (!behaviorValuesMatch(dimension, expected, observed, selectorNames)) {
+        mismatches.push(
+          `${targetKey}/${dimension}: expected=${canonicalBehaviorValue(expected)}；`
+          + `observed=${canonicalBehaviorValue(observed)}；证据=${actual.source_location}`
+        );
+      }
+    }
+  }
+  if (mismatches.length > 0) {
+    throw new Error(
+      `verify 最终行为指纹与 prepare 冻结契约不一致，共 ${mismatches.length} 处：\n`
+      + mismatches.map((item) => `- ${item}`).join("\n")
+    );
+  }
+}
+
+function parseFrozenBehaviorEnvelope(value: string | undefined): FrozenBehaviorEnvelope | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!isPlainObject(parsed) || parsed.schema_version !== 1) return null;
+    const dimension = optionalString(parsed.dimension) as BehaviorDimension | undefined;
+    if (!dimension || !BEHAVIOR_DIMENSIONS.includes(dimension) || !isPlainObject(parsed.targets)) return null;
+    return {
+      schema_version: 1,
+      dimension,
+      targets: parsed.targets
+    };
+  } catch {
+    return null;
+  }
+}
+
+function selectImplementedBehaviorFingerprint(
+  session: AgentSession,
+  mapping: Record<string, unknown>,
+  report: SymbolInvestigationReport
+): BehaviorFingerprint | undefined {
+  const dispatcherLocation = optionalString(mapping.dispatcher_location);
+  const dispatcherFile = dispatcherLocation
+    ? evidenceLocationFile(dispatcherLocation, session.project_path)
+    : null;
+  if (!dispatcherFile) return undefined;
+  const candidates = report.behavior_fingerprints.filter((fingerprint) => (
+    evidenceLocationFile(fingerprint.source_location, session.project_path) === dispatcherFile
+  ));
+  if (candidates.length === 0) return undefined;
+  const tokens = uniqueStrings([
+    optionalString(mapping.requested_token) ?? "",
+    optionalString(mapping.canonical_token) ?? ""
+  ]);
+  const sourceLines = readFileSync(dispatcherFile, "utf8").split(/\r?\n/);
+  const tokenLines = tokens.flatMap((token) => sourceLines.flatMap((line, index) => (
+    containsExactIdentifierOrLiteral(line, token) ? [index + 1] : []
+  )));
+  const scored = candidates.map((fingerprint) => {
+    const serialized = canonicalBehaviorValue({
+      invocation: fingerprint.invocation,
+      arguments: fingerprint.arguments,
+      preconditions: fingerprint.preconditions
+    });
+    const directTokenMatch = tokens.some((token) => containsExactIdentifierOrLiteral(serialized, token));
+    const line = Number(/:(\d+)(?::\d+)?$/.exec(fingerprint.source_location)?.[1] ?? 0);
+    const distance = tokenLines.length > 0
+      ? Math.min(...tokenLines.map((tokenLine) => Math.abs(tokenLine - line)))
+      : Number.POSITIVE_INFINITY;
+    return {
+      fingerprint,
+      score: directTokenMatch ? 10_000 : distance <= 80 ? 1_000 - distance : -1
+    };
+  }).filter((item) => item.score >= 0)
+    .sort((left, right) => right.score - left.score);
+  if (scored.length === 0) return undefined;
+  if (scored.length > 1 && scored[0]!.score === scored[1]!.score) return undefined;
+  return scored[0]!.fingerprint;
+}
+
+function containsExactIdentifierOrLiteral(value: string, token: string): boolean {
+  if (!token) return false;
+  const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:["'\\x60]${escaped}["'\\x60]|(?<![$\\w])${escaped}(?![$\\w]))`, "u").test(value);
+}
+
+function dispatchSelectorNames(
+  mapping: Record<string, unknown>,
+  actual: BehaviorFingerprint
+): string[] {
+  const tokens = uniqueStrings([
+    optionalString(mapping.requested_token) ?? "",
+    optionalString(mapping.canonical_token) ?? ""
+  ]);
+  return uniqueStrings(actual.preconditions.flatMap((condition) => {
+    if (!tokens.some((token) => containsExactIdentifierOrLiteral(condition, token))) return [];
+    return [...condition.matchAll(/[A-Za-z_$][\w$]*/g)].map((match) => match[0]!)
+      .filter((identifier) => !tokens.includes(identifier));
+  }));
+}
+
+function behaviorValuesMatch(
+  dimension: BehaviorDimension,
+  expected: unknown,
+  observed: unknown,
+  selectorNames: string[]
+): boolean {
+  if (canonicalBehaviorValue(expected) === canonicalBehaviorValue(observed)) return true;
+  if (
+    (dimension === "preconditions" || dimension === "context" || dimension === "side_effects")
+    && Array.isArray(expected)
+    && Array.isArray(observed)
+  ) {
+    const observedStrings = observed.filter((item): item is string => typeof item === "string");
+    return expected.every((item) => {
+      if (typeof item !== "string") return false;
+      if (observedStrings.includes(item)) return true;
+      if (dimension !== "preconditions") return false;
+      const normalizedExpected = normalizeDispatchSelectorCondition(item, selectorNames);
+      return observedStrings.some((actual) => (
+        normalizeDispatchSelectorCondition(actual, selectorNames) === normalizedExpected
+      ));
+    });
+  }
+  return false;
+}
+
+function normalizeDispatchSelectorCondition(value: string, selectorNames: string[]): string {
+  if (!selectorNames.some((identifier) => new RegExp(`(?<![$\\w])${identifier}(?![$\\w])`, "u").test(value))) {
+    return value;
+  }
+  return value.replace(/(["'`])(?:\\.|(?!\1).)*\1/g, "<target-token>");
+}
+
+function assertPrepareBehaviorFingerprints(
+  session: AgentSession,
+  operation: Extract<HierarchicalNextOperation, { kind: "run_phase" }>,
+  passed: Extract<HierarchicalEvent, { type: "phase_passed" }>,
+  stageId: string
+): void {
+  const state = session.hierarchical_state;
+  const investigate = state
+    ? latestHierarchicalArtifact(state, operation.requirement_id, "investigate")
+    : undefined;
+  if (!investigate) return;
+  const referenceAnalysis = isPlainObject(investigate.handoff.reference_analysis)
+    ? investigate.handoff.reference_analysis
+    : null;
+  const selectedKeys = (Array.isArray(referenceAnalysis?.target_selections)
+    ? referenceAnalysis.target_selections.filter(isPlainObject)
+    : []).flatMap((selection) => (
+    optionalString(selection.selected_location)
+      ? [optionalString(selection.target_key)].filter((value): value is string => Boolean(value))
+      : []
+  ));
+  if (selectedKeys.length === 0) return;
+  const fingerprints = selectedReferenceBehaviorFingerprints(
+    session,
+    investigate,
+    completedSymbolInvestigationReports(session, stageId)
+  );
+  const fingerprintsByTarget = new Map(fingerprints.map((item) => [item.targetKey, item.fingerprint]));
+  const missing = selectedKeys.filter((targetKey) => !fingerprintsByTarget.has(targetKey));
+  if (missing.length > 0) {
+    throw new Error(
+      "prepare 选中的同功能入口尚未解析为真实调用边，不能仅凭最终组件定义冻结行为："
+      + missing.join(", ")
+      + "；请调查入口函数/方法，或让符号调查报告解析其参数传递、guard 与外层调用"
+    );
+  }
+  const obligations = Array.isArray(passed.handoff?.behavior_obligations)
+    ? passed.handoff.behavior_obligations.filter(isPlainObject)
+    : [];
+  for (const obligation of obligations) {
+    const dimension = optionalString(obligation.dimension) as BehaviorDimension | undefined;
+    if (!dimension || !BEHAVIOR_DIMENSIONS.includes(dimension)) continue;
+    const targets = Object.fromEntries([...fingerprintsByTarget]
+      .map(([targetKey, fingerprint]) => [
+        targetKey,
+        behaviorDimensionValue(fingerprint, dimension)
+      ])
+      .sort(([left], [right]) => String(left).localeCompare(String(right))));
+    const expectedReference = canonicalBehaviorValue({
+      schema_version: 1,
+      dimension,
+      targets
+    });
+    if (optionalString(obligation.reference_behavior) !== expectedReference) {
+      throw new Error(`行为义务 ${dimension} 未使用宿主提取的逐目标参考指纹`);
+    }
+    if (
+      optionalString(obligation.decision) === "reuse"
+      && optionalString(obligation.required_behavior) !== expectedReference
+    ) {
+      throw new Error(`行为义务 ${dimension} 判定 reuse 时 required_behavior 必须保持参考指纹`);
     }
   }
 }
@@ -4645,6 +4928,138 @@ function prepareCurrentTargetEvidence(
   return sameTargetFile.length > 0 ? sameTargetFile : independent;
 }
 
+interface SelectedBehaviorFingerprint {
+  targetKey: string;
+  fingerprint: BehaviorFingerprint;
+}
+
+/**
+ * Freeze source-derived behavior facts into the existing six-dimensional
+ * prepare contract. Values are keyed by target so multi-target requirements do
+ * not collapse distinct argument sets or guards into one prose summary.
+ *
+ * The model still owns the reuse/intentional-difference decision. For reuse,
+ * the required value is mechanically identical to the reference fingerprint;
+ * an intentional difference keeps the model's required value but cannot alter
+ * the source-derived reference value.
+ */
+export function reconcileHierarchicalPrepareBehaviorFingerprints(
+  session: AgentSession,
+  operation: Extract<HierarchicalNextOperation, {
+    kind: "run_phase" | "run_alignment_batch" | "run_planner" | "run_integrator"
+  }>,
+  structured: unknown,
+  stageId: string
+): string[] {
+  if (
+    operation.kind !== "run_phase"
+    || operation.phase !== "prepare"
+    || !isPlainObject(structured)
+  ) return [];
+  const handoff = isPlainObject(structured.handoff) ? structured.handoff : null;
+  const obligations = handoff && Array.isArray(handoff.behavior_obligations)
+    ? handoff.behavior_obligations.filter(isPlainObject)
+    : [];
+  if (obligations.length === 0) return [];
+  const state = session.hierarchical_state;
+  const investigate = state
+    ? latestHierarchicalArtifact(state, operation.requirement_id, "investigate")
+    : undefined;
+  const fingerprints = selectedReferenceBehaviorFingerprints(
+    session,
+    investigate,
+    completedSymbolInvestigationReports(session, stageId)
+  );
+  if (fingerprints.length === 0) return [];
+
+  const reconciled: string[] = [];
+  for (const obligation of obligations) {
+    const dimension = optionalString(obligation.dimension) as BehaviorDimension | undefined;
+    if (!dimension || !BEHAVIOR_DIMENSIONS.includes(dimension)) continue;
+    const targetValues = Object.fromEntries(fingerprints
+      .map(({ targetKey, fingerprint }) => [
+        targetKey,
+        behaviorDimensionValue(fingerprint, dimension)
+      ])
+      .sort(([left], [right]) => String(left).localeCompare(String(right))));
+    const frozen = canonicalBehaviorValue({
+      schema_version: 1,
+      dimension,
+      targets: targetValues
+    });
+    obligation.reference_behavior = frozen;
+    if (optionalString(obligation.decision) === "reuse") {
+      obligation.required_behavior = frozen;
+    }
+    const evidence = optionalStringArray(obligation.evidence_refs) ?? [];
+    for (const { fingerprint } of fingerprints) {
+      const location = fingerprint.source_location.replace(/:\d+$/, "");
+      if (!evidence.includes(location)) evidence.push(location);
+    }
+    obligation.evidence_refs = evidence;
+    reconciled.push(dimension);
+  }
+  return reconciled;
+}
+
+function selectedReferenceBehaviorFingerprints(
+  session: AgentSession,
+  investigate: HierarchicalInvestigateArtifact | undefined,
+  reports: ReturnType<typeof completedSymbolInvestigationReports>
+): SelectedBehaviorFingerprint[] {
+  if (!investigate) return [];
+  const referenceAnalysis = isPlainObject(investigate.handoff.reference_analysis)
+    ? investigate.handoff.reference_analysis
+    : null;
+  const candidates = Array.isArray(referenceAnalysis?.candidates)
+    ? referenceAnalysis.candidates.filter(isPlainObject)
+    : [];
+  const selections = Array.isArray(referenceAnalysis?.target_selections)
+    ? referenceAnalysis.target_selections.filter(isPlainObject)
+    : [];
+  const selected: SelectedBehaviorFingerprint[] = [];
+
+  for (const selection of selections) {
+    const targetKey = optionalString(selection.target_key);
+    const selectedLocation = optionalString(selection.selected_location);
+    if (!targetKey || !selectedLocation) continue;
+    const candidate = candidates.find((item) => (
+      optionalString(item.target_key) === targetKey
+      && optionalString(item.location) === selectedLocation
+    ));
+    if (!candidate) continue;
+    const contractFile = evidenceLocationFile(
+      optionalString(candidate.contract_location) ?? "",
+      session.project_path
+    );
+    const contractSymbol = optionalString(candidate.contract_symbol);
+    const report = reports.find((item) => (
+      Boolean(contractFile)
+      && path.resolve(session.project_path, item.report.target.file) === contractFile
+      && item.report.target.symbol === contractSymbol
+    ))?.report;
+    if (!report) continue;
+    const anchors = uniqueStrings([
+      selectedLocation,
+      ...(optionalStringArray(candidate.evidence_refs) ?? [])
+    ]).flatMap((location) => {
+      const anchor = evidenceLocationAnchor(location, session.project_path);
+      return anchor ? [anchor] : [];
+    });
+    const exact = report.behavior_fingerprints.find((fingerprint) => (
+      anchors.includes(evidenceLocationAnchor(fingerprint.source_location, session.project_path) ?? "")
+    ));
+    const selectedFile = evidenceLocationFile(selectedLocation, session.project_path);
+    const sameFile = report.behavior_fingerprints.filter((fingerprint) => (
+      Boolean(selectedFile)
+      && evidenceLocationFile(fingerprint.source_location, session.project_path) === selectedFile
+    ));
+    const fingerprint = exact ?? (sameFile.length === 1 ? sameFile[0] : undefined);
+    if (fingerprint) selected.push({ targetKey, fingerprint });
+  }
+  return selected;
+}
+
 // Prefill (every prepare attempt, before validation) the same-feature entry
 // citation, target coverage and already-satisfied proof the host already knows
 // from investigate. The model decides the behavior and disposition; the host
@@ -4923,6 +5338,8 @@ function analyzedTargetFromInvestigationReport(
       `${call.location.file}:${call.location.line}`,
       call.kind,
       call.enclosing_callable ? `caller=${call.enclosing_callable}` : "caller=<module>",
+      `invocation=${call.invocation}`,
+      call.target_path ? `target_path=${call.target_path}` : "target_path=<direct>",
       `provided=${call.provided_parameters.join(",") || "none"}`,
       `omitted=${call.omitted_parameters.join(",") || "none"}`
     ].join("；")
@@ -4932,6 +5349,14 @@ function analyzedTargetFromInvestigationReport(
   )));
   const guards = uniqueStrings(report.calls.items.flatMap((call) => (
     call.preconditions.map((guard) => `${call.location.file}:${call.location.line}；${guard}`)
+  )));
+  const outgoingEffects = uniqueStrings(report.effects.items.map((effect) => (
+    [
+      `${effect.location.file}:${effect.location.line}`,
+      `${effect.kind}:${effect.callee}`,
+      `invocation=${effect.invocation}`,
+      `guards=${effect.preconditions.join(" && ") || "none"}`
+    ].join("；")
   )));
   const target: Record<string, unknown> = {
     target_file: report.target.file,
@@ -4948,9 +5373,9 @@ function analyzedTargetFromInvestigationReport(
       ? wrappers
       : [`未发现公共封装；${definitionRef}`],
     guards: guards.length > 0 ? guards : [`未发现可静态识别的调用 guard；${definitionRef}`],
-    state_and_side_effects: [
-      `调查脚本仅证明调用契约；目标体内状态与副作用仍以定义审阅为准；${definitionRef}`
-    ],
+    state_and_side_effects: outgoingEffects.length > 0
+      ? outgoingEffects
+      : [`未发现可静态识别的出向调用或副作用；${definitionRef}`],
     compatibility_obligations: [
       `保持 ${report.target.symbol} 的输入、输出及既有调用组合兼容；${definitionRef}`
     ],
@@ -5703,12 +6128,20 @@ export function validateHierarchicalBehaviorObligationContinuity(
       type: "integration_passed"
     }> => event.type === "integration_passed");
     if (!passedIntegration) return;
+    const finalWorkspaceReports = new Map<string, SymbolInvestigationReport>();
     for (const requirement of state.requirements) {
       const prepare = latestHierarchicalArtifact(state, requirement.id, "prepare");
       const verify = latestHierarchicalArtifact(state, requirement.id, "verify");
       if (!prepare || !verify) {
         throw new Error(`全局审计缺少 ${requirement.id} 的 prepare 行为契约或 verify 契约结果`);
       }
+      assertVerifiedBehaviorFingerprints(session, {
+        kind: "run_phase",
+        requirement_id: requirement.id,
+        work_unit_id: `${requirement.id}:integrate-final-workspace`,
+        phase: "verify",
+        role: "completeness-checker"
+      }, finalWorkspaceReports);
       assertObligationResultClosure(
         prepare.handoff.behavior_obligations,
         passedIntegration.contract_results.filter((result) => result.requirement_id === requirement.id),

@@ -5,6 +5,10 @@ import {
   type AnalyzeSymbolContractInput,
   type SymbolContractAnalysis
 } from "./symbolContractAnalyzer.js";
+import {
+  buildBehaviorFingerprint,
+  type BehaviorFingerprint
+} from "./behaviorFingerprint.js";
 
 const DEFAULT_PAGE_SIZE = 100;
 const DEFAULT_MAX_WRAPPER_DEPTH = 8;
@@ -15,6 +19,7 @@ const completedReportCache = new Map<string, SymbolInvestigationReport>();
 type CallsPayload = NonNullable<SymbolContractAnalysis["calls"]>;
 type WrappersPayload = NonNullable<SymbolContractAnalysis["wrappers"]>;
 type ReferencesPayload = NonNullable<SymbolContractAnalysis["references"]>;
+type EffectsPayload = NonNullable<SymbolContractAnalysis["effects"]>;
 type Page = CallsPayload["page"];
 type CallItem = CallsPayload["items"][number];
 type ReferenceItem = ReferencesPayload["items"][number];
@@ -44,6 +49,7 @@ interface CollectedSymbolContract {
   calls: Omit<CallsPayload, "page"> & { coverage: SectionCoverage };
   wrappers: Omit<WrappersPayload, "page"> & { coverage: SectionCoverage };
   references: Omit<ReferencesPayload, "page"> & { coverage: SectionCoverage };
+  effects: Omit<EffectsPayload, "page"> & { coverage: SectionCoverage };
   analyzer_coverage: SymbolContractAnalysis["coverage"];
   analyzer_runs: number;
 }
@@ -69,12 +75,15 @@ export interface SymbolReferenceCard {
     line: number;
     column: number;
   };
-  kind: "call" | "jsx" | "non-call-reference";
+  kind: "call" | "jsx" | "indirect" | "non-call-reference";
   enclosing_callable: string | null;
   arguments: CallItem["arguments"];
   provided_parameters: string[];
   omitted_parameters: string[];
   preconditions: string[];
+  invocation: string | null;
+  target_path: string | null;
+  payload_expression: string | null;
   expression: string | null;
   reference_kind: string | null;
   disposition: "resolved" | "irrelevant" | "blocked";
@@ -84,7 +93,7 @@ export interface SymbolInvestigationReport extends CollectedSymbolContract {
   schema_version: 1;
   script: "symbol-contract-investigation";
   status: "complete" | "complete_with_dynamic_unknowns" | "partial";
-  sections_completed: readonly ["contract", "calls", "wrappers", "references"];
+  sections_completed: readonly ["contract", "calls", "wrappers", "references", "effects"];
   all_pages_consumed: true;
   wrapper_graph: {
     nodes: WrapperInvestigationNode[];
@@ -96,6 +105,7 @@ export interface SymbolInvestigationReport extends CollectedSymbolContract {
   unresolved_dynamic_references: ReferencesPayload["items"];
   static_analysis_limits: string[];
   reference_cards: SymbolReferenceCard[];
+  behavior_fingerprints: BehaviorFingerprint[];
   reference_accounting: {
     total: number;
     resolved: number;
@@ -202,6 +212,21 @@ export function investigateSymbolContract(
     ...wrapperNodes.flatMap((node) => node.analyzer_coverage.static_analysis_limits)
   ])];
   const referenceCards = buildReferenceCards(primary, wrapperNodes);
+  const behaviorFingerprints = referenceCards.flatMap((card) => (
+    card.kind === "non-call-reference" || !card.invocation
+      ? []
+      : [buildBehaviorFingerprint({
+          reference_id: card.reference_id,
+          target: card.target,
+          location: card.location,
+          kind: card.kind,
+          invocation: card.invocation,
+          target_path: card.target_path,
+          payload_expression: card.payload_expression,
+          arguments: card.arguments,
+          preconditions: card.preconditions
+        })]
+  ));
   const referenceAccounting = {
     total: referenceCards.length,
     resolved: referenceCards.filter((card) => card.disposition === "resolved").length,
@@ -217,7 +242,7 @@ export function investigateSymbolContract(
     ...primary,
     schema_version: 1 as const,
     script: "symbol-contract-investigation" as const,
-    sections_completed: ["contract", "calls", "wrappers", "references"] as const,
+    sections_completed: ["contract", "calls", "wrappers", "references", "effects"] as const,
     all_pages_consumed: true as const,
     wrapper_graph: {
       nodes: wrapperNodes,
@@ -229,6 +254,7 @@ export function investigateSymbolContract(
     unresolved_dynamic_references: unresolvedDynamicReferences,
     static_analysis_limits: staticAnalysisLimits,
     reference_cards: referenceCards,
+    behavior_fingerprints: behaviorFingerprints,
     reference_accounting: referenceAccounting,
     runtime_verification_required: runtimeVerificationRequired,
     status: (
@@ -277,6 +303,10 @@ export function formatSymbolInvestigationToolResult(
     references: {
       coverage: report.references.coverage
     },
+    effects: {
+      outgoing_calls: report.effects.items,
+      coverage: report.effects.coverage
+    },
     wrapper_graph: {
       max_depth: report.wrapper_graph.max_depth,
       max_symbols: report.wrapper_graph.max_symbols,
@@ -290,6 +320,7 @@ export function formatSymbolInvestigationToolResult(
       }))
     },
     reference_cards: report.reference_cards,
+    behavior_fingerprints: report.behavior_fingerprints,
     reference_accounting: report.reference_accounting,
     unresolved_dynamic_references: report.unresolved_dynamic_references,
     static_analysis_limits: report.static_analysis_limits,
@@ -350,6 +381,9 @@ function referenceCardForCall(
     provided_parameters: call.provided_parameters,
     omitted_parameters: call.omitted_parameters,
     preconditions: call.preconditions,
+    invocation: call.invocation,
+    target_path: call.target_path,
+    payload_expression: call.payload_expression,
     expression: null,
     reference_kind: null,
     disposition: "resolved"
@@ -379,6 +413,9 @@ function referenceCardForNonCallReference(
     provided_parameters: [],
     omitted_parameters: [],
     preconditions: [],
+    invocation: null,
+    target_path: null,
+    payload_expression: null,
     expression: reference.expression,
     reference_kind: reference.kind,
     disposition: reference.kind === "import" || reference.kind === "export"
@@ -450,7 +487,7 @@ function collectSymbolContract(
     limit: pageSize
   };
   const initial = analyzeSymbolContract(analyzerInput);
-  if (!initial.contract || !initial.calls || !initial.wrappers || !initial.references) {
+  if (!initial.contract || !initial.calls || !initial.wrappers || !initial.references || !initial.effects) {
     throw new Error(`符号调查脚本未获得完整首屏：${input.targetFile}#${input.symbol}`);
   }
   let analyzerRuns = 1;
@@ -472,6 +509,12 @@ function collectSymbolContract(
     if (!result.references) throw new Error("references 分页缺少结果");
     return result.references;
   });
+  const effects = collectPages(initial.effects, (offset) => {
+    analyzerRuns += 1;
+    const result = analyzeSymbolContract({ ...analyzerInput, section: "effects", offset });
+    if (!result.effects) throw new Error("effects 分页缺少结果");
+    return result.effects;
+  });
   return {
     target: initial.target,
     contract: initial.contract,
@@ -487,6 +530,10 @@ function collectSymbolContract(
     references: {
       items: references.items,
       coverage: references.coverage
+    },
+    effects: {
+      items: effects.items,
+      coverage: effects.coverage
     },
     analyzer_coverage: initial.coverage,
     analyzer_runs: analyzerRuns

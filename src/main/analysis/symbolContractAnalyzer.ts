@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import ts from "typescript";
 import { createBoundedTypeScriptProgram } from "./boundedTypeScriptProgram.js";
 
-export type SymbolAnalysisSection = "all" | "contract" | "calls" | "wrappers" | "references";
+export type SymbolAnalysisSection = "all" | "contract" | "calls" | "wrappers" | "references" | "effects";
 
 export interface AnalyzeSymbolContractInput {
   projectPath: string;
@@ -38,12 +38,25 @@ interface CallArgument {
 }
 
 interface CallSite {
-  kind: "call" | "jsx";
+  kind: "call" | "jsx" | "indirect";
   location: SourceLocation;
   enclosing_callable: string | null;
   arguments: CallArgument[];
   provided_parameters: string[];
   omitted_parameters: string[];
+  preconditions: string[];
+  invocation: string;
+  target_path: string | null;
+  payload_expression: string | null;
+}
+
+interface OutgoingCall {
+  kind: "call" | "new" | "jsx";
+  location: SourceLocation;
+  enclosing_callable: string | null;
+  callee: string;
+  invocation: string;
+  arguments: CallArgument[];
   preconditions: string[];
 }
 
@@ -79,6 +92,7 @@ export interface SymbolContractAnalysis {
     total_call_sites: number;
     total_public_wrappers: number;
     total_non_call_references: number;
+    total_outgoing_calls: number;
     static_analysis_limits: string[];
     analysis_notes: string[];
   };
@@ -94,7 +108,7 @@ export interface SymbolContractAnalysis {
   calls?: {
     items: CallSite[];
     combinations: Array<{
-      kind: "call" | "jsx";
+      kind: "call" | "jsx" | "indirect";
       provided_parameters: string[];
       count: number;
       locations: SourceLocation[];
@@ -119,6 +133,16 @@ export interface SymbolContractAnalysis {
   };
   references?: {
     items: NonCallReference[];
+    page: {
+      offset: number;
+      limit: number;
+      returned: number;
+      total: number;
+      next_offset: number | null;
+    };
+  };
+  effects?: {
+    items: OutgoingCall[];
     page: {
       offset: number;
       limit: number;
@@ -155,6 +179,7 @@ export function analyzeSymbolContract(input: AnalyzeSymbolContractInput): Symbol
   const callSites: CallSite[] = [];
   const wrapperCalls = new Map<ts.Node, CallSite[]>();
   const nonCallReferences: NonCallReference[] = [];
+  const indirectCallKeys = new Set<string>();
   const projectSources = program.getSourceFiles().filter((file) => (
     !file.isDeclarationFile && isInsideProject(projectPath, file.fileName)
   ));
@@ -186,11 +211,40 @@ export function analyzeSymbolContract(input: AnalyzeSymbolContractInput): Symbol
         }
       } else if (isReferenceNode(node) && symbolMatches(node, target.symbol, targetDeclarationSet, checker)) {
         if (!isDefinitionName(node, targetDeclarationSet) && !isDirectInvocationReference(node)) {
-          nonCallReferences.push({
-            location: locationOf(node, projectPath),
-            kind: classifyNonCallReference(node),
-            expression: node.getText().slice(0, 300)
-          });
+          const referenceKind = classifyNonCallReference(node);
+          const lifted = referenceKind === "import" || referenceKind === "export"
+            ? []
+            : liftReferenceToIndirectCalls(node, checker, projectSources, projectPath);
+          if (lifted.length > 0) {
+            for (const callSite of lifted) {
+              const key = [
+                callSite.location.file,
+                callSite.location.line,
+                callSite.location.column,
+                callSite.target_path,
+                callSite.payload_expression
+              ].join("\0");
+              if (indirectCallKeys.has(key)) continue;
+              indirectCallKeys.add(key);
+              callSites.push(callSite);
+              const enclosing = findEnclosingCallableAtLocation(
+                projectSources,
+                callSite.location,
+                projectPath
+              );
+              if (enclosing && isPublicCallable(enclosing)) {
+                const existing = wrapperCalls.get(enclosing) ?? [];
+                existing.push(callSite);
+                wrapperCalls.set(enclosing, existing);
+              }
+            }
+          } else {
+            nonCallReferences.push({
+              location: locationOf(node, projectPath),
+              kind: referenceKind,
+              expression: node.getText().slice(0, 300)
+            });
+          }
         }
       }
       ts.forEachChild(node, visit);
@@ -200,6 +254,11 @@ export function analyzeSymbolContract(input: AnalyzeSymbolContractInput): Symbol
 
   callSites.sort(compareLocations);
   nonCallReferences.sort(compareLocations);
+  const outgoingCalls = collectOutgoingCalls(
+    targetDeclarations,
+    checker,
+    projectPath
+  ).sort(compareLocations);
   const wrappers = [...wrapperCalls.entries()]
     .map(([node, calls]) => buildPublicWrapper(node, calls, checker, projectPath))
     .sort((a, b) => compareSourceLocations(a.location, b.location));
@@ -223,6 +282,7 @@ export function analyzeSymbolContract(input: AnalyzeSymbolContractInput): Symbol
       total_call_sites: callSites.length,
       total_public_wrappers: wrappers.length,
       total_non_call_references: nonCallReferences.length,
+      total_outgoing_calls: outgoingCalls.length,
       static_analysis_limits: programBuild.mode === "syntax-fallback"
         ? [
             "未加载有效 TypeScript 项目配置，符号解析采用语法回退。",
@@ -269,6 +329,15 @@ export function analyzeSymbolContract(input: AnalyzeSymbolContractInput): Symbol
       page: buildPage(offset, limit, items.length, nonCallReferences.length)
     };
   }
+  if (section === "all" || section === "effects") {
+    const items = section === "effects"
+      ? outgoingCalls.slice(offset, offset + limit)
+      : outgoingCalls;
+    result.effects = {
+      items,
+      page: buildPage(offset, limit, items.length, outgoingCalls.length)
+    };
+  }
   return result;
 }
 
@@ -294,7 +363,88 @@ function createProgram(
     }
   });
   if (!evidenceFiles.includes(targetFile)) evidenceFiles.push(targetFile);
+  expandEvidenceFilesForAliases(sourceFiles, evidenceFiles, symbol);
   return createBoundedTypeScriptProgram(projectPath, evidenceFiles);
+}
+
+function expandEvidenceFilesForAliases(
+  sourceFiles: string[],
+  evidenceFiles: string[],
+  initialSymbol: string
+): void {
+  const included = new Set(evidenceFiles.map((file) => path.resolve(file)));
+  let frontier = new Set([initialSymbol]);
+  const seenSymbols = new Set(frontier);
+  const maxRounds = 4;
+  const maxFiles = 500;
+
+  for (let round = 0; round < maxRounds && frontier.size > 0 && included.size < maxFiles; round += 1) {
+    const aliases = new Set<string>();
+    for (const file of [...included]) {
+      let content: string;
+      try {
+        content = readFileSync(file, "utf8");
+      } catch {
+        continue;
+      }
+      if (![...frontier].some((name) => containsIdentifierText(content, name))) continue;
+      const source = ts.createSourceFile(
+        file,
+        content,
+        ts.ScriptTarget.Latest,
+        true,
+        scriptKindForFile(file)
+      );
+      const visit = (node: ts.Node): void => {
+        if (
+          ts.isVariableDeclaration(node)
+          && ts.isIdentifier(node.name)
+          && node.initializer
+          && [...frontier].some((name) => containsIdentifierText(node.initializer!.getText(source), name))
+          && isExportedVariableDeclaration(node)
+        ) {
+          const alias = node.name.text;
+          if (alias.length >= 4 && !seenSymbols.has(alias)) aliases.add(alias);
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(source);
+    }
+    if (aliases.size === 0) break;
+    for (const alias of aliases) seenSymbols.add(alias);
+    for (const file of sourceFiles) {
+      if (included.has(path.resolve(file))) continue;
+      let content: string;
+      try {
+        content = readFileSync(file, "utf8");
+      } catch {
+        continue;
+      }
+      if (![...aliases].some((alias) => containsIdentifierText(content, alias))) continue;
+      included.add(path.resolve(file));
+      evidenceFiles.push(file);
+      if (included.size >= maxFiles) break;
+    }
+    frontier = aliases;
+  }
+}
+
+function isExportedVariableDeclaration(node: ts.VariableDeclaration): boolean {
+  const statement = node.parent.parent;
+  return ts.isVariableStatement(statement)
+    && hasModifier(statement, ts.SyntaxKind.ExportKeyword);
+}
+
+function containsIdentifierText(content: string, identifier: string): boolean {
+  const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?<![$\\w])${escaped}(?![$\\w])`, "u").test(content);
+}
+
+function scriptKindForFile(file: string): ts.ScriptKind {
+  if (/\.tsx$/i.test(file)) return ts.ScriptKind.TSX;
+  if (/\.jsx$/i.test(file)) return ts.ScriptKind.JSX;
+  if (/\.(?:js|mjs|cjs)$/i.test(file)) return ts.ScriptKind.JS;
+  return ts.ScriptKind.TS;
 }
 
 function discoverProjectSources(projectPath: string): string[] {
@@ -557,7 +707,10 @@ function buildCallSite(
     arguments: argumentsList,
     provided_parameters: argumentsList.filter((item) => item.provided).map((item) => item.parameter),
     omitted_parameters: argumentsList.filter((item) => !item.provided).map((item) => item.parameter),
-    preconditions: collectPreconditions(node)
+    preconditions: collectPreconditions(node),
+    invocation: node.getText().slice(0, 1_000),
+    target_path: null,
+    payload_expression: null
   };
 }
 
@@ -611,8 +764,313 @@ function buildJsxCallSite(
     arguments: argumentsList,
     provided_parameters: [...provided],
     omitted_parameters: props.filter((prop) => !provided.has(prop.name)).map((prop) => prop.name),
-    preconditions: collectPreconditions(node)
+    preconditions: collectPreconditions(node),
+    invocation: node.getText().slice(0, 1_000),
+    target_path: null,
+    payload_expression: null
   };
+}
+
+interface LiftState {
+  node: ts.Node;
+  payloadNode: ts.Expression;
+  path: string[];
+  depth: number;
+}
+
+/**
+ * Lift a symbol used as data to the call that consumes that data.
+ *
+ * This is deliberately API agnostic. It covers components stored in route
+ * objects, callbacks registered in options, dependency-injection descriptors,
+ * command tables and any equivalent "value eventually passed to a call"
+ * shape. A bounded alias traversal handles the common case where the payload
+ * is first assigned to a local/module variable.
+ */
+function liftReferenceToIndirectCalls(
+  reference: ts.Identifier | ts.PropertyAccessExpression,
+  checker: ts.TypeChecker,
+  projectSources: ts.SourceFile[],
+  projectPath: string
+): CallSite[] {
+  const queue: LiftState[] = [{
+    node: reference,
+    payloadNode: reference,
+    path: [],
+    depth: 0
+  }];
+  const seen = new Set<string>();
+  const results: CallSite[] = [];
+  const maxDepth = 12;
+  const maxStates = 100;
+
+  while (queue.length > 0 && seen.size < maxStates) {
+    const state = queue.shift()!;
+    if (state.depth > maxDepth) continue;
+    const stateKey = [
+      state.node.getSourceFile().fileName,
+      state.node.pos,
+      state.node.end,
+      state.path.join(".")
+    ].join(":");
+    if (seen.has(stateKey)) continue;
+    seen.add(stateKey);
+    const parent = state.node.parent;
+    if (!parent) continue;
+
+    if (
+      (ts.isCallExpression(parent) || ts.isNewExpression(parent))
+      && Boolean(parent.arguments?.includes(state.node as ts.Expression))
+    ) {
+      results.push(buildIndirectCallSite(
+        parent,
+        state.payloadNode,
+        state.path,
+        checker,
+        projectPath
+      ));
+      continue;
+    }
+
+    const lifted = liftThroughContainer(parent, state);
+    if (lifted) {
+      queue.push({ ...lifted, depth: state.depth + 1 });
+      continue;
+    }
+
+    if (
+      ts.isVariableDeclaration(parent)
+      && parent.initializer
+      && containsNode(parent.initializer, state.node)
+      && ts.isIdentifier(parent.name)
+    ) {
+      const alias = checker.getSymbolAtLocation(parent.name);
+      if (!alias) continue;
+      for (const use of findSymbolReferences(alias, checker, projectSources)) {
+        if (use === parent.name) continue;
+        queue.push({
+          ...state,
+          node: use,
+          depth: state.depth + 1
+        });
+      }
+    }
+  }
+  return results;
+}
+
+function liftThroughContainer(parent: ts.Node, state: LiftState): Omit<LiftState, "depth"> | null {
+  if (ts.isPropertyAssignment(parent) && containsNode(parent.initializer, state.node)) {
+    return {
+      ...state,
+      node: parent,
+      path: [propertyNameText(parent.name), ...state.path]
+    };
+  }
+  if (ts.isShorthandPropertyAssignment(parent) && parent.name === state.node) {
+    return {
+      ...state,
+      node: parent,
+      path: [parent.name.getText(), ...state.path]
+    };
+  }
+  if (ts.isSpreadAssignment(parent) && containsNode(parent.expression, state.node)) {
+    return { ...state, node: parent, path: ["...spread", ...state.path] };
+  }
+  if (ts.isObjectLiteralExpression(parent) && parent.properties.includes(state.node as ts.ObjectLiteralElementLike)) {
+    return { ...state, node: parent, payloadNode: parent };
+  }
+  if (ts.isArrayLiteralExpression(parent) && parent.elements.includes(state.node as ts.Expression)) {
+    const index = parent.elements.indexOf(state.node as ts.Expression);
+    return { ...state, node: parent, payloadNode: parent, path: [`[${index}]`, ...state.path] };
+  }
+  if (
+    ts.isParenthesizedExpression(parent)
+    || ts.isAsExpression(parent)
+    || ts.isTypeAssertionExpression(parent)
+    || ts.isNonNullExpression(parent)
+    || ts.isSatisfiesExpression(parent)
+    || ts.isAwaitExpression(parent)
+  ) {
+    return { ...state, node: parent };
+  }
+  if (ts.isConditionalExpression(parent) && (
+    containsNode(parent.whenTrue, state.node) || containsNode(parent.whenFalse, state.node)
+  )) {
+    return { ...state, node: parent, payloadNode: parent };
+  }
+  return null;
+}
+
+function findSymbolReferences(
+  symbol: ts.Symbol,
+  checker: ts.TypeChecker,
+  projectSources: ts.SourceFile[]
+): Array<ts.Identifier | ts.PropertyAccessExpression> {
+  const resolved = resolveAlias(symbol, checker);
+  const declarations = new Set(resolved.getDeclarations() ?? symbol.getDeclarations() ?? []);
+  const references: Array<ts.Identifier | ts.PropertyAccessExpression> = [];
+  for (const source of projectSources) {
+    const visit = (node: ts.Node): void => {
+      if (
+        isReferenceNode(node)
+        && symbolMatches(node, resolved, declarations, checker)
+        && !isDefinitionName(node, declarations)
+      ) references.push(node);
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
+  }
+  return references;
+}
+
+function buildIndirectCallSite(
+  carrier: ts.CallExpression | ts.NewExpression,
+  payload: ts.Expression,
+  pathParts: string[],
+  checker: ts.TypeChecker,
+  projectPath: string
+): CallSite {
+  const argumentsList = genericCallArguments(carrier, checker);
+  if (ts.isObjectLiteralExpression(payload)) {
+    for (const property of payload.properties) {
+      if (ts.isSpreadAssignment(property)) {
+        argumentsList.push(callArgument(
+          "payload...spread",
+          property.expression,
+          checker
+        ));
+        continue;
+      }
+      const expression = ts.isPropertyAssignment(property)
+        ? property.initializer
+        : ts.isShorthandPropertyAssignment(property)
+          ? property.name
+          : undefined;
+      if (expression) {
+        argumentsList.push(callArgument(
+          `payload.${propertyNameText(property.name)}`,
+          expression,
+          checker
+        ));
+      }
+    }
+  }
+  return {
+    kind: "indirect",
+    location: locationOf(carrier, projectPath),
+    enclosing_callable: callableName(findEnclosingCallable(carrier)),
+    arguments: argumentsList,
+    provided_parameters: argumentsList.map((item) => item.parameter),
+    omitted_parameters: [],
+    preconditions: collectPreconditions(carrier),
+    invocation: carrier.getText().slice(0, 1_000),
+    target_path: pathParts.length > 0 ? pathParts.join(".") : "<argument>",
+    payload_expression: payload.getText().slice(0, 1_000)
+  };
+}
+
+function genericCallArguments(
+  node: ts.CallExpression | ts.NewExpression,
+  checker: ts.TypeChecker
+): CallArgument[] {
+  const signature = checker.getResolvedSignature(node);
+  const parameters = signature?.getParameters() ?? [];
+  return [...(node.arguments ?? [])].map((argument, index) => callArgument(
+    parameters[index]?.getName() ?? `arg${index + 1}`,
+    argument,
+    checker
+  ));
+}
+
+function callArgument(
+  parameter: string,
+  expression: ts.Expression,
+  checker: ts.TypeChecker
+): CallArgument {
+  return {
+    parameter,
+    expression: expression.getText().slice(0, 500),
+    inferred_type: checker.typeToString(
+      checker.getTypeAtLocation(expression),
+      expression,
+      ts.TypeFormatFlags.NoTruncation
+    ),
+    provided: true
+  };
+}
+
+function propertyNameText(name: ts.PropertyName | undefined): string {
+  if (!name) return "<unknown>";
+  if (ts.isStringLiteral(name) || ts.isNumericLiteral(name)) return name.text;
+  return name.getText();
+}
+
+function collectOutgoingCalls(
+  declarations: readonly ts.Declaration[],
+  checker: ts.TypeChecker,
+  projectPath: string
+): OutgoingCall[] {
+  const calls: OutgoingCall[] = [];
+  const seen = new Set<string>();
+  for (const declaration of declarations) {
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
+        const location = locationOf(node, projectPath);
+        const key = `${location.file}:${location.line}:${location.column}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          calls.push({
+            kind: ts.isNewExpression(node) ? "new" : "call",
+            location,
+            enclosing_callable: callableName(findEnclosingCallable(node)),
+            callee: node.expression.getText().slice(0, 500),
+            invocation: node.getText().slice(0, 1_000),
+            arguments: genericCallArguments(node, checker),
+            preconditions: collectPreconditions(node)
+          });
+        }
+      } else if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) {
+        const location = locationOf(node, projectPath);
+        const key = `${location.file}:${location.line}:${location.column}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          const jsxCall = buildJsxCallSite(node, [], checker, projectPath);
+          calls.push({
+            kind: "jsx",
+            location,
+            enclosing_callable: jsxCall.enclosing_callable,
+            callee: node.tagName.getText().slice(0, 500),
+            invocation: jsxCall.invocation,
+            arguments: jsxCall.arguments,
+            preconditions: jsxCall.preconditions
+          });
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(declaration);
+  }
+  return calls;
+}
+
+function findEnclosingCallableAtLocation(
+  sources: ts.SourceFile[],
+  location: SourceLocation,
+  projectPath: string
+): ts.Node | undefined {
+  const source = sources.find((item) => relative(projectPath, item.fileName) === location.file);
+  if (!source) return undefined;
+  const position = source.getPositionOfLineAndCharacter(location.line - 1, location.column - 1);
+  let found: ts.Node | undefined;
+  const visit = (node: ts.Node): void => {
+    if (position < node.getStart(source) || position >= node.end) return;
+    const callable = findEnclosingCallable(node);
+    if (callable) found = callable;
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return found;
 }
 
 function buildPublicWrapper(

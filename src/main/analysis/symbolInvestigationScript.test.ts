@@ -48,7 +48,7 @@ describe("investigateSymbolContract", () => {
       pageSize: 100
     });
 
-    expect(report.sections_completed).toEqual(["contract", "calls", "wrappers", "references"]);
+    expect(report.sections_completed).toEqual(["contract", "calls", "wrappers", "references", "effects"]);
     expect(report.all_pages_consumed).toBe(true);
     expect(report.calls.coverage).toMatchObject({
       total: 106,

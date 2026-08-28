@@ -117,7 +117,7 @@ function handoffFor(phase: "investigate" | "prepare" | "implement" | "verify") {
           symbol: "target",
           analysis_method: "investigation-script",
           method_reason: "",
-          analyzer_sections: ["contract", "calls", "wrappers", "references"],
+          analyzer_sections: ["contract", "calls", "wrappers", "references", "effects"],
           all_pages_consumed: true,
           definition: "src/target.ts:1",
           inputs: ["input at src/target.ts:1"],

@@ -29,6 +29,7 @@ import {
   reconcileHierarchicalInvestigateReferenceHandoff,
   reconcileHierarchicalIntegratorContractResults,
   reconcileHierarchicalPrepareContractHandoff,
+  reconcileHierarchicalPrepareBehaviorFingerprints,
   reconcileHierarchicalPrepareObligationEvidence,
   recordFeatureCensusReceipt,
   validateHierarchicalBehaviorObligationContinuity,
@@ -544,7 +545,7 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       const callContract = handoff.call_contract as { analyzed_targets: Array<Record<string, unknown>> };
       callContract.analyzed_targets[0]!.analysis_method = "investigation-script";
       callContract.analyzed_targets[0]!.method_reason = "";
-      callContract.analyzed_targets[0]!.analyzer_sections = ["contract", "calls", "wrappers", "references"];
+      callContract.analyzed_targets[0]!.analyzer_sections = ["contract", "calls", "wrappers", "references", "effects"];
       callContract.analyzed_targets[0]!.all_pages_consumed = true;
       callContract.analyzed_targets[1]!.target_file = "target.ts";
       callContract.analyzed_targets[1]!.symbol = "missingReference";
@@ -885,7 +886,7 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     try {
       await writeFile(path.join(projectPath, "entry.ts"), [
         "import { reference } from './reference.js';",
-        "export const existingRoute = reference;"
+        "export function existingRoute(input: string) { return reference(input); }"
       ].join("\n"));
       await writeFile(path.join(projectPath, "reference.ts"), [
         "export function reference(input: string) { return input; }",
@@ -973,6 +974,12 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
         structured,
         stageId
       );
+      reconcileHierarchicalPrepareBehaviorFingerprints(
+        session,
+        operation,
+        structured,
+        stageId
+      );
 
       const targets = (
         prepareHandoff.call_contract as { analyzed_targets: Array<Record<string, unknown>> }
@@ -1000,6 +1007,202 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
         }],
         stageId
       )).not.toThrow();
+    } finally {
+      await rm(projectPath, { recursive: true, force: true });
+    }
+  });
+
+  it("re-extracts final behavior fingerprints and rejects argument drift", async () => {
+    const projectPath = await mkdtemp(path.join(os.tmpdir(), "ai-coder-behavior-fingerprint-"));
+    try {
+      await writeFile(path.join(projectPath, "target.ts"),
+        "export function Target(props: { mode: string }) { return props.mode; }\n");
+      const routes = (
+        mode: string,
+        includeEnabledGuard = true,
+        directInvocation = false
+      ) => [
+        "import { Target } from './target.js';",
+        "",
+        "export function dispatch(token: string, enabled: boolean, runner: (value: unknown) => void) {",
+        "  if (token === 'OLD' && enabled) {",
+        "    runner({ handler: Target, params: { mode: 'safe' } });",
+        "  }",
+        `  if (token === 'NEW'${includeEnabledGuard ? " && enabled" : ""}) {`,
+        directInvocation
+          ? `    Target({ mode: '${mode}' });`
+          : `    runner({ handler: Target, params: { mode: '${mode}' } });`,
+        "  }",
+        "}"
+      ].join("\n");
+      await writeFile(path.join(projectPath, "routes.ts"), routes("safe"));
+
+      const session = { ...createSession(), project_path: projectPath };
+      const state = createHierarchicalExecutionState(session.task_prompt);
+      state.requirements = [{
+        id: "R1",
+        source_anchor: "user:R1",
+        observable_result: "pageName 'NEW' routes to Target",
+        acceptance: [{
+          id: "R1-A1",
+          criterion: "pageName 'NEW' routes to Target",
+          status: "pending",
+          evidence_refs: []
+        }],
+        dependencies: [],
+        status: "active",
+        evidence_refs: []
+      }];
+      const investigateHandoff = handoffFor("investigate", "routes.ts", "routes.ts", true) as Record<string, unknown>;
+      (investigateHandoff.target_mappings as Array<Record<string, unknown>>)[0] = {
+        target_key: "NEW",
+        requested_token: "NEW",
+        canonical_token: "NEW",
+        dispatcher_location: "routes.ts:3",
+        contract_symbol: "Target",
+        contract_location: "target.ts:1",
+        evidence_refs: ["routes.ts:3", "target.ts:1"]
+      };
+      const reference = investigateHandoff.reference_analysis as {
+        candidates: Array<Record<string, unknown>>;
+        target_selections: Array<Record<string, unknown>>;
+      };
+      reference.candidates = [{
+        ...reference.candidates[0],
+        target_key: "NEW",
+        location: "routes.ts:5",
+        contract_symbol: "Target",
+        contract_location: "target.ts:1",
+        destination: "Target",
+        invocation: "runner({ handler: Target, params: { mode: 'safe' } })",
+        evidence_refs: ["routes.ts:5", "target.ts:1"]
+      }];
+      reference.target_selections = [{
+        target_key: "NEW",
+        selected_location: "routes.ts:5",
+        selection_reason: "existing entry reaches the same target",
+        no_reference_reason: ""
+      }];
+      state.phase_artifacts = [{
+        id: "R1:investigate:artifact",
+        work_unit_id: "R1:investigate",
+        requirement_id: "R1",
+        phase: "investigate",
+        attempt: 1,
+        summary: "reference selected",
+        handoff: investigateHandoff,
+        evidence_refs: ["routes.ts:5", "target.ts:1"],
+        knowledge_revision: 0,
+        workspace_revision: 0,
+        created_at: state.created_at
+      }];
+      session.hierarchical_state = state;
+
+      const prepareHandoff = handoffFor("prepare", "routes.ts", "routes.ts") as Record<string, unknown>;
+      (prepareHandoff.call_contract as { analyzed_targets: unknown[] }).analyzed_targets = [{
+        target_file: "target.ts",
+        symbol: "Target"
+      }];
+      const structured = {
+        status: "passed",
+        summary: "prepared",
+        evidence_refs: ["routes.ts:5", "target.ts:1"],
+        allowed_files: ["routes.ts"],
+        handoff: prepareHandoff
+      };
+      const prepareStageId = "hierarchical:R1/prepare";
+      session.tool_calls = [{
+        id: "target-contract",
+        stage_id: prepareStageId,
+        tool: "mcp__ai_coder__investigate_symbol_contract",
+        input: { target_file: "target.ts", symbol: "Target", target_line: 1 },
+        status: "completed",
+        created_at: new Date().toISOString()
+      }];
+      const prepareOperation = {
+        kind: "run_phase" as const,
+        requirement_id: "R1",
+        work_unit_id: "R1:prepare",
+        phase: "prepare" as const,
+        role: "implementation-preparer"
+      };
+      reconcileHierarchicalPrepareContractHandoff(
+        session,
+        prepareOperation,
+        structured,
+        prepareStageId
+      );
+      expect(reconcileHierarchicalPrepareBehaviorFingerprints(
+        session,
+        prepareOperation,
+        structured,
+        prepareStageId
+      )).toEqual(expect.arrayContaining([
+        "destination",
+        "invocation",
+        "arguments",
+        "preconditions",
+        "context",
+        "side_effects"
+      ]));
+      state.phase_artifacts.push({
+        id: "R1:prepare:artifact",
+        work_unit_id: "R1:prepare",
+        requirement_id: "R1",
+        phase: "prepare",
+        attempt: 1,
+        summary: "behavior frozen",
+        handoff: prepareHandoff,
+        evidence_refs: ["routes.ts:5", "target.ts:1"],
+        knowledge_revision: 0,
+        workspace_revision: 0,
+        created_at: state.created_at
+      });
+      const verifyOperation = {
+        kind: "run_phase" as const,
+        requirement_id: "R1",
+        work_unit_id: "R1:verify",
+        phase: "verify" as const,
+        role: "independent-verifier"
+      };
+      const verifyEvent = [{
+        type: "phase_passed" as const,
+        work_unit_id: "R1:verify",
+        summary: "verified",
+        handoff: handoffFor("verify"),
+        evidence_refs: ["routes.ts:8"]
+      }];
+
+      expect(() => validateHierarchicalContractToolEvidence(
+        session,
+        verifyOperation,
+        verifyEvent,
+        "hierarchical:R1/verify"
+      )).not.toThrow();
+
+      await writeFile(path.join(projectPath, "routes.ts"), routes("fast"));
+      expect(() => validateHierarchicalContractToolEvidence(
+        session,
+        verifyOperation,
+        verifyEvent,
+        "hierarchical:R1/verify"
+      )).toThrow(/NEW\/arguments/);
+
+      await writeFile(path.join(projectPath, "routes.ts"), routes("safe", false));
+      expect(() => validateHierarchicalContractToolEvidence(
+        session,
+        verifyOperation,
+        verifyEvent,
+        "hierarchical:R1/verify"
+      )).toThrow(/NEW\/preconditions/);
+
+      await writeFile(path.join(projectPath, "routes.ts"), routes("safe", true, true));
+      expect(() => validateHierarchicalContractToolEvidence(
+        session,
+        verifyOperation,
+        verifyEvent,
+        "hierarchical:R1/verify"
+      )).toThrow(/NEW\/invocation/);
     } finally {
       await rm(projectPath, { recursive: true, force: true });
     }
