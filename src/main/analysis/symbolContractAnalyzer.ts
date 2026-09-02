@@ -15,6 +15,50 @@ export interface AnalyzeSymbolContractInput {
   limit?: number;
 }
 
+export interface EnclosingCallableDefinition {
+  symbol: string;
+  file: string;
+  line: number;
+  column: number;
+}
+
+/** Resolve the smallest JS/TS callable whose source span owns a branch/call line. */
+export function resolveEnclosingCallableDefinition(
+  projectPath: string,
+  targetFile: string,
+  targetLine: number
+): EnclosingCallableDefinition | undefined {
+  const project = path.resolve(projectPath);
+  const absoluteFile = path.isAbsolute(targetFile)
+    ? path.resolve(targetFile)
+    : path.resolve(project, targetFile);
+  if (absoluteFile !== project && !absoluteFile.startsWith(`${project}${path.sep}`)) {
+    throw new Error("目标文件必须位于项目目录内");
+  }
+  const source = ts.createSourceFile(
+    absoluteFile,
+    readFileSync(absoluteFile, "utf8"),
+    ts.ScriptTarget.Latest,
+    true,
+    scriptKindForFile(absoluteFile)
+  );
+  let selected: ts.Node | undefined;
+  const visit = (node: ts.Node): void => {
+    const startLine = source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1;
+    const endLine = source.getLineAndCharacterOfPosition(Math.max(node.getStart(source), node.end - 1)).line + 1;
+    if (targetLine < startLine || targetLine > endLine) return;
+    const name = isCallableNode(node) ? callableName(node) : null;
+    if (name && name !== "<anonymous>") selected = node;
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  if (!selected) return undefined;
+  const symbol = callableName(selected);
+  if (!symbol) return undefined;
+  const location = locationOf(selected, project);
+  return { symbol, ...location };
+}
+
 interface SourceLocation {
   file: string;
   line: number;
@@ -1216,6 +1260,16 @@ function findEnclosingCallable(node: ts.Node): ts.Node | undefined {
   return undefined;
 }
 
+function isCallableNode(node: ts.Node): boolean {
+  return ts.isFunctionDeclaration(node)
+    || ts.isFunctionExpression(node)
+    || ts.isArrowFunction(node)
+    || ts.isMethodDeclaration(node)
+    || ts.isConstructorDeclaration(node)
+    || ts.isGetAccessorDeclaration(node)
+    || ts.isSetAccessorDeclaration(node);
+}
+
 function callableName(node: ts.Node | undefined): string | null {
   if (!node) return null;
   if ("name" in node && node.name && ts.isIdentifier(node.name as ts.Node)) {
@@ -1223,9 +1277,16 @@ function callableName(node: ts.Node | undefined): string | null {
   }
   if (
     (ts.isArrowFunction(node) || ts.isFunctionExpression(node))
-    && ts.isVariableDeclaration(node.parent)
+    && (ts.isVariableDeclaration(node.parent) || ts.isPropertyDeclaration(node.parent))
   ) {
     return node.parent.name.getText();
+  }
+  if (
+    (ts.isArrowFunction(node) || ts.isFunctionExpression(node))
+    && ts.isBinaryExpression(node.parent)
+    && node.parent.operatorToken.kind === ts.SyntaxKind.EqualsToken
+  ) {
+    return node.parent.left.getText();
   }
   return ts.isConstructorDeclaration(node) ? "constructor" : "<anonymous>";
 }

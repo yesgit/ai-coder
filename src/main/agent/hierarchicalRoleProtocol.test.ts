@@ -85,6 +85,8 @@ function handoffFor(phase: "investigate" | "prepare" | "implement" | "verify") {
           target_key: "route",
           reference_kind: "same-feature-entry",
           location: "src/reference.ts:5",
+          entry_symbol: "reference",
+          entry_location: "src/reference.ts:5",
           contract_location: "src/reference.ts:5",
           contract_symbol: "reference",
           feature_equivalence: ["same user-visible feature at src/reference.ts:5"],
@@ -432,6 +434,29 @@ describe("hierarchicalRoleProtocol", () => {
     })).toThrow("逐目标说明 no_reference_reason");
   });
 
+  it("accepts a compact investigate candidate and leaves behavior dimensions to host capabilities", () => {
+    const operation = {
+      kind: "run_phase" as const,
+      requirement_id: "R1",
+      work_unit_id: "R1:investigate",
+      phase: "investigate" as const,
+      role: "code-investigator"
+    };
+    const handoff = handoffFor("investigate") as Record<string, unknown>;
+    const reference = handoff.reference_analysis as { candidates: Array<Record<string, unknown>> };
+    for (const field of [
+      "similarity", "reusable_behavior", "differences", "destination", "invocation",
+      "arguments", "preconditions", "context_forwarding", "side_effects"
+    ]) delete reference.candidates[0]![field];
+
+    expect(() => parseHierarchicalRoleResult(operation, {
+      status: "passed",
+      summary: "compact reference edge selected",
+      evidence_refs: ["src/target.ts:1", "src/reference.ts:5"],
+      handoff
+    })).not.toThrow();
+  });
+
   it("surfaces every investigate reference-analysis violation in one fail-collect rejection", () => {
     const operation = {
       kind: "run_phase" as const,
@@ -697,7 +722,7 @@ describe("hierarchicalRoleProtocol", () => {
       phase: "prepare",
       role: "implementation-preparer"
     });
-    expect(spec.tools).toContain("mcp__ai_coder__investigate_symbol_contract");
+    expect(spec.tools).not.toContain("mcp__ai_coder__investigate_symbol_contract");
     expect(spec.tools).not.toContain("mcp__ai_coder__analyze_symbol_contract");
 
     const handoff = handoffFor("prepare") as Record<string, unknown>;
@@ -767,6 +792,7 @@ describe("hierarchicalRoleProtocol", () => {
     const spec = buildHierarchicalRoleSpec(session, workflow, operation);
     expect(spec.prompt).toContain("本阶段最终输出骨架（开始工作前即生效）");
     expect(spec.prompt).toContain("destination/invocation/arguments/preconditions/context/side_effects");
+    expect(spec.prompt).toContain("callsite_reviews");
     expect(spec.prompt).toContain("不要等到工作完成后再猜字段嵌套");
 
     const handoff = handoffFor("prepare") as Record<string, unknown>;
@@ -779,6 +805,93 @@ describe("hierarchicalRoleProtocol", () => {
       handoff,
       allowed_files: ["src/target.ts"]
     })).toThrow("缺少行为维度：preconditions");
+  });
+
+  it("accepts LSP topology only when semantic boundaries remain explicit", () => {
+    const operation = {
+      kind: "run_phase" as const,
+      requirement_id: "R1",
+      work_unit_id: "R1:prepare",
+      phase: "prepare" as const,
+      role: "implementation-preparer"
+    };
+    const handoff = handoffFor("prepare") as Record<string, unknown>;
+    const targets = (handoff.call_contract as { analyzed_targets: Array<Record<string, unknown>> })
+      .analyzed_targets;
+    Object.assign(targets[0]!, {
+      analysis_method: "language-adapter",
+      method_reason: "LSP only proves call topology",
+      analyzer_sections: ["definition", "incoming-calls", "outgoing-calls"],
+      all_pages_consumed: true,
+      unresolved: ["arguments and guards require source inspection; src/target.ts:1"],
+      adapter_id: "python-pyright-call-hierarchy",
+      adapter_report_digest: "a".repeat(64),
+      runtime_verification_required: true
+    });
+    const result = {
+      status: "passed",
+      summary: "topology frozen and semantics inspected",
+      evidence_refs: ["src/target.ts:1"],
+      handoff,
+      allowed_files: ["src/target.ts"]
+    };
+
+    expect(() => parseHierarchicalRoleResult(operation, result)).not.toThrow();
+    targets[0]!.runtime_verification_required = false;
+    expect(() => parseHierarchicalRoleResult(operation, result))
+      .toThrow("runtime_verification_required=true");
+  });
+
+  it("requires a conservative and balanced per-callsite semantic ledger", () => {
+    const operation = {
+      kind: "run_phase" as const,
+      requirement_id: "R1",
+      work_unit_id: "R1:prepare",
+      phase: "prepare" as const,
+      role: "implementation-preparer"
+    };
+    const handoff = handoffFor("prepare") as Record<string, unknown>;
+    const target = (handoff.call_contract as { analyzed_targets: Array<Record<string, unknown>> })
+      .analyzed_targets[0]!;
+    target.callsite_reviews = [{
+      schema_version: 1,
+      callsite_id: "ref:entry",
+      target_file: "src/target.ts",
+      symbol: "target",
+      evidence_ref: "src/reference.ts:5",
+      review_basis: "host-exact+source",
+      disposition: "relevant",
+      summary: "entry invokes target",
+      destination: "target@src/target.ts",
+      invocation: "direct call",
+      arguments: ["value=1"],
+      preconditions: ["authenticated"],
+      context: ["navigator forwarded"],
+      side_effects: ["navigation"],
+      unresolved: [],
+      evidence_refs: ["src/reference.ts:5"],
+      definition_digest: "definition-digest",
+      host_fingerprint_digest: "digest"
+    }];
+    target.callsite_accounting = {
+      total: 1,
+      reviewed: 1,
+      relevant: 1,
+      irrelevant: 0,
+      unresolved: 0,
+      accounted: true
+    };
+    const result = {
+      status: "passed",
+      summary: "callsite ledger complete",
+      evidence_refs: ["src/reference.ts:5"],
+      handoff,
+      allowed_files: ["src/target.ts"]
+    };
+
+    expect(() => parseHierarchicalRoleResult(operation, result)).not.toThrow();
+    (target.callsite_accounting as Record<string, unknown>).reviewed = 0;
+    expect(() => parseHierarchicalRoleResult(operation, result)).toThrow("调用点调查未闭合");
   });
 
   it("supports a proven no-op without issuing a write lease", () => {

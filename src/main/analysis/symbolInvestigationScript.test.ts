@@ -129,4 +129,66 @@ describe("investigateSymbolContract", () => {
       "未加载有效 TypeScript 项目配置，符号解析采用语法回退。"
     );
   });
+
+  it("lifts a routed component reference to navigator.push with params and guards", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "symbol-investigation-component-route-"));
+    await writeFile(path.join(root, "tsconfig.json"), JSON.stringify({
+      compilerOptions: {
+        strict: true,
+        target: "ES2022",
+        module: "NodeNext",
+        moduleResolution: "NodeNext"
+      },
+      include: ["*.ts"]
+    }));
+    await writeFile(path.join(root, "target.ts"), [
+      "export function TargetPage(props: { navigator: unknown; dispatch: unknown }) {",
+      "  return props;",
+      "}"
+    ].join("\n"));
+    await writeFile(path.join(root, "entry.ts"), [
+      "import { TargetPage } from './target.js';",
+      "declare const navigator: { push(route: unknown): void };",
+      "declare const dispatch: unknown;",
+      "declare function isLoggedIn(): boolean;",
+      "declare function isRealName(): boolean;",
+      "export function openTarget() {",
+      "  if (!isLoggedIn()) return;",
+      "  if (!isRealName()) return;",
+      "  const route = {",
+      "    component: TargetPage,",
+      "    params: { navigator, dispatch, productType: '零钱宝' }",
+      "  };",
+      "  navigator.push(route);",
+      "}"
+    ].join("\n"));
+
+    const report = investigateSymbolContract({
+      projectPath: root,
+      targetFile: "target.ts",
+      symbol: "TargetPage"
+    });
+    const routed = report.behavior_fingerprints.find((fingerprint) => (
+      fingerprint.invocation.kind === "indirect"
+      && fingerprint.invocation.callee === "navigator.push"
+    ));
+
+    expect(routed).toBeDefined();
+    expect(routed?.invocation.target_path).toBe("component");
+    expect(routed?.arguments).toMatchObject({
+      "payload.component": "TargetPage",
+      "payload.params": "{ navigator, dispatch, productType: '零钱宝' }"
+    });
+    expect(routed?.preconditions).toEqual(expect.arrayContaining([
+      expect.stringContaining("isLoggedIn"),
+      expect.stringContaining("isRealName")
+    ]));
+    expect(routed?.context).toEqual(expect.arrayContaining([
+      "navigator", "dispatch", "isLoggedIn", "isRealName"
+    ]));
+    expect(routed?.side_effects).toEqual(expect.arrayContaining([
+      "delivers:component",
+      "indirect:navigator.push"
+    ]));
+  });
 });

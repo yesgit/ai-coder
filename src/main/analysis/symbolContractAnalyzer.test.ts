@@ -2,7 +2,10 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { analyzeSymbolContract } from "./symbolContractAnalyzer.js";
+import {
+  analyzeSymbolContract,
+  resolveEnclosingCallableDefinition
+} from "./symbolContractAnalyzer.js";
 
 async function createFixture(): Promise<string> {
   const root = await mkdtemp(path.join(tmpdir(), "symbol-contract-"));
@@ -47,6 +50,36 @@ export const registeredAction = Action;
 }
 
 describe("analyzeSymbolContract", () => {
+  it("resolves a dispatcher branch to its named owner, including class-field arrows", async () => {
+    const root = await createFixture();
+    await writeFile(path.join(root, "routes.ts"), `
+export function dispatch(page: string) {
+  [page].forEach((candidate) => {
+    if (candidate === "target") open(candidate);
+  });
+}
+
+export class ScreenRoutes {
+  openTarget = (enabled: boolean) => {
+    if (enabled) navigator.push({ component: Target });
+  };
+}
+`);
+
+    expect(resolveEnclosingCallableDefinition(root, "routes.ts", 4)).toMatchObject({
+      symbol: "dispatch",
+      file: "routes.ts",
+      line: 2
+    });
+    expect(resolveEnclosingCallableDefinition(root, "routes.ts", 10)).toMatchObject({
+      symbol: "openTarget",
+      file: "routes.ts",
+      line: 9
+    });
+    expect(() => resolveEnclosingCallableDefinition(root, "../outside.ts", 1))
+      .toThrow("目标文件必须位于项目目录内");
+  });
+
   it("collects the target contract, all call combinations, guards, wrappers and indirect references", async () => {
     const root = await createFixture();
     const result = analyzeSymbolContract({

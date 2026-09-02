@@ -13,10 +13,14 @@ import {
   censusFeatureImplementationsInWorker,
   type FeatureCensusWorkerResult
 } from "../analysis/featureImplementationCensusWorkerClient.js";
-import { analyzeSymbolContract } from "../analysis/symbolContractAnalyzer.js";
+import {
+  analyzeSymbolContract,
+  resolveEnclosingCallableDefinition
+} from "../analysis/symbolContractAnalyzer.js";
 import {
   BEHAVIOR_DIMENSIONS,
   behaviorDimensionValue,
+  buildOutgoingBehaviorFingerprint,
   canonicalBehaviorValue,
   type BehaviorDimension,
   type BehaviorFingerprint
@@ -27,6 +31,7 @@ import {
   investigateSymbolContract,
   type SymbolInvestigationReport
 } from "../analysis/symbolInvestigationScript.js";
+import { TYPESCRIPT_JAVASCRIPT_ADAPTER } from "../analysis/languageAnalysisAdapter.js";
 import {
   approveOrDenyToolUse,
   assertPathInsideProject,
@@ -47,6 +52,16 @@ import {
   buildHierarchicalPlannerCoverageContract,
   extractBusinessSequenceNumbers
 } from "../workflows/hierarchicalPlannerCoverage.js";
+import {
+  buildWorkflowCapabilityAgentSpec,
+  discoverWorkflowCapabilityRequests,
+  executeWorkflowCapability,
+  validateWorkflowCapabilityAgentResult,
+  workflowCapabilityExecutionMode,
+  CALLSITE_SEMANTIC_REVIEW_CAPABILITY,
+  SYMBOL_CONTRACT_CAPABILITY,
+  type WorkflowCapabilityResult
+} from "../workflows/workflowCapabilities.js";
 import { buildStageInstructions } from "./workflowPrompt.js";
 import { buildStageOutputFormat } from "./stageOutputFormat.js";
 import { evaluateHook, checkCommandSafety, checkCallsiteInvestigationGate } from "./stageHookEnforcer.js";
@@ -294,6 +309,8 @@ export class ClaudeAgentRunner {
 
     try {
       for (let iteration = 0; iteration < maxHierarchicalTransitions; iteration += 1) {
+        const capabilitySync = buildHierarchicalCapabilitySyncEvent(input.session.hierarchical_state);
+        if (capabilitySync) this.applyHierarchicalEvents(input.session, [capabilitySync]);
         const state = input.session.hierarchical_state;
         if (!state) throw new Error("分层循环状态意外丢失");
 
@@ -321,6 +338,71 @@ export class ClaudeAgentRunner {
             requirement_id: operation.requirement_id
           }]);
           await this.recordProgress(input, "runner", `需求 ${operation.requirement_id} 已由逐项验收证据关闭。`, "milestone");
+          continue;
+        }
+
+        if (operation.kind === "run_capability") {
+          input.session.current_stage = `${operation.requirement_id}/${operation.parent_phase}/${operation.capability}`;
+          const capabilityNode = state.capability_nodes.find((node) => node.id === operation.node_id);
+          if (capabilityNode?.status !== "running") {
+            this.applyHierarchicalEvents(input.session, [{
+              type: "capability_started",
+              node_id: operation.node_id
+            }]);
+          }
+          await this.recordProgress(
+            input,
+            "runner",
+            `宿主执行 capability 节点：${operation.node_id}（attempt ${operation.attempt}）`,
+            "milestone"
+          );
+          try {
+            const result = workflowCapabilityExecutionMode(operation.capability) === "agent"
+              ? await this.runAgentWorkflowCapabilityQuery(input, operation, abortController)
+              : await executeWorkflowCapability(
+                  operation.capability,
+                  input.session.project_path,
+                  operation.input
+                );
+            this.applyHierarchicalEvents(input.session, [{
+              type: "capability_passed",
+              node_id: operation.node_id,
+              output: result.output,
+              evidence_refs: result.evidence_refs
+            }]);
+            await this.recordProgress(
+              input,
+              "runner",
+              `capability 节点完成：${operation.node_id}`,
+              "milestone"
+            );
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            const fingerprint = hierarchicalErrorFingerprint(operation.node_id, message);
+            const route = operation.attempt >= 3 ? "blocked" : "retry";
+            this.applyHierarchicalEvents(input.session, [{
+              type: "capability_failed",
+              node_id: operation.node_id,
+              reason: message,
+              route,
+              error_fingerprint: fingerprint
+            }]);
+            await this.recordProgress(
+              input,
+              "status",
+              route === "retry"
+                ? `capability 节点失败，仅重试该节点（${operation.attempt}/3）：${message}`
+                : `capability 节点连续失败，停止该节点：${message}`,
+              "milestone"
+            );
+            if (route === "blocked") {
+              this.raiseHierarchicalHostBlocker(input.session, "agent_failed", error, {
+                requirementId: operation.requirement_id,
+                workUnitId: operation.node_id,
+                fingerprint
+              });
+            }
+          }
           continue;
         }
 
@@ -512,7 +594,11 @@ export class ClaudeAgentRunner {
             const sameFailureLimit = selfHealRoute === "retry" && roleOperation.phase !== "investigate"
               ? 6
               : 3;
-            const recoveryRoute = repeats >= 3
+            const missingCapabilityDependency = roleOperation.phase === "prepare"
+              && /选中的同功能入口尚未解析为真实调用边|选中的同功能入口缺少 entry_symbol|同功能入口对应的真实函数\/组件/.test(message);
+            const recoveryRoute = missingCapabilityDependency
+              ? "investigate"
+              : repeats >= 3
               ? selfHealRoute
               : "retry";
             this.applyHierarchicalEvents(input.session, [{
@@ -562,7 +648,7 @@ export class ClaudeAgentRunner {
                 `当前 investigate 工作单元 attempt ${failedAttempt} 连续 ${repeats} 次遇到同类问题；无前置阶段可退回，宿主升级为阻塞并保留诊断：${message}`,
                 "milestone"
               );
-            } else if (repeats >= 3 && recoveryRoute !== "retry") {
+            } else if ((repeats >= 3 || missingCapabilityDependency) && recoveryRoute !== "retry") {
               await this.recordProgress(
                 input,
                 "status",
@@ -625,6 +711,85 @@ export class ClaudeAgentRunner {
         this.abortControllers.delete(input.session.id);
       }
     }
+  }
+
+  private async runAgentWorkflowCapabilityQuery(
+    input: AgentRunInput,
+    operation: Extract<HierarchicalNextOperation, { kind: "run_capability" }>,
+    abortController: AbortController
+  ): Promise<WorkflowCapabilityResult> {
+    const spec = buildWorkflowCapabilityAgentSpec(operation.capability, operation.input);
+    const query = await this.resolveQuery();
+    const claudeCodeExecutable = resolveBundledClaudeCodeExecutable();
+    const sdkMessages: unknown[] = [];
+    const sdkStderr: string[] = [];
+    const stageId = `hierarchical:${operation.requirement_id}:capability:${operation.node_id}`;
+    const queryInstance = query({
+      prompt: spec.prompt,
+      options: {
+        cwd: input.session.project_path,
+        ...(claudeCodeExecutable ? { pathToClaudeCodeExecutable: claudeCodeExecutable } : {}),
+        env: buildClaudeSdkEnv(),
+        stderr: (chunk: string) => captureBoundedSdkStderr(sdkStderr, chunk),
+        abortController,
+        ...(this.options.pluginPaths?.length
+          ? { plugins: this.options.pluginPaths.map((pluginPath) => ({ type: "local" as const, path: pluginPath })) }
+          : {}),
+        tools: [],
+        disallowedTools: buildHierarchicalDisallowedClaudeTools(input.workflow),
+        permissionMode: "default",
+        settingSources: [],
+        outputFormat: spec.outputFormat
+      }
+    } as never);
+
+    let postResultProcessError: unknown;
+    try {
+      for await (const message of queryInstance) {
+        sdkMessages.push(message);
+        this.recordSdkToolUses(input.session, stageId, message);
+        this.recordToolExecutionResult(input.session, message);
+        const snippet = this.describeSdkMessage(message);
+        if (isMeaningfulSdkProgress(snippet)) {
+          await this.recordProgress(input, "sdk_message", snippet, "transient");
+        }
+        if (extractCorruptedStructuredOutputToolUse(message)) break;
+      }
+    } catch (error) {
+      const recoverable = extractRecoverableStructuredOutputToolInput(sdkMessages);
+      if (abortController.signal.aborted || (!hasSuccessfulSdkTerminalResult(sdkMessages) && !recoverable)) {
+        throw enrichClaudeSdkProcessError(error, sdkStderr);
+      }
+      postResultProcessError = error;
+    }
+    if (abortController.signal.aborted) throw new Error("调用点契约调查被中止");
+    const output = extractClaudeStageOutput(sdkMessages);
+    const recovered = output.structuredOutput === undefined
+      ? extractRecoverableStructuredOutputToolInput(sdkMessages)
+      : undefined;
+    if (output.error && !recovered) throw new Error(output.error);
+    const structured = normalizeHierarchicalStructuredContainers(
+      output.structuredOutput !== undefined
+        ? output.structuredOutput
+        : recovered ?? (output.resultText || output.assistantText)
+    );
+    const result = validateWorkflowCapabilityAgentResult(
+      operation.capability,
+      operation.input,
+      structured
+    );
+    if (postResultProcessError) {
+      const warning = postResultProcessError instanceof Error
+        ? postResultProcessError.message
+        : String(postResultProcessError);
+      await this.recordProgress(
+        input,
+        "status",
+        `调用点调查结果已保留；SDK 随后异常退出：${warning.slice(0, 160)}`,
+        "milestone"
+      );
+    }
+    return result;
   }
 
   private async runHierarchicalRoleQuery(
@@ -693,7 +858,7 @@ export class ClaudeAgentRunner {
         // a deliberately tool-free planner remains tool-free so retries cannot
         // drift into repository exploration or write workarounds.
         tools: buildHierarchicalSdkToolSurface(spec.tools),
-        disallowedTools: buildDisallowedClaudeTools(input.workflow),
+        disallowedTools: buildHierarchicalDisallowedClaudeTools(input.workflow),
         permissionMode: "default",
         settingSources: [],
         outputFormat: spec.outputFormat,
@@ -934,6 +1099,11 @@ export class ClaudeAgentRunner {
       stageId
     );
     reconcileHierarchicalPrepareObligationEvidence(input.session, operation, structured);
+    reconcileHierarchicalPrepareDerivedBehaviorContract(
+      input.session,
+      operation,
+      structured
+    );
     const reconciledIntegratorContracts = reconcileHierarchicalIntegratorContractResults(
       input.session,
       operation,
@@ -3432,8 +3602,9 @@ export class ClaudeAgentRunner {
       ) => unknown)(
         "locate_feature_implementation",
         [
-          "运行宿主持有的功能实现候选普查脚本。脚本先快速扫描范围内全部 TypeScript/JavaScript/React 文件，",
-          "再对独特证据命中文件执行受限语义分析，合并符号名、路径、定义正文和配置邻接候选，并以两跳调用图补充上下文；",
+          "运行宿主持有的功能实现候选普查脚本。脚本先快速扫描范围内全部 JavaScript/TypeScript/React/Python/Java 文件，",
+          "对独特证据命中的 JavaScript/TypeScript 文件执行受限语义分析，对 Python/Java 建立声明、定义范围和词面引用索引，合并符号名、路径、定义正文和配置邻接候选；",
+          "JavaScript/TypeScript 以两跳调用图补充上下文，Python/Java 的精确调用边在 prepare 前由 Pyright/JDT LS capability 确认；",
           "候选按多通道证据排序并携带宿主提取的定义上下文：短定义直接完整返回，大定义返回有摘要指纹的片段、完整行范围和项目内 Read 分页提示。",
           "宿主以项目和符号频率排除 pageName/linkType 等高频管道词，只把具有直接检索或配置邻接证据的符号列为候选；调用图用于补充上下文，不把所有可达包装器扩张成候选。",
           "语义结论依赖完整实现时必须读完整定义；首次成功返回后宿主锁定 feature/aliases/clues/scope，每次只需提交当前返回的高相关检索前沿 adjudications，宿主会在锁定查询内自动累计。批次中出现 yes 后剪枝低排名尾部；若本批全部为 no，自动展开下一批，直到 status=complete。"
@@ -3675,6 +3846,44 @@ export function validateHierarchicalContractToolEvidence(
     const symbol = optionalString(rawTarget.symbol);
     const method = optionalString(rawTarget.analysis_method);
     if (!targetFile || !symbol) continue;
+    validatePreparedCallsiteLedger(
+      session,
+      operation.requirement_id,
+      targetFile,
+      symbol,
+      rawTarget
+    );
+
+    if (method === "language-adapter") {
+      const targetPath = path.resolve(session.project_path, targetFile);
+      const capabilityNode = (session.hierarchical_state?.capability_nodes ?? []).find((node) => {
+        if (
+          node.capability !== SYMBOL_CONTRACT_CAPABILITY
+          || node.requirement_id !== operation.requirement_id
+          || node.status !== "passed"
+          || !isPlainObject(node.output?.analyzed_target)
+        ) return false;
+        const calledFile = optionalString(node.output.analyzed_target.target_file);
+        return Boolean(
+          calledFile
+          && path.resolve(session.project_path, calledFile) === targetPath
+          && optionalString(node.output.analyzed_target.symbol) === symbol
+        );
+      });
+      if (!capabilityNode) {
+        throw new Error(`目标 ${targetFile}#${symbol} 没有已通过的语言分析 capability 节点`);
+      }
+      if (
+        rawTarget.adapter_id !== capabilityNode.output?.adapter_id
+        || rawTarget.adapter_report_digest !== capabilityNode.output?.adapter_report_digest
+      ) {
+        throw new Error(`目标 ${targetFile}#${symbol} 的语言适配器摘要未正确回填`);
+      }
+      if (rawTarget.runtime_verification_required !== true) {
+        throw new Error(`目标 ${targetFile}#${symbol} 必须保留运行时验证边界`);
+      }
+      continue;
+    }
 
     if (method === "manual-static-analysis") {
       const absoluteTarget = path.resolve(session.project_path, targetFile);
@@ -3713,11 +3922,27 @@ export function validateHierarchicalContractToolEvidence(
         && optionalString(call.input.symbol) === symbol
       );
     });
-    if (calls.length === 0) {
+    const capabilityNode = (session.hierarchical_state?.capability_nodes ?? []).find((node) => {
+      if (
+        node.capability !== SYMBOL_CONTRACT_CAPABILITY
+        || node.requirement_id !== operation.requirement_id
+        || node.status !== "passed"
+      ) return false;
+      const calledFile = optionalString(node.input.target_file);
+      return Boolean(
+        calledFile
+        && path.resolve(session.project_path, calledFile) === targetPath
+        && optionalString(node.input.symbol) === symbol
+      );
+    });
+    if (calls.length === 0 && !capabilityNode) {
       throw new Error(`目标 ${targetFile}#${symbol} 未实际执行完整调用契约调查脚本`);
     }
 
-    const lastCallInput = calls[calls.length - 1]?.input;
+    const capabilityEffectiveInput = capabilityNode && isPlainObject(capabilityNode.output?.effective_input)
+      ? capabilityNode.output.effective_input
+      : capabilityNode?.input;
+    const lastCallInput = calls[calls.length - 1]?.input ?? capabilityEffectiveInput;
     const investigationInput = {
       projectPath: session.project_path,
       targetFile,
@@ -3796,6 +4021,74 @@ export function validateHierarchicalContractToolEvidence(
   assertPrepareBehaviorFingerprints(session, operation, passed, stageId);
 }
 
+function validatePreparedCallsiteLedger(
+  session: AgentSession,
+  requirementId: string,
+  targetFile: string,
+  symbol: string,
+  rawTarget: Record<string, unknown>
+): void {
+  const nodes = session.hierarchical_state?.capability_nodes ?? [];
+  const targetPath = path.resolve(session.project_path, targetFile);
+  const symbolNode = nodes.find((node) => {
+    if (
+      node.requirement_id !== requirementId
+      || node.capability !== SYMBOL_CONTRACT_CAPABILITY
+      || node.status !== "passed"
+    ) return false;
+    const nodeFile = optionalString(node.output?.target_file ?? node.input.target_file);
+    const nodeSymbol = optionalString(node.output?.symbol ?? node.input.symbol);
+    return Boolean(
+      nodeFile
+      && path.resolve(session.project_path, nodeFile) === targetPath
+      && nodeSymbol === symbol
+    );
+  });
+  if (!symbolNode || !isPlainObject(symbolNode.output?.callsite_inventory)) return;
+  const inventory = symbolNode.output.callsite_inventory;
+  const entries = Array.isArray(inventory.entries) ? inventory.entries.filter(isPlainObject) : [];
+  if (inventory.accounted !== true || inventory.total !== entries.length) {
+    throw new Error(`目标 ${targetFile}#${symbol} 的宿主调用点清单不守恒`);
+  }
+  const expectedIds = entries.map((entry) => optionalString(entry.callsite_id)).filter(Boolean) as string[];
+  if (new Set(expectedIds).size !== expectedIds.length) {
+    throw new Error(`目标 ${targetFile}#${symbol} 的宿主调用点 ID 重复`);
+  }
+  const reviewNodes = nodes.filter((node) => (
+    node.requirement_id === requirementId
+    && node.capability === CALLSITE_SEMANTIC_REVIEW_CAPABILITY
+    && node.status === "passed"
+    && optionalString(node.input.parent_symbol_node_id) === symbolNode.id
+  ));
+  const completedIds = reviewNodes.map((node) => optionalString(node.output?.callsite_id)).filter(Boolean) as string[];
+  const reviews = Array.isArray(rawTarget.callsite_reviews)
+    ? rawTarget.callsite_reviews.filter(isPlainObject)
+    : [];
+  const declaredIds = reviews.map((review) => optionalString(review.callsite_id)).filter(Boolean) as string[];
+  const missingNodes = expectedIds.filter((id) => !completedIds.includes(id));
+  const missingRows = expectedIds.filter((id) => !declaredIds.includes(id));
+  const unexpectedRows = declaredIds.filter((id) => !expectedIds.includes(id));
+  if (missingNodes.length > 0 || missingRows.length > 0 || unexpectedRows.length > 0) {
+    throw new Error([
+      `目标 ${targetFile}#${symbol} 的逐调用点 AI 调查未闭环`,
+      `missing_nodes=${missingNodes.join(",") || "none"}`,
+      `missing_rows=${missingRows.join(",") || "none"}`,
+      `unexpected_rows=${unexpectedRows.join(",") || "none"}`
+    ].join("；"));
+  }
+  const accounting = isPlainObject(rawTarget.callsite_accounting)
+    ? rawTarget.callsite_accounting
+    : null;
+  if (
+    !accounting
+    || accounting.accounted !== true
+    || accounting.total !== expectedIds.length
+    || accounting.reviewed !== expectedIds.length
+  ) {
+    throw new Error(`目标 ${targetFile}#${symbol} 的逐调用点分类账未守恒`);
+  }
+}
+
 interface FrozenBehaviorEnvelope {
   schema_version: 1;
   dimension: BehaviorDimension;
@@ -3840,25 +4133,69 @@ function assertVerifiedBehaviorFingerprints(
       continue;
     }
     const relativeFile = path.relative(session.project_path, contractFile).split(path.sep).join("/");
-    const reportKey = `${relativeFile}\0${contractSymbol}`;
-    let report = reports.get(reportKey);
-    if (!report) {
+    let actual: BehaviorFingerprint | undefined;
+    const dispatcherLocation = optionalString(mapping.dispatcher_location);
+    const dispatcherFile = dispatcherLocation
+      ? evidenceLocationFile(dispatcherLocation, session.project_path)
+      : null;
+    const dispatcherAnchor = dispatcherLocation
+      ? evidenceLocationAnchor(dispatcherLocation, session.project_path)
+      : null;
+    if (dispatcherFile && dispatcherAnchor && /\.[cm]?[jt]sx?$/i.test(dispatcherFile)) {
+      const dispatcherLine = Number(dispatcherAnchor.slice(dispatcherAnchor.lastIndexOf(":") + 1));
+      const dispatcherRelative = path.relative(session.project_path, dispatcherFile).split(path.sep).join("/");
       try {
-        report = investigateSymbolContract({
-          projectPath: session.project_path,
-          targetFile: relativeFile,
-          symbol: contractSymbol
-        });
-        reports.set(reportKey, report);
-      } catch (error) {
-        mismatches.push(
-          `${targetKey}: 无法重新调查最终契约 ${contractSymbol}@${relativeFile}：`
-          + (error instanceof Error ? error.message : String(error))
+        const owner = resolveEnclosingCallableDefinition(
+          session.project_path,
+          dispatcherRelative,
+          dispatcherLine
         );
-        continue;
+        if (owner) {
+          const reportKey = `${owner.file}\0${owner.symbol}`;
+          let dispatcherReport = reports.get(reportKey);
+          if (!dispatcherReport) {
+            dispatcherReport = investigateSymbolContract({
+              projectPath: session.project_path,
+              targetFile: owner.file,
+              symbol: owner.symbol,
+              targetLine: owner.line
+            });
+            reports.set(reportKey, dispatcherReport);
+          }
+          actual = selectImplementedOutgoingBehaviorFingerprint(
+            session,
+            mapping,
+            dispatcherReport,
+            relativeFile,
+            contractSymbol
+          );
+        }
+      } catch {
+        // Fall back to destination incoming-reference analysis below. Verify
+        // reports the usual missing-edge error if neither route is provable.
       }
     }
-    const actual = selectImplementedBehaviorFingerprint(session, mapping, report);
+    if (!actual) {
+      const reportKey = `${relativeFile}\0${contractSymbol}`;
+      let report = reports.get(reportKey);
+      if (!report) {
+        try {
+          report = investigateSymbolContract({
+            projectPath: session.project_path,
+            targetFile: relativeFile,
+            symbol: contractSymbol
+          });
+          reports.set(reportKey, report);
+        } catch (error) {
+          mismatches.push(
+            `${targetKey}: 无法重新调查最终契约 ${contractSymbol}@${relativeFile}：`
+            + (error instanceof Error ? error.message : String(error))
+          );
+          continue;
+        }
+      }
+      actual = selectImplementedBehaviorFingerprint(session, mapping, report);
+    }
     if (!actual) {
       mismatches.push(`${targetKey}: 最终工作区未找到与目标 token 对应的真实调用边`);
       continue;
@@ -3899,6 +4236,40 @@ function parseFrozenBehaviorEnvelope(value: string | undefined): FrozenBehaviorE
   } catch {
     return null;
   }
+}
+
+function selectImplementedOutgoingBehaviorFingerprint(
+  session: AgentSession,
+  mapping: Record<string, unknown>,
+  report: SymbolInvestigationReport,
+  contractFile: string,
+  contractSymbol: string
+): BehaviorFingerprint | undefined {
+  const tokens = uniqueStrings([
+    optionalString(mapping.requested_token) ?? "",
+    optionalString(mapping.canonical_token) ?? ""
+  ]);
+  const scored = report.effects.items.map((effect) => {
+    const searchable = canonicalBehaviorValue({
+      invocation: effect.invocation,
+      preconditions: effect.preconditions
+    });
+    const tokenMatch = tokens.some((token) => containsExactIdentifierOrLiteral(searchable, token));
+    const destinationMatch = containsExactIdentifierOrLiteral(effect.invocation, contractSymbol);
+    return {
+      effect,
+      score: (tokenMatch ? 10_000 : 0) + (destinationMatch ? 1_000 : 0)
+    };
+  }).filter(({ score }) => score >= 11_000)
+    .sort((left, right) => right.score - left.score);
+  if (scored.length === 0) return undefined;
+  if (scored.length > 1 && scored[0]!.score === scored[1]!.score) return undefined;
+  const effect = scored[0]!.effect;
+  return buildOutgoingBehaviorFingerprint({
+    reference_id: `implemented:${report.target.file}:${report.target.symbol}:${effect.location.line}:${effect.location.column}`,
+    target: { file: contractFile, symbol: contractSymbol },
+    call: effect
+  });
 }
 
 function selectImplementedBehaviorFingerprint(
@@ -4021,13 +4392,37 @@ function assertPrepareBehaviorFingerprints(
       : []
   ));
   if (selectedKeys.length === 0) return;
+  const candidates = Array.isArray(referenceAnalysis?.candidates)
+    ? referenceAnalysis.candidates.filter(isPlainObject)
+    : [];
+  const missingEntryMetadata = selectedKeys.filter((targetKey) => {
+    const selection = (Array.isArray(referenceAnalysis?.target_selections)
+      ? referenceAnalysis.target_selections.filter(isPlainObject)
+      : []).find((item) => optionalString(item.target_key) === targetKey);
+    const selectedLocation = optionalString(selection?.selected_location);
+    const candidate = candidates.find((item) => (
+      optionalString(item.target_key) === targetKey
+      && optionalString(item.location) === selectedLocation
+    ));
+    return !optionalString(candidate?.entry_symbol) || !optionalString(candidate?.entry_location);
+  });
+  if (missingEntryMetadata.length > 0) {
+    throw new Error(
+      "prepare 选中的同功能入口缺少 entry_symbol@entry_location，必须退回 investigate 建立真实入口调用边："
+      + missingEntryMetadata.join(", ")
+    );
+  }
   const fingerprints = selectedReferenceBehaviorFingerprints(
     session,
     investigate,
     completedSymbolInvestigationReports(session, stageId)
   );
   const fingerprintsByTarget = new Map(fingerprints.map((item) => [item.targetKey, item.fingerprint]));
-  const missing = selectedKeys.filter((targetKey) => !fingerprintsByTarget.has(targetKey));
+  const exactFingerprintKeys = selectedKeys.filter((targetKey) => (
+    selectedReferenceUsesExactSymbolAnalyzer(session, investigate, targetKey)
+  ));
+  if (exactFingerprintKeys.length === 0) return;
+  const missing = exactFingerprintKeys.filter((targetKey) => !fingerprintsByTarget.has(targetKey));
   if (missing.length > 0) {
     throw new Error(
       "prepare 选中的同功能入口尚未解析为真实调用边，不能仅凭最终组件定义冻结行为："
@@ -4062,6 +4457,34 @@ function assertPrepareBehaviorFingerprints(
       throw new Error(`行为义务 ${dimension} 判定 reuse 时 required_behavior 必须保持参考指纹`);
     }
   }
+}
+
+function selectedReferenceUsesExactSymbolAnalyzer(
+  session: AgentSession,
+  investigate: NonNullable<HierarchicalInvestigateArtifact>,
+  targetKey: string
+): boolean {
+  const referenceAnalysis = isPlainObject(investigate.handoff.reference_analysis)
+    ? investigate.handoff.reference_analysis
+    : null;
+  const selections = Array.isArray(referenceAnalysis?.target_selections)
+    ? referenceAnalysis.target_selections.filter(isPlainObject)
+    : [];
+  const candidates = Array.isArray(referenceAnalysis?.candidates)
+    ? referenceAnalysis.candidates.filter(isPlainObject)
+    : [];
+  const selectedLocation = optionalString(selections.find((selection) => (
+    optionalString(selection.target_key) === targetKey
+  ))?.selected_location);
+  const candidate = candidates.find((item) => (
+    optionalString(item.target_key) === targetKey
+    && optionalString(item.location) === selectedLocation
+  ));
+  const entryFile = evidenceLocationFile(
+    optionalString(candidate?.entry_location) ?? "",
+    session.project_path
+  );
+  return Boolean(entryFile && /\.(?:[cm]?[jt]sx?|mts|cts)$/i.test(entryFile));
 }
 
 /**
@@ -4322,13 +4745,29 @@ export function reconcileHierarchicalInvestigateContractLocations(
   const candidates = referenceAnalysis && Array.isArray(referenceAnalysis.candidates)
     ? referenceAnalysis.candidates.filter(isPlainObject)
     : [];
-  const rows = [...mappings, ...candidates];
+  const rows = [
+    ...mappings.map((row) => ({
+      row,
+      symbolField: "contract_symbol" as const,
+      locationField: "contract_location" as const
+    })),
+    ...candidates.flatMap((row) => [{
+      row,
+      symbolField: "contract_symbol" as const,
+      locationField: "contract_location" as const
+    }, {
+      row,
+      symbolField: "entry_symbol" as const,
+      locationField: "entry_location" as const
+    }])
+  ];
   const resolved = new Map<string, string | null>();
   const changed: string[] = [];
 
-  for (const row of rows) {
-    const symbol = optionalString(row.contract_symbol);
-    const submittedLocation = optionalString(row.contract_location);
+  for (const item of rows) {
+    const { row, symbolField, locationField } = item;
+    const symbol = optionalString(row[symbolField]);
+    const submittedLocation = optionalString(row[locationField]);
     const submittedAnchor = submittedLocation
       ? evidenceLocationAnchor(submittedLocation, session.project_path)
       : null;
@@ -4371,7 +4810,7 @@ export function reconcileHierarchicalInvestigateContractLocations(
     const canonicalAnchor = evidenceLocationAnchor(canonicalLocation, session.project_path);
     if (!canonicalAnchor || canonicalAnchor === submittedAnchor) continue;
 
-    row.contract_location = canonicalLocation;
+    row[locationField] = canonicalLocation;
     appendInvestigateEvidence(row, canonicalLocation);
     changed.push(`${symbol}@${submittedLocation} → ${canonicalLocation}`);
   }
@@ -4624,16 +5063,8 @@ function investigateCandidateProvesDestination(
   candidate: Record<string, unknown>,
   symbol: string
 ): boolean {
-  const destination = optionalString(candidate.destination);
-  const invocation = optionalString(candidate.invocation);
   const location = optionalString(candidate.location);
-  if (
-    !destination
-    || !invocation
-    || !location
-    || !containsExactIdentifier(destination, symbol)
-    || !containsExactIdentifier(invocation, symbol)
-  ) return false;
+  if (!location) return false;
   const absoluteFile = evidenceLocationFile(location, projectPath);
   const anchor = evidenceLocationAnchor(location, projectPath);
   if (!absoluteFile || !anchor || !existsSync(absoluteFile)) return false;
@@ -4714,7 +5145,29 @@ export function reconcileHierarchicalPrepareContractHandoff(
   if (!callContract || !Array.isArray(callContract.analyzed_targets)) return;
   const analyzedTargets = callContract.analyzed_targets.filter(isPlainObject);
   const reports = completedSymbolInvestigationReports(session, stageId);
-  if (reports.length === 0) return;
+  const adapterTargets = completedLanguageAdapterTargets(session, operation.requirement_id);
+
+  for (const hostTarget of adapterTargets) {
+    const targetFile = optionalString(hostTarget.target_file);
+    const symbol = optionalString(hostTarget.symbol);
+    if (!targetFile || !symbol) continue;
+    const existing = analyzedTargets.find((target) => {
+      const existingFile = optionalString(target.target_file);
+      return Boolean(
+        existingFile
+        && path.resolve(session.project_path, existingFile)
+          === path.resolve(session.project_path, targetFile)
+        && optionalString(target.symbol) === symbol
+      );
+    });
+    if (existing) {
+      mergeHostOwnedLanguageAnalysis(existing, hostTarget);
+    } else {
+      const appended = structuredClone(hostTarget);
+      callContract.analyzed_targets.push(appended);
+      analyzedTargets.push(appended);
+    }
+  }
 
   // Never let a model's prose summary silently drop a dynamic reference that
   // the trusted report found. An unresolved entry is the conservative default;
@@ -4824,7 +5277,10 @@ export function reconcileHierarchicalPrepareContractHandoff(
   // host already owns.
   const hostBackedFiles = new Set(
     callContract.analyzed_targets.flatMap((item) => {
-      if (!isPlainObject(item) || item.analysis_method !== "investigation-script") return [];
+      if (
+        !isPlainObject(item)
+        || (item.analysis_method !== "investigation-script" && item.analysis_method !== "language-adapter")
+      ) return [];
       const targetFile = optionalString(item.target_file);
       return targetFile ? [path.resolve(session.project_path, targetFile)] : [];
     })
@@ -4834,7 +5290,7 @@ export function reconcileHierarchicalPrepareContractHandoff(
     return contractFile && request.symbol ? [`${contractFile}\0${request.symbol}`] : [];
   }));
   const seenHostTargets = new Set<string>();
-  callContract.analyzed_targets = callContract.analyzed_targets.filter((item) => {
+  const filteredAnalyzedTargets = callContract.analyzed_targets.filter((item) => {
     if (!isPlainObject(item)) return true;
     const targetFile = optionalString(item.target_file);
     const symbol = optionalString(item.symbol);
@@ -4846,12 +5302,79 @@ export function reconcileHierarchicalPrepareContractHandoff(
       && hostBackedFiles.has(absoluteFile)
       && (!symbol || !requestedContractKeys.has(`${absoluteFile}\0${symbol}`))
     ) return false;
-    if (method !== "investigation-script" || !symbol) return true;
+    if ((method !== "investigation-script" && method !== "language-adapter") || !symbol) return true;
     const key = `${absoluteFile}\0${symbol}`;
     if (seenHostTargets.has(key)) return false;
     seenHostTargets.add(key);
     return true;
   });
+  callContract.analyzed_targets = filteredAnalyzedTargets;
+  attachCompletedCallsiteReviews(
+    session,
+    operation.requirement_id,
+    filteredAnalyzedTargets.filter(isPlainObject)
+  );
+}
+
+function attachCompletedCallsiteReviews(
+  session: AgentSession,
+  requirementId: string,
+  analyzedTargets: Array<Record<string, unknown>>
+): void {
+  const nodes = session.hierarchical_state?.capability_nodes ?? [];
+  for (const symbolNode of nodes) {
+    if (
+      symbolNode.requirement_id !== requirementId
+      || symbolNode.capability !== SYMBOL_CONTRACT_CAPABILITY
+      || symbolNode.status !== "passed"
+    ) continue;
+    const targetFile = optionalString(symbolNode.output?.target_file ?? symbolNode.input.target_file);
+    const symbol = optionalString(symbolNode.output?.symbol ?? symbolNode.input.symbol);
+    const inventory = isPlainObject(symbolNode.output?.callsite_inventory)
+      ? symbolNode.output.callsite_inventory
+      : null;
+    const entries = Array.isArray(inventory?.entries)
+      ? inventory.entries.filter(isPlainObject)
+      : [];
+    if (!targetFile || !symbol || !inventory) continue;
+    const target = analyzedTargets.find((item) => {
+      const itemFile = optionalString(item.target_file);
+      return Boolean(
+        itemFile
+        && path.resolve(session.project_path, itemFile) === path.resolve(session.project_path, targetFile)
+        && optionalString(item.symbol) === symbol
+      );
+    });
+    if (!target) continue;
+    const reviewById = new Map(nodes.flatMap((node) => {
+      if (
+        node.requirement_id !== requirementId
+        || node.capability !== CALLSITE_SEMANTIC_REVIEW_CAPABILITY
+        || node.status !== "passed"
+        || optionalString(node.input.parent_symbol_node_id) !== symbolNode.id
+        || !isPlainObject(node.output)
+      ) return [];
+      const callsiteId = optionalString(node.output.callsite_id);
+      return callsiteId ? [[callsiteId, node.output] as const] : [];
+    }));
+    const reviews = entries.flatMap((entry) => {
+      const callsiteId = optionalString(entry.callsite_id);
+      const review = callsiteId ? reviewById.get(callsiteId) : undefined;
+      return review ? [structuredClone(review)] : [];
+    });
+    const relevant = reviews.filter((review) => review.disposition === "relevant").length;
+    const irrelevant = reviews.filter((review) => review.disposition === "irrelevant").length;
+    const unresolved = reviews.filter((review) => review.disposition === "unresolved").length;
+    target.callsite_reviews = reviews;
+    target.callsite_accounting = {
+      total: entries.length,
+      reviewed: reviews.length,
+      relevant,
+      irrelevant,
+      unresolved,
+      accounted: entries.length === reviews.length
+    };
+  }
 }
 
 type HierarchicalInvestigateArtifact = ReturnType<typeof latestHierarchicalArtifact>;
@@ -5028,36 +5551,85 @@ function selectedReferenceBehaviorFingerprints(
       && optionalString(item.location) === selectedLocation
     ));
     if (!candidate) continue;
+    const entryFile = evidenceLocationFile(
+      optionalString(candidate.entry_location) ?? "",
+      session.project_path
+    );
+    const entrySymbol = optionalString(candidate.entry_symbol);
+    const report = reports.find((item) => (
+      Boolean(entryFile)
+      && path.resolve(session.project_path, item.report.target.file) === entryFile
+      && item.report.target.symbol === entrySymbol
+    ))?.report;
+    if (!report) continue;
     const contractFile = evidenceLocationFile(
       optionalString(candidate.contract_location) ?? "",
       session.project_path
     );
     const contractSymbol = optionalString(candidate.contract_symbol);
-    const report = reports.find((item) => (
-      Boolean(contractFile)
-      && path.resolve(session.project_path, item.report.target.file) === contractFile
-      && item.report.target.symbol === contractSymbol
-    ))?.report;
-    if (!report) continue;
-    const anchors = uniqueStrings([
+    if (!contractFile || !contractSymbol) continue;
+    const fingerprint = selectedEntryOutgoingFingerprint(
+      session,
+      candidate,
       selectedLocation,
-      ...(optionalStringArray(candidate.evidence_refs) ?? [])
-    ]).flatMap((location) => {
-      const anchor = evidenceLocationAnchor(location, session.project_path);
-      return anchor ? [anchor] : [];
-    });
-    const exact = report.behavior_fingerprints.find((fingerprint) => (
-      anchors.includes(evidenceLocationAnchor(fingerprint.source_location, session.project_path) ?? "")
-    ));
-    const selectedFile = evidenceLocationFile(selectedLocation, session.project_path);
-    const sameFile = report.behavior_fingerprints.filter((fingerprint) => (
-      Boolean(selectedFile)
-      && evidenceLocationFile(fingerprint.source_location, session.project_path) === selectedFile
-    ));
-    const fingerprint = exact ?? (sameFile.length === 1 ? sameFile[0] : undefined);
+      report,
+      contractFile,
+      contractSymbol
+    );
     if (fingerprint) selected.push({ targetKey, fingerprint });
   }
   return selected;
+}
+
+function selectedEntryOutgoingFingerprint(
+  session: AgentSession,
+  candidate: Record<string, unknown>,
+  selectedLocation: string,
+  report: SymbolInvestigationReport,
+  contractFile: string,
+  contractSymbol: string
+): BehaviorFingerprint | undefined {
+  const anchors = new Set(uniqueStrings([
+    selectedLocation,
+    ...(optionalStringArray(candidate.evidence_refs) ?? [])
+  ]).flatMap((location) => {
+    const anchor = evidenceLocationAnchor(location, session.project_path);
+    return anchor ? [anchor] : [];
+  }));
+  const entryFile = evidenceLocationFile(
+    optionalString(candidate.entry_location) ?? selectedLocation,
+    session.project_path
+  );
+  const scored = report.effects.items.map((effect) => {
+    const effectLocation = `${effect.location.file}:${effect.location.line}`;
+    const effectAnchor = evidenceLocationAnchor(effectLocation, session.project_path);
+    const sameEntryFile = Boolean(
+      entryFile
+      && evidenceLocationFile(effectLocation, session.project_path) === entryFile
+    );
+    const mentionsDestination = containsExactIdentifierOrLiteral(
+      effect.invocation,
+      contractSymbol
+    );
+    return {
+      effect,
+      score: (effectAnchor && anchors.has(effectAnchor) ? 10_000 : 0)
+        + (mentionsDestination ? 1_000 : 0)
+        + (sameEntryFile ? 100 : 0)
+    };
+  }).filter(({ score }) => score >= 1_000)
+    .sort((left, right) => right.score - left.score);
+  if (scored.length === 0) return undefined;
+  if (scored.length > 1 && scored[0]!.score === scored[1]!.score) return undefined;
+  const effect = scored[0]!.effect;
+  return buildOutgoingBehaviorFingerprint({
+    reference_id: `selected-entry:${report.target.file}:${report.target.symbol}:${effect.location.line}:${effect.location.column}`,
+    target: {
+      file: path.relative(session.project_path, contractFile).split(path.sep).join("/"),
+      symbol: contractSymbol
+    },
+    call: effect
+  });
 }
 
 // Prefill (every prepare attempt, before validation) the same-feature entry
@@ -5115,6 +5687,197 @@ export function reconcileHierarchicalPrepareObligationEvidence(
       const dimension = optionalString(obligation.dimension) ?? "behavior";
       return `${id} ${dimension} 已由当前目标代码满足：${currentTargetEvidence[0]}`;
     });
+  }
+}
+
+/**
+ * Expand the model's compact six decisions into the repetitive transport
+ * fields owned by the host. Exact JS/TS fingerprints have already been
+ * applied above; candidate behavior from the accepted investigate artifact is
+ * the conservative cross-language fallback when an LSP can prove topology but
+ * not argument semantics.
+ */
+export function reconcileHierarchicalPrepareDerivedBehaviorContract(
+  session: AgentSession,
+  operation: Extract<HierarchicalNextOperation, {
+    kind: "run_phase" | "run_alignment_batch" | "run_planner" | "run_integrator"
+  }>,
+  structured: unknown
+): void {
+  if (operation.kind !== "run_phase" || operation.phase !== "prepare" || !isPlainObject(structured)) return;
+  const handoff = isPlainObject(structured.handoff) ? structured.handoff : null;
+  const obligations = handoff && Array.isArray(handoff.behavior_obligations)
+    ? handoff.behavior_obligations.filter(isPlainObject)
+    : [];
+  const state = session.hierarchical_state;
+  const investigate = state
+    ? latestHierarchicalArtifact(state, operation.requirement_id, "investigate")
+    : undefined;
+  if (!handoff || obligations.length === 0 || !investigate) return;
+  const mappings = Array.isArray(investigate.handoff.target_mappings)
+    ? investigate.handoff.target_mappings.filter(isPlainObject)
+    : [];
+  const targetKeys = mappings
+    .map((mapping) => optionalString(mapping.target_key))
+    .filter((value): value is string => Boolean(value));
+  const referenceAnalysis = isPlainObject(investigate.handoff.reference_analysis)
+    ? investigate.handoff.reference_analysis
+    : null;
+  const candidates = Array.isArray(referenceAnalysis?.candidates)
+    ? referenceAnalysis.candidates.filter(isPlainObject)
+    : [];
+  const selections = Array.isArray(referenceAnalysis?.target_selections)
+    ? referenceAnalysis.target_selections.filter(isPlainObject)
+    : [];
+  const selectedByTarget = new Map<string, Record<string, unknown>>();
+  for (const selection of selections) {
+    const targetKey = optionalString(selection.target_key);
+    const location = optionalString(selection.selected_location);
+    if (!targetKey || !location) continue;
+    const candidate = candidates.find((item) => (
+      optionalString(item.target_key) === targetKey
+      && optionalString(item.location) === location
+    ));
+    if (candidate) selectedByTarget.set(targetKey, candidate);
+  }
+
+  for (const obligation of obligations) {
+    const dimension = optionalString(obligation.dimension) as BehaviorDimension | undefined;
+    if (!dimension || !BEHAVIOR_DIMENSIONS.includes(dimension)) continue;
+    if (!optionalString(obligation.id)) {
+      obligation.id = `B${BEHAVIOR_DIMENSIONS.indexOf(dimension) + 1}-${dimension}`;
+    }
+    obligation.target_keys = [...targetKeys];
+    if (!optionalString(obligation.reference_behavior)) {
+      const targets = Object.fromEntries(targetKeys.map((targetKey) => [
+        targetKey,
+        selectedCapabilityBehaviorDimension(
+          session,
+          operation.requirement_id,
+          selectedByTarget.get(targetKey),
+          dimension
+        ) ?? candidateBehaviorDimension(selectedByTarget.get(targetKey), dimension)
+      ]));
+      obligation.reference_behavior = canonicalBehaviorValue({
+        schema_version: 1,
+        dimension,
+        targets
+      });
+    }
+    if (
+      optionalString(obligation.decision) !== "intentional-difference"
+      && !optionalString(obligation.required_behavior)
+    ) {
+      obligation.required_behavior = obligation.reference_behavior;
+    }
+  }
+
+  const applications: Array<Record<string, unknown>> = [];
+  for (const targetKey of targetKeys) {
+    const candidate = selectedByTarget.get(targetKey);
+    const mapping = mappings.find((item) => optionalString(item.target_key) === targetKey);
+    const evidence = uniqueStrings([
+      ...(optionalStringArray(candidate?.evidence_refs) ?? []),
+      optionalString(candidate?.location) ?? "",
+      optionalString(mapping?.dispatcher_location) ?? ""
+    ]).filter((item) => Boolean(evidenceLocationAnchor(item, session.project_path)));
+    for (const obligation of obligations) {
+      const dimension = optionalString(obligation.dimension);
+      const referenceBehavior = optionalString(obligation.reference_behavior);
+      const requiredBehavior = optionalString(obligation.required_behavior);
+      const decision = optionalString(obligation.decision);
+      const reason = optionalString(obligation.reason) ?? "";
+      if (!dimension || !referenceBehavior || !requiredBehavior || !decision || evidence.length === 0) continue;
+      applications.push({
+        target_key: targetKey,
+        dimension,
+        target_behavior: requiredBehavior,
+        reference_behavior: referenceBehavior,
+        decision,
+        reason,
+        evidence_refs: evidence
+      });
+    }
+  }
+  handoff.reference_application = applications;
+}
+
+function selectedCapabilityBehaviorDimension(
+  session: AgentSession,
+  requirementId: string,
+  candidate: Record<string, unknown> | undefined,
+  dimension: BehaviorDimension
+): unknown | undefined {
+  const state = session.hierarchical_state;
+  const entrySymbol = optionalString(candidate?.entry_symbol);
+  const entryLocation = optionalString(candidate?.entry_location);
+  const callLocation = optionalString(candidate?.location);
+  const entryFile = entryLocation
+    ? evidenceLocationFile(entryLocation, session.project_path)
+    : null;
+  const callAnchor = callLocation
+    ? evidenceLocationAnchor(callLocation, session.project_path)
+    : null;
+  if (!state || !entrySymbol || !entryFile || !callAnchor) return undefined;
+  const symbolNode = state.capability_nodes.find((node) => {
+    if (
+      node.requirement_id !== requirementId
+      || node.capability !== SYMBOL_CONTRACT_CAPABILITY
+      || node.status !== "passed"
+    ) return false;
+    const nodeFile = optionalString(node.output?.target_file ?? node.input.target_file);
+    const nodeSymbol = optionalString(node.output?.symbol ?? node.input.symbol);
+    return Boolean(
+      nodeFile
+      && path.resolve(session.project_path, nodeFile) === entryFile
+      && nodeSymbol === entrySymbol
+    );
+  });
+  if (!symbolNode || !isPlainObject(symbolNode.output?.callsite_inventory)) return undefined;
+  const entries = Array.isArray(symbolNode.output.callsite_inventory.entries)
+    ? symbolNode.output.callsite_inventory.entries.filter(isPlainObject)
+    : [];
+  const callsite = entries.find((entry) => {
+    const evidenceRef = optionalString(entry.evidence_ref);
+    return Boolean(
+      evidenceRef
+      && optionalString(entry.direction) === "outgoing"
+      && evidenceLocationAnchor(evidenceRef, session.project_path) === callAnchor
+    );
+  });
+  const callsiteId = optionalString(callsite?.callsite_id);
+  if (!callsiteId) return undefined;
+  const reviewNode = state.capability_nodes.find((node) => (
+    node.requirement_id === requirementId
+    && node.capability === CALLSITE_SEMANTIC_REVIEW_CAPABILITY
+    && node.status === "passed"
+    && optionalString(node.input.parent_symbol_node_id) === symbolNode.id
+    && optionalString(node.input.callsite_id) === callsiteId
+  ));
+  const output = reviewNode?.output;
+  if (!isPlainObject(output)) return undefined;
+  switch (dimension) {
+    case "destination": return optionalString(output.destination);
+    case "invocation": return optionalString(output.invocation);
+    case "arguments": return optionalStringArray(output.arguments);
+    case "preconditions": return optionalStringArray(output.preconditions);
+    case "context": return optionalStringArray(output.context);
+    case "side_effects": return optionalStringArray(output.side_effects);
+  }
+}
+
+function candidateBehaviorDimension(
+  candidate: Record<string, unknown> | undefined,
+  dimension: BehaviorDimension
+): unknown {
+  if (!candidate) return "未找到可验证的同功能入口";
+  switch (dimension) {
+    case "destination": return optionalString(candidate.destination) ?? "未观察到目标";
+    case "invocation": return optionalString(candidate.invocation) ?? "未观察到调用方式";
+    case "arguments": return optionalStringArray(candidate.arguments) ?? ["未观察到显式参数"];
+    case "preconditions": return optionalStringArray(candidate.preconditions) ?? ["未观察到静态 guard"];
+    case "context": return optionalStringArray(candidate.context_forwarding) ?? ["未观察到额外上下文"];
+    case "side_effects": return optionalStringArray(candidate.side_effects) ?? ["未观察到额外副作用"];
   }
 }
 
@@ -5224,13 +5987,18 @@ function uniqueContractRequests(
   const seen = new Set<string>();
   const requests: Array<{ location: string; symbol?: string; exact: boolean }> = [];
   for (const item of items) {
-    const location = optionalString(item.contract_location);
-    const symbol = optionalString(item.contract_symbol);
-    if (!location) continue;
-    const key = `${location}\0${symbol ?? ""}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    requests.push({ location, symbol, exact: Boolean(symbol) });
+    for (const [locationField, symbolField] of [
+      ["contract_location", "contract_symbol"],
+      ["entry_location", "entry_symbol"]
+    ] as const) {
+      const location = optionalString(item[locationField]);
+      const symbol = optionalString(item[symbolField]);
+      if (!location) continue;
+      const key = `${location}\0${symbol ?? ""}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      requests.push({ location, symbol, exact: Boolean(symbol) });
+    }
   }
   return requests;
 }
@@ -5260,6 +6028,48 @@ function completedSymbolInvestigationReports(
     };
     report: SymbolInvestigationReport;
   }> = [];
+  const seen = new Set<string>();
+  const appendReport = (rawInput: Record<string, unknown>) => {
+    const targetFile = optionalString(rawInput.target_file);
+    const symbol = optionalString(rawInput.symbol);
+    if (!targetFile || !symbol) return;
+    const key = `${path.resolve(session.project_path, targetFile)}\u0000${symbol}`;
+    if (seen.has(key)) return;
+    const reportInput = {
+      projectPath: session.project_path,
+      targetFile,
+      symbol,
+      ...(typeof rawInput.target_line === "number"
+        ? { targetLine: rawInput.target_line }
+        : {}),
+      ...(typeof rawInput.max_wrapper_depth === "number"
+        ? { maxWrapperDepth: rawInput.max_wrapper_depth }
+        : {}),
+      ...(typeof rawInput.max_wrapper_symbols === "number"
+        ? { maxWrapperSymbols: rawInput.max_wrapper_symbols }
+        : {})
+    };
+    try {
+      const report = getCachedSymbolInvestigationReport(reportInput)
+        ?? investigateSymbolContract(reportInput);
+      reports.push({ input: reportInput, report });
+      seen.add(key);
+    } catch {
+      // The semantic evidence gate below reports a precise error for any
+      // declared target. Reconciliation is best-effort and must not hide the
+      // model draft or turn stale evidence into an orchestration crash.
+    }
+  };
+
+  for (const node of session.hierarchical_state?.capability_nodes ?? []) {
+    if (
+      node.capability !== SYMBOL_CONTRACT_CAPABILITY
+      || node.status !== "passed"
+      || node.output?.adapter_id !== TYPESCRIPT_JAVASCRIPT_ADAPTER
+    ) continue;
+    appendReport(isPlainObject(node.output?.effective_input) ? node.output.effective_input : node.input);
+  }
+
   for (const call of session.tool_calls) {
     if (
       call.stage_id !== stageId
@@ -5267,34 +6077,53 @@ function completedSymbolInvestigationReports(
       || call.status !== "completed"
       || !isPlainObject(call.input)
     ) continue;
-    const targetFile = optionalString(call.input.target_file);
-    const symbol = optionalString(call.input.symbol);
-    if (!targetFile || !symbol) continue;
-    const reportInput = {
-      projectPath: session.project_path,
-      targetFile,
-      symbol,
-      ...(typeof call.input.target_line === "number"
-        ? { targetLine: call.input.target_line }
-        : {}),
-      ...(typeof call.input.max_wrapper_depth === "number"
-        ? { maxWrapperDepth: call.input.max_wrapper_depth }
-        : {}),
-      ...(typeof call.input.max_wrapper_symbols === "number"
-        ? { maxWrapperSymbols: call.input.max_wrapper_symbols }
-        : {})
-    };
-    try {
-      const report = getCachedSymbolInvestigationReport(reportInput)
-        ?? investigateSymbolContract(reportInput);
-      reports.push({ input: reportInput, report });
-    } catch {
-      // The semantic evidence gate below reports a precise error for any
-      // declared target. Reconciliation is best-effort and must not hide the
-      // model draft or turn a stale historical call into an orchestration crash.
-    }
+    appendReport(call.input);
   }
   return reports;
+}
+
+function completedLanguageAdapterTargets(
+  session: AgentSession,
+  requirementId: string
+): Array<Record<string, unknown>> {
+  return (session.hierarchical_state?.capability_nodes ?? []).flatMap((node) => {
+    if (
+      node.capability !== SYMBOL_CONTRACT_CAPABILITY
+      || node.requirement_id !== requirementId
+      || node.status !== "passed"
+      || node.output?.adapter_id === TYPESCRIPT_JAVASCRIPT_ADAPTER
+      || !isPlainObject(node.output?.analyzed_target)
+    ) return [];
+    return [structuredClone(node.output.analyzed_target)];
+  });
+}
+
+function mergeHostOwnedLanguageAnalysis(
+  target: Record<string, unknown>,
+  host: Record<string, unknown>
+): void {
+  const mergeFields = [
+    "inputs",
+    "outputs",
+    "callers",
+    "wrappers_and_indirect_references",
+    "guards",
+    "state_and_side_effects",
+    "compatibility_obligations",
+    "unresolved",
+    "evidence_refs"
+  ] as const;
+  const modelValues = new Map(mergeFields.map((field) => [
+    field,
+    optionalStringArray(target[field]) ?? []
+  ]));
+  Object.assign(target, structuredClone(host));
+  for (const field of mergeFields) {
+    target[field] = uniqueStrings([
+      ...(optionalStringArray(host[field]) ?? []),
+      ...(modelValues.get(field) ?? [])
+    ]);
+  }
 }
 
 function mergeHostOwnedSymbolInvestigation(
@@ -5980,8 +6809,25 @@ function validateInvestigateTargetMappingEvidence(
       `reference candidate ${targetKey ?? "<unknown>"}`
     );
     if (candidateContractError) violations.push(candidateContractError);
+    const entrySymbol = optionalString(candidate.entry_symbol);
+    const entryLocation = optionalString(candidate.entry_location);
+    const entryContractError = validateContract(
+      entrySymbol,
+      entryLocation,
+      `reference entry ${targetKey ?? "<unknown>"}`
+    );
+    if (entryContractError) violations.push(entryContractError);
+    const ownershipError = assertReferenceEntryOwnsCallsite(
+      session.project_path,
+      entrySymbol,
+      entryLocation,
+      selectedLocation,
+      contractSymbol
+    );
+    if (ownershipError) violations.push(`${targetKey ?? "<unknown>"}: ${ownershipError}`);
     for (const [kind, location] of [
       ["入口", selectedLocation],
+      ["入口定义", entryLocation],
       ["最终契约", contractLocation]
     ] as const) {
       if (location && isWorkingTreeAddedEvidenceLocation(session, location)) {
@@ -5992,6 +6838,64 @@ function validateInvestigateTargetMappingEvidence(
       }
     }
   }
+}
+
+function assertReferenceEntryOwnsCallsite(
+  projectPath: string,
+  entrySymbol: string | undefined,
+  entryLocation: string | undefined,
+  callsiteLocation: string,
+  destinationSymbol: string | undefined
+): string | undefined {
+  if (!entrySymbol || !entryLocation) {
+    return "同功能入口必须声明 entry_symbol@entry_location";
+  }
+  const entryFile = evidenceLocationFile(entryLocation, projectPath);
+  const callsiteFile = evidenceLocationFile(callsiteLocation, projectPath);
+  const callsiteAnchor = evidenceLocationAnchor(callsiteLocation, projectPath);
+  const entryAnchor = evidenceLocationAnchor(entryLocation, projectPath);
+  if (
+    entrySymbol === destinationSymbol
+    && entryAnchor
+    && callsiteAnchor === entryAnchor
+  ) {
+    // The selected user entry can itself be the final callable/component. In
+    // that direct-entry shape there is no intermediate outgoing edge to own.
+    return undefined;
+  }
+  if (!entryFile || !callsiteFile || entryFile !== callsiteFile || !callsiteAnchor) {
+    return `调用边 ${callsiteLocation} 不在入口定义 ${entrySymbol}@${entryLocation} 的文件内`;
+  }
+  const relativeFile = path.relative(projectPath, entryFile).split(path.sep).join("/");
+  if (!/\.[cm]?[jt]sx?$/i.test(relativeFile)) return undefined;
+  try {
+    const report = investigateSymbolContract({
+      projectPath,
+      targetFile: relativeFile,
+      symbol: entrySymbol
+    });
+    const matching = report.effects.items.filter((effect) => (
+      evidenceLocationAnchor(
+        `${effect.location.file}:${effect.location.line}`,
+        projectPath
+      ) === callsiteAnchor
+    ));
+    if (matching.length === 0) {
+      return `candidate.location 必须指向 ${entrySymbol} 函数体内的真实出调用行：${callsiteLocation}`;
+    }
+    if (
+      destinationSymbol
+      && !matching.some((effect) => containsExactIdentifierOrLiteral(
+        effect.invocation,
+        destinationSymbol
+      ))
+    ) {
+      return `调用边 ${callsiteLocation} 未把既有入口追到最终目标 ${destinationSymbol}`;
+    }
+  } catch (error) {
+    return `无法核对入口调用边 ${entrySymbol}@${entryLocation}：${error instanceof Error ? error.message : String(error)}`;
+  }
+  return undefined;
 }
 
 function assertExactDeclaredContract(
@@ -6725,7 +7629,7 @@ export function hierarchicalValidationCorrection(
     return "只修正 investigate.reference_analysis 的逐目标对应关系：每条非空 selected_location 都必须有 target_key 和 location 同时匹配的 candidate；共享同一入口时，为每个 target_key 各提交一条 candidate（最终 contract_symbol@contract_location 可相同）。确实没有同功能入口时，才将 selected_location/selection_reason 置空并填写非空 no_reference_reason。";
   }
   if (/逐目标分析|真实函数\/组件|选中的同功能入口/.test(reason)) {
-    return "不要改写 investigate 已确认的逐目标映射：对错误点名的每个 contract_symbol@contract_location 分别调用 investigate_symbol_contract；宿主只接受符号、文件和定义行完全一致的报告。六类义务的 target_keys 覆盖全部目标，并逐项引用各自既有入口。";
+    return "不要在 prepare 手工重复调查最终组件。退回 investigate，为每个候选补齐承载真实调用边的 entry_symbol@entry_location，并让 candidate.location 精确指向该入口函数体内调用最终目标的源码行；宿主会自动生成入口契约与 outgoing-edge capability 节点，再回到 prepare 冻结六类行为。";
   }
   if (/allowed_files/.test(reason)) {
     return "只规范化或补齐精确的项目相对文件路径；prepare 不要 Edit，宿主接受后会自动把这些文件租给 implement。";
@@ -6836,7 +7740,7 @@ function countHierarchicalPhaseFailures(
   ).length;
 }
 
-function hierarchicalPhaseSelfHealRoute(
+export function hierarchicalPhaseSelfHealRoute(
   phase: Exclude<HierarchicalWorkPhase, "close">,
   reason: string
 ): "retry" | "investigate" | "prepare" | "implement" {
@@ -6846,7 +7750,7 @@ function hierarchicalPhaseSelfHealRoute(
     // investigate_symbol_contract tool and recreates the same prepare draft,
     // which caused the R38 loop. Retreat only when the accepted investigate
     // artifact itself is invalid.
-    return /冒充同功能既有入口|prepare 前必须由 investigate|prepare 缺少 investigate 同功能入口/.test(reason)
+    return /冒充同功能既有入口|prepare 前必须由 investigate|prepare 缺少 investigate 同功能入口|选中的同功能入口尚未解析为真实调用边|选中的同功能入口缺少 entry_symbol|同功能入口对应的真实函数\/组件/.test(reason)
       ? "investigate"
       : "retry";
   }
@@ -6919,7 +7823,20 @@ async function assertHierarchicalWorkUnitIntegrity(snapshot: HierarchicalWorkUni
 
 export function buildHierarchicalSdkToolSurface(declaredTools: string[]): string[] {
   if (declaredTools.length === 0) return [];
-  return [...new Set([...declaredTools, "Edit", "Write"])];
+  return [...new Set([...declaredTools, "Edit", "Write"])]
+    .filter((toolName) => !HIERARCHICAL_LEGACY_MCP_TOOLS.has(toolName));
+}
+
+const HIERARCHICAL_LEGACY_MCP_TOOLS = new Set([
+  "mcp__ai_coder__update_task_tree",
+  "mcp__ai_coder__checkpoint_exploration"
+]);
+
+function buildHierarchicalDisallowedClaudeTools(workflow: WorkflowTemplate): string[] {
+  return [...new Set([
+    ...buildDisallowedClaudeTools(workflow),
+    ...HIERARCHICAL_LEGACY_MCP_TOOLS
+  ])];
 }
 
 export function getHierarchicalMcpBoundaryMessage(
@@ -7100,7 +8017,7 @@ function hierarchicalProjectPathMessage(toolName: string, suppliedPath: string, 
   return [
     `${toolName} 路径越出当前项目：${suppliedPath}。`,
     `唯一项目根目录是 ${projectRoot}；请使用该目录下的项目相对路径，或以该目录逐字开头的绝对路径。`,
-    "不得改用 /workspace、/home/user/workspace 或省略项目目录的路径。"
+    "不得改用 /workspace、/home/user/workspace 或省略项目目录的路径；也不要读取 ~/.claude、SDK tool-results 等内部缓存，能力节点结果已由宿主直接注入。"
   ].join(" ");
 }
 
@@ -7987,10 +8904,12 @@ function migrateHierarchicalAlignmentState(state: HierarchicalExecutionState, pr
   const migratable = state as HierarchicalExecutionState & {
     alignment_batches?: HierarchicalExecutionState["alignment_batches"];
     phase_artifacts?: HierarchicalExecutionState["phase_artifacts"];
+    capability_nodes?: HierarchicalExecutionState["capability_nodes"];
     workspace_revision?: number;
   };
   migratable.alignment_batches ??= [];
   migratable.phase_artifacts ??= [];
+  migratable.capability_nodes ??= [];
   migratable.workspace_revision ??= 0;
   for (const artifact of migratable.phase_artifacts) {
     artifact.workspace_revision ??= 0;
@@ -8004,6 +8923,42 @@ function migrateHierarchicalAlignmentState(state: HierarchicalExecutionState, pr
   for (const batch of migratable.alignment_batches) {
     batch.consecutive_failure_count ??= 0;
   }
+}
+
+function buildHierarchicalCapabilitySyncEvent(
+  state: HierarchicalExecutionState | undefined
+): Extract<HierarchicalEvent, { type: "capability_graph_synchronized" }> | undefined {
+  if (
+    !state?.active_requirement_id
+    || state.active_work_unit?.phase !== "prepare"
+    || state.active_work_unit.requirement_id !== state.active_requirement_id
+  ) return undefined;
+  state.capability_nodes ??= [];
+  const requests = discoverWorkflowCapabilityRequests(state, state.active_requirement_id);
+  const current = state.capability_nodes.filter((node) =>
+    node.requirement_id === state.active_requirement_id
+    && node.parent_phase === "prepare"
+    && node.status !== "superseded"
+  );
+  const requestShape = requests.map((request) => ({
+    id: request.id,
+    capability: request.capability,
+    dependencies: request.dependencies,
+    input: request.input
+  }));
+  const currentShape = current.map((node) => ({
+    id: node.id,
+    capability: node.capability,
+    dependencies: node.dependencies,
+    input: node.input
+  }));
+  if (JSON.stringify(currentShape) === JSON.stringify(requestShape)) return undefined;
+  return {
+    type: "capability_graph_synchronized",
+    requirement_id: state.active_requirement_id,
+    parent_phase: "prepare",
+    requests: requestShape
+  };
 }
 
 function getHierarchicalAttachmentReadError(

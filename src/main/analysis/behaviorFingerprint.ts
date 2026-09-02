@@ -56,6 +56,30 @@ export interface BehaviorFingerprint {
   digest: string;
 }
 
+export interface OutgoingBehaviorFingerprintInput {
+  reference_id: string;
+  target: {
+    file: string;
+    symbol: string;
+  };
+  call: {
+    location: {
+      file: string;
+      line: number;
+      column: number;
+    };
+    kind: "call" | "new" | "jsx";
+    callee: string;
+    invocation: string;
+    arguments: Array<{
+      parameter: string;
+      expression: string;
+      provided: boolean;
+    }>;
+    preconditions: string[];
+  };
+}
+
 /** Build a stable, source-derived behavior contract for one invocation edge. */
 export function buildBehaviorFingerprint(input: BehaviorFingerprintInput): BehaviorFingerprint {
   const invocationExpression = normalizeExpression(input.invocation);
@@ -78,7 +102,6 @@ export function buildBehaviorFingerprint(input: BehaviorFingerprintInput): Behav
     ))
   ].filter((identifier) => (
     identifier !== input.target.symbol
-    && !callee.split(".").includes(identifier)
   )));
   const sideEffects = uniqueSorted([
     `${input.kind}:${callee}`,
@@ -109,6 +132,32 @@ export function buildBehaviorFingerprint(input: BehaviorFingerprintInput): Behav
     ...base,
     digest: createHash("sha256").update(JSON.stringify(base)).digest("hex")
   };
+}
+
+/**
+ * Turn one call made *inside* an entry function into the same behavior shape
+ * used for incoming/indirect references to a destination symbol. This is the
+ * missing half of entry-point analysis: callers tell us who enters a symbol,
+ * while outgoing calls preserve the payload, guards and side effects that the
+ * entry forwards to the real destination.
+ */
+export function buildOutgoingBehaviorFingerprint(
+  input: OutgoingBehaviorFingerprintInput
+): BehaviorFingerprint {
+  const payload = outgoingPayloadArguments(input.call.arguments, input.target.symbol);
+  return buildBehaviorFingerprint({
+    reference_id: input.reference_id,
+    target: input.target,
+    location: input.call.location,
+    kind: payload.arguments.some((argument) => argument.parameter.startsWith("payload."))
+      ? "indirect"
+      : input.call.kind === "jsx" ? "jsx" : "call",
+    invocation: input.call.invocation,
+    target_path: payload.targetPath,
+    payload_expression: payload.payloadExpression,
+    arguments: payload.arguments,
+    preconditions: input.call.preconditions
+  });
 }
 
 export function behaviorDimensionValue(
@@ -161,6 +210,74 @@ function normalizeExpression(value: string): string {
     // Fall through to conservative whitespace normalization.
   }
   return compactWhitespace(trimmed);
+}
+
+function outgoingPayloadArguments(
+  argumentsList: OutgoingBehaviorFingerprintInput["call"]["arguments"],
+  targetSymbol: string
+): {
+  arguments: BehaviorFingerprintInput["arguments"];
+  targetPath: string | null;
+  payloadExpression: string | null;
+} {
+  const result: BehaviorFingerprintInput["arguments"] = argumentsList.map((argument) => ({
+    parameter: argument.parameter,
+    expression: argument.expression,
+    provided: argument.provided
+  }));
+  let targetPath: string | null = null;
+  let payloadExpression: string | null = null;
+  for (const argument of argumentsList) {
+    if (!argument.provided) continue;
+    const expression = parseExpression(argument.expression);
+    if (!expression || !ts.isObjectLiteralExpression(expression)) continue;
+    payloadExpression ??= expression.getText();
+    for (const property of expression.properties) {
+      if (ts.isSpreadAssignment(property)) {
+        result.push({
+          parameter: "payload...spread",
+          expression: property.expression.getText(),
+          provided: true
+        });
+        continue;
+      }
+      const name = objectPropertyName(property.name);
+      const value = ts.isPropertyAssignment(property)
+        ? property.initializer
+        : ts.isShorthandPropertyAssignment(property)
+          ? property.name
+          : undefined;
+      if (!value) continue;
+      const valueText = value.getText();
+      result.push({
+        parameter: `payload.${name}`,
+        expression: valueText,
+        provided: true
+      });
+      if (normalizeExpression(valueText) === targetSymbol) targetPath = name;
+    }
+  }
+  return { arguments: result, targetPath, payloadExpression };
+}
+
+function parseExpression(value: string): ts.Expression | null {
+  const source = ts.createSourceFile(
+    "outgoing-expression.ts",
+    `const __value = (${value});`,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS
+  );
+  const statement = source.statements[0];
+  if (!statement || !ts.isVariableStatement(statement)) return null;
+  const initializer = statement.declarationList.declarations[0]?.initializer;
+  return initializer ? unwrapParentheses(initializer) : null;
+}
+
+function objectPropertyName(name: ts.PropertyName | undefined): string {
+  if (!name) return "<unknown>";
+  if (ts.isStringLiteral(name) || ts.isNumericLiteral(name)) return name.text;
+  return name.getText();
 }
 
 function normalizeCondition(value: string): string {

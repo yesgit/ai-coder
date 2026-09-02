@@ -14,6 +14,7 @@ import {
   getHierarchicalCapabilityLeaseError,
   getHierarchicalMcpBoundaryMessage,
   hierarchicalErrorFingerprint,
+  hierarchicalPhaseSelfHealRoute,
   hierarchicalValidationCorrection,
   isLineAddedByGitDiff,
   isWorkingTreeAddedEvidenceLocation,
@@ -30,6 +31,7 @@ import {
   reconcileHierarchicalIntegratorContractResults,
   reconcileHierarchicalPrepareContractHandoff,
   reconcileHierarchicalPrepareBehaviorFingerprints,
+  reconcileHierarchicalPrepareDerivedBehaviorContract,
   reconcileHierarchicalPrepareObligationEvidence,
   recordFeatureCensusReceipt,
   validateHierarchicalBehaviorObligationContinuity,
@@ -120,6 +122,8 @@ function handoffFor(
         target_key: "route",
         reference_kind: "same-feature-entry",
         location: reference,
+        entry_symbol: "reference",
+        entry_location: reference,
         contract_location: reference,
         contract_symbol: "reference",
         feature_equivalence: [`same user-visible feature at ${reference}`],
@@ -607,6 +611,183 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     }
   });
 
+  it("reconciles and validates a host-owned Java/Python language-adapter result", () => {
+    const session = createSession();
+    const state = createHierarchicalExecutionState("analyze Python target");
+    const hostTarget = {
+      target_file: "sample.py",
+      symbol: "target",
+      analysis_method: "language-adapter",
+      method_reason: "LSP freezes topology; prepare inspects semantics",
+      analyzer_sections: ["definition", "incoming-calls", "outgoing-calls"],
+      all_pages_consumed: true,
+      definition: "target；sample.py:1",
+      inputs: ["参数未由 LSP 证明；sample.py:1"],
+      outputs: ["返回未由 LSP 证明；sample.py:1"],
+      callers: ["sample.py:4；caller=caller；LSP incoming call"],
+      wrappers_and_indirect_references: ["动态边界；sample.py:1"],
+      guards: ["guard 未由 LSP 证明；sample.py:1"],
+      state_and_side_effects: ["sample.py:2；callee=helper；LSP outgoing call"],
+      compatibility_obligations: ["保持拓扑并补齐语义；sample.py:1"],
+      unresolved: ["参数、guard 和副作用仍需源码检查；sample.py:1"],
+      evidence_refs: ["sample.py:1", "sample.py:4", "sample.py:2"],
+      adapter_id: "python-pyright-call-hierarchy",
+      adapter_report_digest: "a".repeat(64),
+      runtime_verification_required: true
+    };
+    state.capability_nodes.push({
+      id: "cap:R1:symbol-contract:python",
+      capability: "symbol-contract-analysis",
+      requirement_id: "R1",
+      parent_phase: "prepare",
+      dependencies: [],
+      status: "passed",
+      attempt: 1,
+      input: {
+        target_file: "sample.py",
+        symbol: "target",
+        adapter_id: "python-pyright-call-hierarchy"
+      },
+      output: {
+        adapter_id: "python-pyright-call-hierarchy",
+        adapter_report_digest: "a".repeat(64),
+        target_file: "sample.py",
+        symbol: "target",
+        analyzed_target: hostTarget,
+        callsite_inventory: {
+          schema_version: 1,
+          total: 1,
+          accounted: true,
+          entries: [{
+            callsite_id: "lsp:caller",
+            evidence_ref: "sample.py:4",
+            source_excerpt: "4: target(value)",
+            source_digest: "source",
+            destination_definition_excerpt: "1: def target(value):",
+            definition_digest: "definition",
+            review_basis: "source+topology"
+          }]
+        }
+      },
+      evidence_refs: ["sample.py:1"],
+      consecutive_failure_count: 0,
+      created_at: state.created_at,
+      updated_at: state.created_at
+    });
+    state.capability_nodes.push({
+      id: "cap:R1:callsite-review:python",
+      capability: "callsite-semantic-review",
+      requirement_id: "R1",
+      parent_phase: "prepare",
+      dependencies: ["cap:R1:symbol-contract:python"],
+      status: "passed",
+      attempt: 1,
+      input: {
+        parent_symbol_node_id: "cap:R1:symbol-contract:python",
+        callsite_id: "lsp:caller"
+      },
+      output: {
+        schema_version: 1,
+        callsite_id: "lsp:caller",
+        target_file: "sample.py",
+        symbol: "target",
+        evidence_ref: "sample.py:4",
+        review_basis: "source+topology",
+        disposition: "relevant",
+        summary: "caller invokes target",
+        destination: "target@sample.py",
+        invocation: "direct call",
+        arguments: ["value is forwarded"],
+        preconditions: ["authenticated"],
+        context: ["caller context"],
+        side_effects: ["target invocation"],
+        unresolved: [],
+        evidence_refs: ["sample.py:4"],
+        definition_digest: "definition",
+        host_fingerprint_digest: ""
+      },
+      evidence_refs: ["sample.py:4"],
+      consecutive_failure_count: 0,
+      created_at: state.created_at,
+      updated_at: state.created_at
+    });
+    state.phase_artifacts.push({
+      id: "R1:investigate:artifact",
+      work_unit_id: "R1:investigate",
+      requirement_id: "R1",
+      phase: "investigate",
+      attempt: 1,
+      summary: "Python reference selected",
+      handoff: {
+        target_mappings: [{
+          target_key: "route",
+          contract_symbol: "target",
+          contract_location: "sample.py:1"
+        }],
+        reference_analysis: {
+          candidates: [],
+          target_selections: [{
+            target_key: "route",
+            selected_location: null,
+            no_reference_reason: "This fixture isolates host-owned Python adapter reconciliation"
+          }]
+        }
+      },
+      evidence_refs: ["sample.py:1", "sample.py:5"],
+      knowledge_revision: 0,
+      workspace_revision: 0,
+      created_at: state.created_at
+    });
+    session.hierarchical_state = state;
+    const handoff = handoffFor("prepare", "sample.py", "sample.py") as Record<string, unknown>;
+    const callContract = handoff.call_contract as { analyzed_targets: Array<Record<string, unknown>> };
+    callContract.analyzed_targets = [{
+      target_file: "sample.py",
+      symbol: "target",
+      guards: ["源码检查：调用前检查 authenticated；sample.py:4"]
+    }];
+    const operation = {
+      kind: "run_phase" as const,
+      requirement_id: "R1",
+      work_unit_id: "R1:prepare",
+      phase: "prepare" as const,
+      role: "implementation-preparer"
+    };
+    const structured = { status: "passed", handoff };
+    const stageId = "hierarchical:R1/prepare";
+
+    reconcileHierarchicalPrepareContractHandoff(session, operation, structured, stageId);
+    expect(callContract.analyzed_targets).toHaveLength(1);
+    expect(callContract.analyzed_targets[0]).toMatchObject({
+      analysis_method: "language-adapter",
+      adapter_id: "python-pyright-call-hierarchy",
+      adapter_report_digest: "a".repeat(64),
+      runtime_verification_required: true,
+      callsite_accounting: {
+        total: 1,
+        reviewed: 1,
+        relevant: 1,
+        irrelevant: 0,
+        unresolved: 0,
+        accounted: true
+      }
+    });
+    expect(callContract.analyzed_targets[0]!.callsite_reviews).toEqual([
+      expect.objectContaining({ callsite_id: "lsp:caller", disposition: "relevant" })
+    ]);
+    expect(callContract.analyzed_targets[0]!.guards).toEqual(expect.arrayContaining([
+      expect.stringContaining("authenticated")
+    ]));
+    expect(() => validateHierarchicalContractToolEvidence(session, operation, [{
+      type: "phase_passed",
+      work_unit_id: "R1:prepare",
+      summary: "prepared",
+      handoff,
+      evidence_refs: ["sample.py:1"],
+      allowed_files: ["sample.py"]
+    }], stageId)).not.toThrow();
+  });
+
   it("requires a real successful validation command after the last code change", () => {
     const session = createSession();
     const operation = {
@@ -920,6 +1101,8 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       };
       const targetMappings = investigateHandoff.target_mappings as Array<Record<string, unknown>>;
       referenceAnalysis.candidates[0]!.location = "entry.ts:2";
+      referenceAnalysis.candidates[0]!.entry_symbol = "existingRoute";
+      referenceAnalysis.candidates[0]!.entry_location = "entry.ts:2";
       referenceAnalysis.candidates[0]!.contract_location = "reference.ts:1";
       referenceAnalysis.candidates[0]!.evidence_refs = ["entry.ts:2", "reference.ts:1"];
       targetMappings[0]!.contract_location = "reference.ts:1";
@@ -959,6 +1142,13 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
         input: { target_file: "reference.ts", symbol: "reference", target_line: 1 },
         status: "completed",
         created_at: new Date().toISOString()
+      }, {
+        id: "entry-contract",
+        stage_id: stageId,
+        tool: "mcp__ai_coder__investigate_symbol_contract",
+        input: { target_file: "entry.ts", symbol: "existingRoute", target_line: 2 },
+        status: "completed",
+        created_at: new Date().toISOString()
       }];
       const operation = {
         kind: "run_phase" as const,
@@ -984,14 +1174,14 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       const targets = (
         prepareHandoff.call_contract as { analyzed_targets: Array<Record<string, unknown>> }
       ).analyzed_targets;
-      expect(targets).toHaveLength(1);
-      expect(targets[0]).toMatchObject({
+      expect(targets).toHaveLength(2);
+      expect(targets).toContainEqual(expect.objectContaining({
         target_file: "reference.ts",
         symbol: "reference",
         analysis_method: "investigation-script",
         all_pages_consumed: true
-      });
-      expect(targets[0]!.unresolved).toEqual(expect.arrayContaining([
+      }));
+      expect(targets.find((target) => target.symbol === "reference")!.unresolved).toEqual(expect.arrayContaining([
         expect.stringContaining("reference.ts:2")
       ]));
       expect(() => validateHierarchicalContractToolEvidence(
@@ -1071,6 +1261,8 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
         ...reference.candidates[0],
         target_key: "NEW",
         location: "routes.ts:5",
+        entry_symbol: "dispatch",
+        entry_location: "routes.ts:3",
         contract_symbol: "Target",
         contract_location: "target.ts:1",
         destination: "Target",
@@ -1116,6 +1308,13 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
         stage_id: prepareStageId,
         tool: "mcp__ai_coder__investigate_symbol_contract",
         input: { target_file: "target.ts", symbol: "Target", target_line: 1 },
+        status: "completed",
+        created_at: new Date().toISOString()
+      }, {
+        id: "entry-contract",
+        stage_id: prepareStageId,
+        tool: "mcp__ai_coder__investigate_symbol_contract",
+        input: { target_file: "routes.ts", symbol: "dispatch", target_line: 3 },
         status: "completed",
         created_at: new Date().toISOString()
       }];
@@ -1206,7 +1405,7 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     } finally {
       await rm(projectPath, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   it("keeps rejected structured drafts parseable while retaining tail contract fields", () => {
     const handoff = handoffFor("prepare") as Record<string, unknown>;
@@ -1291,10 +1490,14 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
         target_selections: Array<Record<string, unknown>>;
       };
       referenceAnalysis.candidates[0]!.target_key = "LQBInvest";
+      referenceAnalysis.candidates[0]!.location = "feature.ts:1";
+      referenceAnalysis.candidates[0]!.entry_symbol = "LQBInvest";
+      referenceAnalysis.candidates[0]!.entry_location = "feature.ts:1";
       referenceAnalysis.candidates[0]!.contract_symbol = "LQBInvest";
       referenceAnalysis.candidates[0]!.contract_location = "feature.ts:1";
-      referenceAnalysis.candidates[0]!.evidence_refs = ["reference.ts:5", "feature.ts:1"];
+      referenceAnalysis.candidates[0]!.evidence_refs = ["feature.ts:1"];
       referenceAnalysis.target_selections[0]!.target_key = "LQBInvest";
+      referenceAnalysis.target_selections[0]!.selected_location = "feature.ts:1";
       handoff.feature_census = {
         applicability: "required",
         reason: "业务功能描述需要完整候选普查",
@@ -2519,6 +2722,138 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     expect(composite).toBe(destination);
   });
 
+  it("routes a missing reference-entry graph edge back to investigate immediately", () => {
+    expect(hierarchicalPhaseSelfHealRoute(
+      "prepare",
+      "prepare 选中的同功能入口缺少 entry_symbol@entry_location：LQBInvest"
+    )).toBe("investigate");
+    expect(hierarchicalPhaseSelfHealRoute(
+      "prepare",
+      "prepare 选中的同功能入口尚未解析为真实调用边：ESCTR"
+    )).toBe("investigate");
+    expect(hierarchicalPhaseSelfHealRoute(
+      "prepare",
+      "behavior_obligations JSON 格式错误"
+    )).toBe("retry");
+  });
+
+  it("expands compact prepare decisions from the selected entry callsite capability", () => {
+    const session = createSession();
+    const state = createHierarchicalExecutionState("prepare compact behavior");
+    const now = state.created_at;
+    const source = "src/main/agent/claudeAgentRunner.ts";
+    state.phase_artifacts.push({
+      id: "R1:investigate:artifact",
+      work_unit_id: "R1:investigate",
+      requirement_id: "R1",
+      phase: "investigate",
+      attempt: 1,
+      summary: "entry selected",
+      handoff: {
+        target_mappings: [{
+          target_key: "route",
+          dispatcher_location: `${source}:100`,
+          contract_symbol: "Target",
+          contract_location: `${source}:200`
+        }],
+        reference_analysis: {
+          candidates: [{
+            target_key: "route",
+            location: `${source}:120`,
+            entry_symbol: "openTarget",
+            entry_location: `${source}:100`,
+            contract_symbol: "Target",
+            contract_location: `${source}:200`,
+            evidence_refs: [`${source}:120`]
+          }],
+          target_selections: [{ target_key: "route", selected_location: `${source}:120` }]
+        }
+      },
+      evidence_refs: [`${source}:120`],
+      knowledge_revision: 0,
+      workspace_revision: 0,
+      created_at: now
+    });
+    state.capability_nodes.push({
+      id: "cap:R1:symbol-contract:entry",
+      capability: "symbol-contract-analysis",
+      requirement_id: "R1",
+      parent_phase: "prepare",
+      dependencies: [],
+      status: "passed",
+      attempt: 1,
+      input: { target_file: source, symbol: "openTarget" },
+      output: {
+        target_file: source,
+        symbol: "openTarget",
+        callsite_inventory: {
+          entries: [{
+            callsite_id: "entry:outgoing",
+            direction: "outgoing",
+            evidence_ref: `${source}:120`
+          }]
+        }
+      },
+      evidence_refs: [`${source}:100`],
+      consecutive_failure_count: 0,
+      created_at: now,
+      updated_at: now
+    }, {
+      id: "cap:R1:callsite-review:entry",
+      capability: "callsite-semantic-review",
+      requirement_id: "R1",
+      parent_phase: "prepare",
+      dependencies: ["cap:R1:symbol-contract:entry"],
+      status: "passed",
+      attempt: 1,
+      input: {
+        parent_symbol_node_id: "cap:R1:symbol-contract:entry",
+        callsite_id: "entry:outgoing"
+      },
+      output: {
+        destination: "Target",
+        invocation: "navigator.push",
+        arguments: ["mode=safe"],
+        preconditions: ["authenticated"],
+        context: ["navigator"],
+        side_effects: ["navigation"]
+      },
+      evidence_refs: [`${source}:120`],
+      consecutive_failure_count: 0,
+      created_at: now,
+      updated_at: now
+    });
+    session.hierarchical_state = state;
+    const handoff = {
+      behavior_obligations: [
+        "destination", "invocation", "arguments", "preconditions", "context", "side_effects"
+      ].map((dimension) => ({ dimension, decision: "reuse", reason: "same feature" })),
+      reference_application: []
+    };
+
+    reconcileHierarchicalPrepareDerivedBehaviorContract(session, {
+      kind: "run_phase",
+      requirement_id: "R1",
+      work_unit_id: "R1:prepare",
+      phase: "prepare",
+      role: "implementation-preparer"
+    }, { status: "passed", handoff });
+
+    expect(handoff.reference_application).toHaveLength(6);
+    expect(handoff.behavior_obligations).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "B3-arguments",
+        target_keys: ["route"],
+        reference_behavior: expect.stringContaining("mode=safe"),
+        required_behavior: expect.stringContaining("mode=safe")
+      }),
+      expect.objectContaining({
+        id: "B4-preconditions",
+        reference_behavior: expect.stringContaining("authenticated")
+      })
+    ]));
+  });
+
   it("groups investigate handoff violations into per-section class fingerprints", () => {
     const contractMismatchA = hierarchicalErrorFingerprint(
       "R33/investigate",
@@ -2704,6 +3039,8 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       target_key: "second-route",
       reference_kind: "same-feature-entry",
       location: "secondEntry.ts:4",
+      entry_symbol: "secondEntry",
+      entry_location: "secondEntry.ts:4",
       contract_symbol: "secondReference",
       contract_location: "secondReference.ts:8",
       evidence_refs: ["secondEntry.ts:4", "secondReference.ts:8"]
@@ -2741,6 +3078,18 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       symbol: "secondReference",
       definition: "secondReference function；secondReference.ts:8",
       evidence_refs: ["secondReference.ts:8"]
+    });
+    expect(() => validateHierarchicalBehaviorObligationContinuity(
+      session,
+      prepareOperation,
+      [prepareEvent]
+    )).toThrow("secondEntry@secondEntry.ts:4");
+    analyzedTargets.push({
+      ...referenceTarget,
+      target_file: "secondEntry.ts",
+      symbol: "secondEntry",
+      definition: "secondEntry function；secondEntry.ts:4",
+      evidence_refs: ["secondEntry.ts:4"]
     });
     expect(() => validateHierarchicalBehaviorObligationContinuity(
       session,
@@ -3311,7 +3660,10 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       const uploadDir = path.join(projectPath, ".ai-coder", "uploads", "spec");
       await mkdir(uploadDir, { recursive: true });
       await writeFile(path.join(projectPath, "target.ts"), "export const fixtureTarget = true;\n");
-      await writeFile(path.join(projectPath, "reference.ts"), "export const fixtureReference = true;\n");
+      await writeFile(
+        path.join(projectPath, "reference.ts"),
+        "\n\n\n\nexport function reference(value) { return value; }\nexport function entry() { return reference(1); }\n"
+      );
       const attachments = [];
       for (let index = 1; index <= 21; index += 1) {
         const filename = `page-${String(index).padStart(2, "0")}.png`;
@@ -3329,6 +3681,7 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       let plannerAttachmentSearchDenial = "";
       let wrongBatchPathDenial = "";
       let crashedA2 = false;
+      let callsiteReviewCalls = 0;
       async function* query(params: unknown) {
         const typed = params as {
           prompt?: unknown;
@@ -3400,6 +3753,27 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
               dependencies: []
             }]
           };
+        } else if (prompt.includes("调用点契约调查节点，只审查下面唯一一个调用点")) {
+          callsiteReviewCalls += 1;
+          const callsiteId = /"callsite_id":"([^"]+)"/.exec(prompt)?.[1] ?? "missing-callsite";
+          const evidenceRef = /"evidence_ref":"([^"]+)"/.exec(prompt)?.[1] ?? "reference.ts:6";
+          const fingerprint = /"host_fingerprint_digest":"([^"]*)"/.exec(prompt)?.[1] ?? "";
+          const definitionDigest = /"definition_digest":"([^"]+)"/.exec(prompt)?.[1] ?? "missing-definition";
+          structuredOutput = {
+            callsite_id: callsiteId,
+            disposition: "relevant",
+            summary: "entry calls reference with value 1",
+            destination: "reference@reference.ts",
+            invocation: "direct function call",
+            arguments: ["value=1"],
+            preconditions: ["no guard observed"],
+            context: ["entry local context"],
+            side_effects: ["invokes reference"],
+            unresolved: [],
+            evidence_refs: [evidenceRef],
+            definition_digest: definitionDigest,
+            host_fingerprint_digest: fingerprint
+          };
         } else if (prompt.includes("对照用户原始目标、稳定需求账本")) {
           structuredOutput = {
             status: "passed",
@@ -3448,6 +3822,27 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       expect(updated.status, updated.error).toBe("completed");
       expect(updated.hierarchical_state?.alignment_batches).toHaveLength(7);
       expect(updated.hierarchical_state?.alignment_batches.every((batch) => batch.status === "completed")).toBe(true);
+      expect(updated.hierarchical_state?.capability_nodes).toContainEqual(expect.objectContaining({
+        capability: "symbol-contract-analysis",
+        requirement_id: "R1",
+        status: "passed",
+        attempt: 1,
+        output: expect.objectContaining({
+          target_file: "reference.ts",
+          symbol: "reference",
+          all_pages_consumed: true
+        })
+      }));
+      expect(updated.hierarchical_state?.capability_nodes).toContainEqual(expect.objectContaining({
+        capability: "callsite-semantic-review",
+        requirement_id: "R1",
+        status: "passed",
+        output: expect.objectContaining({
+          disposition: "relevant",
+          arguments: ["value=1"]
+        })
+      }));
+      expect(callsiteReviewCalls).toBe(1);
       expect(batchSizes.every((size) => size >= 1 && size <= 3)).toBe(true);
       expect(batchCalls.get("A1")).toBe(1);
       expect(batchCalls.get("A2")).toBe(2);
@@ -3457,6 +3852,9 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       expect(plannerAttachmentSearchDenial).toContain("禁止再次 Read");
       expect(updated.progress_events).toContainEqual(expect.objectContaining({
         message: expect.stringContaining("21 个附件拆成 7 个")
+      }));
+      expect(updated.progress_events).toContainEqual(expect.objectContaining({
+        message: expect.stringContaining("capability 节点完成")
       }));
       expect(updated.progress_events).toContainEqual(expect.objectContaining({
         message: expect.stringContaining("A2 失败，仅重试本批")
@@ -3813,7 +4211,10 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     const targetPath = path.join(projectPath, "target.js");
     const original = `export const value = "stable";\n${"// preserved\n".repeat(120)}`;
     await writeFile(targetPath, original);
-    await writeFile(path.join(projectPath, "reference.js"), "export const fixtureReference = true;\n");
+    await writeFile(
+      path.join(projectPath, "reference.js"),
+      "\n\n\n\nexport function reference(value) { return value; }\n"
+    );
     let implementAttempts = 0;
 
     async function* query(params: unknown) {
@@ -3885,7 +4286,10 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
   it("steps back to prepare after repeated implement failures without interrupting the goal", async () => {
     const projectPath = await mkdtemp(path.join(os.tmpdir(), "ai-coder-inner-self-heal-"));
     await writeFile(path.join(projectPath, "target.js"), "export const stable = true;\n");
-    await writeFile(path.join(projectPath, "reference.js"), "export const fixtureReference = true;\n");
+    await writeFile(
+      path.join(projectPath, "reference.js"),
+      "\n\n\n\nexport function reference(value) { return value; }\n"
+    );
     let implementAttempts = 0;
     let prepareAttempts = 0;
 
@@ -3952,7 +4356,10 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
   it("stops an unchanged implement/prepare failure cycle after six correction opportunities", async () => {
     const projectPath = await mkdtemp(path.join(os.tmpdir(), "ai-coder-bounded-self-heal-"));
     await writeFile(path.join(projectPath, "target.js"), "export const stable = true;\n");
-    await writeFile(path.join(projectPath, "reference.js"), "export const fixtureReference = true;\n");
+    await writeFile(
+      path.join(projectPath, "reference.js"),
+      "\n\n\n\nexport function reference(value) { return value; }\n"
+    );
     let implementAttempts = 0;
     let prepareAttempts = 0;
 

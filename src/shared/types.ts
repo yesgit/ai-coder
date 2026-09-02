@@ -672,6 +672,29 @@ export interface HierarchicalPhaseArtifact {
   created_at: string;
 }
 
+/**
+ * A host-owned, independently retryable capability leaf in the execution
+ * graph. Capability inputs/outputs are intentionally generic; language and
+ * tool adapters own their schemas.
+ */
+export interface HierarchicalCapabilityNode {
+  id: string;
+  capability: string;
+  requirement_id: string;
+  parent_phase: Exclude<HierarchicalWorkPhase, "close">;
+  dependencies: string[];
+  status: "pending" | "running" | "passed" | "failed" | "blocked" | "superseded";
+  attempt: number;
+  input: Record<string, unknown>;
+  output?: Record<string, unknown>;
+  evidence_refs: string[];
+  error_fingerprint?: string;
+  consecutive_failure_count: number;
+  failure_reason?: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface HierarchicalWorkspaceContract {
   project_path: string;
   /** 工作区建立属于 Goal 级动作；叶子角色只能读取，不能重新 checkout/stash/reset。 */
@@ -784,6 +807,8 @@ export interface HierarchicalExecutionState {
   blockers: HierarchicalBlocker[];
   phase_runs: HierarchicalPhaseRun[];
   phase_artifacts: HierarchicalPhaseArtifact[];
+  /** Dynamically expanded, capability-specific leaves between broad phases. */
+  capability_nodes: HierarchicalCapabilityNode[];
   /** 每次 implement 成功提交后递增；用于判定只读观察是否仍然新鲜。 */
   workspace_revision: number;
   integration_status: "pending" | "running" | "passed" | "failed";

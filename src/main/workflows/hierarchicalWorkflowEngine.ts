@@ -2,6 +2,7 @@ import type {
   GoalContract,
   HierarchicalAlignmentFinding,
   HierarchicalBlocker,
+  HierarchicalCapabilityNode,
   HierarchicalExecutionState,
   HierarchicalLoopFrame,
   HierarchicalRequirement,
@@ -12,6 +13,7 @@ import type {
   KnowledgeUnknown,
   RequirementAcceptance
 } from "../../shared/types.js";
+import { deriveHierarchicalGraphOperation } from "./hierarchicalExecutionGraph.js";
 
 export interface PlannedRequirement {
   id: string;
@@ -52,6 +54,15 @@ export type HierarchicalNextOperation =
       work_unit_id: string;
       phase: Exclude<HierarchicalWorkPhase, "close">;
       role: string;
+    }
+  | {
+      kind: "run_capability";
+      node_id: string;
+      requirement_id: string;
+      parent_phase: Exclude<HierarchicalWorkPhase, "close">;
+      capability: string;
+      input: Record<string, unknown>;
+      attempt: number;
     }
   | { kind: "close_requirement"; requirement_id: string }
   | { kind: "run_integrator" }
@@ -98,6 +109,34 @@ export type HierarchicalEvent =
   | { type: "requirements_appended"; requirements: PlannedRequirement[]; occurred_at?: string }
   | { type: "requirement_activated"; requirement_id: string; occurred_at?: string }
   | { type: "phase_started"; work_unit_id: string; occurred_at?: string }
+  | {
+      type: "capability_graph_synchronized";
+      requirement_id: string;
+      parent_phase: Exclude<HierarchicalWorkPhase, "close">;
+      requests: Array<{
+        id: string;
+        capability: string;
+        dependencies?: string[];
+        input: Record<string, unknown>;
+      }>;
+      occurred_at?: string;
+    }
+  | { type: "capability_started"; node_id: string; occurred_at?: string }
+  | {
+      type: "capability_passed";
+      node_id: string;
+      output: Record<string, unknown>;
+      evidence_refs: string[];
+      occurred_at?: string;
+    }
+  | {
+      type: "capability_failed";
+      node_id: string;
+      reason: string;
+      route: "retry" | "blocked";
+      error_fingerprint?: string;
+      occurred_at?: string;
+    }
   | {
       type: "phase_passed";
       work_unit_id: string;
@@ -190,6 +229,7 @@ export function createHierarchicalExecutionState(
     blockers: [],
     phase_runs: [],
     phase_artifacts: [],
+    capability_nodes: [],
     workspace_revision: 0,
     integration_status: "pending",
     integration_evidence_refs: [],
@@ -232,6 +272,18 @@ export function applyHierarchicalEvent(
       break;
     case "phase_started":
       startPhase(next, event.work_unit_id, now);
+      break;
+    case "capability_graph_synchronized":
+      synchronizeCapabilityGraph(next, event, now);
+      break;
+    case "capability_started":
+      startCapability(next, event.node_id, now);
+      break;
+    case "capability_passed":
+      passCapability(next, event.node_id, event.output, event.evidence_refs, now);
+      break;
+    case "capability_failed":
+      failCapability(next, event.node_id, event.reason, event.route, event.error_fingerprint, now);
       break;
     case "phase_passed":
       passPhase(next, event, now);
@@ -338,51 +390,15 @@ export function deriveHierarchicalNextOperation(
   if (internalBlocker) return { kind: "blocked", blocker_id: internalBlocker.id };
 
   if (state.macro_phase === "complete") return { kind: "complete" };
-  if (state.requirements.length === 0) {
-    const batch = state.alignment_batches.find((item) => item.status === "running")
-      ?? state.alignment_batches.find((item) => item.status === "pending");
-    if (batch) {
-      return {
-        kind: "run_alignment_batch",
-        batch_id: batch.id,
-        source_refs: [...batch.source_refs],
-        attempt: batch.attempt
-      };
-    }
-    return { kind: "run_planner" };
-  }
+  const operation = deriveHierarchicalGraphOperation(state);
+  if (operation) return operation;
 
-  const active = state.requirements.find((requirement) => requirement.id === state.active_requirement_id);
-  if (!active) {
-    const ready = selectReadyRequirement(state);
-    if (ready) return { kind: "activate_requirement", requirement_id: ready.id };
-    if (allRequirementsClosed(state)) return { kind: "run_integrator" };
-    const blocked = state.requirements.filter((requirement) => requirement.status === "blocked");
-    throw new Error(
-      blocked.length > 0
-        ? `没有可执行需求；阻塞项：${blocked.map((requirement) => requirement.id).join(", ")}`
-        : "没有 dependency-ready 的需求；请检查依赖关系"
-    );
-  }
-
-  const phase = active.current_phase;
-  if (!phase) throw new Error(`活动需求 ${active.id} 缺少当前阶段`);
-  if (phase === "close") return { kind: "close_requirement", requirement_id: active.id };
-
-  const workUnit = state.active_work_unit;
-  if (!workUnit || workUnit.requirement_id !== active.id || workUnit.phase !== phase) {
-    throw new Error(`活动需求 ${active.id} 的工作单元与阶段不一致`);
-  }
-  if (workUnit.status === "blocked") {
-    throw new Error(`当前工作单元 ${workUnit.id} 已阻塞`);
-  }
-  return {
-    kind: "run_phase",
-    requirement_id: active.id,
-    work_unit_id: workUnit.id,
-    phase,
-    role: ROLE_BY_PHASE[phase]
-  };
+  const blocked = state.requirements.filter((requirement) => requirement.status === "blocked");
+  throw new Error(
+    blocked.length > 0
+      ? `工作图没有可运行节点；阻塞需求：${blocked.map((requirement) => requirement.id).join(", ")}`
+      : "工作图没有可运行节点；请检查依赖、活动工作单元与验收证据状态"
+  );
 }
 
 export function deriveHierarchicalLoopStack(
@@ -423,6 +439,20 @@ export function deriveHierarchicalLoopStack(
     objective: phaseObjective(state.active_work_unit.phase),
     status: state.active_work_unit.status
   });
+  const capability = (state.capability_nodes ?? []).find((node) =>
+    node.requirement_id === requirement.id
+    && node.parent_phase === state.active_work_unit?.phase
+    && (node.status === "pending" || node.status === "running" || node.status === "failed" || node.status === "blocked")
+  );
+  if (capability) {
+    frames.push({
+      kind: "action",
+      id: capability.id,
+      objective: `执行 capability：${capability.capability}`,
+      status: `${capability.status} · attempt ${capability.attempt}`
+    });
+    return frames;
+  }
   frames.push({
     kind: "action",
     id: state.active_work_unit.id,
@@ -829,6 +859,139 @@ function failPhase(
   state.active_work_unit = recoveryWorkUnit;
 }
 
+function synchronizeCapabilityGraph(
+  state: HierarchicalExecutionState,
+  event: Extract<HierarchicalEvent, { type: "capability_graph_synchronized" }>,
+  now: string
+): void {
+  requireRequirement(state, event.requirement_id);
+  state.capability_nodes ??= [];
+  const requestIds = new Set<string>();
+  for (const request of event.requests) {
+    if (!request.id.trim()) throw new Error("capability 节点 ID 不能为空");
+    if (!request.capability.trim()) throw new Error(`capability 节点 ${request.id} 缺少能力标识`);
+    if (requestIds.has(request.id)) throw new Error(`capability 请求 ID 重复：${request.id}`);
+    if ((request.dependencies ?? []).includes(request.id)) {
+      throw new Error(`capability 节点不能依赖自身：${request.id}`);
+    }
+    requestIds.add(request.id);
+  }
+  for (const request of event.requests) {
+    for (const dependency of request.dependencies ?? []) {
+      if (
+        !requestIds.has(dependency)
+        && !(state.capability_nodes ?? []).some((node) => node.id === dependency)
+      ) {
+        throw new Error(`capability 节点 ${request.id} 依赖不存在的节点：${dependency}`);
+      }
+    }
+  }
+
+  const scoped = state.capability_nodes.filter((node) =>
+    node.requirement_id === event.requirement_id && node.parent_phase === event.parent_phase
+  );
+  for (const node of scoped) {
+    if (requestIds.has(node.id)) continue;
+    if (node.status === "running") {
+      throw new Error(`运行中的 capability 节点不能被同步移除：${node.id}`);
+    }
+    node.status = "superseded";
+    node.updated_at = now;
+  }
+
+  for (const request of event.requests) {
+    const existing = state.capability_nodes.find((node) => node.id === request.id);
+    if (existing) {
+      if (
+        existing.requirement_id !== event.requirement_id
+        || existing.parent_phase !== event.parent_phase
+        || existing.capability !== request.capability
+        || JSON.stringify(existing.input) !== JSON.stringify(request.input)
+      ) {
+        throw new Error(`capability 节点稳定 ID 对应了不同请求：${request.id}`);
+      }
+      existing.dependencies = unique(request.dependencies ?? []);
+      if (existing.status === "superseded") {
+        existing.status = "pending";
+        existing.attempt += 1;
+        existing.output = undefined;
+        existing.evidence_refs = [];
+        existing.failure_reason = undefined;
+      }
+      existing.updated_at = now;
+      continue;
+    }
+    const node: HierarchicalCapabilityNode = {
+      id: request.id,
+      capability: request.capability,
+      requirement_id: event.requirement_id,
+      parent_phase: event.parent_phase,
+      dependencies: unique(request.dependencies ?? []),
+      status: "pending",
+      attempt: 1,
+      input: structuredClone(request.input),
+      evidence_refs: [],
+      consecutive_failure_count: 0,
+      created_at: now,
+      updated_at: now
+    };
+    state.capability_nodes.push(node);
+  }
+}
+
+function startCapability(state: HierarchicalExecutionState, nodeId: string, now: string): void {
+  const node = requireCapabilityNode(state, nodeId);
+  if (node.status === "running") return;
+  if (node.status !== "pending") {
+    throw new Error(`capability 节点 ${nodeId} 当前不能启动：${node.status}`);
+  }
+  node.status = "running";
+  node.failure_reason = undefined;
+  node.updated_at = now;
+}
+
+function passCapability(
+  state: HierarchicalExecutionState,
+  nodeId: string,
+  output: Record<string, unknown>,
+  evidenceRefs: string[],
+  now: string
+): void {
+  const node = requireCapabilityNode(state, nodeId);
+  if (node.status !== "running") throw new Error(`capability 节点 ${nodeId} 尚未运行`);
+  if (evidenceRefs.length === 0) throw new Error(`capability 节点 ${nodeId} 通过必须包含证据`);
+  node.status = "passed";
+  node.output = structuredClone(output);
+  node.evidence_refs = unique(evidenceRefs);
+  node.error_fingerprint = undefined;
+  node.consecutive_failure_count = 0;
+  node.failure_reason = undefined;
+  node.updated_at = now;
+}
+
+function failCapability(
+  state: HierarchicalExecutionState,
+  nodeId: string,
+  reason: string,
+  route: "retry" | "blocked",
+  errorFingerprint: string | undefined,
+  now: string
+): void {
+  const node = requireCapabilityNode(state, nodeId);
+  if (node.status !== "running") throw new Error(`capability 节点 ${nodeId} 尚未运行`);
+  if (!reason.trim()) throw new Error(`capability 节点 ${nodeId} 缺少失败原因`);
+  node.consecutive_failure_count = errorFingerprint && node.error_fingerprint === errorFingerprint
+    ? node.consecutive_failure_count + 1
+    : 1;
+  node.error_fingerprint = errorFingerprint;
+  node.failure_reason = reason.trim();
+  node.output = undefined;
+  node.evidence_refs = [];
+  node.status = route === "retry" ? "pending" : "blocked";
+  if (route === "retry") node.attempt += 1;
+  node.updated_at = now;
+}
+
 function closeRequirement(state: HierarchicalExecutionState, requirementId: string): void {
   if (state.active_requirement_id !== requirementId) throw new Error(`需求 ${requirementId} 不是当前活动需求`);
   const requirement = requireRequirement(state, requirementId);
@@ -993,15 +1156,6 @@ function validateBlocker(blocker: HierarchicalBlocker): void {
   }
 }
 
-function selectReadyRequirement(state: HierarchicalExecutionState): HierarchicalRequirement | undefined {
-  return state.requirements.find((requirement) =>
-    requirement.status === "pending"
-    && requirement.dependencies.every((dependencyId) =>
-      state.requirements.find((item) => item.id === dependencyId)?.status === "completed"
-    )
-  );
-}
-
 function allRequirementsClosed(state: HierarchicalExecutionState): boolean {
   return state.requirements.length > 0 && state.requirements.every(isRequirementClosed);
 }
@@ -1039,6 +1193,12 @@ function requireWorkUnit(state: HierarchicalExecutionState, id: string): Hierarc
   const workUnit = state.active_work_unit;
   if (!workUnit || workUnit.id !== id) throw new Error(`工作单元不存在或不是当前活动单元：${id}`);
   return workUnit;
+}
+
+function requireCapabilityNode(state: HierarchicalExecutionState, id: string): HierarchicalCapabilityNode {
+  const node = (state.capability_nodes ?? []).find((item) => item.id === id);
+  if (!node) throw new Error(`capability 节点不存在：${id}`);
+  return node;
 }
 
 function settleCurrentPhaseRun(

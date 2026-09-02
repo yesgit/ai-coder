@@ -195,6 +195,83 @@ fun openLqbHome() {
     expect(report.unresolved.join("\n")).toContain("当前脚本不支持语义解析");
   });
 
+  it("enumerates and adjudicates Python declarations in a Python-only project", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "feature-census-python-"));
+    await writeFile(path.join(root, "account_routes.py"), [
+      "def helper():",
+      "    return True",
+      "",
+      "def open_account_security(user):",
+      "    # 账户安全入口",
+      "    if user.authenticated:",
+      "        return helper()",
+      "",
+      "def caller(user):",
+      "    return open_account_security(user)"
+    ].join("\n"));
+    const initial = censusFeatureImplementations({
+      projectPath: root,
+      feature: "账户安全入口",
+      aliases: ["open_account_security"]
+    });
+    expect(initial.candidates).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        symbol: "open_account_security",
+        kind: "function",
+        definition: expect.objectContaining({ file: "account_routes.py", line: 4 })
+      })
+    ]));
+    const report = censusFeatureImplementations({
+      projectPath: root,
+      feature: "账户安全入口",
+      aliases: ["open_account_security"],
+      adjudications: initial.candidates.map((candidate) => ({
+        candidate_id: candidate.id,
+        verdict: candidate.symbol === "open_account_security" ? "yes" : "no",
+        reason: candidate.symbol === "open_account_security" ? "真实账户安全入口" : "辅助函数",
+        evidence_refs: [`${candidate.definition.file}:${candidate.definition.line}`]
+      }))
+    });
+    expect(report.selected_targets).toEqual([
+      expect.objectContaining({ symbol: "open_account_security" })
+    ]);
+    expect(report.coverage).toMatchObject({
+      language: "typescript-javascript+python-java-lexical",
+      unsupported_matching_files: []
+    });
+    expect(report.closure).toMatchObject({
+      inventory_complete: true,
+      semantic_complete: true,
+      runtime_verification_required: true
+    });
+  });
+
+  it("enumerates Java classes and methods without promoting every class member", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "feature-census-java-"));
+    await writeFile(path.join(root, "AccountRoutes.java"), [
+      "public class AccountRoutes {",
+      "  public boolean helper() { return true; }",
+      "",
+      "  // 账户安全入口",
+      "  public boolean openAccountSecurity(User user) {",
+      "    return user.isAuthenticated() && helper();",
+      "  }",
+      "}"
+    ].join("\n"));
+    const report = censusFeatureImplementations({
+      projectPath: root,
+      feature: "账户安全入口",
+      aliases: ["openAccountSecurity"]
+    });
+    expect(report.candidates.map((candidate) => candidate.symbol)).toEqual(expect.arrayContaining([
+      "AccountRoutes",
+      "openAccountSecurity"
+    ]));
+    expect(report.candidates.map((candidate) => candidate.symbol)).not.toContain("helper");
+    expect(report.candidates.find((candidate) => candidate.symbol === "openAccountSecurity"))
+      .toMatchObject({ kind: "method", definition: { file: "AccountRoutes.java", line: 5 } });
+  });
+
   it("records dynamic dispatch limits without blocking feature-location completion", async () => {
     const root = await createNavigationFixture();
     await writeFile(path.join(root, "dynamic.ts"), `

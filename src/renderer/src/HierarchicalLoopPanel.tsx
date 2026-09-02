@@ -1,7 +1,10 @@
+import { useState } from "react";
 import type { HierarchicalExecutionState } from "../../shared/types.js";
+import WorkGraphPanel, { ViewSwitch } from "./WorkGraphPanel.js";
 
 interface HierarchicalLoopPanelProps {
   state?: HierarchicalExecutionState;
+  defaultView?: "graph" | "loop";
 }
 
 const PHASE_LABELS: Record<string, string> = {
@@ -28,7 +31,14 @@ const STATUS_CLASS: Record<string, string> = {
   skipped: "superseded"
 };
 
-export default function HierarchicalLoopPanel({ state }: HierarchicalLoopPanelProps) {
+export default function HierarchicalLoopPanel({
+  state,
+  defaultView = "graph"
+}: HierarchicalLoopPanelProps) {
+  const [view, setView] = useState<"graph" | "loop">(defaultView);
+  if (view === "graph") {
+    return <WorkGraphPanel state={state} onShowLoop={() => setView("loop")} />;
+  }
   if (!state) {
     return (
       <section className="stages-panel hierarchical-loop-panel" aria-live="polite">
@@ -36,6 +46,7 @@ export default function HierarchicalLoopPanel({ state }: HierarchicalLoopPanelPr
           <h3>分层循环</h3>
           <span className="task-tree-count">初始化</span>
         </div>
+        <ViewSwitch graph={false} onShowGraph={() => setView("graph")} />
         <div className="task-tree-empty">
           <strong>等待宿主建立目标契约</strong>
           <small>目标、需求、阶段与动作会由宿主状态机分别管理。</small>
@@ -64,6 +75,8 @@ export default function HierarchicalLoopPanel({ state }: HierarchicalLoopPanelPr
         <h3>分层循环</h3>
         <span className="task-tree-count">{completed}/{state.requirements.length}</span>
       </div>
+
+      <ViewSwitch graph={false} onShowGraph={() => setView("graph")} />
 
       <div className="hierarchical-goal">
         <small>目标 {state.goal.id} · rev {state.goal.revision}</small>

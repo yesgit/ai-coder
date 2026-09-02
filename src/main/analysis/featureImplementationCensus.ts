@@ -95,7 +95,7 @@ export interface FeatureImplementationCensusReport {
     scope_paths: string[];
   };
   coverage: {
-    language: "typescript-javascript";
+    language: "typescript-javascript+python-java-lexical";
     analysis_mode: "project-config" | "syntax-fallback";
     files_discovered: number;
     files_scanned: number;
@@ -182,6 +182,24 @@ interface InternalCandidate {
   evidenceAgainst: FeatureEvidence[];
 }
 
+interface AdjudicationCandidateScope {
+  definition: SourceLocation;
+  source_span: { start_line: number; end_line: number };
+  evidence: FeatureEvidence[];
+  evidenceAgainst: FeatureEvidence[];
+}
+
+interface LexicalLanguageCandidate extends AdjudicationCandidateScope {
+  id: string;
+  symbol: string;
+  kind: FeatureImplementationCandidate["kind"];
+  role: FeatureImplementationCandidate["role"];
+  declarationText: string;
+  referenceLocations: SourceLocation[];
+  nested: boolean;
+  enclosingCandidateId?: string;
+}
+
 interface GraphEdge {
   from: string;
   to: string;
@@ -190,7 +208,8 @@ interface GraphEdge {
 }
 
 const SOURCE_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"];
-const UNSUPPORTED_SOURCE_EXTENSIONS = [".java", ".kt", ".kts", ".swift", ".go", ".rs", ".py", ".rb", ".php", ".cs"];
+const LEXICAL_LANGUAGE_EXTENSIONS = [".java", ".py"];
+const UNSUPPORTED_SOURCE_EXTENSIONS = [".kt", ".kts", ".swift", ".go", ".rs", ".rb", ".php", ".cs"];
 const EXCLUDED_PATHS = [
   "**/node_modules/**",
   "**/dist/**",
@@ -251,19 +270,26 @@ export function censusFeatureImplementations(
   if (terms.length === 0) throw new Error("无法从 feature、aliases 或 acceptance_clues 提取有效搜索词");
 
   const allSources = discoverSources(projectPath);
+  const allLexicalSources = discoverLexicalLanguageSources(projectPath);
   const scopedSources = allSources.filter((file) => (
     isInScope(projectPath, file, scopePaths)
   ));
-  if (scopedSources.length === 0) {
-    throw new Error(`scope_paths 内没有可分析的 TypeScript/JavaScript 文件：${scopePaths.join(", ")}`);
+  const scopedLexicalSources = allLexicalSources.filter((file) => (
+    isInScope(projectPath, file, scopePaths)
+  ));
+  if (scopedSources.length === 0 && scopedLexicalSources.length === 0) {
+    throw new Error(`scope_paths 内没有可分析的 JavaScript/TypeScript/Python/Java 文件：${scopePaths.join(", ")}`);
   }
-  const analysisSources = selectEvidenceBearingSources(
-    projectPath,
-    scopedSources,
-    scopePaths,
-    terms
-  );
-  const programBuild = createBoundedTypeScriptProgram(projectPath, analysisSources);
+  const analysisSources = scopedSources.length > 0
+    ? selectEvidenceBearingSources(projectPath, scopedSources, scopePaths, terms)
+    : [];
+  const programBuild = analysisSources.length > 0
+    ? createBoundedTypeScriptProgram(projectPath, analysisSources)
+    : {
+        program: ts.createProgram({ rootNames: [], options: { noEmit: true } }),
+        mode: "syntax-fallback" as const,
+        warnings: ["当前范围没有 JavaScript/TypeScript 证据文件，跳过 TypeScript 语义图。"]
+      };
   const program = programBuild.program;
   const checker = program.getTypeChecker();
   const analysisSourceSet = new Set(analysisSources.map((file) => path.resolve(file)));
@@ -273,6 +299,12 @@ export function censusFeatureImplementations(
     && analysisSourceSet.has(path.resolve(sourceFile.fileName))
   ));
   const candidates = collectCandidates(projectPath, sourceFiles, checker);
+  const lexicalCandidates = collectLexicalLanguageCandidates(
+    projectPath,
+    scopedLexicalSources,
+    scopePaths,
+    terms
+  );
   const bySymbol = indexCandidatesBySymbol(candidates, checker);
   const byId = new Map(candidates.map((candidate) => [candidate.id, candidate]));
   const candidateTermSelection = selectCandidateEvidenceTerms(candidates, terms);
@@ -343,13 +375,18 @@ export function censusFeatureImplementations(
   // Promoting all reachable symbols made a single dispatcher fan out into
   // hundreds of unrelated manual adjudications.
   const possibleIds = new Set<string>(directCandidateIds);
+  const adjudicationCandidates = new Map<string, AdjudicationCandidateScope>();
+  for (const candidate of candidates) {
+    adjudicationCandidates.set(candidate.id, adjudicationScopeForInternalCandidate(candidate));
+  }
+  for (const candidate of lexicalCandidates) adjudicationCandidates.set(candidate.id, candidate);
   const adjudications = validateAdjudications(
     projectPath,
     input.adjudications ?? [],
-    byId
+    adjudicationCandidates
   );
   const unresolved: string[] = [];
-  const materialized = [...possibleIds]
+  const materializedTypeScript = [...possibleIds]
     .map((id) => byId.get(id))
     .filter((candidate): candidate is InternalCandidate => Boolean(candidate))
     .sort(compareCandidateLocations)
@@ -359,6 +396,15 @@ export function censusFeatureImplementations(
       upstream.get(candidate.id),
       downstream.get(candidate.id),
       adjudications.get(candidate.id)
+    ));
+  const materializedLexical = lexicalCandidates.map((candidate) => (
+    materializeLexicalLanguageCandidate(candidate, adjudications.get(candidate.id))
+  ));
+  const materialized = [...materializedTypeScript, ...materializedLexical]
+    .sort((left, right) => (
+      left.definition.file.localeCompare(right.definition.file)
+      || left.definition.line - right.definition.line
+      || left.symbol.localeCompare(right.symbol)
     ));
   const reviewFrontier = applySemanticReviewFrontier(materialized);
 
@@ -440,18 +486,20 @@ export function censusFeatureImplementations(
       scope_paths: scopePaths
     },
     coverage: {
-      language: "typescript-javascript" as const,
+      language: "typescript-javascript+python-java-lexical" as const,
       analysis_mode: programBuild.mode,
-      files_discovered: allSources.length,
-      files_scanned: sourceFiles.length,
+      files_discovered: allSources.length + allLexicalSources.length,
+      files_scanned: sourceFiles.length + scopedLexicalSources.length,
       unsupported_matching_files: unsupportedMatchingFiles,
-      symbols_indexed: candidates.length,
+      symbols_indexed: candidates.length + lexicalCandidates.length,
       graph_edges: edges.length,
       search_channels_completed: SEARCH_CHANNELS,
       excluded_paths: EXCLUDED_PATHS,
       warnings: [
         ...programBuild.warnings,
-        `已对范围内 ${scopedSources.length} 个源码文件完成词面普查，并对其中 ${sourceFiles.length} 个证据命中文件执行受限语义分析。`,
+        `已对范围内 ${scopedSources.length + scopedLexicalSources.length} 个源码文件完成词面普查；`
+          + `其中 ${sourceFiles.length} 个 JavaScript/TypeScript 文件执行受限语义分析，`
+          + `${scopedLexicalSources.length} 个 Python/Java 文件执行声明与引用索引。`,
         candidateTermSelection.suppressed.length > 0
           ? `已用符号频率排除高频管道词：${candidateTermSelection.suppressed.join(", ")}。`
           : "未发现需要排除的高频管道词。",
@@ -729,6 +777,271 @@ function truncateUtf8(value: string, maxBytes: number): string {
 
 function discoverSources(projectPath: string): string[] {
   return ts.sys.readDirectory(projectPath, SOURCE_EXTENSIONS, EXCLUDED_PATHS);
+}
+
+function discoverLexicalLanguageSources(projectPath: string): string[] {
+  return ts.sys.readDirectory(projectPath, LEXICAL_LANGUAGE_EXTENSIONS, EXCLUDED_PATHS);
+}
+
+interface RawLexicalDeclaration {
+  symbol: string;
+  kind: FeatureImplementationCandidate["kind"];
+  line: number;
+  column: number;
+  endLine: number;
+  nested: boolean;
+  enclosing?: { symbol: string; line: number };
+}
+
+function collectLexicalLanguageCandidates(
+  projectPath: string,
+  sources: string[],
+  scopePaths: string[],
+  terms: SearchTerm[]
+): LexicalLanguageCandidate[] {
+  const files = sources.flatMap((file) => {
+    try {
+      const content = readFileSync(file, "utf8");
+      return [{
+        absolute: file,
+        relative: relative(projectPath, file),
+        content,
+        lines: content.split(/\r?\n/)
+      }];
+    } catch {
+      return [];
+    }
+  });
+  const exactFileScopes = new Set(scopePaths.filter((scope) => (
+    LEXICAL_LANGUAGE_EXTENSIONS.some((extension) => scope.toLowerCase().endsWith(extension))
+  )));
+  const all: LexicalLanguageCandidate[] = [];
+  for (const file of files) {
+    const declarations = file.relative.toLowerCase().endsWith(".py")
+      ? parsePythonDeclarations(file.lines)
+      : parseJavaDeclarations(file.lines);
+    for (const declaration of declarations) {
+      const definition = {
+        file: file.relative,
+        line: declaration.line,
+        column: declaration.column
+      };
+      const declarationText = file.lines
+        .slice(declaration.line - 1, declaration.endLine)
+        .join("\n");
+      const candidate: LexicalLanguageCandidate = {
+        id: candidateId(file.relative, declaration.symbol, declaration.line),
+        symbol: declaration.symbol,
+        kind: declaration.kind,
+        role: declaration.kind === "class" ? "component" : declaration.nested ? "implementation" : "entry",
+        definition,
+        source_span: { start_line: declaration.line, end_line: declaration.endLine },
+        declarationText,
+        referenceLocations: [],
+        nested: declaration.nested,
+        ...(declaration.enclosing
+          ? { enclosingCandidateId: candidateId(file.relative, declaration.enclosing.symbol, declaration.enclosing.line) }
+          : {}),
+        evidence: [],
+        evidenceAgainst: []
+      };
+      for (const term of terms) {
+        const target = term.polarity === "negative"
+          ? candidate.evidenceAgainst
+          : candidate.evidence;
+        if (matchesValue(candidate.symbol, term)) {
+          target.push(evidence(
+            term.polarity === "negative" ? "negative-clue" : "symbol-name",
+            definition,
+            `符号名 ${candidate.symbol} 命中${term.polarity === "negative" ? "排除线索" : "功能词"} ${term.value}`,
+            term.value
+          ));
+        }
+        if (!candidate.nested && matchesValue(file.relative, term)) {
+          target.push(evidence(
+            term.polarity === "negative" ? "negative-clue" : "file-path",
+            definition,
+            `文件路径命中${term.polarity === "negative" ? "排除线索" : "功能词"} ${term.value}`,
+            term.value
+          ));
+        }
+        if (matchesValue(declarationText, term)) {
+          target.push(evidence(
+            term.polarity === "negative" ? "negative-clue" : "declaration-text",
+            definition,
+            `定义正文命中${term.polarity === "negative" ? "排除线索" : "功能词"} ${term.value}`,
+            term.value
+          ));
+        }
+      }
+      if (exactFileScopes.has(file.relative) && candidate.evidence.length === 0 && !candidate.nested) {
+        candidate.evidence.push(evidence(
+          "file-path",
+          definition,
+          `显式 scope_path 指向声明文件 ${file.relative}`,
+          null
+        ));
+      }
+      all.push(candidate);
+    }
+  }
+
+  const bySymbol = new Map<string, LexicalLanguageCandidate[]>();
+  for (const candidate of all) {
+    const values = bySymbol.get(candidate.symbol) ?? [];
+    values.push(candidate);
+    bySymbol.set(candidate.symbol, values);
+  }
+  for (const file of files) {
+    file.lines.forEach((lineText, index) => {
+      for (const term of terms) {
+        if (!matchesValue(lineText, term)) continue;
+        for (const identifier of lineText.match(/[A-Za-z_$][\w$]*/g) ?? []) {
+          for (const candidate of bySymbol.get(identifier) ?? []) {
+            const target = term.polarity === "negative"
+              ? candidate.evidenceAgainst
+              : candidate.evidence;
+            target.push(evidence(
+              term.polarity === "negative" ? "negative-clue" : "adjacent-anchor",
+              { file: file.relative, line: index + 1, column: Math.max(1, lineText.indexOf(identifier) + 1) },
+              `符号 ${identifier} 与${term.polarity === "negative" ? "排除线索" : "功能证据"} ${term.value} 位于同一源码行`,
+              term.value
+            ));
+          }
+        }
+      }
+    });
+  }
+
+  for (const candidate of all) {
+    const pattern = new RegExp(`(?<![$\\w])${escapeRegExp(candidate.symbol)}\\s*\\(`, "g");
+    for (const file of files) {
+      file.lines.forEach((lineText, index) => {
+        if (!pattern.test(lineText)) return;
+        pattern.lastIndex = 0;
+        if (file.relative === candidate.definition.file && index + 1 === candidate.definition.line) return;
+        candidate.referenceLocations.push({
+          file: file.relative,
+          line: index + 1,
+          column: Math.max(1, lineText.search(pattern) + 1)
+        });
+        pattern.lastIndex = 0;
+      });
+    }
+    candidate.referenceLocations = dedupeBy(candidate.referenceLocations, (location) => (
+      `${location.file}:${location.line}:${location.column}`
+    ));
+  }
+
+  const evidenceBearing = all.filter((candidate) => candidate.evidence.length > 0 || candidate.evidenceAgainst.length > 0);
+  const evidenceIds = new Set(evidenceBearing.map((candidate) => candidate.id));
+  return evidenceBearing.filter((candidate) => {
+    if (!candidate.nested || candidate.evidence.some((item) => item.kind === "symbol-name")) return true;
+    return !candidate.enclosingCandidateId || !evidenceIds.has(candidate.enclosingCandidateId);
+  });
+}
+
+function parsePythonDeclarations(lines: string[]): RawLexicalDeclaration[] {
+  const declarations: RawLexicalDeclaration[] = [];
+  lines.forEach((line, index) => {
+    const match = /^(\s*)(?:async\s+def|def|class)\s+([A-Za-z_]\w*)\b/.exec(line);
+    if (!match?.[2]) return;
+    const indent = indentationWidth(match[1] ?? "");
+    const kind: RawLexicalDeclaration["kind"] = /^(?:\s*)class\b/.test(line)
+      ? "class"
+      : indent > 0 ? "method" : "function";
+    let endLine = lines.length;
+    for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
+      const next = lines[cursor]!;
+      if (!next.trim() || /^\s*#/.test(next)) continue;
+      if (indentationWidth(/^\s*/.exec(next)?.[0] ?? "") <= indent) {
+        endLine = cursor;
+        break;
+      }
+    }
+    const enclosing = declarations.slice().reverse().find((candidate) => (
+      candidate.kind === "class"
+      && candidate.line <= index + 1
+      && candidate.endLine >= index + 1
+    ));
+    declarations.push({
+      symbol: match[2],
+      kind,
+      line: index + 1,
+      column: indent + 1,
+      endLine: Math.max(index + 1, endLine),
+      nested: indent > 0,
+      ...(enclosing ? { enclosing: { symbol: enclosing.symbol, line: enclosing.line } } : {})
+    });
+  });
+  return declarations;
+}
+
+function parseJavaDeclarations(lines: string[]): RawLexicalDeclaration[] {
+  const declarations: RawLexicalDeclaration[] = [];
+  const classRanges: RawLexicalDeclaration[] = [];
+  lines.forEach((line, index) => {
+    const classMatch = /\b(?:class|interface|enum|record)\s+([A-Za-z_$][\w$]*)\b/.exec(line);
+    if (!classMatch?.[1]) return;
+    const declaration: RawLexicalDeclaration = {
+      symbol: classMatch[1],
+      kind: "class",
+      line: index + 1,
+      column: (classMatch.index ?? 0) + 1,
+      endLine: javaDeclarationEnd(lines, index),
+      nested: classRanges.some((candidate) => candidate.endLine >= index + 1)
+    };
+    classRanges.push(declaration);
+    declarations.push(declaration);
+  });
+  lines.forEach((line, index) => {
+    const trimmed = line.trim();
+    if (!trimmed || /^(?:if|for|while|switch|catch|return|throw|new|assert|case)\b/.test(trimmed)) return;
+    if (/\b(?:class|interface|enum|record)\s+[A-Za-z_$]/.test(line)) return;
+    const enclosing = classRanges.find((candidate) => (
+      candidate.line < index + 1 && candidate.endLine >= index + 1
+    ));
+    if (!enclosing) return;
+    const methodMatch = /^(?:\s*@[^\s]+\s*)*(?:\s*(?:public|protected|private|static|final|abstract|synchronized|native|default|strictfp)\s+)*(?:<[^>]+>\s+)?(?:[\w$.[\]<>?,]+\s+)+([A-Za-z_$][\w$]*)\s*\(/.exec(line);
+    const constructorMatch = new RegExp(
+      `^(?:\\s*@[^\\s]+\\s*)*(?:\\s*(?:public|protected|private)\\s+)*${escapeRegExp(enclosing.symbol)}\\s*\\(`
+    ).exec(line);
+    const symbol = methodMatch?.[1] ?? (constructorMatch ? enclosing.symbol : undefined);
+    if (!symbol) return;
+    declarations.push({
+      symbol,
+      kind: "method",
+      line: index + 1,
+      column: Math.max(1, line.indexOf(symbol) + 1),
+      endLine: javaDeclarationEnd(lines, index),
+      nested: true,
+      enclosing: { symbol: enclosing.symbol, line: enclosing.line }
+    });
+  });
+  return declarations;
+}
+
+function javaDeclarationEnd(lines: string[], start: number): number {
+  let balance = 0;
+  let opened = false;
+  for (let cursor = start; cursor < lines.length; cursor += 1) {
+    const sanitized = lines[cursor]!.replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g, "");
+    for (const character of sanitized) {
+      if (character === "{") {
+        balance += 1;
+        opened = true;
+      } else if (character === "}") {
+        balance -= 1;
+      }
+    }
+    if (opened && balance <= 0) return cursor + 1;
+    if (!opened && sanitized.includes(";")) return cursor + 1;
+  }
+  return start + 1;
+}
+
+function indentationWidth(value: string): number {
+  return [...value].reduce((total, character) => total + (character === "\t" ? 4 : 1), 0);
 }
 
 function selectEvidenceBearingSources(
@@ -1278,6 +1591,112 @@ function materializeCandidate(
   };
 }
 
+function materializeLexicalLanguageCandidate(
+  candidate: LexicalLanguageCandidate,
+  adjudication: FeatureCandidateAdjudication | undefined
+): FeatureImplementationCandidate {
+  const evidenceFor = dedupeBy([
+    ...candidate.evidence,
+    ...candidate.referenceLocations.slice(0, 24).map((location) => evidence(
+      "upstream-path",
+      location,
+      `词面引用调用 ${candidate.symbol}；精确绑定由语言服务器 Call Hierarchy 在 prepare 前确认`,
+      candidate.symbol
+    ))
+  ], (item) => item.id);
+  const evidenceAgainst = dedupeBy([...candidate.evidenceAgainst], (item) => item.id);
+  const testOnly = isTestLikePath(candidate.definition.file);
+  if (testOnly) {
+    evidenceAgainst.push(evidence(
+      "test-only",
+      candidate.definition,
+      "符号位于测试、Fixture 或 Mock 路径，不能作为生产功能实现",
+      null
+    ));
+  }
+  let verdict: FeatureCandidateVerdict = testOnly || evidenceAgainst.length > 0 ? "no" : "unknown";
+  let verdictReason = testOnly
+    ? "候选位于测试或 Fixture 路径"
+    : evidenceAgainst.length > 0
+      ? "候选命中调用方提供的明确排除线索"
+      : "Python/Java 声明与引用已穷举，业务等价性仍须 AI 逐项裁决";
+  let adjudicated = false;
+  if (adjudication) {
+    verdict = adjudication.verdict;
+    verdictReason = adjudication.reason.trim();
+    adjudicated = true;
+    const adjudicationEvidence = adjudication.evidence_refs.map((ref) => evidence(
+      "human-adjudication",
+      parseEvidenceRef(ref),
+      `${adjudication.verdict === "yes" ? "支持" : "排除"}候选：${verdictReason}`,
+      null
+    ));
+    if (verdict === "yes") evidenceFor.push(...adjudicationEvidence);
+    else evidenceAgainst.push(...adjudicationEvidence);
+  }
+  const score = Math.min(100, evidenceFor.reduce((total, item) => total + (
+    item.kind === "symbol-name" ? 28
+      : item.kind === "file-path" ? 18
+        : item.kind === "adjacent-anchor" ? 16
+          : item.kind === "declaration-text" ? 12
+            : item.kind === "upstream-path" ? 3
+              : 0
+  ), 0));
+  const traceSummary = verdict === "yes"
+    ? (() => {
+        const base = {
+          status: "bounded_with_dynamic_unknowns" as const,
+          target: candidate.definition,
+          calls: candidate.referenceLocations.length,
+          wrappers: 0,
+          references: evidenceFor.length,
+          unresolved_dynamic_references: 1
+        };
+        return {
+          status: base.status,
+          report_digest: createHash("sha256").update(JSON.stringify(base)).digest("hex"),
+          calls: base.calls,
+          wrappers: base.wrappers,
+          references: base.references,
+          unresolved_dynamic_references: base.unresolved_dynamic_references
+        };
+      })()
+    : null;
+  return {
+    id: candidate.id,
+    symbol: candidate.symbol,
+    kind: candidate.kind,
+    role: candidate.role,
+    definition: candidate.definition,
+    source_span: { ...candidate.source_span },
+    retrieval_score: score,
+    why_possible: evidenceFor.map((item) => item.detail),
+    evidence_for: dedupeBy(evidenceFor, (item) => item.id),
+    evidence_against: dedupeBy(evidenceAgainst, (item) => item.id),
+    graph_paths: [],
+    verdict,
+    verdict_reason: verdictReason,
+    adjudicated,
+    trace_summary: traceSummary
+  };
+}
+
+function adjudicationScopeForInternalCandidate(
+  candidate: InternalCandidate
+): AdjudicationCandidateScope {
+  const sourceFile = candidate.declaration.getSourceFile();
+  const startLine = sourceFile.getLineAndCharacterOfPosition(
+    candidate.declaration.getStart(sourceFile)
+  ).line + 1;
+  const endLine = sourceFile.getLineAndCharacterOfPosition(candidate.declaration.getEnd()).line + 1;
+  return {
+    definition: candidate.definition,
+    source_span: { start_line: startLine, end_line: endLine },
+    evidence: candidate.evidence,
+    evidenceAgainst: candidate.evidenceAgainst
+  };
+}
+
 function applySemanticReviewFrontier(
   candidates: FeatureImplementationCandidate[]
 ): FeatureImplementationCensusReport["review_frontier"] {
@@ -1375,7 +1794,7 @@ function scoreFeatureCandidate(
 function validateAdjudications(
   projectPath: string,
   adjudications: FeatureCandidateAdjudication[],
-  candidates: Map<string, InternalCandidate>
+  candidates: Map<string, AdjudicationCandidateScope>
 ): Map<string, FeatureCandidateAdjudication> {
   const result = new Map<string, FeatureCandidateAdjudication>();
   for (const adjudication of adjudications) {
@@ -1390,13 +1809,8 @@ function validateAdjudications(
       throw new Error(`候选 ${adjudication.candidate_id} 的 adjudication 缺少 evidence_refs`);
     }
     let candidateScopedEvidence = false;
-    const sourceFile = candidate.declaration.getSourceFile();
-    const declarationStart = sourceFile.getLineAndCharacterOfPosition(
-      candidate.declaration.getStart(sourceFile)
-    ).line + 1;
-    const declarationEnd = sourceFile.getLineAndCharacterOfPosition(
-      candidate.declaration.getEnd()
-    ).line + 1;
+    const declarationStart = candidate.source_span.start_line;
+    const declarationEnd = candidate.source_span.end_line;
     const candidateFile = path.resolve(projectPath, candidate.definition.file);
     const knownEvidence = [...candidate.evidence, ...candidate.evidenceAgainst];
     for (const ref of adjudication.evidence_refs) {
@@ -1810,8 +2224,12 @@ function stripQuotes(value: string): string {
   return value.replace(/^['"`]|['"`]$/g, "");
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function isTestLikePath(file: string): boolean {
-  return /(?:^|\/)(?:__tests__|test|tests|fixtures?|mocks?)(?:\/|$)|\.(?:test|spec)\.[cm]?[jt]sx?$/i.test(file);
+  return /(?:^|\/)(?:__tests__|test|tests|fixtures?|mocks?)(?:\/|$)|\.(?:test|spec)\.[cm]?[jt]sx?$|(?:^|\/)test_[^/]+\.py$|(?:^|\/)[^/]+_test\.py$|(?:^|\/)[^/]+Test\.java$/i.test(file);
 }
 
 function compareCandidateLocations(left: InternalCandidate, right: InternalCandidate): number {
