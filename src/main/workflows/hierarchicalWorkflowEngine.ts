@@ -512,8 +512,14 @@ function registerAlignmentSources(
     if (batch.source_refs.length === 0) throw new Error(`附件摄取批次 ${batch.id} 没有来源`);
     const sources = unique(batch.source_refs.map((source) => source.trim()).filter(Boolean));
     if (sources.length !== batch.source_refs.length) throw new Error(`附件摄取批次 ${batch.id} 含空值或重复来源`);
-    const duplicateSource = sources.find((source) => knownSources.has(source));
-    if (duplicateSource) throw new Error(`附件来源被重复注册：${duplicateSource}`);
+    const previousLastSource = state.alignment_batches.at(-1)?.source_refs.at(-1);
+    const duplicateSources = sources.filter((source) => knownSources.has(source));
+    const validBoundaryOverlap = duplicateSources.length === 1
+      && sources[0] === duplicateSources[0]
+      && duplicateSources[0] === previousLastSource;
+    if (duplicateSources.length > 0 && !validBoundaryOverlap) {
+      throw new Error(`附件来源被重复注册：${duplicateSources[0]}`);
+    }
     state.alignment_batches.push({
       id: batch.id,
       source_refs: sources,

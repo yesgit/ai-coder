@@ -163,6 +163,31 @@ describe("hierarchical workflow engine", () => {
     expect(state.alignment_batches.map((batch) => batch.status)).toEqual(["completed", "completed"]);
   });
 
+  it("allows exactly one predecessor-page overlap between adjacent attachment batches", () => {
+    let state = createHierarchicalExecutionState("读取跨页附件", { now: NOW });
+    state = applyHierarchicalEvent(state, {
+      type: "alignment_sources_registered",
+      batches: [
+        { id: "A1", source_refs: ["page-01.png", "page-02.png", "page-03.png"] },
+        { id: "A2", source_refs: ["page-03.png", "page-04.png", "page-05.png"] }
+      ],
+      occurred_at: NOW
+    });
+    expect(state.alignment_batches[1]?.source_refs[0]).toBe("page-03.png");
+
+    expect(() => applyHierarchicalEvent(
+      createHierarchicalExecutionState("拒绝非边界重复", { now: NOW }),
+      {
+        type: "alignment_sources_registered",
+        batches: [
+          { id: "A1", source_refs: ["page-01.png", "page-02.png"] },
+          { id: "A2", source_refs: ["page-01.png", "page-03.png"] }
+        ],
+        occurred_at: NOW
+      }
+    )).toThrow("附件来源被重复注册");
+  });
+
   it("keeps stable requirement IDs when knowledge revisions change", () => {
     const state = plannedState();
     const idsBefore = state.requirements.map((requirement) => requirement.id);

@@ -26,6 +26,7 @@ import {
   reconcileHierarchicalInvestigateContractLocations,
   reconcileHierarchicalInvestigateFinalContracts,
   reconcileHierarchicalInvestigateMappingScope,
+  reconcileHierarchicalInvestigateReferenceEntryCallsites,
   reconcileHierarchicalInvestigateReferenceContracts,
   reconcileHierarchicalInvestigateReferenceHandoff,
   reconcileHierarchicalIntegratorContractResults,
@@ -338,7 +339,12 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
   });
 
   it("keeps guarded write tools visible and redirects legacy MCP tools without involving the user", () => {
-    expect(buildHierarchicalSdkToolSurface(["Read", "Bash"])).toEqual([
+    expect(buildHierarchicalSdkToolSurface([
+      "Read",
+      "Bash",
+      "mcp__ai_coder__investigate_symbol_contract",
+      "mcp__ai_coder__analyze_symbol_contract"
+    ])).toEqual([
       "Read",
       "Bash",
       "Edit",
@@ -356,6 +362,14 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       session,
       "mcp__ai_coder__update_task_tree"
     )).toContain("旧 Profile 循环");
+    expect(getHierarchicalMcpBoundaryMessage(
+      session,
+      "mcp__ai_coder__investigate_symbol_contract"
+    )).toContain("由分层宿主");
+    expect(getHierarchicalMcpBoundaryMessage(
+      session,
+      "mcp__ai_coder__analyze_symbol_contract"
+    )).toContain("capability 节点");
     session.current_stage = "R1/prepare";
     expect(getHierarchicalCapabilityLeaseError(session, "Edit", {
       file_path: "src/route.ts"
@@ -495,6 +509,16 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
 
     structured.requirements.push({ id: "R44", source_anchor: "序号44" });
     expect(() => validateHierarchicalPlannerEnumeratedCoverage(session, operation, structured)).not.toThrow();
+
+    expect(() => validateHierarchicalPlannerEnumeratedCoverage(session, operation, {
+      status: "blocked",
+      blocker: {
+        id: "attachment-conflict",
+        kind: "user_decision",
+        message: "附件本身无法裁决序号 33 的两个用户可观察目标"
+      },
+      requirements: []
+    })).not.toThrow();
   });
 
   it("normalizes dashed numeric planner ids and dependency references before validation", () => {
@@ -532,6 +556,70 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       { id: "R33", source_anchor: "序号33", dependencies: [] },
       { id: "R34-entry", source_anchor: "序号34", dependencies: ["R33"] }
     ]);
+    expect(() => validateHierarchicalPlannerEnumeratedCoverage(session, operation, structured)).not.toThrow();
+  });
+
+  it("rejects a planner union of conflicting attachment targets until one source is adopted", () => {
+    const session = createSession();
+    session.task_prompt = "请从序号 33 开始实现所有页面跳转";
+    session.hierarchical_state = {
+      ...session.hierarchical_state!,
+      alignment_batches: [{
+        id: "A4",
+        source_refs: ["page-12.png"],
+        status: "completed",
+        attempt: 1,
+        consecutive_failure_count: 0,
+        summary: "first reading",
+        findings: [{
+          source_anchor: "page-12.png 序号 33",
+          observable_result: "序号 33：零钱宝页面",
+          acceptance: ["opens wallet"]
+        }],
+        evidence_refs: ["page-12.png"]
+      }, {
+        id: "A6",
+        source_refs: ["page-18.png"],
+        status: "completed",
+        attempt: 1,
+        consecutive_failure_count: 0,
+        summary: "conflicting edge reading",
+        findings: [{
+          source_anchor: "page-18.png 序号 33",
+          observable_result: "序号 33：转托管入页面",
+          acceptance: ["opens transfer"]
+        }],
+        evidence_refs: ["page-18.png"]
+      }]
+    };
+    const operation = { kind: "run_planner" as const };
+    const structured = {
+      requirements: [{
+        id: "R33",
+        source_anchor: "序号 33，来源 page-12.png 与 page-18.png",
+        observable_result: "用户可进入零钱宝页面和转托管入页面",
+        acceptance: ["两个页面都能打开"]
+      }]
+    };
+
+    expect(() => validateHierarchicalPlannerEnumeratedCoverage(session, operation, structured))
+      .toThrow("互斥附件目标合并");
+
+    structured.requirements[0] = {
+      id: "R33",
+      source_anchor: "序号 33，来源 page-12.png 与 page-18.png",
+      observable_result: "用户可进入零钱宝页面",
+      acceptance: ["零钱宝页面能打开"]
+    };
+    expect(() => validateHierarchicalPlannerEnumeratedCoverage(session, operation, structured))
+      .toThrow("尚未声明序号 33 的附件冲突裁决");
+
+    structured.requirements[0] = {
+      id: "R33",
+      source_anchor: "序号 33：采用 page-12.png 的完整行；排除 page-18.png 的批次边缘误读",
+      observable_result: "用户可进入零钱宝页面",
+      acceptance: ["零钱宝页面能打开"]
+    };
     expect(() => validateHierarchicalPlannerEnumeratedCoverage(session, operation, structured)).not.toThrow();
   });
 
@@ -2667,6 +2755,104 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     });
   });
 
+  it("replaces a dispatcher branch reference with the unique independent entry callsite", async () => {
+    const projectPath = await mkdtemp(path.join(os.tmpdir(), "ai-coder-reference-entry-"));
+    try {
+      await writeFile(path.join(projectPath, "target.ts"), [
+        "declare function connect(mapper: unknown): (component: unknown) => unknown;",
+        "const mapState = (state: unknown) => state;",
+        "class Target {}",
+        "export default connect(mapState)(Target);"
+      ].join("\n"));
+      await writeFile(path.join(projectPath, "routes.ts"), [
+        "import Target from './target.js';",
+        "declare const navigator: { push(value: unknown): void };",
+        "export function dispatch(page: string) {",
+        "  if (page === 'TARGET')",
+        "    navigator.push({ component: Target });",
+        "}"
+      ].join("\n"));
+      await writeFile(path.join(projectPath, "screen.ts"), [
+        "import Target from './target.js';",
+        "declare const navigator: { push(value: unknown): void };",
+        "export class Screen {",
+        "  openTarget = (authenticated: boolean) => {",
+        "    if (!authenticated) return;",
+        "    navigator.push({ component: Target, params: { mode: 'safe' } });",
+        "  };",
+        "}"
+      ].join("\n"));
+      const session = createSession();
+      session.project_path = projectPath;
+      const handoff = {
+        target_mappings: [{
+          target_key: "TARGET",
+          dispatcher_location: "routes.ts:3",
+          contract_symbol: "Target",
+          contract_location: "target.ts:3"
+        }],
+        reference_analysis: {
+          candidates: [{
+            target_key: "TARGET",
+            location: "routes.ts:4",
+            entry_symbol: "dispatch",
+            entry_location: "routes.ts:3",
+            contract_symbol: "Target",
+            contract_location: "target.ts:3",
+            evidence_refs: ["routes.ts:4"]
+          }],
+          target_selections: [{ target_key: "TARGET", selected_location: "routes.ts:4" }]
+        }
+      };
+
+      const reconciled = reconcileHierarchicalInvestigateReferenceEntryCallsites(session, {
+        kind: "run_phase",
+        requirement_id: "R1",
+        work_unit_id: "R1:investigate",
+        phase: "investigate",
+        role: "code-investigator"
+      }, { status: "passed", handoff });
+
+      expect(reconciled).toEqual(expect.arrayContaining([
+        expect.stringContaining("TARGET: dispatcher → openTarget@screen.ts:4")
+      ]));
+      expect(handoff.reference_analysis.candidates[0]).toMatchObject({
+        location: "screen.ts:6",
+        entry_symbol: "openTarget",
+        entry_location: "screen.ts:4"
+      });
+      expect(handoff.reference_analysis.target_selections[0].selected_location).toBe("screen.ts:6");
+
+      const guardLineHandoff = {
+        target_mappings: handoff.target_mappings,
+        reference_analysis: {
+          candidates: [{
+            target_key: "TARGET",
+            location: "screen.ts:5",
+            entry_symbol: "openTarget",
+            entry_location: "screen.ts:4",
+            contract_symbol: "Target",
+            contract_location: "target.ts:1",
+            evidence_refs: ["screen.ts:5"]
+          }],
+          target_selections: [{ target_key: "TARGET", selected_location: "screen.ts:5" }]
+        }
+      };
+      const normalizedGuardLine = reconcileHierarchicalInvestigateReferenceEntryCallsites(session, {
+        kind: "run_phase",
+        requirement_id: "R1",
+        work_unit_id: "R1:investigate",
+        phase: "investigate",
+        role: "code-investigator"
+      }, { status: "passed", handoff: guardLineHandoff });
+      expect(normalizedGuardLine).toContain("TARGET: screen.ts:5 → screen.ts:6");
+      expect(guardLineHandoff.reference_analysis.target_selections[0].selected_location)
+        .toBe("screen.ts:6");
+    } finally {
+      await rm(projectPath, { recursive: true, force: true });
+    }
+  });
+
   it("groups changing census inventories under one bounded-retry fingerprint", () => {
     const first = hierarchicalErrorFingerprint(
       "R33/investigate",
@@ -3843,7 +4029,12 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
         })
       }));
       expect(callsiteReviewCalls).toBe(1);
-      expect(batchSizes.every((size) => size >= 1 && size <= 3)).toBe(true);
+      expect(batchSizes.every((size) => size >= 1 && size <= 4)).toBe(true);
+      expect(updated.hierarchical_state?.alignment_batches[0]?.source_refs).toHaveLength(3);
+      expect(updated.hierarchical_state?.alignment_batches.slice(1).every((batch, index, batches) => {
+        const previous = updated.hierarchical_state!.alignment_batches[index]!;
+        return batch.source_refs[0] === previous.source_refs.at(-1);
+      })).toBe(true);
       expect(batchCalls.get("A1")).toBe(1);
       expect(batchCalls.get("A2")).toBe(2);
       expect(batchCalls.get("A3")).toBe(1);

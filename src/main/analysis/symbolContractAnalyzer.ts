@@ -873,6 +873,16 @@ function liftReferenceToIndirectCalls(
         checker,
         projectPath
       ));
+      // A value passed to a HOC/factory is often returned as another component
+      // and immediately assigned or exported (React.memo/connect/forwardRef are
+      // common examples). Keep following that result as a possible carrier.
+      // A registration call used only as a statement naturally terminates on
+      // the next iteration, so this remains API agnostic and bounded.
+      queue.push({
+        ...state,
+        node: parent,
+        depth: state.depth + 1
+      });
       continue;
     }
 
@@ -898,9 +908,57 @@ function liftReferenceToIndirectCalls(
           depth: state.depth + 1
         });
       }
+      continue;
+    }
+
+    if (
+      ts.isExportAssignment(parent)
+      && !parent.isExportEquals
+      && containsNode(parent.expression, state.node)
+    ) {
+      for (const use of findDefaultImportReferences(
+        parent.getSourceFile(),
+        checker,
+        projectSources
+      )) {
+        queue.push({
+          ...state,
+          node: use,
+          path: [],
+          depth: state.depth + 1
+        });
+      }
     }
   }
   return results;
+}
+
+function findDefaultImportReferences(
+  exportedSource: ts.SourceFile,
+  checker: ts.TypeChecker,
+  projectSources: ts.SourceFile[]
+): Array<ts.Identifier | ts.PropertyAccessExpression> {
+  const references: Array<ts.Identifier | ts.PropertyAccessExpression> = [];
+  for (const source of projectSources) {
+    const visit = (node: ts.Node): void => {
+      if (ts.isImportDeclaration(node) && node.importClause?.name) {
+        const localName = node.importClause.name;
+        const localSymbol = checker.getSymbolAtLocation(localName);
+        const resolved = localSymbol ? resolveAlias(localSymbol, checker) : undefined;
+        const importsExportedSource = resolved?.declarations?.some((declaration) => (
+          path.resolve(declaration.getSourceFile().fileName) === path.resolve(exportedSource.fileName)
+        ));
+        if (localSymbol && importsExportedSource) {
+          for (const use of findSymbolReferences(localSymbol, checker, projectSources)) {
+            if (use !== localName) references.push(use);
+          }
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
+  }
+  return references;
 }
 
 function liftThroughContainer(parent: ts.Node, state: LiftState): Omit<LiftState, "depth"> | null {

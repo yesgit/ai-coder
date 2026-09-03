@@ -366,7 +366,8 @@ describe("hierarchicalRoleProtocol", () => {
     expect(spec.prompt).toContain("例如 33 写成 R33");
     expect(spec.prompt).toContain("当前为第 2 次 planner 尝试");
     expect(spec.prompt).toContain("planner 需求账本遗漏用户范围内业务序号：12");
-    expect(spec.prompt).toContain("同一序号在不同附件中解释冲突时，仍保留该序号的 R-ID");
+    expect(spec.prompt).toContain("同一序号在不同附件中解释冲突时仍保留该序号的 R-ID");
+    expect(spec.prompt).toContain("不得把互斥页面目标合并成一个并集需求");
   });
 
   it("gives a phase role only its leaf tools and explicit loop stack", () => {

@@ -290,9 +290,10 @@ export class ClaudeAgentRunner {
 
     const registeredAlignmentBatches = this.ensureHierarchicalAlignmentBatches(input.session);
     if (registeredAlignmentBatches > 0) {
-      const sourceCount = input.session.hierarchical_state?.alignment_batches
+      const registeredBatches = input.session.hierarchical_state?.alignment_batches
         .slice(-registeredAlignmentBatches)
-        .reduce((total, batch) => total + batch.source_refs.length, 0) ?? 0;
+        ?? [];
+      const sourceCount = new Set(registeredBatches.flatMap((batch) => batch.source_refs)).size;
       await this.recordProgress(
         input,
         "runner",
@@ -1070,6 +1071,20 @@ export class ClaudeAgentRunner {
         "milestone"
       );
     }
+    const reconciledReferenceEntries = reconcileHierarchicalInvestigateReferenceEntryCallsites(
+      input.session,
+      operation,
+      structured
+    );
+    if (reconciledReferenceEntries.length > 0) {
+      await this.recordProgress(
+        input,
+        "tool_policy",
+        "宿主已依据最终组件引用图，将同功能参考归一到独立入口及其真实出调用行："
+          + reconciledReferenceEntries.join(", "),
+        "milestone"
+      );
+    }
     const removedReferenceContracts = reconcileHierarchicalInvestigateReferenceContracts(
       input.session,
       operation,
@@ -1207,7 +1222,17 @@ export class ClaudeAgentRunner {
       return Math.max(largest, numeric ? Number(numeric) : 0);
     }, 0) + 1;
     for (let index = 0; index < newSources.length; index += 3) {
-      batches.push({ id: `A${nextId}`, source_refs: newSources.slice(index, index + 3) });
+      // Keep one predecessor page as read-only context. Tables and numbered
+      // requirements commonly continue across page boundaries; hard chunks of
+      // three caused the reader to lose the row header and later fabricate a
+      // conflicting sequence mapping. The overlap does not create another
+      // attachment, and the planner still receives one persisted finding set
+      // per batch.
+      const context = index > 0 ? [newSources[index - 1]!] : [];
+      batches.push({
+        id: `A${nextId}`,
+        source_refs: [...context, ...newSources.slice(index, index + 3)]
+      });
       nextId += 1;
     }
     this.applyHierarchicalEvents(session, [{ type: "alignment_sources_registered", batches }]);
@@ -4921,6 +4946,226 @@ export function reconcileHierarchicalInvestigateFinalContracts(
   return reconciled;
 }
 
+interface ReferenceEntrypointSuggestion {
+  callsite_location: string;
+  entry_symbol: string;
+  entry_location: string;
+}
+
+/** Normalize selected references to an independent entry and its real outgoing call line. */
+export function reconcileHierarchicalInvestigateReferenceEntryCallsites(
+  session: AgentSession,
+  operation: Extract<HierarchicalNextOperation, {
+    kind: "run_phase" | "run_alignment_batch" | "run_planner" | "run_integrator"
+  }>,
+  structured: unknown
+): string[] {
+  if (
+    operation.kind !== "run_phase"
+    || operation.phase !== "investigate"
+    || !isPlainObject(structured)
+  ) return [];
+  const handoff = isPlainObject(structured.handoff) ? structured.handoff : null;
+  const referenceAnalysis = handoff && isPlainObject(handoff.reference_analysis)
+    ? handoff.reference_analysis
+    : null;
+  const mappings = handoff && Array.isArray(handoff.target_mappings)
+    ? handoff.target_mappings.filter(isPlainObject)
+    : [];
+  const candidates = referenceAnalysis && Array.isArray(referenceAnalysis.candidates)
+    ? referenceAnalysis.candidates.filter(isPlainObject)
+    : [];
+  const selections = referenceAnalysis && Array.isArray(referenceAnalysis.target_selections)
+    ? referenceAnalysis.target_selections.filter(isPlainObject)
+    : [];
+  const reconciled: string[] = [];
+
+  for (const candidate of candidates) {
+    const targetKey = optionalString(candidate.target_key);
+    const mapping = mappings.find((item) => optionalString(item.target_key) === targetKey);
+    const oldCallsite = optionalString(candidate.location);
+    if (!targetKey || !mapping || !oldCallsite) continue;
+    if (!selections.some((selection) => (
+      optionalString(selection.target_key) === targetKey
+      && optionalString(selection.selected_location) === oldCallsite
+    ))) continue;
+
+    const entryAnchor = evidenceLocationAnchor(
+      optionalString(candidate.entry_location) ?? "",
+      session.project_path
+    );
+    const dispatcherAnchor = evidenceLocationAnchor(
+      optionalString(mapping.dispatcher_location) ?? "",
+      session.project_path
+    );
+    if (entryAnchor && dispatcherAnchor && entryAnchor === dispatcherAnchor) {
+      const independent = independentReferenceEntrypoints(session, mapping, candidate);
+      if (independent.length === 1) {
+        const replacement = independent[0]!;
+        candidate.entry_symbol = replacement.entry_symbol;
+        candidate.entry_location = replacement.entry_location;
+        replaceSelectedReferenceLocation(selections, targetKey, oldCallsite, replacement.callsite_location);
+        candidate.location = replacement.callsite_location;
+        appendCandidateEvidence(candidate, replacement.entry_location, replacement.callsite_location);
+        reconciled.push(
+          `${targetKey}: dispatcher → ${replacement.entry_symbol}@${replacement.entry_location}`
+        );
+      }
+    }
+
+    const currentCallsite = optionalString(candidate.location);
+    const entrySymbol = optionalString(candidate.entry_symbol);
+    const entryLocation = optionalString(candidate.entry_location);
+    const destinationSymbol = optionalString(candidate.contract_symbol);
+    const entryFile = evidenceLocationFile(entryLocation ?? "", session.project_path);
+    const currentAnchor = evidenceLocationAnchor(currentCallsite ?? "", session.project_path);
+    if (
+      !currentCallsite
+      || !entrySymbol
+      || !entryLocation
+      || !destinationSymbol
+      || !entryFile
+      || !/\.[cm]?[jt]sx?$/i.test(entryFile)
+    ) continue;
+    try {
+      const relativeEntryFile = path.relative(session.project_path, entryFile).split(path.sep).join("/");
+      const entryAnchorNow = evidenceLocationAnchor(entryLocation, session.project_path);
+      const entryLine = entryAnchorNow
+        ? Number(entryAnchorNow.slice(entryAnchorNow.lastIndexOf(":") + 1))
+        : 0;
+      const report = investigateSymbolContract({
+        projectPath: session.project_path,
+        targetFile: relativeEntryFile,
+        symbol: entrySymbol,
+        ...(entryLine > 0 ? { targetLine: entryLine } : {})
+      });
+      const destinationEffects = report.effects.items.filter((effect) => (
+        containsExactIdentifierOrLiteral(effect.invocation, destinationSymbol)
+      ));
+      if (destinationEffects.some((effect) => (
+        evidenceLocationAnchor(`${effect.location.file}:${effect.location.line}`, session.project_path)
+          === currentAnchor
+      ))) continue;
+      const currentLine = currentAnchor
+        ? Number(currentAnchor.slice(currentAnchor.lastIndexOf(":") + 1))
+        : 0;
+      const ranked = destinationEffects
+        .map((effect) => ({
+          effect,
+          distance: currentLine > 0
+            ? Math.abs(effect.location.line - currentLine)
+            : Number.MAX_SAFE_INTEGER
+        }))
+        .sort((left, right) => left.distance - right.distance);
+      if (ranked.length === 0 || (ranked[1] && ranked[0]!.distance === ranked[1].distance)) continue;
+      const exactCallsite = `${ranked[0]!.effect.location.file}:${ranked[0]!.effect.location.line}`;
+      replaceSelectedReferenceLocation(selections, targetKey, currentCallsite, exactCallsite);
+      candidate.location = exactCallsite;
+      appendCandidateEvidence(candidate, exactCallsite);
+      reconciled.push(`${targetKey}: ${currentCallsite} → ${exactCallsite}`);
+    } catch {
+      // Strict investigate validation below retains a precise diagnostic.
+    }
+  }
+  return reconciled;
+}
+
+function independentReferenceEntrypoints(
+  session: AgentSession,
+  mapping: Record<string, unknown>,
+  candidate: Record<string, unknown>
+): ReferenceEntrypointSuggestion[] {
+  const projectPath = session.project_path;
+  const contractSymbol = optionalString(candidate.contract_symbol);
+  const contractLocation = optionalString(candidate.contract_location);
+  const contractFile = evidenceLocationFile(contractLocation ?? "", projectPath);
+  const dispatcherLocation = optionalString(mapping.dispatcher_location);
+  const dispatcherFile = evidenceLocationFile(dispatcherLocation ?? "", projectPath);
+  const dispatcherAnchor = evidenceLocationAnchor(dispatcherLocation ?? "", projectPath);
+  if (!contractSymbol || !contractFile || !/\.[cm]?[jt]sx?$/i.test(contractFile)) return [];
+  let dispatcherOwner: ReturnType<typeof resolveEnclosingCallableDefinition>;
+  try {
+    const dispatcherLine = dispatcherAnchor
+      ? Number(dispatcherAnchor.slice(dispatcherAnchor.lastIndexOf(":") + 1))
+      : 0;
+    dispatcherOwner = dispatcherFile && dispatcherLine > 0
+      ? resolveEnclosingCallableDefinition(
+          projectPath,
+          path.relative(projectPath, dispatcherFile).split(path.sep).join("/"),
+          dispatcherLine
+        )
+      : undefined;
+  } catch {
+    dispatcherOwner = undefined;
+  }
+  try {
+    const report = investigateSymbolContract({
+      projectPath,
+      targetFile: path.relative(projectPath, contractFile).split(path.sep).join("/"),
+      symbol: contractSymbol
+    });
+    const unique = new Map<string, ReferenceEntrypointSuggestion>();
+    for (const call of report.calls.items) {
+      if (!call.enclosing_callable || call.enclosing_callable === "<anonymous>") continue;
+      let owner: ReturnType<typeof resolveEnclosingCallableDefinition>;
+      try {
+        owner = resolveEnclosingCallableDefinition(projectPath, call.location.file, call.location.line);
+      } catch {
+        continue;
+      }
+      if (!owner) continue;
+      if (
+        owner.symbol === contractSymbol
+        && path.resolve(projectPath, owner.file) === path.resolve(contractFile)
+      ) continue;
+      if (/(?:^|\/)(?:__tests__|tests?|specs?|fixtures?)(?:\/|$)|\.(?:test|spec)\.[^.]+$/i.test(call.location.file)) {
+        continue;
+      }
+      if (
+        dispatcherOwner
+        && owner.file === dispatcherOwner.file
+        && owner.symbol === dispatcherOwner.symbol
+        && owner.line === dispatcherOwner.line
+      ) continue;
+      const callsiteLocation = `${call.location.file}:${call.location.line}`;
+      if (isWorkingTreeAddedEvidenceLocation(session, callsiteLocation)) continue;
+      const suggestion = {
+        callsite_location: callsiteLocation,
+        entry_symbol: owner.symbol,
+        entry_location: `${owner.file}:${owner.line}`
+      };
+      unique.set(
+        `${suggestion.callsite_location}\0${suggestion.entry_symbol}\0${suggestion.entry_location}`,
+        suggestion
+      );
+    }
+    return [...unique.values()];
+  } catch {
+    return [];
+  }
+}
+
+function replaceSelectedReferenceLocation(
+  selections: Record<string, unknown>[],
+  targetKey: string,
+  oldLocation: string,
+  newLocation: string
+): void {
+  for (const selection of selections) {
+    if (
+      optionalString(selection.target_key) === targetKey
+      && optionalString(selection.selected_location) === oldLocation
+    ) selection.selected_location = newLocation;
+  }
+}
+
+function appendCandidateEvidence(candidate: Record<string, unknown>, ...locations: string[]): void {
+  candidate.evidence_refs = uniqueStrings([
+    ...(optionalStringArray(candidate.evidence_refs) ?? []),
+    ...locations
+  ]);
+}
+
 /**
  * Remove stale same-feature candidates after the host census has independently
  * confirmed the target mapping's exact final callable/component.
@@ -6817,6 +7062,24 @@ function validateInvestigateTargetMappingEvidence(
       `reference entry ${targetKey ?? "<unknown>"}`
     );
     if (entryContractError) violations.push(entryContractError);
+    const mapping = targetMappings.find((item) => optionalString(item.target_key) === targetKey);
+    const entryAnchor = evidenceLocationAnchor(entryLocation ?? "", session.project_path);
+    const dispatcherAnchor = evidenceLocationAnchor(
+      optionalString(mapping?.dispatcher_location) ?? "",
+      session.project_path
+    );
+    if (mapping && entryAnchor && dispatcherAnchor && entryAnchor === dispatcherAnchor) {
+      const alternatives = independentReferenceEntrypoints(session, mapping, candidate);
+      if (alternatives.length > 0) {
+        violations.push(
+          `${targetKey ?? "<unknown>"}: 选中的同功能入口不能是待改公共 dispatcher 自身；`
+          + "请改用最终目标引用图中的独立既有入口："
+          + alternatives.map((item) => (
+            `${item.entry_symbol}@${item.entry_location}，调用行 ${item.callsite_location}`
+          )).join("；")
+        );
+      }
+    }
     const ownershipError = assertReferenceEntryOwnsCallsite(
       session.project_path,
       entrySymbol,
@@ -6881,7 +7144,17 @@ function assertReferenceEntryOwnsCallsite(
       ) === callsiteAnchor
     ));
     if (matching.length === 0) {
-      return `candidate.location 必须指向 ${entrySymbol} 函数体内的真实出调用行：${callsiteLocation}`;
+      const destinationEffects = report.effects.items.filter((effect) => (
+        !destinationSymbol
+        || containsExactIdentifierOrLiteral(effect.invocation, destinationSymbol)
+      ));
+      const expected = destinationEffects.map((effect) => (
+        `${effect.location.file}:${effect.location.line} (${effect.invocation})`
+      ));
+      return `candidate.location=${callsiteLocation} 不是 ${entrySymbol} 函数体内的真实出调用行；`
+        + (expected.length > 0
+          ? `可用调用行：${expected.join("；")}`
+          : `未找到通向 ${destinationSymbol ?? "目标"} 的出调用边`);
     }
     if (
       destinationSymbol
@@ -7401,6 +7674,11 @@ export function validateHierarchicalPlannerEnumeratedCoverage(
 ): void {
   if (operation.kind !== "run_planner") return;
   if (!isPlainObject(structured) || !session.hierarchical_state) return;
+  const blocker = isPlainObject(structured.blocker) ? structured.blocker : null;
+  if (
+    optionalString(structured.status) === "blocked"
+    && ["user_decision", "external_resource_missing"].includes(optionalString(blocker?.kind) ?? "")
+  ) return;
   const coverageContract = buildHierarchicalPlannerCoverageContract(
     session.task_prompt,
     session.hierarchical_state
@@ -7424,6 +7702,101 @@ export function validateHierarchicalPlannerEnumeratedCoverage(
   if (missing.length > 0) {
     throw new Error(`planner 需求账本遗漏用户范围内业务序号：${missing.join(", ")}`);
   }
+  validatePlannerAttachmentConflictResolution(
+    session.hierarchical_state,
+    requirements.filter(isPlainObject)
+  );
+}
+
+/**
+ * Reject the failure mode where two contradictory attachment readings become
+ * one union requirement. Code investigation can resolve symbols for one
+ * adopted business target; it cannot decide whether the user asked for target
+ * A or target B. We keep this deliberately lexical and language-neutral: only
+ * clearly labelled page/screen/view targets for the same enumerated item are
+ * treated as conflicts, leaving ordinary continuation fragments alone.
+ */
+function validatePlannerAttachmentConflictResolution(
+  state: HierarchicalExecutionState,
+  requirements: Record<string, unknown>[]
+): void {
+  const findingsBySequence = new Map<number, Array<{ label: string; source: string }>>();
+  for (const batch of state.alignment_batches) {
+    for (const finding of batch.findings) {
+      const findingText = `${finding.source_anchor}\n${finding.observable_result}`;
+      const labels = extractAttachmentTargetLabels(findingText);
+      if (labels.length === 0) continue;
+      for (const sequence of extractBusinessSequenceNumbers(findingText)) {
+        const existing = findingsBySequence.get(sequence) ?? [];
+        for (const label of labels) existing.push({ label, source: finding.source_anchor });
+        findingsBySequence.set(sequence, existing);
+      }
+    }
+  }
+
+  for (const [sequence, observations] of findingsBySequence) {
+    const labels = uniqueStrings(observations.map((item) => item.label));
+    if (labels.length < 2) continue;
+    const requirement = requirements.find((item) => (
+      canonicalNumericRequirementId(optionalString(item.id) ?? "") === `R${sequence}`
+      || extractBusinessSequenceNumbers([
+        optionalString(item.source_anchor),
+        optionalString(item.observable_result)
+      ].filter(Boolean).join("\n")).includes(sequence)
+    ));
+    if (!requirement) continue;
+    const sourceAnchor = optionalString(requirement.source_anchor) ?? "";
+    const resultText = [
+      optionalString(requirement.observable_result),
+      ...(optionalStringArray(requirement.acceptance) ?? [])
+    ].filter(Boolean).join("\n");
+    const mentionedLabels = labels.filter((label) => normalizedTextIncludes(resultText, label));
+    if (mentionedLabels.length > 1) {
+      throw new Error(
+        `planner 将序号 ${sequence} 的互斥附件目标合并成一个需求：${mentionedLabels.join(" / ")}；`
+        + "必须只采用一个目标，不能把目标裁决转交 investigate"
+      );
+    }
+    if (!/(?:采用|采信|排除|舍弃|以.+为准|adopt|exclude|canonical)/i.test(sourceAnchor)) {
+      throw new Error(
+        `planner 尚未声明序号 ${sequence} 的附件冲突裁决：${labels.join(" / ")}；`
+        + "请在 source_anchor 中明确采用、排除的来源及理由"
+      );
+    }
+  }
+}
+
+function extractAttachmentTargetLabels(value: string): string[] {
+  const labels: string[] = [];
+  const patterns = [
+    /(?:业务)?序号\s*\d+\s*(?:[:：.、-]\s*)?([^\n，,；;|→]{2,40}?)(?=(?:页面|页)(?:$|[\s，,；;|:：=→\n])|(?:screen|view)\b|[，,；;|→\n])/giu,
+    /(?:页面名称|目标页面|target\s*(?:page|screen|view))\s*[:：=]\s*([^\n，,；;|→]{2,40})/giu,
+    /(?:^|[，,；;|])\s*([^\n，,；;|:：=→]{2,30}?)(?=(?:页面|页)(?:$|[\s，,；;|:：=→\n])|(?:screen|view)\b)/giu
+  ];
+  for (const pattern of patterns) {
+    for (const match of value.matchAll(pattern)) {
+      const normalized = normalizeAttachmentTargetLabel(match[1] ?? "");
+      if (normalized) labels.push(normalized);
+    }
+  }
+  return uniqueStrings(labels);
+}
+
+function normalizeAttachmentTargetLabel(value: string): string {
+  const normalized = value
+    .replace(/[`*_'"“”‘’]/g, "")
+    .replace(/^(?:业务)?序号\s*\d+\s*[:：.、-]?\s*/u, "")
+    .replace(/^(?:用户)?(?:可)?(?:从入口)?(?:跳转至|跳转到|进入|打开)/u, "")
+    .replace(/(?:页面跳转(?:配置|支持)?|跳转(?:配置|支持)?|配置需求|页面|页|screen|view)$/iu, "")
+    .replace(/\s+/g, "")
+    .trim();
+  if (normalized.length < 2 || /^(?:目标|页面|条目|需求|nativeLink)$/i.test(normalized)) return "";
+  return normalized;
+}
+
+function normalizedTextIncludes(text: string, label: string): boolean {
+  const normalizedText = text.replace(/[\s`*_'"“”‘’]/g, "").toLocaleLowerCase();
+  return normalizedText.includes(label.toLocaleLowerCase());
 }
 
 /**
@@ -7824,7 +8197,7 @@ async function assertHierarchicalWorkUnitIntegrity(snapshot: HierarchicalWorkUni
 export function buildHierarchicalSdkToolSurface(declaredTools: string[]): string[] {
   if (declaredTools.length === 0) return [];
   return [...new Set([...declaredTools, "Edit", "Write"])]
-    .filter((toolName) => !HIERARCHICAL_LEGACY_MCP_TOOLS.has(toolName));
+    .filter((toolName) => !HIERARCHICAL_ROLE_FORBIDDEN_MCP_TOOLS.has(toolName));
 }
 
 const HIERARCHICAL_LEGACY_MCP_TOOLS = new Set([
@@ -7832,10 +8205,24 @@ const HIERARCHICAL_LEGACY_MCP_TOOLS = new Set([
   "mcp__ai_coder__checkpoint_exploration"
 ]);
 
+// The graph/call-contract analyzers are orchestrator capabilities in the
+// hierarchical workflow. Exposing the raw MCP variants to leaf roles lets a
+// model start a second, untracked investigation loop whose receipts do not
+// belong to the host capability node and can contradict its normalized graph.
+const HIERARCHICAL_HOST_OWNED_MCP_TOOLS = new Set([
+  "mcp__ai_coder__analyze_symbol_contract",
+  "mcp__ai_coder__investigate_symbol_contract"
+]);
+
+const HIERARCHICAL_ROLE_FORBIDDEN_MCP_TOOLS = new Set([
+  ...HIERARCHICAL_LEGACY_MCP_TOOLS,
+  ...HIERARCHICAL_HOST_OWNED_MCP_TOOLS
+]);
+
 function buildHierarchicalDisallowedClaudeTools(workflow: WorkflowTemplate): string[] {
   return [...new Set([
     ...buildDisallowedClaudeTools(workflow),
-    ...HIERARCHICAL_LEGACY_MCP_TOOLS
+    ...HIERARCHICAL_ROLE_FORBIDDEN_MCP_TOOLS
   ])];
 }
 
@@ -7858,6 +8245,13 @@ export function getHierarchicalMcpBoundaryMessage(
     return [
       `${toolName} 属于旧 Profile 循环，当前 Goal/Requirement/Phase 已由分层宿主持有。`,
       "不要初始化第二套任务树或 checkpoint；继续当前叶子并通过 StructuredOutput 提交阶段 handoff。"
+    ].join("");
+  }
+  if (HIERARCHICAL_HOST_OWNED_MCP_TOOLS.has(toolName)) {
+    return [
+      `${toolName} 已由分层宿主的 symbol-contract/callsite-review capability 节点统一执行。`,
+      "叶子角色不要另起一套符号调查、手工分页或拼接调用证据；",
+      "请使用宿主已注入的图证据完成当前 handoff，并通过 StructuredOutput 提交。"
     ].join("");
   }
   return null;

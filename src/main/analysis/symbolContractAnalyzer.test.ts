@@ -362,4 +362,43 @@ export function consume() {
     ]));
     expect(result.coverage.files_scanned).toBeLessThan(10);
   });
+
+  it("follows a component through a default-exported HOC into real navigation entries", async () => {
+    const root = await createFixture();
+    await writeFile(path.join(root, "connected.tsx"), `
+declare function connect(mapper: unknown): (component: unknown) => unknown;
+const mapState = (state: unknown) => state;
+
+class Destination {}
+export default connect(mapState)(Destination);
+`);
+    await writeFile(path.join(root, "connected-entry.ts"), `
+import ConnectedDestination from "./connected.js";
+declare const navigator: { push(route: unknown): void };
+
+export function openDestination(ready: boolean, title: string) {
+  if (!ready) return;
+  navigator.push({
+    component: ConnectedDestination,
+    params: { title }
+  });
+}
+`);
+
+    const result = analyzeSymbolContract({
+      projectPath: root,
+      targetFile: "connected.tsx",
+      symbol: "Destination"
+    });
+
+    expect(result.calls?.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "indirect",
+        enclosing_callable: "openDestination",
+        invocation: expect.stringContaining("navigator.push"),
+        target_path: "component",
+        preconditions: ["after guard: NOT (!ready)"]
+      })
+    ]));
+  });
 });
