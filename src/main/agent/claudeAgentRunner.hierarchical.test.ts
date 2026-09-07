@@ -833,6 +833,16 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       target_file: "sample.py",
       symbol: "target",
       guards: ["源码检查：调用前检查 authenticated；sample.py:4"]
+    }, {
+      // Simulates a provider copying a partial, non-canonical dispatcher
+      // contract. Passed capability nodes must replace this draft atomically
+      // rather than exposing one malformed field per retry.
+      target_file: "routes.py",
+      symbol: "redirectActionPush",
+      analysis_method: "",
+      callers: "not-an-array",
+      callsite_accounting: { total: 50, reviewed: 50, accounted: true },
+      callsite_reviews: []
     }];
     const operation = {
       kind: "run_phase" as const,
@@ -846,6 +856,9 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
 
     reconcileHierarchicalPrepareContractHandoff(session, operation, structured, stageId);
     expect(callContract.analyzed_targets).toHaveLength(1);
+    expect(callContract.analyzed_targets.some((target) => (
+      target.symbol === "redirectActionPush"
+    ))).toBe(false);
     expect(callContract.analyzed_targets[0]).toMatchObject({
       analysis_method: "language-adapter",
       adapter_id: "python-pyright-call-hierarchy",
@@ -1468,6 +1481,21 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       )).not.toThrow();
 
       await writeFile(path.join(projectPath, "routes.ts"), routes("fast"));
+      prepareHandoff.change_disposition = "already_satisfied";
+      expect(() => validateHierarchicalContractToolEvidence(
+        session,
+        prepareOperation,
+        [{
+          type: "phase_passed",
+          work_unit_id: "R1:prepare",
+          summary: "incorrect no-op",
+          handoff: prepareHandoff,
+          evidence_refs: ["routes.ts:8"],
+          allowed_files: []
+        }],
+        prepareStageId
+      )).toThrow(/prepare 最终行为指纹.*不一致/);
+      prepareHandoff.change_disposition = "changes_required";
       expect(() => validateHierarchicalContractToolEvidence(
         session,
         verifyOperation,
@@ -1489,6 +1517,31 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
         verifyOperation,
         verifyEvent,
         "hierarchical:R1/verify"
+      )).toThrow(/NEW\/invocation/);
+
+      // A reference uses a member receiver while the implementation forwards
+      // that receiver through a parameter. The gate must use source bindings
+      // for both invocation and its matching side-effect entry.
+      const forwarded = routes("safe")
+        .replace("runner: (value: unknown) => void", "navigator: any")
+        .replaceAll("runner({", "navigator.push({");
+      for (const obligation of prepareHandoff.behavior_obligations as Array<Record<string, unknown>>) {
+        if (obligation.dimension !== "invocation" && obligation.dimension !== "side_effects") continue;
+        const envelope = JSON.parse(obligation.required_behavior as string);
+        envelope.targets.NEW = obligation.dimension === "invocation"
+          ? { kind: "indirect", callee: "this.props.navigator.push", target_path: "handler" }
+          : ["delivers:handler", "indirect:this.props.navigator.push"];
+        obligation.required_behavior = JSON.stringify(envelope);
+      }
+      await writeFile(path.join(projectPath, "routes.ts"), forwarded
+        + "\nclass Screen { props: any; open() { dispatch('NEW', true, this.props.navigator); } }\n");
+      expect(() => validateHierarchicalContractToolEvidence(
+        session, verifyOperation, verifyEvent, "hierarchical:R1/verify"
+      )).not.toThrow();
+      await writeFile(path.join(projectPath, "routes.ts"), forwarded
+        + "\nclass Screen { props: any; open() { dispatch('NEW', true, this.props.other); } }\n");
+      expect(() => validateHierarchicalContractToolEvidence(
+        session, verifyOperation, verifyEvent, "hierarchical:R1/verify"
       )).toThrow(/NEW\/invocation/);
     } finally {
       await rm(projectPath, { recursive: true, force: true });
@@ -2909,6 +2962,13 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
   });
 
   it("routes a missing reference-entry graph edge back to investigate immediately", () => {
+    const mismatch = "verify 最终行为指纹与 prepare 冻结契约不一致，共 2 处：arguments, preconditions";
+    expect(hierarchicalPhaseSelfHealRoute("verify", mismatch, "already_satisfied")).toBe("prepare");
+    expect(hierarchicalPhaseSelfHealRoute("verify", mismatch, "changes_required")).toBe("implement");
+    expect(hierarchicalValidationCorrection({
+      kind: "run_phase", requirement_id: "R1", work_unit_id: "R1:verify",
+      phase: "verify", role: "independent-verifier"
+    }, mismatch)).toContain("修改 verify 的 observed_behavior 不能消除");
     expect(hierarchicalPhaseSelfHealRoute(
       "prepare",
       "prepare 选中的同功能入口缺少 entry_symbol@entry_location：LQBInvest"

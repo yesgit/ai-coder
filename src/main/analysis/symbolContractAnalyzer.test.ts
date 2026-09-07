@@ -4,8 +4,42 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   analyzeSymbolContract,
+  proveForwardedReceiver,
   resolveEnclosingCallableDefinition
 } from "./symbolContractAnalyzer.js";
+
+describe("source-backed receiver forwarding", () => {
+  it("proves multi-hop parameters and rejects different origins, methods and reassignment", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "receiver-forwarding-"));
+    const code = (source: string, mutation = "") => [
+      "export function route(item: any, nav: any) {",
+      mutation,
+      "  nav.push({ component: 'Target' });",
+      "}",
+      "function wrapper(item: any, nav: any) { route(item, nav); }",
+      "class Screen { props: any; open(item: any) { wrapper(item, " + source + "); } }"
+    ].join("\n");
+    await writeFile(path.join(root, "route.ts"), code("this.props.navigator"));
+    expect(proveForwardedReceiver(root, "route.ts", 3, "nav.push", "this.props.navigator.push"))
+      .toEqual(expect.arrayContaining(["route.ts:1", "route.ts:5", "route.ts:6"]));
+    expect(proveForwardedReceiver(root, "route.ts", 3, "nav.pop", "this.props.navigator.push"))
+      .toBeUndefined();
+    await writeFile(path.join(root, "route.ts"), code("receiver")
+      .replace("open(item: any) {", "open(item: any) { const { navigator: receiver } = this.props;"));
+    expect(proveForwardedReceiver(root, "route.ts", 3, "nav.push", "this.props.navigator.push"))
+      .toBeDefined();
+    await writeFile(path.join(root, "route.ts"), code("this.props.otherNavigator"));
+    expect(proveForwardedReceiver(root, "route.ts", 3, "nav.push", "this.props.navigator.push"))
+      .toBeUndefined();
+    await writeFile(path.join(root, "route.ts"), code("this.props.navigator", "nav = replacement;"));
+    expect(proveForwardedReceiver(root, "route.ts", 3, "nav.push", "this.props.navigator.push"))
+      .toBeUndefined();
+    await writeFile(path.join(root, "route.ts"), code("this.props.navigator")
+      + "\nroute({}, otherNavigator);\n");
+    expect(proveForwardedReceiver(root, "route.ts", 3, "nav.push", "this.props.navigator.push"))
+      .toBeUndefined();
+  });
+});
 
 async function createFixture(): Promise<string> {
   const root = await mkdtemp(path.join(tmpdir(), "symbol-contract-"));

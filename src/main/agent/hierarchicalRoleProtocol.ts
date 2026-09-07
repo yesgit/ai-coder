@@ -302,11 +302,8 @@ function buildPhaseSpec(
       phaseSpecific,
       ...(commitMark && operation.phase === "implement"
         ? [
-            "## Git 提交印记",
-            `当本阶段改动需要提交 git commit 时，必须在 commit message 尾部追加以下印记文本（作为 git trailer，与正文之间用一个空行分隔）：`,
-            commitMark,
-            "示例：git commit -m \"fix: 修复登录验证\" -m \"" + commitMark + "\"",
-            "该印记用于工具统计 AI 生成的代码量，不得省略或修改其内容。"
+            "Git 提交由阶段外的交付流程处理。本 implement 叶子只通过 Edit 修改租约文件、运行验证并提交 StructuredOutput；不执行 git add/commit。",
+            `后续交付流程的提交印记：${commitMark}`
           ]
         : []),
       "如果本阶段发现了原账本未覆盖、但完成 Goal 必需的独立可验证结果，只在 discovered_requirements 中追加新的稳定 R-ID；不要捎带执行。",
@@ -1293,71 +1290,16 @@ function phaseHandoffSchema(
     ],
     additionalProperties: false
   };
-  const callsiteReviewSchema = strictObjectSchema({
-    schema_version: { type: "integer", const: 1 },
-    callsite_id: { type: "string", minLength: 1 },
-    target_file: { type: "string", minLength: 1 },
-    symbol: { type: "string", minLength: 1 },
-    evidence_ref: { type: "string", minLength: 1 },
-    review_basis: {
-      type: "string",
-      enum: ["host-exact+source", "source+topology", "source+lexical"]
-    },
-    disposition: { type: "string", enum: ["relevant", "irrelevant", "unresolved"] },
-    summary: { type: "string", minLength: 1 },
-    destination: { type: "string", minLength: 1 },
-    invocation: { type: "string", minLength: 1 },
-    arguments: stringList(1),
-    preconditions: stringList(1),
-    context: stringList(1),
-    side_effects: stringList(1),
-    unresolved: stringList(),
-    evidence_refs: evidenceList(),
-    definition_digest: { type: "string", minLength: 1 },
-    host_fingerprint_digest: { type: "string" }
-  });
+  // Prepare only selects the symbols whose capability results should be used.
+  // The host owns every other field of the analyzed target (including the
+  // callsite ledger). Exposing those fields in the provider schema encouraged
+  // models to copy partial analyzer reports, which then failed validation one
+  // field at a time before the trusted capability output could take over.
   const analyzedTargetSchema = {
     type: "object",
     properties: {
-    target_file: { type: "string", minLength: 1 },
-    symbol: { type: "string", minLength: 1 },
-    analysis_method: {
-      type: "string",
-      enum: ["investigation-script", "language-adapter", "manual-static-analysis"]
-    },
-    method_reason: { type: "string" },
-    analyzer_sections: stringList(),
-    all_pages_consumed: { type: "boolean" },
-    definition: { type: "string", minLength: 1 },
-    inputs: stringList(1),
-    outputs: stringList(1),
-    callers: stringList(1),
-    wrappers_and_indirect_references: stringList(1),
-    guards: stringList(1),
-    state_and_side_effects: stringList(1),
-    compatibility_obligations: stringList(1),
-    unresolved: stringList(),
-    evidence_refs: evidenceList(),
-    investigation_report_digest: { type: "string" },
-    adapter_id: { type: "string" },
-    adapter_report_digest: { type: "string" },
-    reference_accounting: strictObjectSchema({
-      total: { type: "integer", minimum: 0 },
-      resolved: { type: "integer", minimum: 0 },
-      irrelevant: { type: "integer", minimum: 0 },
-      blocked: { type: "integer", minimum: 0 },
-      accounted: { type: "boolean", const: true }
-    }),
-    callsite_reviews: { type: "array", items: callsiteReviewSchema },
-    callsite_accounting: strictObjectSchema({
-      total: { type: "integer", minimum: 0 },
-      reviewed: { type: "integer", minimum: 0 },
-      relevant: { type: "integer", minimum: 0 },
-      irrelevant: { type: "integer", minimum: 0 },
-      unresolved: { type: "integer", minimum: 0 },
-      accounted: { type: "boolean", const: true }
-    }),
-    runtime_verification_required: { type: "boolean" }
+      target_file: { type: "string", minLength: 1 },
+      symbol: { type: "string", minLength: 1 }
     },
     required: ["target_file", "symbol"],
     additionalProperties: false

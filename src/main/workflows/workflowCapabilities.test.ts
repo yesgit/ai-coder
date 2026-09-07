@@ -236,6 +236,33 @@ describe("workflow capabilities", () => {
     }
   });
 
+  it("keeps destination internals in the report without scheduling each as an AI review", async () => {
+    const projectPath = await mkdtemp(path.join(os.tmpdir(), "capability-scope-"));
+    try {
+      await writeFile(path.join(projectPath, "route.ts"), [
+        "export class Target { render() { console.log('render'); return ['a'].map(x => x); } }",
+        "export function openTarget(nav: any) { nav.push({ component: Target }); }"
+      ].join("\n"));
+      const result = await executeWorkflowCapability(SYMBOL_CONTRACT_CAPABILITY, projectPath, {
+        target_file: "route.ts", symbol: "Target", target_line: 1,
+        adapter_id: "typescript-javascript", symbol_role: "destination-contract"
+      });
+      const inventory = result.output.callsite_inventory as {
+        entries: Array<Record<string, unknown>>;
+        scope_exclusions: Array<Record<string, unknown>>;
+      };
+      expect(inventory.entries.some(entry => entry.direction === "outgoing")).toBe(false);
+      expect(inventory.entries).toContainEqual(expect.objectContaining({
+        direction: "incoming", peer_symbol: "openTarget"
+      }));
+      expect(inventory.scope_exclusions).toContainEqual(expect.objectContaining({
+        evidence_ref: "route.ts:1", reason: expect.stringContaining("目标内部实现保留")
+      }));
+    } finally {
+      await rm(projectPath, { recursive: true, force: true });
+    }
+  });
+
   it("keeps Python/Java callsite coverage when no external language server is installed", async () => {
     const projectPath = await mkdtemp(path.join(os.tmpdir(), "ai-coder-capability-python-"));
     try {

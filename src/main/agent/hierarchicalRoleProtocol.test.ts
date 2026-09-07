@@ -725,6 +725,17 @@ describe("hierarchicalRoleProtocol", () => {
     });
     expect(spec.tools).not.toContain("mcp__ai_coder__investigate_symbol_contract");
     expect(spec.tools).not.toContain("mcp__ai_coder__analyze_symbol_contract");
+    const rootProperties = spec.outputFormat.schema.properties as Record<string, Record<string, unknown>>;
+    const handoffProperties = (rootProperties.handoff.properties as Record<string, Record<string, unknown>>);
+    const callContractProperties = (
+      handoffProperties.call_contract.properties as Record<string, Record<string, unknown>>
+    );
+    const analyzedTargetItem = callContractProperties.analyzed_targets.items as {
+      properties: Record<string, unknown>;
+      required: string[];
+    };
+    expect(Object.keys(analyzedTargetItem.properties)).toEqual(["target_file", "symbol"]);
+    expect(analyzedTargetItem.required).toEqual(["target_file", "symbol"]);
 
     const handoff = handoffFor("prepare") as Record<string, unknown>;
     const callContract = handoff.call_contract as { analyzed_targets: Array<Record<string, unknown>> };
@@ -1127,10 +1138,10 @@ describe("hierarchicalRoleProtocol", () => {
       role: "task-executor"
     }, "Generated-by: AI Coder");
 
-    expect(spec.prompt).toContain("## Git 提交印记");
+    expect(spec.prompt).toContain("不执行 git add/commit");
     expect(spec.prompt).toContain("Generated-by: AI Coder");
-    expect(spec.prompt).toContain("git commit -m");
-    expect(spec.prompt).toContain("不得省略");
+    expect(spec.prompt).not.toContain("git commit -m");
+    expect(spec.prompt).toContain("后续交付流程的提交印记");
   });
 
   it("omits commit mark section when commitMark is empty", () => {

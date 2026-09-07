@@ -22,6 +22,111 @@ export interface EnclosingCallableDefinition {
   column: number;
 }
 
+/** Prove a receiver is forwarded from the expected member through parameters.
+ * This is a bounded source proof, never a spelling/prefix equivalence rule.
+ * Every statically resolved caller must agree; missing callers, mutation,
+ * defaults, cycles and unsupported expressions fail closed.
+ */
+export function proveForwardedReceiver(
+  projectPath: string,
+  targetFile: string,
+  line: number,
+  observedCallee: string,
+  expectedCallee: string
+): string[] | undefined {
+  const observed = /^(\w+)\.([\w$]+)$/.exec(observedCallee);
+  const expected = /^(this(?:\.[\w$]+)+)\.([\w$]+)$/.exec(expectedCallee);
+  if (!observed || !expected || observed[2] !== expected[2]) return undefined;
+  const project = path.resolve(projectPath);
+  const file = path.resolve(project, targetFile);
+  assertInsideProject(project, file);
+  const { program } = createBoundedTypeScriptProgram(project, discoverProjectSources(project));
+  const checker = program.getTypeChecker();
+  const source = program.getSourceFile(file);
+  if (!source) return undefined;
+  const calls: ts.CallExpression[] = [];
+  for (const unit of program.getSourceFiles()) {
+    if (unit.isDeclarationFile || !isInsideProject(project, unit.fileName)) continue;
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node)) calls.push(node);
+      ts.forEachChild(node, visit);
+    };
+    visit(unit);
+  }
+  const candidates = calls.filter((call) => call.getSourceFile() === source
+    && locationOf(call, project).line === line
+    && call.expression.getText() === observedCallee);
+  if (candidates.length !== 1) return undefined;
+  const member = candidates[0]!.expression;
+  if (!ts.isPropertyAccessExpression(member)) return undefined;
+  const evidence = new Set<string>();
+  const trace = (expression: ts.Expression, visited: Set<ts.Symbol>, depth: number): boolean => {
+    if (depth > 8) return false;
+    if (ts.isParenthesizedExpression(expression)) return trace(expression.expression, visited, depth + 1);
+    if (expression.getText() === expected[1]) {
+      const loc = locationOf(expression, project);
+      evidence.add(`${loc.file}:${loc.line}`);
+      return true;
+    }
+    if (!ts.isIdentifier(expression)) return false;
+    const symbol = checker.getSymbolAtLocation(expression);
+    if (!symbol || visited.has(symbol)) return false;
+    const declaration = symbol.valueDeclaration;
+    if (declaration && ts.isVariableDeclaration(declaration)
+      && ts.isVariableDeclarationList(declaration.parent)
+      && (declaration.parent.flags & ts.NodeFlags.Const) !== 0 && declaration.initializer) {
+      return trace(declaration.initializer, new Set(visited).add(symbol), depth + 1);
+    }
+    if (declaration && ts.isBindingElement(declaration) && !declaration.initializer
+      && !declaration.dotDotDotToken && ts.isObjectBindingPattern(declaration.parent)) {
+      const container = declaration.parent.parent;
+      if (ts.isVariableDeclaration(container) && container.initializer
+        && ts.isVariableDeclarationList(container.parent)
+        && (container.parent.flags & ts.NodeFlags.Const) !== 0) {
+        const property = declaration.propertyName ?? declaration.name;
+        if (ts.isIdentifier(property)
+          && `${container.initializer.getText()}.${property.text}` === expected[1]) {
+          const loc = locationOf(declaration, project);
+          evidence.add(`${loc.file}:${loc.line}`);
+          return true;
+        }
+      }
+      return false;
+    }
+    if (!declaration || !ts.isParameter(declaration) || declaration.initializer || declaration.dotDotDotToken) return false;
+    const owner = declaration.parent;
+    if (!ts.isFunctionLike(owner) || !("body" in owner) || !owner.body) return false;
+    let mutated = false;
+    const inspect = (node: ts.Node): void => {
+      if (ts.isBinaryExpression(node)
+        && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment
+        && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment) {
+        let root: ts.Node = node.left;
+        while (ts.isPropertyAccessExpression(root) || ts.isElementAccessExpression(root)) root = root.expression;
+        if (ts.isIdentifier(root) && checker.getSymbolAtLocation(root) === symbol) mutated = true;
+      }
+      if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node))
+        && (node.operator === ts.SyntaxKind.PlusPlusToken || node.operator === ts.SyntaxKind.MinusMinusToken)
+        && checker.getSymbolAtLocation(node.operand) === symbol) mutated = true;
+      ts.forEachChild(node, inspect);
+    };
+    inspect(owner.body);
+    if (mutated) return false;
+    const index = owner.parameters.indexOf(declaration);
+    const incoming = calls.filter((call) => checker.getResolvedSignature(call)?.declaration === owner);
+    if (index < 0 || incoming.length === 0) return false;
+    const next = new Set(visited).add(symbol);
+    const loc = locationOf(declaration, project);
+    evidence.add(`${loc.file}:${loc.line}`);
+    return incoming.every((call) => {
+      if (call.arguments.some(ts.isSpreadElement)) return false;
+      const arg = call.arguments[index];
+      return Boolean(arg && trace(arg, next, depth + 1));
+    });
+  };
+  return trace(member.expression, new Set(), 0) ? [...evidence] : undefined;
+}
+
 /** Resolve the smallest JS/TS callable whose source span owns a branch/call line. */
 export function resolveEnclosingCallableDefinition(
   projectPath: string,

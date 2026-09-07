@@ -15,6 +15,7 @@ import {
 } from "../analysis/featureImplementationCensusWorkerClient.js";
 import {
   analyzeSymbolContract,
+  proveForwardedReceiver,
   resolveEnclosingCallableDefinition
 } from "../analysis/symbolContractAnalyzer.js";
 import {
@@ -578,26 +579,23 @@ export class ClaudeAgentRunner {
               roleOperation.work_unit_id,
               fingerprint
             ) + 1;
-            let selfHealRoute = hierarchicalPhaseSelfHealRoute(
+            const selfHealRoute = hierarchicalPhaseSelfHealRoute(
               roleOperation.phase,
-              message
-            );
-            // prepare 判定 already_satisfied 时，verify 退回 implement 毫无意义（无代码可改），
-            // 改为原地重试，避免 implement → verify 空转循环。
-            if (selfHealRoute === "implement" && roleOperation.phase === "verify") {
-              const prepareArtifact = input.session.hierarchical_state
+              message,
+              input.session.hierarchical_state
                 ? latestHierarchicalArtifact(input.session.hierarchical_state, roleOperation.requirement_id, "prepare")
-                : undefined;
-              if (prepareArtifact?.handoff?.change_disposition === "already_satisfied") {
-                selfHealRoute = "retry";
-              }
-            }
+                  ?.handoff?.change_disposition
+                : undefined
+            );
+            const behaviorMismatch = /最终行为指纹与 prepare 冻结契约不一致/.test(message);
             const sameFailureLimit = selfHealRoute === "retry" && roleOperation.phase !== "investigate"
               ? 6
               : 3;
             const missingCapabilityDependency = roleOperation.phase === "prepare"
               && /选中的同功能入口尚未解析为真实调用边|选中的同功能入口缺少 entry_symbol|同功能入口对应的真实函数\/组件/.test(message);
-            const recoveryRoute = missingCapabilityDependency
+            const recoveryRoute = behaviorMismatch
+              ? selfHealRoute
+              : missingCapabilityDependency
               ? "investigate"
               : repeats >= 3
               ? selfHealRoute
@@ -649,7 +647,7 @@ export class ClaudeAgentRunner {
                 `当前 investigate 工作单元 attempt ${failedAttempt} 连续 ${repeats} 次遇到同类问题；无前置阶段可退回，宿主升级为阻塞并保留诊断：${message}`,
                 "milestone"
               );
-            } else if ((repeats >= 3 || missingCapabilityDependency) && recoveryRoute !== "retry") {
+            } else if ((repeats >= 3 || missingCapabilityDependency || behaviorMismatch) && recoveryRoute !== "retry") {
               await this.recordProgress(
                 input,
                 "status",
@@ -4044,6 +4042,9 @@ export function validateHierarchicalContractToolEvidence(
     }
   }
   assertPrepareBehaviorFingerprints(session, operation, passed, stageId);
+  if (passed.handoff?.change_disposition === "already_satisfied") {
+    assertVerifiedBehaviorFingerprints(session, operation, new Map(), passed.handoff);
+  }
 }
 
 function validatePreparedCallsiteLedger(
@@ -4123,15 +4124,17 @@ interface FrozenBehaviorEnvelope {
 function assertVerifiedBehaviorFingerprints(
   session: AgentSession,
   operation: Extract<HierarchicalNextOperation, { kind: "run_phase" }>,
-  reports = new Map<string, SymbolInvestigationReport>()
+  reports = new Map<string, SymbolInvestigationReport>(),
+  prepareHandoff?: Record<string, unknown>
 ): void {
   const state = session.hierarchical_state;
   if (!state) return;
   const investigate = latestHierarchicalArtifact(state, operation.requirement_id, "investigate");
   const prepare = latestHierarchicalArtifact(state, operation.requirement_id, "prepare");
-  if (!investigate || !prepare) return;
-  const obligations = Array.isArray(prepare.handoff.behavior_obligations)
-    ? prepare.handoff.behavior_obligations.filter(isPlainObject)
+  const contract = prepareHandoff ?? prepare?.handoff;
+  if (!investigate || !contract) return;
+  const obligations = Array.isArray(contract.behavior_obligations)
+    ? contract.behavior_obligations.filter(isPlainObject)
     : [];
   const frozen = new Map<BehaviorDimension, FrozenBehaviorEnvelope>();
   for (const obligation of obligations) {
@@ -4226,10 +4229,30 @@ function assertVerifiedBehaviorFingerprints(
       continue;
     }
     const selectorNames = dispatchSelectorNames(mapping, actual);
+    const expectedInvocation = frozen.get("invocation")?.targets[targetKey];
+    let provenCallee: string | undefined;
+    if (isPlainObject(expectedInvocation) && typeof expectedInvocation.callee === "string"
+      && expectedInvocation.callee !== actual.invocation.callee) {
+      const location = /^(.*):(\d+):(\d+)$/.exec(actual.source_location);
+      try {
+        if (location && proveForwardedReceiver(session.project_path, location[1]!, Number(location[2]),
+          actual.invocation.callee, expectedInvocation.callee)) {
+          provenCallee = expectedInvocation.callee;
+        }
+      } catch {
+        // Unsupported or unavailable source evidence must not waive the gate.
+      }
+    }
     for (const [dimension, envelope] of frozen) {
       if (!(targetKey in envelope.targets)) continue;
       const expected = envelope.targets[targetKey];
-      const observed = behaviorDimensionValue(actual, dimension);
+      let observed = behaviorDimensionValue(actual, dimension);
+      if (provenCallee && dimension === "invocation" && isPlainObject(observed)) {
+        observed = { ...observed, callee: provenCallee };
+      } else if (provenCallee && dimension === "side_effects" && Array.isArray(observed)) {
+        observed = observed.map((value) => value === `${actual.invocation.kind}:${actual.invocation.callee}`
+          ? `${actual.invocation.kind}:${provenCallee}` : value);
+      }
       if (!behaviorValuesMatch(dimension, expected, observed, selectorNames)) {
         mismatches.push(
           `${targetKey}/${dimension}: expected=${canonicalBehaviorValue(expected)}；`
@@ -4240,7 +4263,7 @@ function assertVerifiedBehaviorFingerprints(
   }
   if (mismatches.length > 0) {
     throw new Error(
-      `verify 最终行为指纹与 prepare 冻结契约不一致，共 ${mismatches.length} 处：\n`
+      `${operation.phase} 最终行为指纹与 prepare 冻结契约不一致，共 ${mismatches.length} 处：\n`
       + mismatches.map((item) => `- ${item}`).join("\n")
     );
   }
@@ -5389,8 +5412,56 @@ export function reconcileHierarchicalPrepareContractHandoff(
     : null;
   if (!callContract || !Array.isArray(callContract.analyzed_targets)) return;
   const analyzedTargets = callContract.analyzed_targets.filter(isPlainObject);
-  const reports = completedSymbolInvestigationReports(session, stageId);
+  const reports = completedSymbolInvestigationReports(
+    session,
+    stageId,
+    operation.requirement_id
+  );
   const adapterTargets = completedLanguageAdapterTargets(session, operation.requirement_id);
+
+  // Capability nodes are the source of truth for prepare call contracts. Once
+  // they have passed, rebuild the complete list atomically from their outputs
+  // instead of merging into model-authored objects. This drops invented helper
+  // targets and partial ledgers (for example total=50/reviewed=50/rows=0) that
+  // otherwise survive under a different symbol and trigger serial field errors.
+  const passedSymbolNodes = (session.hierarchical_state?.capability_nodes ?? []).filter((node) => (
+    node.requirement_id === operation.requirement_id
+    && node.capability === SYMBOL_CONTRACT_CAPABILITY
+    && node.status === "passed"
+  ));
+  if (passedSymbolNodes.length > 0) {
+    const canonicalTargets: Array<Record<string, unknown>> = [];
+    const seen = new Set<string>();
+    for (const node of passedSymbolNodes) {
+      const targetFile = optionalString(node.output?.target_file ?? node.input.target_file);
+      const symbol = optionalString(node.output?.symbol ?? node.input.symbol);
+      if (!targetFile || !symbol) continue;
+      const key = `${path.resolve(session.project_path, targetFile)}\0${symbol}`;
+      if (seen.has(key)) continue;
+      const hostTarget = node.output?.adapter_id === TYPESCRIPT_JAVASCRIPT_ADAPTER
+        ? reports.find(({ report }) => (
+          path.resolve(session.project_path, report.target.file)
+            === path.resolve(session.project_path, targetFile)
+          && report.target.symbol === symbol
+        ))?.report
+        : undefined;
+      const analyzedTarget = hostTarget
+        ? analyzedTargetFromInvestigationReport(hostTarget)
+        : (isPlainObject(node.output?.analyzed_target)
+          ? structuredClone(node.output.analyzed_target)
+          : undefined);
+      if (!analyzedTarget) continue;
+      canonicalTargets.push(analyzedTarget);
+      seen.add(key);
+    }
+    callContract.analyzed_targets = canonicalTargets;
+    attachCompletedCallsiteReviews(
+      session,
+      operation.requirement_id,
+      canonicalTargets
+    );
+    return;
+  }
 
   for (const hostTarget of adapterTargets) {
     const targetFile = optionalString(hostTarget.target_file);
@@ -5619,6 +5690,26 @@ function attachCompletedCallsiteReviews(
       unresolved,
       accounted: entries.length === reviews.length
     };
+    // Semantic callsite nodes are host-owned evidence too. Fold their concrete
+    // guard and side-effect findings into the target summary so language
+    // adapters can replace conservative placeholders without asking prepare to
+    // restate source facts in its now intentionally compact schema.
+    target.guards = uniqueStrings([
+      ...(optionalStringArray(target.guards) ?? []),
+      ...reviews.flatMap((review) => optionalStringArray(review.preconditions) ?? [])
+    ]);
+    target.state_and_side_effects = uniqueStrings([
+      ...(optionalStringArray(target.state_and_side_effects) ?? []),
+      ...reviews.flatMap((review) => optionalStringArray(review.side_effects) ?? [])
+    ]);
+    target.unresolved = uniqueStrings([
+      ...(optionalStringArray(target.unresolved) ?? []),
+      ...reviews.flatMap((review) => optionalStringArray(review.unresolved) ?? [])
+    ]);
+    target.evidence_refs = uniqueStrings([
+      ...(optionalStringArray(target.evidence_refs) ?? []),
+      ...reviews.flatMap((review) => optionalStringArray(review.evidence_refs) ?? [])
+    ]);
   }
 }
 
@@ -6250,7 +6341,8 @@ function uniqueContractRequests(
 
 function completedSymbolInvestigationReports(
   session: AgentSession,
-  stageId: string
+  stageId: string,
+  requirementId?: string
 ): Array<{
   input: {
     projectPath: string;
@@ -6309,6 +6401,7 @@ function completedSymbolInvestigationReports(
   for (const node of session.hierarchical_state?.capability_nodes ?? []) {
     if (
       node.capability !== SYMBOL_CONTRACT_CAPABILITY
+      || (requirementId !== undefined && node.requirement_id !== requirementId)
       || node.status !== "passed"
       || node.output?.adapter_id !== TYPESCRIPT_JAVASCRIPT_ADAPTER
     ) continue;
@@ -7927,6 +8020,9 @@ export function hierarchicalValidationCorrection(
   reason: string,
   featureCensusReceipt?: Pick<FeatureCensusReceipt, "status" | "candidate_accounting"> | null
 ): string {
+  if (/最终行为指纹与 prepare 冻结契约不一致/.test(reason)) {
+    return "这是源码行为差异，修改 verify 的 observed_behavior 不能消除。保留冻结契约和差异证据；若此前为 already_satisfied，退回 prepare，建立 changes_required 的 patch_plan 和 allowed_files；已有修改计划则退回 implement 修复参数、业务 guard 和上下文传递，再重新验证。表达式不同不能直接视为语义不同或相同，别名等价必须有源码绑定证据；不得通过改写报告或删除义务放行。";
+  }
   const rejectedTarget = /被误裁为 no（candidate_id=([^)）]+)[)）]/.exec(reason)?.[1];
   if (rejectedTarget) {
     return `沿用最后一次完全相同的 feature、aliases、clues 与 scope 重跑 locate_feature_implementation，并只提交 candidate_id=${rejectedTarget} 的 yes adjudication、真实 reason 和 path:line 证据以覆盖此前误裁；历史其他裁决由宿主自动累计。重新达到 complete 后直接提交 handoff，selected ids 由宿主回填。`;
@@ -8115,8 +8211,15 @@ function countHierarchicalPhaseFailures(
 
 export function hierarchicalPhaseSelfHealRoute(
   phase: Exclude<HierarchicalWorkPhase, "close">,
-  reason: string
+  reason: string,
+  prepareDisposition?: unknown
 ): "retry" | "investigate" | "prepare" | "implement" {
+  if (phase === "verify" && /最终行为指纹与 prepare 冻结契约不一致/.test(reason)) {
+    // A disproven no-op needs a new write plan and lease; an existing plan can
+    // go straight back to its implementation. Neither is a transcript repair.
+    return prepareDisposition === "already_satisfied" ? "prepare" : "implement";
+  }
+  if (phase === "verify" && prepareDisposition === "already_satisfied") return "retry";
   if (phase === "prepare") {
     // Most prepare failures are transcription, schema or prepare-only contract
     // investigation problems. Sending them back to investigate removes the

@@ -70,7 +70,9 @@ export function discoverWorkflowCapabilityRequests(
   state: HierarchicalExecutionState,
   requirementId: string
 ): WorkflowCapabilityRequest[] {
-  return DEFINITIONS.flatMap((definition) => definition.discover(state, requirementId));
+  const symbols = discoverSymbolContractRequests(state, requirementId);
+  return [...symbols, ...discoverCallsiteReviewRequests(state, requirementId,
+    new Set(symbols.map(request => request.id)))];
 }
 
 export async function executeWorkflowCapability(
@@ -327,9 +329,18 @@ function discoverSymbolContractRequests(
       symbol,
       parsed.line ?? "",
       adapter.id,
+      "callsite-scope-v2",
       `workspace-revision:${investigate.workspace_revision}`
     ].join("\u0000");
-    if (seen.has(key)) continue;
+    if (seen.has(key)) {
+      // A callable serving both roles still needs its entry's outgoing edges.
+      if (item.symbol_role === "reference-entry") {
+        const existing = requests.find((request) => request.input.target_file === parsed.file
+          && request.input.symbol === symbol);
+        if (existing) existing.input.symbol_role = "reference-entry";
+      }
+      continue;
+    }
     seen.add(key);
     const digest = createHash("sha256").update(key).digest("hex").slice(0, 16);
     requests.push({
@@ -354,7 +365,8 @@ function discoverSymbolContractRequests(
 
 function discoverCallsiteReviewRequests(
   state: HierarchicalExecutionState,
-  requirementId: string
+  requirementId: string,
+  currentSymbols = new Set<string>()
 ): WorkflowCapabilityRequest[] {
   const requests: WorkflowCapabilityRequest[] = [];
   for (const node of state.capability_nodes ?? []) {
@@ -362,6 +374,7 @@ function discoverCallsiteReviewRequests(
       node.requirement_id !== requirementId
       || node.capability !== SYMBOL_CONTRACT_CAPABILITY
       || node.status !== "passed"
+      || (currentSymbols.size > 0 && !currentSymbols.has(node.id))
     ) continue;
     const inventory = record(node.output?.callsite_inventory);
     const entries = arrayOfRecords(inventory?.entries);
@@ -478,7 +491,7 @@ async function executeSymbolContractCapability(
     output: {
       ...symbolContractOutput(report),
       adapter_id: analysis.adapter_id,
-      callsite_inventory: exactCallsiteInventory(projectPath, report),
+      callsite_inventory: exactCallsiteInventory(projectPath, report, stringValue(input.symbol_role)),
       effective_input: {
         target_file: targetFile,
         symbol,
@@ -518,12 +531,15 @@ interface CallsiteInventory {
   total: number;
   entries: CallsiteInventoryEntry[];
   accounted: true;
+  scope_exclusions?: Array<{ evidence_ref: string; reason: string }>;
 }
 
 function exactCallsiteInventory(
   projectPath: string,
-  report: SymbolInvestigationReport
+  report: SymbolInvestigationReport,
+  symbolRole?: string
 ): CallsiteInventory {
+  const scopeExclusions: NonNullable<CallsiteInventory["scope_exclusions"]> = [];
   const fingerprints = new Map(report.behavior_fingerprints.map((item) => (
     [item.source_reference_id, item] as const
   )));
@@ -532,7 +548,17 @@ function exactCallsiteInventory(
     ? sourceExcerptAt(projectPath, definition.file, definition.line)
     : `目标定义源码未定位：${report.target.symbol}`;
   const definitionDigest = digestText(definitionExcerpt);
-  const incomingEntries = report.reference_cards.map((card) => {
+  const incomingEntries = report.reference_cards.filter((card) => {
+    const reason = card.disposition === "irrelevant"
+      ? "静态分析已归类为 import/export 引用，保留原始引用账本，无需单独语义节点"
+      : symbolRole === "destination-contract"
+        && (card.target.file !== report.target.file || card.target.symbol !== report.target.symbol)
+        ? "公共封装的上游引用保留在符号报告中；目标契约审查聚焦直接使用目标的边"
+        : undefined;
+    if (!reason) return true;
+    scopeExclusions.push({ evidence_ref: `${card.location.file}:${card.location.line}`, reason });
+    return false;
+  }).map((card) => {
     const evidenceRef = `${card.location.file}:${card.location.line}`;
     const sourceExcerpt = sourceExcerptAt(projectPath, card.location.file, card.location.line);
     const fingerprint = fingerprints.get(card.reference_id);
@@ -568,7 +594,14 @@ function exactCallsiteInventory(
       }
     };
   });
-  const outgoingEntries = report.effects.items.map((effect) => {
+  const outgoingEntries = report.effects.items.filter((effect) => {
+    if (symbolRole !== "destination-contract") return true;
+    scopeExclusions.push({
+      evidence_ref: `${effect.location.file}:${effect.location.line}`,
+      reason: "目标内部实现保留在完整符号报告中；由需求验收和实际改动决定深入审查，非入口契约调用点"
+    });
+    return false;
+  }).map((effect) => {
     const evidenceRef = `${effect.location.file}:${effect.location.line}`;
     const sourceExcerpt = sourceExcerptAt(
       projectPath,
@@ -621,7 +654,7 @@ function exactCallsiteInventory(
     };
   });
   const entries = [...incomingEntries, ...outgoingEntries];
-  return { schema_version: 1, total: entries.length, entries, accounted: true };
+  return { schema_version: 1, total: entries.length, entries, accounted: true, scope_exclusions: scopeExclusions };
 }
 
 function lspCallsiteInventory(
