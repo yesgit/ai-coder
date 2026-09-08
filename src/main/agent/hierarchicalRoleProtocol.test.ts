@@ -393,7 +393,20 @@ describe("hierarchicalRoleProtocol", () => {
     expect(spec.prompt).toContain("严禁猜测 /workspace");
     expect(spec.prompt).toContain("本阶段启动前已声明的交接契约");
     expect(spec.prompt).toContain("confirmed_facts");
-    expect((spec.outputFormat.schema.required as string[])).toContain("handoff");
+    expect((spec.outputFormat.schema.required as string[])).not.toContain("handoff");
+    expect(spec.outputFormat.schema.allOf).toEqual([{
+      if: { properties: { status: { const: "passed" } }, required: ["status"] },
+      then: { required: ["handoff"] }
+    }]);
+    expect(parseHierarchicalRoleResult({
+      kind: "run_phase", requirement_id: "R1", work_unit_id: "R1:prepare", phase: "prepare", role: "preparer"
+    }, {
+      status: "failed", summary: "Need entry evidence", evidence_refs: [],
+      failure_reason: "Reference selection needs investigation", failure_route: "investigate"
+    })).toMatchObject([{
+      type: "phase_failed", work_unit_id: "R1:prepare",
+      reason: "Reference selection needs investigation", route: "investigate"
+    }]);
     expect(() => parseHierarchicalRoleResult({
       kind: "run_phase",
       requirement_id: "R1",
@@ -727,6 +740,8 @@ describe("hierarchicalRoleProtocol", () => {
     expect(spec.tools).not.toContain("mcp__ai_coder__analyze_symbol_contract");
     const rootProperties = spec.outputFormat.schema.properties as Record<string, Record<string, unknown>>;
     const handoffProperties = (rootProperties.handoff.properties as Record<string, Record<string, unknown>>);
+    expect(handoffProperties.behavior_contract_version).toEqual({ type: "integer", const: 1 });
+    expect(rootProperties.handoff.required).not.toContain("behavior_contract_version");
     const callContractProperties = (
       handoffProperties.call_contract.properties as Record<string, Record<string, unknown>>
     );

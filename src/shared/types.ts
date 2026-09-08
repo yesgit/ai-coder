@@ -709,6 +709,14 @@ export interface HierarchicalAlignmentFinding {
   source_anchor: string;
   observable_result: string;
   acceptance: string[];
+  /** Stable document identity supplied by attachment readers when available. */
+  section_id?: string;
+  /** Business sequence, kept separate from prose anchors and page numbers. */
+  sequence?: number;
+  /** Canonical user-visible target, such as a pageName or route key. */
+  target_label?: string;
+  /** Explicit continuation relationship across an attachment boundary. */
+  continuation_of?: string;
 }
 
 /**

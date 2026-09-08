@@ -565,13 +565,32 @@ function passAlignmentBatch(
       throw new Error(`${batchId}.findings[${index}] 缺少验收标准`);
     }
   }
+  const priorFindingKeys = new Set(state.alignment_batches
+    .filter((item) => item.id !== batchId && item.status === "completed")
+    .flatMap((item) => item.findings.map(alignmentFindingKey)));
+  const uniqueFindings = findings.filter((finding) => {
+    const key = alignmentFindingKey(finding);
+    if (priorFindingKeys.has(key)) return false;
+    priorFindingKeys.add(key);
+    return true;
+  });
   batch.status = "completed";
   batch.summary = summary.trim();
-  batch.findings = structuredClone(findings);
+  batch.findings = structuredClone(uniqueFindings);
   batch.evidence_refs = unique(evidenceRefs);
   batch.failure_reason = undefined;
   batch.error_fingerprint = undefined;
   batch.consecutive_failure_count = 0;
+}
+
+function alignmentFindingKey(finding: HierarchicalAlignmentFinding): string {
+  return JSON.stringify([
+    finding.source_anchor.trim(),
+    finding.section_id?.trim() ?? "",
+    finding.sequence ?? null,
+    finding.target_label?.trim() ?? "",
+    finding.observable_result.trim()
+  ]);
 }
 
 function failAlignmentBatch(
@@ -817,6 +836,17 @@ function passPhase(
   state.active_work_unit = createWorkUnit(state, requirement.id, nextPhase, 1, allowedFiles);
 }
 
+function hasObjectHandoff(draft: string | undefined): boolean {
+  if (!draft) return false;
+  try {
+    const value = JSON.parse(draft);
+    return value !== null && typeof value === "object" && value.handoff !== null
+      && typeof value.handoff === "object" && !Array.isArray(value.handoff);
+  } catch {
+    return false;
+  }
+}
+
 function failPhase(
   state: HierarchicalExecutionState,
   event: Extract<HierarchicalEvent, { type: "phase_failed" }>,
@@ -832,7 +862,10 @@ function failPhase(
     ...(workUnit.correction_history ?? []),
     event.reason
   ]).slice(-4);
-  if (event.rejected_output) workUnit.last_rejected_output = event.rejected_output;
+  if (event.rejected_output && (hasObjectHandoff(event.rejected_output)
+    || !hasObjectHandoff(workUnit.last_rejected_output))) {
+    workUnit.last_rejected_output = event.rejected_output;
+  }
   settleCurrentPhaseRun(state, workUnit.id, "failed", now, [], event.error_fingerprint, event.reason);
 
   if (event.route === "blocked") {
@@ -861,7 +894,11 @@ function failPhase(
   );
   recoveryWorkUnit.failure_reason = `下游 ${workUnit.phase} 未通过：${event.reason}`;
   recoveryWorkUnit.correction_history = [...(workUnit.correction_history ?? [])];
-  recoveryWorkUnit.last_rejected_output = workUnit.last_rejected_output;
+  // A rejected verify/implement document is not a prepare/investigate template.
+  // Keep the diagnostic history, but only reuse drafts with the same schema.
+  if (event.route === workUnit.phase) {
+    recoveryWorkUnit.last_rejected_output = workUnit.last_rejected_output;
+  }
   state.active_work_unit = recoveryWorkUnit;
 }
 

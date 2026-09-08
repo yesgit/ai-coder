@@ -14,6 +14,8 @@ import {
   getHierarchicalCapabilityLeaseError,
   getHierarchicalMcpBoundaryMessage,
   hierarchicalErrorFingerprint,
+  countHierarchicalRecoveryFailures,
+  validateFrozenBehaviorObligations,
   hierarchicalPhaseSelfHealRoute,
   hierarchicalValidationCorrection,
   isLineAddedByGitDiff,
@@ -45,6 +47,58 @@ import {
   createHierarchicalExecutionState
 } from "../workflows/hierarchicalWorkflowEngine.js";
 import { parseHierarchicalRoleResult } from "./hierarchicalRoleProtocol.js";
+
+describe("generic frozen contract recovery", () => {
+  const dimensions = ["destination", "invocation", "arguments", "preconditions", "context", "side_effects"];
+  const contract = () => dimensions.map((dimension) => {
+    const envelope = JSON.stringify({ schema_version: 1, dimension, targets: { task: [] } });
+    return { dimension, decision: "reuse", reference_behavior: envelope, required_behavior: envelope };
+  });
+
+  it("never drops an intentional difference encoded as prose or a malformed envelope", () => {
+    expect(validateFrozenBehaviorObligations(contract()).size).toBe(6);
+    for (const value of ["reuse the handler", "{}", JSON.stringify({ schema_version: 2, dimension: "preconditions", targets: { task: [] } }),
+      JSON.stringify({ schema_version: 1, dimension: "context", targets: { task: [] } }),
+      JSON.stringify({ schema_version: 1, dimension: "preconditions", targets: {} })]) {
+      const obligations = contract();
+      obligations[3]!.decision = "intentional-difference";
+      obligations[3]!.required_behavior = value;
+      expect(() => validateFrozenBehaviorObligations(obligations)).toThrow("冻结行为契约格式无效");
+    }
+    expect(() => validateFrozenBehaviorObligations(contract().slice(1))).toThrow("destination");
+    expect(() => validateFrozenBehaviorObligations([...contract(), contract()[0]!])).toThrow("destination");
+    expect(validateFrozenBehaviorObligations([{ required_behavior: "legacy prose" }]).size).toBe(0);
+    expect(() => validateFrozenBehaviorObligations([{ required_behavior: "legacy prose" }], true)).toThrow();
+    expect(() => validateFrozenBehaviorObligations(contract().map((item) => ({
+      ...item, reference_behavior: "{broken", required_behavior: "{broken"
+    })))).toThrow();
+  });
+
+  it("keeps one failure identity when dimensions, source lines and diagnostic payload change", () => {
+    expect(hierarchicalErrorFingerprint("task/prepare", "prepare 最终行为指纹与 prepare 冻结契约不一致，共 4 处：a.ts:7"))
+      .toBe(hierarchicalErrorFingerprint("task/prepare", "prepare 最终行为指纹与 prepare 冻结契约不一致，共 3 处：b.ts:90"));
+    expect(hierarchicalPhaseSelfHealRoute("prepare", "prepare 最终行为指纹与 prepare 冻结契约不一致", "already_satisfied", 1)).toBe("retry");
+    expect(hierarchicalPhaseSelfHealRoute("prepare", "prepare 最终行为指纹与 prepare 冻结契约不一致", "already_satisfied", 2)).toBe("investigate");
+  });
+
+  it("retains recovery debt across schema detours and successful intermediate stages", () => {
+    const session = createSession();
+    session.hierarchical_state = createHierarchicalExecutionState("generic task");
+    const state = session.hierarchical_state;
+    const add = (phase: "prepare" | "investigate" | "verify", status: "failed" | "passed", requirement_id = "R1") => {
+      state.phase_runs.push({ id: String(state.phase_runs.length), work_unit_id: `${requirement_id}:${phase}`,
+        requirement_id, phase, role: phase, attempt: 1, status, evidence_refs: [], started_at: state.created_at });
+    };
+    add("verify", "failed");
+    add("prepare", "failed");
+    add("investigate", "passed");
+    add("prepare", "failed");
+    add("prepare", "failed", "R2");
+    expect(countHierarchicalRecoveryFailures(session, "R1")).toBe(3);
+    add("verify", "passed");
+    expect(countHierarchicalRecoveryFailures(session, "R1")).toBe(0);
+  });
+});
 
 const workflow: WorkflowTemplate = {
   id: "hierarchical-test",
@@ -621,6 +675,51 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       acceptance: ["零钱宝页面能打开"]
     };
     expect(() => validateHierarchicalPlannerEnumeratedCoverage(session, operation, structured)).not.toThrow();
+  });
+
+  it("does not compare identical sequence numbers from different attachment sections", () => {
+    const session = createSession();
+    session.task_prompt = "请从序号 33 开始实现所有页面跳转";
+    session.hierarchical_state = {
+      ...session.hierarchical_state!,
+      alignment_batches: [{
+        id: "A1",
+        source_refs: ["page-12.png"],
+        status: "completed",
+        attempt: 1,
+        consecutive_failure_count: 0,
+        summary: "two document sections",
+        findings: [
+          {
+            source_anchor: "page-12.png 序号 33",
+            observable_result: "配置表中的零钱宝页面",
+            acceptance: ["配置可验证"],
+            section_id: "jump-link-config",
+            sequence: 33,
+            target_label: "零钱宝"
+          },
+          {
+            source_anchor: "page-18.png 序号 33",
+            observable_result: "原型图中的转托管入页面",
+            acceptance: ["原型可验证"],
+            section_id: "prototype-screen",
+            sequence: 33,
+            target_label: "转托管入"
+          }
+        ],
+        evidence_refs: ["page-12.png", "page-18.png"]
+      }]
+    };
+    expect(() => validateHierarchicalPlannerEnumeratedCoverage(session, {
+      kind: "run_planner"
+    }, {
+      requirements: [{
+        id: "R33",
+        source_anchor: "序号 33：采用配置表 page-12.png；排除原型图 page-18.png",
+        observable_result: "用户可进入零钱宝页面",
+        acceptance: ["零钱宝页面能打开"]
+      }]
+    })).not.toThrow();
   });
 
   it("requires the host-owned full investigation script for declared prepare contracts", async () => {
@@ -1496,6 +1595,11 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
         prepareStageId
       )).toThrow(/prepare 最终行为指纹.*不一致/);
       prepareHandoff.change_disposition = "changes_required";
+      reconcileHierarchicalPrepareContractHandoff(session, prepareOperation, structured, prepareStageId);
+      expect(() => validateHierarchicalContractToolEvidence(session, prepareOperation, [{
+        type: "phase_passed", work_unit_id: "R1:prepare", summary: "plan source repair",
+        handoff: prepareHandoff, allowed_files: ["routes.ts"], evidence_refs: ["routes.ts:5"]
+      }], prepareStageId)).not.toThrow();
       expect(() => validateHierarchicalContractToolEvidence(
         session,
         verifyOperation,
@@ -1504,6 +1608,15 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       )).toThrow(/NEW\/arguments/);
 
       await writeFile(path.join(projectPath, "routes.ts"), routes("safe", false));
+      const guardObligation = (prepareHandoff.behavior_obligations as Array<Record<string, unknown>>)
+        .find((item) => item.dimension === "preconditions")!;
+      const originalGuard = guardObligation.required_behavior;
+      guardObligation.decision = "intentional-difference";
+      guardObligation.required_behavior = "reuse the handler without guards";
+      expect(() => validateHierarchicalContractToolEvidence(session, verifyOperation, verifyEvent,
+        "hierarchical:R1/verify")).toThrow("冻结行为契约格式无效");
+      guardObligation.required_behavior = originalGuard;
+      guardObligation.decision = "reuse";
       expect(() => validateHierarchicalContractToolEvidence(
         session,
         verifyOperation,
@@ -2965,6 +3078,7 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     const mismatch = "verify 最终行为指纹与 prepare 冻结契约不一致，共 2 处：arguments, preconditions";
     expect(hierarchicalPhaseSelfHealRoute("verify", mismatch, "already_satisfied")).toBe("prepare");
     expect(hierarchicalPhaseSelfHealRoute("verify", mismatch, "changes_required")).toBe("implement");
+    expect(hierarchicalPhaseSelfHealRoute("verify", mismatch, "changes_required", 2)).toBe("prepare");
     expect(hierarchicalValidationCorrection({
       kind: "run_phase", requirement_id: "R1", work_unit_id: "R1:verify",
       phase: "verify", role: "independent-verifier"
@@ -3098,6 +3212,17 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
         reference_behavior: expect.stringContaining("authenticated")
       })
     ]));
+    Object.assign(handoff.behavior_obligations[3]!, {
+      decision: "intentional-difference", reason: "different authorization context evidenced by the caller",
+      required_behavior: { schema_version: 1, dimension: "preconditions", targets: { route: ["authorized"] } }
+    });
+    reconcileHierarchicalPrepareDerivedBehaviorContract(session, {
+      kind: "run_phase", requirement_id: "R1", work_unit_id: "R1:prepare", phase: "prepare", role: "preparer"
+    }, { status: "passed", handoff });
+    expect(handoff.behavior_obligations[3]).toMatchObject({
+      required_behavior: JSON.stringify({ dimension: "preconditions", schema_version: 1, targets: { route: ["authorized"] } })
+    });
+    expect(validateFrozenBehaviorObligations(handoff.behavior_obligations).size).toBe(6);
   });
 
   it("groups investigate handoff violations into per-section class fingerprints", () => {
@@ -3790,8 +3915,8 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     }
     expect(prepareHandoff.satisfaction_evidence).toHaveLength(6);
     expect(prepareHandoff.satisfaction_evidence).toEqual(expect.arrayContaining([
-      expect.stringContaining("B-destination destination 已由当前目标代码满足：target.ts:1"),
-      expect.stringContaining("B-context context 已由当前目标代码满足：target.ts:1")
+      expect.stringContaining("B-destination destination 当前目标待验证证据：target.ts:1"),
+      expect.stringContaining("B-context context 当前目标待验证证据：target.ts:1")
     ]));
     const events = parseHierarchicalRoleResult(operation, structured);
     expect(() => validateHierarchicalBehaviorObligationContinuity(
@@ -4662,7 +4787,7 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       }));
       const progressEvents = updated.progress_events ?? [];
       expect(progressEvents).toContainEqual(expect.objectContaining({
-        message: expect.stringContaining("6 次定向修正机会")
+        message: expect.stringContaining("同类错误累计 6 次")
       }));
       const selfHealMessages = progressEvents
         .filter((event) => event.message.includes("退回 prepare 自愈"))

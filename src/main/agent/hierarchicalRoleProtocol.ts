@@ -67,6 +67,17 @@ function buildAlignmentBatchSpec(
   operation: Extract<HierarchicalNextOperation, { kind: "run_alignment_batch" }>
 ): HierarchicalRoleSpec {
   const role = "attachment-requirements-reader";
+  const batchIndex = state.alignment_batches.findIndex((batch) => batch.id === operation.batch_id);
+  const predecessor = batchIndex > 0 ? state.alignment_batches[batchIndex - 1] : undefined;
+  const boundaryContext = predecessor
+    ? predecessor.findings.slice(-6).map((finding) => ({
+        source_anchor: finding.source_anchor,
+        sequence: finding.sequence,
+        section_id: finding.section_id,
+        target_label: finding.target_label,
+        observable_result: finding.observable_result
+      }))
+    : [];
   return {
     role,
     phaseLabel: `align/${operation.batch_id}`,
@@ -80,7 +91,11 @@ function buildAlignmentBatchSpec(
       `只摄取 ${operation.batch_id} 的附件内容，提炼候选需求事实；不要建立最终 R-ID，不要读取代码，不要修改任何文件。`,
       "一次只发起一个 Read，等待该结果返回后再读取下一个，严禁并行读取多个附件。",
       "Read.file_path 必须逐字复制本批次清单中的绝对路径，不得增删前缀、猜测路径、Glob、搜索或寻找替代副本。",
+      ...(boundaryContext.length > 0
+        ? [`## 前一批边界事实（只用于去重和识别续行）\n${JSON.stringify(boundaryContext)}`]
+        : []),
       "每项 finding 必须保留页码/序号/控件等可追溯 source_anchor，并写成可观察结果与独立验收断言。",
+      "若附件属于表格、原型图、备注清单等不同文档区段，必须填写稳定 section_id；业务序号填写 sequence，页面/路由目标填写 target_label。不要把页码、续行词或整句描述当成 target_label。跨页续行用 continuation_of 指向同一业务条目。",
       "表格、清单或连续编号中的每个业务序号必须单独输出一个 finding；不得把一段编号范围内的多个独立条目合并成一条 finding。跨页续行保留相同业务序号并注明续页关系。",
       "除 A1 外，本批次第一张可能是前一批最后一张的只读衔接页。它只用于恢复跨页表头/续行上下文：若条目已在前批完整输出，不要重复创建 finding；若条目延续到本批新页面，source_anchor 必须同时引用衔接页和续页。",
       "没有独立需求的封面或上下文页可以只进入 summary；evidence_refs 必须列出实际读取的本批次路径。",
@@ -103,7 +118,11 @@ function buildAlignmentBatchSpec(
               properties: {
                 source_anchor: { type: "string" },
                 observable_result: { type: "string" },
-                acceptance: { type: "array", items: { type: "string" } }
+                acceptance: { type: "array", items: { type: "string" } },
+                section_id: { type: "string" },
+                sequence: { type: "number" },
+                target_label: { type: "string" },
+                continuation_of: { type: "string" }
               },
               required: ["source_anchor", "observable_result", "acceptance"],
               additionalProperties: false
@@ -404,7 +423,15 @@ function parseAlignmentBatchResult(
         finding.observable_result,
         `alignment.findings[${index}].observable_result`
       ),
-      acceptance: stringArray(finding.acceptance, `alignment.findings[${index}].acceptance`)
+      acceptance: stringArray(finding.acceptance, `alignment.findings[${index}].acceptance`),
+      ...(typeof finding.section_id === "string" && finding.section_id.trim()
+        ? { section_id: finding.section_id.trim() } : {}),
+      ...(typeof finding.sequence === "number" && Number.isInteger(finding.sequence)
+        ? { sequence: finding.sequence } : {}),
+      ...(typeof finding.target_label === "string" && finding.target_label.trim()
+        ? { target_label: finding.target_label.trim() } : {}),
+      ...(typeof finding.continuation_of === "string" && finding.continuation_of.trim()
+        ? { continuation_of: finding.continuation_of.trim() } : {})
     };
   });
   return [{
@@ -1160,6 +1187,8 @@ function phaseInstructions(
         "结构化输出中 destination/invocation/arguments/preconditions/context/side_effects 六类 behavior_obligations 只需逐项提交 dimension、decision、reason；intentional-difference 另提交 required_behavior。id、target_keys、reference_behavior、reuse 的 required_behavior 和 evidence_refs 由宿主按能力图回填。reference_application 可提交空数组，宿主会按逐目标指纹展开，避免重复抄写大段证据。",
         "changes_required 的 behavior_obligations 是尚待实现的未来契约：每项引用同功能既有入口证据，不得虚构尚不存在的新分支 path:line。目标现状和插入上下文沿用 investigate 已验证证据，实际目标代码证据由 implement、verify 逐项提交；只有 already_satisfied 才必须在 prepare 为每项同时给出当前目标代码证据。",
         "默认逐维度复用同功能入口。任何 intentional-difference 都必须引用用户要求或既有架构证据；不能以‘当前代码已经这样写’作为差异依据。",
+        "intentional-difference 的 required_behavior 提交 {schema_version:1,dimension,targets:{目标键:行为值}} 对象（也兼容 JSON 字符串），不得用文字摘要代替或删除目标。调用名称相似并不证明接收者等价，guard/context 差异也不能因目标组件相同而忽略。",
+        "若 already_satisfied 被源码指纹拒绝，不得继续据‘代码存在’声明满足：参考适用则提交 changes_required 的未来契约与修改计划；参考入口可能选错或证据不足则返回 status=failed、failure_route=investigate、failure_reason、summary、evidence_refs，无需成功阶段的 handoff。参考变更必须经过 investigate 重新取证，不能用目标现状反向覆盖参考。",
         "若六类义务已全部满足，返回 change_disposition=already_satisfied、空 allowed_files、空 patch_plan；satisfaction_evidence 提交空数组即可，宿主会从已确认的目标代码与六类义务逐项生成。否则返回 changes_required、非空 patch_plan 和非空 allowed_files。",
         "prepare 是只读阶段，不需要 Edit。提交合格 handoff 后宿主会自动进入 implement 并授予 allowed_files 的 Edit 权限；不得改用 Bash 写文件，也不得要求用户启用内部工具。"
       ].join("\n");
@@ -1200,7 +1229,13 @@ function phaseOutputFormat(
       items: plannedRequirementSchema(requirement.id)
     }
   };
-  if (phase === "prepare") properties.allowed_files = { type: "array", items: { type: "string" } };
+  if (phase === "prepare") {
+    properties.allowed_files = { type: "array", items: { type: "string" } };
+    // Host-enriched rejected drafts may carry this marker back through the SDK.
+    // It is optional for providers, and never inferred from their declaration.
+    const handoff = properties.handoff as { properties: Record<string, unknown> };
+    handoff.properties.behavior_contract_version = { type: "integer", const: 1 };
+  }
   if (phase === "verify") {
     properties.acceptance_results = {
       type: "array",
@@ -1223,7 +1258,11 @@ function phaseOutputFormat(
     schema: {
       type: "object",
       properties,
-      required: ["status", "summary", "evidence_refs", "handoff"],
+      required: ["status", "summary", "evidence_refs"],
+      allOf: [{
+        if: { properties: { status: { const: "passed" } }, required: ["status"] },
+        then: { required: ["handoff"] }
+      }],
       additionalProperties: false
     }
   };
@@ -1311,7 +1350,19 @@ function phaseHandoffSchema(
       dimension: { type: "string", enum: [...REQUIRED_BEHAVIOR_DIMENSIONS] },
       target_keys: stringList(1),
       reference_behavior: { type: "string", minLength: 1 },
-      required_behavior: { type: "string", minLength: 1 },
+      required_behavior: { anyOf: [
+        { type: "string", minLength: 1 },
+        {
+          type: "object",
+          properties: {
+            schema_version: { const: 1 },
+            dimension: { type: "string", enum: [...REQUIRED_BEHAVIOR_DIMENSIONS] },
+            targets: { type: "object", minProperties: 1, additionalProperties: true }
+          },
+          required: ["schema_version", "dimension", "targets"],
+          additionalProperties: false
+        }
+      ] },
       decision: { type: "string", enum: ["reuse", "intentional-difference", "not-applicable"] },
       reason: { type: "string" },
       evidence_refs: evidenceList()
@@ -1743,6 +1794,10 @@ function formatAlignmentBatchForPlanner(
     ...(batch.findings.length > 0
       ? batch.findings.map((finding) => [
           `- 来源：${finding.source_anchor}`,
+          ...(finding.section_id ? [`  区段：${finding.section_id}`] : []),
+          ...(finding.sequence !== undefined ? [`  业务序号：${finding.sequence}`] : []),
+          ...(finding.target_label ? [`  目标：${finding.target_label}`] : []),
+          ...(finding.continuation_of ? [`  续接：${finding.continuation_of}`] : []),
           `  可观察结果：${finding.observable_result}`,
           `  验收：${finding.acceptance.join("；")}`
         ].join("\n"))

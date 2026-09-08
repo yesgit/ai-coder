@@ -464,6 +464,27 @@ describe("hierarchical workflow engine", () => {
       expect.objectContaining({ failure_reason: "缺少 selected reference" }),
       expect.objectContaining({ failure_reason: "manual target should be removed" })
     ]);
+    const reusableDraft = state.active_work_unit!.last_rejected_output;
+    state = applyHierarchicalEvent(state, { type: "phase_started", work_unit_id: workUnitId, occurred_at: NOW });
+    state = applyHierarchicalEvent(state, {
+      type: "phase_failed", work_unit_id: workUnitId, reason: "phase.handoff 必须是对象", route: "retry",
+      rejected_output: '{"status":"passed","handoff":""}', occurred_at: NOW
+    });
+    expect(state.active_work_unit?.last_rejected_output).toBe(reusableDraft);
+    expect(state.active_work_unit?.correction_history).toContain("phase.handoff 必须是对象");
+  });
+
+  it("keeps failure evidence but never copies a downstream draft into an upstream schema", () => {
+    let state = passCurrentPhase(activateR33());
+    const workUnitId = state.active_work_unit!.id;
+    state = applyHierarchicalEvent(state, { type: "phase_started", work_unit_id: workUnitId, occurred_at: NOW });
+    state = applyHierarchicalEvent(state, {
+      type: "phase_failed", work_unit_id: workUnitId, reason: "reference entry needs evidence",
+      route: "investigate", rejected_output: '{"status":"passed","handoff":{"patch_plan":[]}}', occurred_at: NOW
+    });
+    expect(state.active_work_unit?.phase).toBe("investigate");
+    expect(state.active_work_unit?.last_rejected_output).toBeUndefined();
+    expect(state.active_work_unit?.correction_history).toContain("reference entry needs evidence");
   });
 
   it("skips implement when prepare proves the full behavior contract is already satisfied", () => {

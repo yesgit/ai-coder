@@ -464,6 +464,13 @@ export class ClaudeAgentRunner {
         }
 
         const roleOperation = operation;
+        if (roleOperation.kind === "run_phase"
+          && countHierarchicalRecoveryFailures(input.session, roleOperation.requirement_id) >= 12) {
+          this.raiseHierarchicalHostBlocker(input.session, "agent_failed", new Error(
+            `需求 ${roleOperation.requirement_id} 的恢复失败累计达到 12 次，停止重复调度；保留阶段证据和失败历史。`
+          ));
+          continue;
+        }
         let resumingRunningPhase = false;
         if (roleOperation.kind === "run_alignment_batch") {
           input.session.current_stage = `align/${roleOperation.batch_id}`;
@@ -577,15 +584,19 @@ export class ClaudeAgentRunner {
             const totalFailures = countHierarchicalPhaseFailures(
               input.session,
               roleOperation.work_unit_id,
-              fingerprint
+              fingerprint,
+              roleOperation.requirement_id,
+              message
             ) + 1;
+            const recoveryFailures = countHierarchicalRecoveryFailures(input.session, roleOperation.requirement_id) + 1;
             const selfHealRoute = hierarchicalPhaseSelfHealRoute(
               roleOperation.phase,
               message,
               input.session.hierarchical_state
                 ? latestHierarchicalArtifact(input.session.hierarchical_state, roleOperation.requirement_id, "prepare")
                   ?.handoff?.change_disposition
-                : undefined
+                : undefined,
+              totalFailures
             );
             const behaviorMismatch = /最终行为指纹与 prepare 冻结契约不一致/.test(message);
             const sameFailureLimit = selfHealRoute === "retry" && roleOperation.phase !== "investigate"
@@ -613,9 +624,9 @@ export class ClaudeAgentRunner {
             const retryBasis = error instanceof HierarchicalRoleValidationError && error.rejectedOutput
               ? "基于被拒草稿"
               : "保留已完成证据";
-            if (totalFailures >= 6) {
+            if (totalFailures >= 6 || recoveryFailures >= 12) {
               const exhausted = new Error(
-                `${roleOperation.phase} 的同类错误跨阶段自愈后仍累计出现 ${totalFailures} 次：${message}`
+                `${roleOperation.phase} 的同类错误累计 ${totalFailures} 次，当前需求恢复失败累计 ${recoveryFailures} 次：${message}`
               );
               this.raiseHierarchicalHostBlocker(input.session, "agent_failed", exhausted, {
                 requirementId: roleOperation.requirement_id,
@@ -625,7 +636,7 @@ export class ClaudeAgentRunner {
               await this.recordProgress(
                 input,
                 "status",
-                `当前 ${roleOperation.phase} 已获得 ${totalFailures} 次定向修正机会且同类错误仍未消除；宿主停止无限往返并保留诊断：${message}`,
+                `当前 ${roleOperation.phase} 同类错误累计 ${totalFailures} 次，需求恢复失败累计 ${recoveryFailures} 次；宿主停止无限往返并保留诊断：${message}`,
                 "milestone"
               );
             } else if (roleOperation.phase === "investigate" && repeats >= 3) {
@@ -674,10 +685,11 @@ export class ClaudeAgentRunner {
               await this.recordProgress(
                 input,
                 "status",
-                `align 角色失败，宿主已将拒绝原因写入第 ${retry?.attempt ?? repeats + 1} 次 planner 输出契约（${repeats}/3）：${message}`,
+                `align 角色失败，宿主已将拒绝原因写入第 ${retry?.attempt ?? repeats + 1} 次 planner 输出契约（同类连续 ${repeats}/3）：${message}`,
                 "milestone"
               );
-              if (repeats >= 3) {
+              const plannerAttemptLimit = 6;
+              if (repeats >= 3 || (retry?.attempt ?? 0) >= plannerAttemptLimit) {
                 this.raiseHierarchicalHostBlocker(input.session, "agent_failed", error, { fingerprint });
               }
               continue;
@@ -4121,6 +4133,50 @@ interface FrozenBehaviorEnvelope {
   targets: Record<string, unknown>;
 }
 
+/** Legacy prose-only artifacts remain readable. Once a host envelope exists,
+ * every dimension must stay machine-checkable, including intentional deltas. */
+export function validateFrozenBehaviorObligations(
+  obligations: Record<string, unknown>[],
+  required = false
+): Map<BehaviorDimension, FrozenBehaviorEnvelope> {
+  const frozen = new Map<BehaviorDimension, FrozenBehaviorEnvelope>();
+  const usesEnvelopes = required || obligations.some((item) =>
+    parseFrozenBehaviorEnvelope(optionalString(item.reference_behavior))
+    || parseFrozenBehaviorEnvelope(optionalString(item.required_behavior))
+    || [item.reference_behavior, item.required_behavior].some((value) =>
+      isPlainObject(value) || (typeof value === "string" && /^\s*[\[{]/.test(value)))
+  );
+  if (!usesEnvelopes) return frozen;
+  const errors: string[] = [];
+  for (const dimension of BEHAVIOR_DIMENSIONS) {
+    const matching = obligations.filter((item) => item.dimension === dimension);
+    const obligation = matching[0];
+    const expected = parseFrozenBehaviorEnvelope(optionalString(obligation?.required_behavior));
+    const reference = parseFrozenBehaviorEnvelope(optionalString(obligation?.reference_behavior));
+    if (matching.length !== 1 || !expected || expected.dimension !== dimension
+      || !reference || reference.dimension !== dimension) {
+      errors.push(`${dimension}: 必须提供唯一且同维度的 schema_version=1 行为信封，不能使用普通文字代替`);
+      continue;
+    }
+    const referenceKeys = Object.keys(reference.targets).sort();
+    const expectedKeys = Object.keys(expected.targets).sort();
+    if (referenceKeys.length === 0 || canonicalBehaviorValue(referenceKeys) !== canonicalBehaviorValue(expectedKeys)) {
+      errors.push(`${dimension}: required_behavior 必须完整覆盖参考信封的目标，不能删除或增加目标`);
+    }
+    for (const [key, value] of Object.entries(expected.targets)) {
+      const referenceValue = reference.targets[key];
+      if (value === null || (Array.isArray(referenceValue)
+        ? !Array.isArray(value) || value.some((entry) => typeof entry !== "string")
+        : isPlainObject(referenceValue) ? !isPlainObject(value) : typeof value !== typeof referenceValue)) {
+        errors.push(`${dimension}/${key}: 行为值类型与参考维度不一致`);
+      }
+    }
+    frozen.set(dimension, expected);
+  }
+  if (errors.length) throw new Error(`冻结行为契约格式无效：\n- ${errors.join("\n- ")}`);
+  return frozen;
+}
+
 function assertVerifiedBehaviorFingerprints(
   session: AgentSession,
   operation: Extract<HierarchicalNextOperation, { kind: "run_phase" }>,
@@ -4136,11 +4192,7 @@ function assertVerifiedBehaviorFingerprints(
   const obligations = Array.isArray(contract.behavior_obligations)
     ? contract.behavior_obligations.filter(isPlainObject)
     : [];
-  const frozen = new Map<BehaviorDimension, FrozenBehaviorEnvelope>();
-  for (const obligation of obligations) {
-    const envelope = parseFrozenBehaviorEnvelope(optionalString(obligation.required_behavior));
-    if (envelope) frozen.set(envelope.dimension, envelope);
-  }
+  const frozen = validateFrozenBehaviorObligations(obligations, contract.behavior_contract_version === 1);
   // Persisted/legacy artifacts without host fingerprints keep their previous
   // validation path. Every newly prepared same-feature contract is frozen.
   if (frozen.size === 0) return;
@@ -4481,6 +4533,7 @@ function assertPrepareBehaviorFingerprints(
   const obligations = Array.isArray(passed.handoff?.behavior_obligations)
     ? passed.handoff.behavior_obligations.filter(isPlainObject)
     : [];
+  validateFrozenBehaviorObligations(obligations, true);
   for (const obligation of obligations) {
     const dimension = optionalString(obligation.dimension) as BehaviorDimension | undefined;
     if (!dimension || !BEHAVIOR_DIMENSIONS.includes(dimension)) continue;
@@ -5831,6 +5884,8 @@ export function reconcileHierarchicalPrepareBehaviorFingerprints(
   );
   if (fingerprints.length === 0) return [];
 
+  handoff!.behavior_contract_version = 1;
+
   const reconciled: string[] = [];
   for (const obligation of obligations) {
     const dimension = optionalString(obligation.dimension) as BehaviorDimension | undefined;
@@ -6021,7 +6076,7 @@ export function reconcileHierarchicalPrepareObligationEvidence(
     handoff!.satisfaction_evidence = obligations.map((obligation) => {
       const id = optionalString(obligation.id) ?? "<unknown>";
       const dimension = optionalString(obligation.dimension) ?? "behavior";
-      return `${id} ${dimension} 已由当前目标代码满足：${currentTargetEvidence[0]}`;
+      return `${id} ${dimension} 当前目标待验证证据：${currentTargetEvidence[0]}`;
     });
   }
 }
@@ -6084,6 +6139,10 @@ export function reconcileHierarchicalPrepareDerivedBehaviorContract(
       obligation.id = `B${BEHAVIOR_DIMENSIONS.indexOf(dimension) + 1}-${dimension}`;
     }
     obligation.target_keys = [...targetKeys];
+    // Accept an object delta from the provider; persist one canonical wire form.
+    if (isPlainObject(obligation.required_behavior)) {
+      obligation.required_behavior = canonicalBehaviorValue(obligation.required_behavior);
+    }
     if (!optionalString(obligation.reference_behavior)) {
       const targets = Object.fromEntries(targetKeys.map((targetKey) => [
         targetKey,
@@ -7813,21 +7872,31 @@ function validatePlannerAttachmentConflictResolution(
   state: HierarchicalExecutionState,
   requirements: Record<string, unknown>[]
 ): void {
-  const findingsBySequence = new Map<number, Array<{ label: string; source: string }>>();
+  const findingsBySequence = new Map<string, Array<{ label: string; source: string; sequence: number }>>();
   for (const batch of state.alignment_batches) {
     for (const finding of batch.findings) {
       const findingText = `${finding.source_anchor}\n${finding.observable_result}`;
-      const labels = extractAttachmentTargetLabels(findingText);
+      const labels = finding.target_label?.trim()
+        ? [finding.target_label.trim()]
+        : extractAttachmentTargetLabels(findingText);
       if (labels.length === 0) continue;
-      for (const sequence of extractBusinessSequenceNumbers(findingText)) {
-        const existing = findingsBySequence.get(sequence) ?? [];
-        for (const label of labels) existing.push({ label, source: finding.source_anchor });
-        findingsBySequence.set(sequence, existing);
+      const sequences = typeof finding.sequence === "number" && Number.isInteger(finding.sequence)
+        ? [finding.sequence]
+        : extractBusinessSequenceNumbers(findingText);
+      const section = finding.section_id?.trim() || "legacy";
+      for (const sequence of sequences) {
+        const key = `${section}\0${sequence}`;
+        const existing = findingsBySequence.get(key) ?? [];
+        for (const label of labels) existing.push({ label, source: finding.source_anchor, sequence });
+        findingsBySequence.set(key, existing);
       }
     }
   }
 
-  for (const [sequence, observations] of findingsBySequence) {
+  const violations: string[] = [];
+  for (const [key, observations] of findingsBySequence) {
+    const sequence = observations[0]?.sequence;
+    if (sequence === undefined) continue;
     const labels = uniqueStrings(observations.map((item) => item.label));
     if (labels.length < 2) continue;
     const requirement = requirements.find((item) => (
@@ -7845,26 +7914,29 @@ function validatePlannerAttachmentConflictResolution(
     ].filter(Boolean).join("\n");
     const mentionedLabels = labels.filter((label) => normalizedTextIncludes(resultText, label));
     if (mentionedLabels.length > 1) {
-      throw new Error(
+      violations.push(
         `planner 将序号 ${sequence} 的互斥附件目标合并成一个需求：${mentionedLabels.join(" / ")}；`
-        + "必须只采用一个目标，不能把目标裁决转交 investigate"
+        + `section=${key.split("\0")[0]}；必须只采用一个目标，不能把目标裁决转交 investigate`
       );
     }
     if (!/(?:采用|采信|排除|舍弃|以.+为准|adopt|exclude|canonical)/i.test(sourceAnchor)) {
-      throw new Error(
+      violations.push(
         `planner 尚未声明序号 ${sequence} 的附件冲突裁决：${labels.join(" / ")}；`
-        + "请在 source_anchor 中明确采用、排除的来源及理由"
+        + `section=${key.split("\0")[0]}；请在 source_anchor 中明确采用、排除的来源及理由`
       );
     }
+  }
+  if (violations.length > 0) {
+    throw new Error(`planner 附件冲突校验未通过，共 ${violations.length} 处：\n`
+      + violations.map((violation) => `- ${violation}`).join("\n"));
   }
 }
 
 function extractAttachmentTargetLabels(value: string): string[] {
   const labels: string[] = [];
   const patterns = [
-    /(?:业务)?序号\s*\d+\s*(?:[:：.、-]\s*)?([^\n，,；;|→]{2,40}?)(?=(?:页面|页)(?:$|[\s，,；;|:：=→\n])|(?:screen|view)\b|[，,；;|→\n])/giu,
-    /(?:页面名称|目标页面|target\s*(?:page|screen|view))\s*[:：=]\s*([^\n，,；;|→]{2,40})/giu,
-    /(?:^|[，,；;|])\s*([^\n，,；;|:：=→]{2,30}?)(?=(?:页面|页)(?:$|[\s，,；;|:：=→\n])|(?:screen|view)\b)/giu
+    /(?:页面名称|目标页面|target\s*(?:page|screen|view))\s*[:：=]\s*([^\n，,；;|→]{2,30})/giu,
+    /(?:业务)?序号\s*\d+\s*[:：.、-]\s*([\u4e00-\u9fffA-Za-z][^\n，,；;|→]{1,24}?)(?=页面(?:$|[\s，,；;|:：=→\n]))/giu
   ];
   for (const pattern of patterns) {
     for (const match of value.matchAll(pattern)) {
@@ -8021,7 +8093,13 @@ export function hierarchicalValidationCorrection(
   featureCensusReceipt?: Pick<FeatureCensusReceipt, "status" | "candidate_accounting"> | null
 ): string {
   if (/最终行为指纹与 prepare 冻结契约不一致/.test(reason)) {
+    if (operation.kind === "run_phase" && operation.phase === "prepare") {
+      return "当前证据不能支持 already_satisfied。若参考契约适用于目标，提交 changes_required、patch_plan 和 allowed_files，prepare 不要求未实施源码已满足未来契约；若怀疑选错参考入口或静态分析证据不足，提交 status=failed、failure_route=investigate、failure_reason 和证据，由 investigate 重新调查。不得改写参考指纹、删除维度或仅凭调用名推断别名等价。";
+    }
     return "这是源码行为差异，修改 verify 的 observed_behavior 不能消除。保留冻结契约和差异证据；若此前为 already_satisfied，退回 prepare，建立 changes_required 的 patch_plan 和 allowed_files；已有修改计划则退回 implement 修复参数、业务 guard 和上下文传递，再重新验证。表达式不同不能直接视为语义不同或相同，别名等价必须有源码绑定证据；不得通过改写报告或删除义务放行。";
+  }
+  if (/冻结行为契约格式无效/.test(reason)) {
+    return "保留六个维度和参考目标；intentional-difference 的 required_behavior 必须是 schema_version、dimension、targets 完整的对象或 JSON 字符串，并提供差异理由及代码证据。普通文字放入 reason，不能替代可验证的行为值。";
   }
   const rejectedTarget = /被误裁为 no（candidate_id=([^)）]+)[)）]/.exec(reason)?.[1];
   if (rejectedTarget) {
@@ -8119,6 +8197,8 @@ export function hierarchicalErrorFingerprint(scope: string, message: string): st
 
 function normalizeHierarchicalErrorForFingerprint(message: string): string {
   const reason = message.split(/\n可原地修正：/)[0]!.replace(/\s+/g, " ").trim();
+  if (/最终行为指纹与 prepare 冻结契约不一致/.test(reason)) return "frozen-behavior-mismatch";
+  if (/冻结行为契约格式无效/.test(reason)) return "frozen-behavior-invalid";
   if (/功能实现候选普查未闭合/.test(reason)) {
     return "feature-census-incomplete";
   }
@@ -8131,6 +8211,9 @@ function normalizeHierarchicalErrorForFingerprint(message: string): string {
   }
   if (/feature_census\.selected_candidate_ids/.test(reason)) {
     return "feature-census-selected-candidates";
+  }
+  if (/planner (?:将序号 .*互斥附件目标合并|尚未声明序号 .*附件冲突裁决)|planner 附件冲突校验未通过/.test(reason)) {
+    return "planner-attachment-conflict-resolution";
   }
   // A composite prepare/implement/verify rejection may list many violations at
   // once (fail-collect). Fingerprint the SET of violation classes present, not
@@ -8200,27 +8283,56 @@ function countConsecutiveHierarchicalPhaseFailures(
 function countHierarchicalPhaseFailures(
   session: AgentSession,
   workUnitId: string,
-  fingerprint: string
+  fingerprint: string,
+  requirementId: string,
+  message: string
 ): number {
-  return (session.hierarchical_state?.phase_runs ?? []).filter((run) =>
-    run.work_unit_id === workUnitId
-    && run.status === "failed"
-    && run.error_fingerprint === fingerprint
-  ).length;
+  const behaviorMismatch = /最终行为指纹与 prepare 冻结契约不一致/.test(message);
+  let failures = 0;
+  for (const run of [...(session.hierarchical_state?.phase_runs ?? [])].reverse()) {
+    if (run.requirement_id !== requirementId) continue;
+    if (run.phase === "verify" && run.status === "passed") break;
+    if (run.status === "failed" && (behaviorMismatch
+      ? /最终行为指纹与 prepare 冻结契约不一致/.test(run.failure_reason ?? "")
+      : run.work_unit_id === workUnitId && run.error_fingerprint === fingerprint)) failures += 1;
+  }
+  return failures;
+}
+
+/** Formatting detours and phase changes do not erase unresolved recovery debt.
+ * Only a successful verification closes the requirement's recovery cycle. */
+export function countHierarchicalRecoveryFailures(session: AgentSession, requirementId: string): number {
+  let failures = 0;
+  for (const run of [...(session.hierarchical_state?.phase_runs ?? [])].reverse()) {
+    if (run.requirement_id !== requirementId) continue;
+    if (run.phase === "verify" && run.status === "passed") break;
+    if (run.status === "failed") failures += 1;
+  }
+  return failures;
 }
 
 export function hierarchicalPhaseSelfHealRoute(
   phase: Exclude<HierarchicalWorkPhase, "close">,
   reason: string,
-  prepareDisposition?: unknown
+  prepareDisposition?: unknown,
+  repeatedFailures = 1
 ): "retry" | "investigate" | "prepare" | "implement" {
   if (phase === "verify" && /最终行为指纹与 prepare 冻结契约不一致/.test(reason)) {
-    // A disproven no-op needs a new write plan and lease; an existing plan can
-    // go straight back to its implementation. Neither is a transcript repair.
-    return prepareDisposition === "already_satisfied" ? "prepare" : "implement";
+    // Give an existing implementation plan one chance to repair the source.
+    // If the same source-derived mismatch survives, rebuild the plan and its
+    // frozen contract instead of sending the agent through the same implement
+    // loop. This keeps intentional behavior differences reviewable and makes
+    // stale reference-entry selections observable.
+    if (prepareDisposition === "already_satisfied" || repeatedFailures > 1) return "prepare";
+    return "implement";
   }
   if (phase === "verify" && prepareDisposition === "already_satisfied") return "retry";
   if (phase === "prepare") {
+    if (/最终行为指纹与 prepare 冻结契约不一致/.test(reason)) {
+      // First rebuild a real implementation plan; repeated no-op claims need
+      // upstream reference/entry investigation, not another identical draft.
+      return repeatedFailures > 1 ? "investigate" : "retry";
+    }
     // Most prepare failures are transcription, schema or prepare-only contract
     // investigation problems. Sending them back to investigate removes the
     // investigate_symbol_contract tool and recreates the same prepare draft,
