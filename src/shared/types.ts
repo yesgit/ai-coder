@@ -617,6 +617,14 @@ export interface HierarchicalRequirement {
   status_reason?: string;
 }
 
+/** Machine-readable ownership for host protocol failures; messages are display only. */
+export interface HierarchicalDiagnostic {
+  code: string;
+  owner_phase: "investigate" | "prepare" | "implement" | "verify";
+  artifact_id?: string;
+  issues: Array<{ path: string; message: string }>;
+}
+
 export interface HierarchicalWorkUnit {
   id: string;
   requirement_id: string;
@@ -637,6 +645,7 @@ export interface HierarchicalWorkUnit {
   correction_history?: string[];
   /** Bounded rejected draft that the next attempt should repair in place. */
   last_rejected_output?: string;
+  repair_diagnostic?: HierarchicalDiagnostic;
 }
 
 export interface HierarchicalPhaseRun {
@@ -650,6 +659,7 @@ export interface HierarchicalPhaseRun {
   evidence_refs: string[];
   error_fingerprint?: string;
   failure_reason?: string;
+  diagnostic?: HierarchicalDiagnostic;
   started_at: string;
   completed_at?: string;
   /** 本次通过后形成的、可直接交给下一阶段的结构化产物。 */

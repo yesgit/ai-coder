@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { access, chmod, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { AgentMessage, AgentSession, Attachment, ExplorationCheckpoint, ExplorationDisposition, ExplorationPhase, FeatureCensusReceipt, HierarchicalBlockerKind, HierarchicalExecutionState, HierarchicalWorkPhase, HumanQuestion, HumanQuestionOption, SessionProgressEvent, StageAgentResult, TaskTree, WorkflowStage, WorkflowTemplate } from "../../shared/types.js";
+import type { AgentMessage, AgentSession, Attachment, ExplorationCheckpoint, ExplorationDisposition, ExplorationPhase, FeatureCensusReceipt, HierarchicalBlockerKind, HierarchicalDiagnostic, HierarchicalExecutionState, HierarchicalWorkPhase, HumanQuestion, HumanQuestionOption, SessionProgressEvent, StageAgentResult, TaskTree, WorkflowStage, WorkflowTemplate } from "../../shared/types.js";
 import { isMeaningfulAgentText } from "../../shared/agentMessages.js";
 import type {
   FeatureCandidateAdjudication,
@@ -63,6 +63,8 @@ import {
   SYMBOL_CONTRACT_CAPABILITY,
   type WorkflowCapabilityResult
 } from "../workflows/workflowCapabilities.js";
+import { PhaseContractError, contractRepairRoute, contractFailureIdentity } from "../workflows/phaseContract.js";
+import { compileBehaviorContract, readBehaviorContract, behaviorContractProjection, behaviorDecisionDraft, type BehaviorReference } from "../workflows/behaviorContract.js";
 import { buildStageInstructions } from "./workflowPrompt.js";
 import { buildStageOutputFormat } from "./stageOutputFormat.js";
 import { evaluateHook, checkCommandSafety, checkCallsiteInvestigationGate } from "./stageHookEnforcer.js";
@@ -114,7 +116,7 @@ interface HierarchicalRoleQueryResult {
 class HierarchicalRoleValidationError extends Error {
   readonly rejectedOutput?: string;
 
-  constructor(message: string, rejectedOutput?: string) {
+  constructor(message: string, rejectedOutput?: string, readonly diagnostic?: HierarchicalDiagnostic) {
     super(message);
     this.name = "HierarchicalRoleValidationError";
     this.rejectedOutput = rejectedOutput;
@@ -513,6 +515,7 @@ export class ClaudeAgentRunner {
         let workUnitSnapshot: HierarchicalWorkUnitSnapshot | undefined;
         let workUnitSnapshotRestored = false;
         try {
+          validateHierarchicalPhaseDependencies(input.session, roleOperation);
           if (roleOperation.kind === "run_phase" && roleOperation.phase === "implement") {
             workUnitSnapshot = await captureHierarchicalWorkUnitSnapshot(input.session);
           }
@@ -551,7 +554,9 @@ export class ClaudeAgentRunner {
             return input.session;
           }
           const message = error instanceof Error ? error.message : String(error);
-          const fingerprint = hierarchicalErrorFingerprint(label, message);
+          const diagnostic = error instanceof PhaseContractError || error instanceof HierarchicalRoleValidationError
+            ? error.diagnostic : undefined;
+          const fingerprint = diagnostic ? contractFailureIdentity(diagnostic) : hierarchicalErrorFingerprint(label, message);
           if (roleOperation.kind === "run_alignment_batch") {
             this.applyHierarchicalEvents(input.session, [{
               type: "alignment_batch_failed",
@@ -589,7 +594,7 @@ export class ClaudeAgentRunner {
               message
             ) + 1;
             const recoveryFailures = countHierarchicalRecoveryFailures(input.session, roleOperation.requirement_id) + 1;
-            const selfHealRoute = hierarchicalPhaseSelfHealRoute(
+            const selfHealRoute = diagnostic ? contractRepairRoute(diagnostic, roleOperation.phase) : hierarchicalPhaseSelfHealRoute(
               roleOperation.phase,
               message,
               input.session.hierarchical_state
@@ -599,12 +604,13 @@ export class ClaudeAgentRunner {
               totalFailures
             );
             const behaviorMismatch = /最终行为指纹与 prepare 冻结契约不一致/.test(message);
+            const invalidUpstreamContract = Boolean(diagnostic && diagnostic.owner_phase !== roleOperation.phase);
             const sameFailureLimit = selfHealRoute === "retry" && roleOperation.phase !== "investigate"
               ? 6
               : 3;
             const missingCapabilityDependency = roleOperation.phase === "prepare"
               && /选中的同功能入口尚未解析为真实调用边|选中的同功能入口缺少 entry_symbol|同功能入口对应的真实函数\/组件/.test(message);
-            const recoveryRoute = behaviorMismatch
+            const recoveryRoute = diagnostic || behaviorMismatch || invalidUpstreamContract
               ? selfHealRoute
               : missingCapabilityDependency
               ? "investigate"
@@ -617,6 +623,7 @@ export class ClaudeAgentRunner {
               reason: message,
               route: recoveryRoute,
               error_fingerprint: fingerprint,
+              ...(diagnostic ? { diagnostic } : {}),
               ...(error instanceof HierarchicalRoleValidationError && error.rejectedOutput
                 ? { rejected_output: error.rejectedOutput }
                 : {})
@@ -658,7 +665,7 @@ export class ClaudeAgentRunner {
                 `当前 investigate 工作单元 attempt ${failedAttempt} 连续 ${repeats} 次遇到同类问题；无前置阶段可退回，宿主升级为阻塞并保留诊断：${message}`,
                 "milestone"
               );
-            } else if ((repeats >= 3 || missingCapabilityDependency || behaviorMismatch) && recoveryRoute !== "retry") {
+            } else if ((repeats >= 3 || missingCapabilityDependency || behaviorMismatch || invalidUpstreamContract) && recoveryRoute !== "retry") {
               await this.recordProgress(
                 input,
                 "status",
@@ -825,7 +832,11 @@ export class ClaudeAgentRunner {
           ...loadedSkills.map((skill) => `### ${skill.id}\n${skill.content}`)
         ].join("\n\n")
       : "";
-    const prompt = [spec.prompt, skillContracts].filter(Boolean).join("\n\n");
+    const referenceContext = operation.kind === "run_phase" && operation.phase === "prepare"
+      ? collectHierarchicalBehaviorReferences(input.session, operation.requirement_id, `hierarchical:${spec.phaseLabel}`) : undefined;
+    const prompt = [spec.prompt, referenceContext
+      ? `## 宿主行为参考值\n以下值来自已验收的调查/能力证据，changes.value 使用对应维度的数据结构；不要生成信封或复制未改变的目标。review/null 必须补充审查，不能推断为不存在。\n${JSON.stringify(referenceContext.references)}` : "",
+      skillContracts].filter(Boolean).join("\n\n");
     const query = await this.resolveQuery();
     const needsContractAnalyzer = spec.tools.some((toolName) => (
       toolName === "mcp__ai_coder__analyze_symbol_contract"
@@ -1117,18 +1128,6 @@ export class ClaudeAgentRunner {
       structured,
       stageId
     );
-    reconcileHierarchicalPrepareBehaviorFingerprints(
-      input.session,
-      operation,
-      structured,
-      stageId
-    );
-    reconcileHierarchicalPrepareObligationEvidence(input.session, operation, structured);
-    reconcileHierarchicalPrepareDerivedBehaviorContract(
-      input.session,
-      operation,
-      structured
-    );
     const reconciledIntegratorContracts = reconcileHierarchicalIntegratorContractResults(
       input.session,
       operation,
@@ -1148,6 +1147,7 @@ export class ClaudeAgentRunner {
       : formatClaudeTranscript(sdkMessages) || formatStructuredOutput(structured);
     let events: HierarchicalEvent[];
     try {
+      compileHierarchicalPrepareBehaviorContract(input.session, operation, structured, stageId);
       validateHierarchicalPlannerEnumeratedCoverage(input.session, operation, structured);
       validateHierarchicalInvestigateMappingScope(input.session, operation, structured);
       events = parseHierarchicalRoleResult(operation, structured);
@@ -1175,7 +1175,9 @@ export class ClaudeAgentRunner {
       }
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      const correction = hierarchicalValidationCorrection(
+      const correction = error instanceof PhaseContractError
+        ? `由 ${error.diagnostic.owner_phase} 修复 ${error.diagnostic.code}；按 issues 一次处理全部字段，保留已完成证据。`
+        : hierarchicalValidationCorrection(
         operation,
         reason,
         operation.kind === "run_phase" && operation.phase === "investigate"
@@ -1183,8 +1185,11 @@ export class ClaudeAgentRunner {
           : null
       );
       throw new HierarchicalRoleValidationError(
-        `${reason}\n可原地修正：${correction}`,
-        formatRejectedHierarchicalOutput(structured)
+        `${reason}\n${error instanceof PhaseContractError ? "修复任务" : "可原地修正"}：${correction}`,
+        formatRejectedHierarchicalOutput(operation.kind === "run_phase" && operation.phase === "prepare"
+          && isPlainObject(structured) && isPlainObject(structured.handoff)
+          ? { ...structured, handoff: behaviorDecisionDraft(structured.handoff) } : structured),
+        error instanceof PhaseContractError ? error.diagnostic : undefined
       );
     }
     if (postResultProcessError) {
@@ -3873,6 +3878,14 @@ export function validateHierarchicalContractToolEvidence(
     return;
   }
   if (operation.phase !== "prepare") return;
+  // Validate the persisted contract before analyzer-specific early returns.
+  // Verify consumes this same artifact and cannot repair it locally.
+  if (passed.handoff?.behavior_contract) readBehaviorContract(passed.handoff.behavior_contract);
+  else validateFrozenBehaviorObligations(
+    Array.isArray(passed.handoff?.behavior_obligations)
+      ? passed.handoff.behavior_obligations.filter(isPlainObject) : [],
+    passed.handoff?.behavior_contract_version === 1
+  );
   const callContract = isPlainObject(passed.handoff?.call_contract) ? passed.handoff.call_contract : undefined;
   const targets = Array.isArray(callContract?.analyzed_targets) ? callContract.analyzed_targets : [];
   for (const rawTarget of targets) {
@@ -4141,8 +4154,8 @@ export function validateFrozenBehaviorObligations(
 ): Map<BehaviorDimension, FrozenBehaviorEnvelope> {
   const frozen = new Map<BehaviorDimension, FrozenBehaviorEnvelope>();
   const usesEnvelopes = required || obligations.some((item) =>
-    parseFrozenBehaviorEnvelope(optionalString(item.reference_behavior))
-    || parseFrozenBehaviorEnvelope(optionalString(item.required_behavior))
+    parseFrozenBehaviorEnvelope(item.reference_behavior)
+    || parseFrozenBehaviorEnvelope(item.required_behavior)
     || [item.reference_behavior, item.required_behavior].some((value) =>
       isPlainObject(value) || (typeof value === "string" && /^\s*[\[{]/.test(value)))
   );
@@ -4151,8 +4164,8 @@ export function validateFrozenBehaviorObligations(
   for (const dimension of BEHAVIOR_DIMENSIONS) {
     const matching = obligations.filter((item) => item.dimension === dimension);
     const obligation = matching[0];
-    const expected = parseFrozenBehaviorEnvelope(optionalString(obligation?.required_behavior));
-    const reference = parseFrozenBehaviorEnvelope(optionalString(obligation?.reference_behavior));
+    const expected = parseFrozenBehaviorEnvelope(obligation?.required_behavior);
+    const reference = parseFrozenBehaviorEnvelope(obligation?.reference_behavior);
     if (matching.length !== 1 || !expected || expected.dimension !== dimension
       || !reference || reference.dimension !== dimension) {
       errors.push(`${dimension}: 必须提供唯一且同维度的 schema_version=1 行为信封，不能使用普通文字代替`);
@@ -4192,7 +4205,14 @@ function assertVerifiedBehaviorFingerprints(
   const obligations = Array.isArray(contract.behavior_obligations)
     ? contract.behavior_obligations.filter(isPlainObject)
     : [];
-  const frozen = validateFrozenBehaviorObligations(obligations, contract.behavior_contract_version === 1);
+  const compiled = contract.behavior_contract ? readBehaviorContract(contract.behavior_contract, prepare?.id) : null;
+  const frozen = compiled
+    ? new Map(compiled.obligations.map((item) => [item.dimension, {
+        schema_version: 1 as const, dimension: item.dimension,
+        targets: Object.fromEntries(compiled.references.filter((reference) => reference.verification === "source")
+          .map((reference) => [reference.target_key, item.required[reference.target_key]]))
+      }]))
+    : validateFrozenBehaviorObligations(obligations, contract.behavior_contract_version === 1);
   // Persisted/legacy artifacts without host fingerprints keep their previous
   // validation path. Every newly prepared same-feature contract is frozen.
   if (frozen.size === 0) return;
@@ -4314,17 +4334,22 @@ function assertVerifiedBehaviorFingerprints(
     }
   }
   if (mismatches.length > 0) {
-    throw new Error(
+    throw new PhaseContractError({
+      code: "behavior.source.mismatch",
+      owner_phase: operation.phase === "prepare" || contract.change_disposition === "already_satisfied" ? "prepare" : "implement",
+      ...(operation.phase === "prepare" || contract.change_disposition === "already_satisfied" ? { artifact_id: prepare?.id } : {}),
+      issues: mismatches.map((message) => ({ path: "workspace.behavior", message }))
+    },
       `${operation.phase} 最终行为指纹与 prepare 冻结契约不一致，共 ${mismatches.length} 处：\n`
       + mismatches.map((item) => `- ${item}`).join("\n")
     );
   }
 }
 
-function parseFrozenBehaviorEnvelope(value: string | undefined): FrozenBehaviorEnvelope | null {
+function parseFrozenBehaviorEnvelope(value: unknown): FrozenBehaviorEnvelope | null {
   if (!value) return null;
   try {
-    const parsed = JSON.parse(value) as unknown;
+    const parsed = typeof value === "string" ? JSON.parse(value) as unknown : value;
     if (!isPlainObject(parsed) || parsed.schema_version !== 1) return null;
     const dimension = optionalString(parsed.dimension) as BehaviorDimension | undefined;
     if (!dimension || !BEHAVIOR_DIMENSIONS.includes(dimension) || !isPlainObject(parsed.targets)) return null;
@@ -4507,7 +4532,8 @@ function assertPrepareBehaviorFingerprints(
     return !optionalString(candidate?.entry_symbol) || !optionalString(candidate?.entry_location);
   });
   if (missingEntryMetadata.length > 0) {
-    throw new Error(
+    throw new PhaseContractError({ code: "behavior.reference.entry_missing", owner_phase: "investigate", artifact_id: investigate.id,
+      issues: missingEntryMetadata.map((key) => ({ path: `reference_analysis.${key}`, message: "缺少真实入口 entry_symbol@entry_location" })) },
       "prepare 选中的同功能入口缺少 entry_symbol@entry_location，必须退回 investigate 建立真实入口调用边："
       + missingEntryMetadata.join(", ")
     );
@@ -4524,12 +4550,15 @@ function assertPrepareBehaviorFingerprints(
   if (exactFingerprintKeys.length === 0) return;
   const missing = exactFingerprintKeys.filter((targetKey) => !fingerprintsByTarget.has(targetKey));
   if (missing.length > 0) {
-    throw new Error(
+    throw new PhaseContractError({ code: "behavior.reference.edge_missing", owner_phase: "investigate", artifact_id: investigate.id,
+      issues: missing.map((key) => ({ path: `reference_analysis.${key}`, message: "选定入口尚未解析为真实调用边" })) },
       "prepare 选中的同功能入口尚未解析为真实调用边，不能仅凭最终组件定义冻结行为："
       + missing.join(", ")
       + "；请调查入口函数/方法，或让符号调查报告解析其参数传递、guard 与外层调用"
     );
   }
+  // v2 references were compiled from these host facts, never from provider envelopes.
+  if (passed.handoff?.behavior_contract) return;
   const obligations = Array.isArray(passed.handoff?.behavior_obligations)
     ? passed.handoff.behavior_obligations.filter(isPlainObject)
     : [];
@@ -5845,75 +5874,89 @@ interface SelectedBehaviorFingerprint {
   fingerprint: BehaviorFingerprint;
 }
 
-/**
- * Freeze source-derived behavior facts into the existing six-dimensional
- * prepare contract. Values are keyed by target so multi-target requirements do
- * not collapse distinct argument sets or guards into one prose summary.
- *
- * The model still owns the reuse/intentional-difference decision. For reuse,
- * the required value is mechanically identical to the reference fingerprint;
- * an intentional difference keeps the model's required value but cannot alter
- * the source-derived reference value.
- */
-export function reconcileHierarchicalPrepareBehaviorFingerprints(
+function collectHierarchicalBehaviorReferences(session: AgentSession, requirementId: string, stageId: string): {
+  investigate: NonNullable<HierarchicalInvestigateArtifact>;
+  references: BehaviorReference[];
+} {
+  const state = session.hierarchical_state;
+  const investigate = state ? latestHierarchicalArtifact(state, requirementId, "investigate") : undefined;
+  if (!investigate) throw new PhaseContractError({ code: "behavior.reference.missing", owner_phase: "investigate",
+    issues: [{ path: "investigate", message: "prepare 必须有已验收的调查产物" }] });
+  const mappings = Array.isArray(investigate.handoff.target_mappings)
+    ? investigate.handoff.target_mappings.filter(isPlainObject) : [];
+  const analysis = isPlainObject(investigate.handoff.reference_analysis) ? investigate.handoff.reference_analysis : {};
+  const candidates = Array.isArray(analysis.candidates) ? analysis.candidates.filter(isPlainObject) : [];
+  const selections = Array.isArray(analysis.target_selections) ? analysis.target_selections.filter(isPlainObject) : [];
+  const fingerprints = new Map(selectedReferenceBehaviorFingerprints(session, investigate,
+    completedSymbolInvestigationReports(session, stageId)).map((item) => [item.targetKey, item.fingerprint]));
+  const references: BehaviorReference[] = mappings.map((mapping) => {
+    const key = optionalString(mapping.target_key) ?? "";
+    const selection = selections.find((item) => item.target_key === key);
+    const candidate = candidates.find((item) => item.target_key === key && item.location === selection?.selected_location);
+    const fingerprint = fingerprints.get(key);
+    const values = Object.fromEntries(BEHAVIOR_DIMENSIONS.map((dimension) => [dimension,
+      fingerprint ? behaviorDimensionValue(fingerprint, dimension)
+        : selectedCapabilityBehaviorDimension(session, requirementId, candidate, dimension)
+          // Null explicitly means review-only/unobserved. It is never an empty guard or proof of absence.
+          ?? (candidate ? candidate[dimension === "context" ? "context_forwarding" : dimension] : null) ?? null
+    ])) as Record<BehaviorDimension, unknown>;
+    const evidence = uniqueStrings([
+      ...(optionalStringArray(candidate?.evidence_refs) ?? []),
+      optionalString(candidate?.location) ?? "",
+      optionalString(mapping.dispatcher_location) ?? "",
+      optionalString(mapping.contract_location) ?? "",
+      ...(fingerprint ? [fingerprint.source_location.replace(/:\d+$/, "")] : [])
+    ]).filter((item) => Boolean(evidenceLocationAnchor(item, session.project_path)));
+    return { target_key: key, verification: fingerprint ? "source" : "review", values, evidence_refs: evidence };
+  });
+  return { investigate, references };
+}
+
+/** Single publication boundary: collect accepted evidence, compile once, then commit projections. */
+export function compileHierarchicalPrepareBehaviorContract(
   session: AgentSession,
-  operation: Extract<HierarchicalNextOperation, {
-    kind: "run_phase" | "run_alignment_batch" | "run_planner" | "run_integrator"
-  }>,
+  operation: Extract<HierarchicalNextOperation, { kind: "run_phase" | "run_alignment_batch" | "run_planner" | "run_integrator" }>,
   structured: unknown,
   stageId: string
-): string[] {
-  if (
-    operation.kind !== "run_phase"
-    || operation.phase !== "prepare"
-    || !isPlainObject(structured)
-  ) return [];
-  const handoff = isPlainObject(structured.handoff) ? structured.handoff : null;
-  const obligations = handoff && Array.isArray(handoff.behavior_obligations)
-    ? handoff.behavior_obligations.filter(isPlainObject)
-    : [];
-  if (obligations.length === 0) return [];
-  const state = session.hierarchical_state;
-  const investigate = state
-    ? latestHierarchicalArtifact(state, operation.requirement_id, "investigate")
-    : undefined;
-  const fingerprints = selectedReferenceBehaviorFingerprints(
-    session,
-    investigate,
-    completedSymbolInvestigationReports(session, stageId)
-  );
-  if (fingerprints.length === 0) return [];
-
-  handoff!.behavior_contract_version = 1;
-
-  const reconciled: string[] = [];
-  for (const obligation of obligations) {
-    const dimension = optionalString(obligation.dimension) as BehaviorDimension | undefined;
-    if (!dimension || !BEHAVIOR_DIMENSIONS.includes(dimension)) continue;
-    const targetValues = Object.fromEntries(fingerprints
-      .map(({ targetKey, fingerprint }) => [
-        targetKey,
-        behaviorDimensionValue(fingerprint, dimension)
-      ])
-      .sort(([left], [right]) => String(left).localeCompare(String(right))));
-    const frozen = canonicalBehaviorValue({
-      schema_version: 1,
-      dimension,
-      targets: targetValues
-    });
-    obligation.reference_behavior = frozen;
-    if (optionalString(obligation.decision) === "reuse") {
-      obligation.required_behavior = frozen;
-    }
-    const evidence = optionalStringArray(obligation.evidence_refs) ?? [];
-    for (const { fingerprint } of fingerprints) {
-      const location = fingerprint.source_location.replace(/:\d+$/, "");
-      if (!evidence.includes(location)) evidence.push(location);
-    }
-    obligation.evidence_refs = evidence;
-    reconciled.push(dimension);
+): void {
+  if (operation.kind !== "run_phase" || operation.phase !== "prepare"
+    || !isPlainObject(structured) || structured.status !== "passed" || !isPlainObject(structured.handoff)) return;
+  const handoff = structured.handoff;
+  const { investigate, references } = collectHierarchicalBehaviorReferences(session, operation.requirement_id, stageId);
+  const compiled = compileBehaviorContract(handoff.behavior_obligations, references, investigate.id);
+  readBehaviorContract(compiled);
+  const obligations = behaviorContractProjection(compiled);
+  const applications = obligations.flatMap((item) => references.map((reference) => ({
+    target_key: reference.target_key, dimension: item.dimension,
+    target_behavior: item.required_behavior, reference_behavior: item.reference_behavior,
+    decision: item.decision, reason: item.reason, evidence_refs: item.evidence_refs
+  })));
+  // Nothing above mutates the provider draft. Failed compilation keeps every original decision for repair.
+  Object.assign(handoff, { behavior_contract: compiled, behavior_contract_version: 2,
+    behavior_obligations: obligations, reference_application: applications, satisfaction_evidence: [] });
+  if (handoff.change_disposition === "already_satisfied") {
+    const current = prepareCurrentTargetEvidence(investigate, session.project_path,
+      prepareSelectedEntries(investigate, session.project_path));
+    handoff.satisfaction_evidence = compiled.obligations.flatMap((item) => current.slice(0, 1)
+      .map((location) => `${item.id} ${item.dimension} 当前目标待验证证据：${location}`));
   }
-  return reconciled;
+}
+
+/** Validate dependencies before an SDK query or a writable implementation lease. */
+export function validateHierarchicalPhaseDependencies(
+  session: AgentSession,
+  operation: Extract<HierarchicalNextOperation, { kind: "run_phase" | "run_alignment_batch" | "run_planner" | "run_integrator" }>
+): void {
+  if (operation.kind !== "run_phase" || !["implement", "verify"].includes(operation.phase)) return;
+  const state = session.hierarchical_state;
+  const prepare = state ? latestHierarchicalArtifact(state, operation.requirement_id, "prepare") : undefined;
+  const compiled = readBehaviorContract(prepare?.handoff.behavior_contract, prepare?.id);
+  const investigate = state ? latestHierarchicalArtifact(state, operation.requirement_id, "investigate") : undefined;
+  if (compiled.source_artifact_id !== investigate?.id
+    || canonicalBehaviorValue(prepare?.handoff.behavior_obligations) !== canonicalBehaviorValue(behaviorContractProjection(compiled))) {
+    throw new PhaseContractError({ code: "behavior.artifact.stale", owner_phase: "prepare", artifact_id: prepare?.id,
+      issues: [{ path: "handoff.behavior_contract", message: "调查依赖已更新或派生视图与冻结契约不一致，须重新编译" }] });
+  }
 }
 
 function selectedReferenceBehaviorFingerprints(
@@ -6023,180 +6066,6 @@ function selectedEntryOutgoingFingerprint(
   });
 }
 
-// Prefill (every prepare attempt, before validation) the same-feature entry
-// citation, target coverage and already-satisfied proof the host already knows
-// from investigate. The model decides the behavior and disposition; the host
-// owns duplicated transport fields such as per-obligation target citations and
-// satisfaction_evidence.
-export function reconcileHierarchicalPrepareObligationEvidence(
-  session: AgentSession,
-  operation: Extract<HierarchicalNextOperation, {
-    kind: "run_phase" | "run_alignment_batch" | "run_planner" | "run_integrator"
-  }>,
-  structured: unknown
-): void {
-  if (operation.kind !== "run_phase" || operation.phase !== "prepare" || !isPlainObject(structured)) return;
-  const handoff = isPlainObject(structured.handoff) ? structured.handoff : null;
-  const obligations = handoff && Array.isArray(handoff.behavior_obligations)
-    ? handoff.behavior_obligations.filter(isPlainObject)
-    : [];
-  if (obligations.length === 0) return;
-  const state = session.hierarchical_state;
-  const investigate = state
-    ? latestHierarchicalArtifact(state, operation.requirement_id, "investigate")
-    : undefined;
-  const selectedEntries = prepareSelectedEntries(investigate, session.project_path);
-  const currentTargetEvidence = prepareCurrentTargetEvidence(
-    investigate,
-    session.project_path,
-    selectedEntries
-  );
-  const alreadySatisfied = optionalString(handoff?.change_disposition) === "already_satisfied";
-  for (const obligation of obligations) {
-    const targetKeys = new Set(optionalStringArray(obligation.target_keys) ?? []);
-    for (const { targetKey } of selectedEntries) targetKeys.add(targetKey);
-    obligation.target_keys = [...targetKeys];
-    const evidence = Array.isArray(obligation.evidence_refs)
-      ? obligation.evidence_refs.filter((item): item is string => typeof item === "string")
-      : [];
-    for (const { location } of selectedEntries) {
-      const file = evidenceLocationFile(location, session.project_path);
-      if (file && !evidence.some((item) => evidenceLocationFile(item, session.project_path) === file)) {
-        evidence.push(location);
-      }
-    }
-    if (alreadySatisfied) {
-      for (const location of currentTargetEvidence) {
-        if (!evidence.includes(location)) evidence.push(location);
-      }
-    }
-    obligation.evidence_refs = evidence;
-  }
-  if (alreadySatisfied && currentTargetEvidence.length > 0) {
-    handoff!.satisfaction_evidence = obligations.map((obligation) => {
-      const id = optionalString(obligation.id) ?? "<unknown>";
-      const dimension = optionalString(obligation.dimension) ?? "behavior";
-      return `${id} ${dimension} 当前目标待验证证据：${currentTargetEvidence[0]}`;
-    });
-  }
-}
-
-/**
- * Expand the model's compact six decisions into the repetitive transport
- * fields owned by the host. Exact JS/TS fingerprints have already been
- * applied above; candidate behavior from the accepted investigate artifact is
- * the conservative cross-language fallback when an LSP can prove topology but
- * not argument semantics.
- */
-export function reconcileHierarchicalPrepareDerivedBehaviorContract(
-  session: AgentSession,
-  operation: Extract<HierarchicalNextOperation, {
-    kind: "run_phase" | "run_alignment_batch" | "run_planner" | "run_integrator"
-  }>,
-  structured: unknown
-): void {
-  if (operation.kind !== "run_phase" || operation.phase !== "prepare" || !isPlainObject(structured)) return;
-  const handoff = isPlainObject(structured.handoff) ? structured.handoff : null;
-  const obligations = handoff && Array.isArray(handoff.behavior_obligations)
-    ? handoff.behavior_obligations.filter(isPlainObject)
-    : [];
-  const state = session.hierarchical_state;
-  const investigate = state
-    ? latestHierarchicalArtifact(state, operation.requirement_id, "investigate")
-    : undefined;
-  if (!handoff || obligations.length === 0 || !investigate) return;
-  const mappings = Array.isArray(investigate.handoff.target_mappings)
-    ? investigate.handoff.target_mappings.filter(isPlainObject)
-    : [];
-  const targetKeys = mappings
-    .map((mapping) => optionalString(mapping.target_key))
-    .filter((value): value is string => Boolean(value));
-  const referenceAnalysis = isPlainObject(investigate.handoff.reference_analysis)
-    ? investigate.handoff.reference_analysis
-    : null;
-  const candidates = Array.isArray(referenceAnalysis?.candidates)
-    ? referenceAnalysis.candidates.filter(isPlainObject)
-    : [];
-  const selections = Array.isArray(referenceAnalysis?.target_selections)
-    ? referenceAnalysis.target_selections.filter(isPlainObject)
-    : [];
-  const selectedByTarget = new Map<string, Record<string, unknown>>();
-  for (const selection of selections) {
-    const targetKey = optionalString(selection.target_key);
-    const location = optionalString(selection.selected_location);
-    if (!targetKey || !location) continue;
-    const candidate = candidates.find((item) => (
-      optionalString(item.target_key) === targetKey
-      && optionalString(item.location) === location
-    ));
-    if (candidate) selectedByTarget.set(targetKey, candidate);
-  }
-
-  for (const obligation of obligations) {
-    const dimension = optionalString(obligation.dimension) as BehaviorDimension | undefined;
-    if (!dimension || !BEHAVIOR_DIMENSIONS.includes(dimension)) continue;
-    if (!optionalString(obligation.id)) {
-      obligation.id = `B${BEHAVIOR_DIMENSIONS.indexOf(dimension) + 1}-${dimension}`;
-    }
-    obligation.target_keys = [...targetKeys];
-    // Accept an object delta from the provider; persist one canonical wire form.
-    if (isPlainObject(obligation.required_behavior)) {
-      obligation.required_behavior = canonicalBehaviorValue(obligation.required_behavior);
-    }
-    if (!optionalString(obligation.reference_behavior)) {
-      const targets = Object.fromEntries(targetKeys.map((targetKey) => [
-        targetKey,
-        selectedCapabilityBehaviorDimension(
-          session,
-          operation.requirement_id,
-          selectedByTarget.get(targetKey),
-          dimension
-        ) ?? candidateBehaviorDimension(selectedByTarget.get(targetKey), dimension)
-      ]));
-      obligation.reference_behavior = canonicalBehaviorValue({
-        schema_version: 1,
-        dimension,
-        targets
-      });
-    }
-    if (
-      optionalString(obligation.decision) !== "intentional-difference"
-      && !optionalString(obligation.required_behavior)
-    ) {
-      obligation.required_behavior = obligation.reference_behavior;
-    }
-  }
-
-  const applications: Array<Record<string, unknown>> = [];
-  for (const targetKey of targetKeys) {
-    const candidate = selectedByTarget.get(targetKey);
-    const mapping = mappings.find((item) => optionalString(item.target_key) === targetKey);
-    const evidence = uniqueStrings([
-      ...(optionalStringArray(candidate?.evidence_refs) ?? []),
-      optionalString(candidate?.location) ?? "",
-      optionalString(mapping?.dispatcher_location) ?? ""
-    ]).filter((item) => Boolean(evidenceLocationAnchor(item, session.project_path)));
-    for (const obligation of obligations) {
-      const dimension = optionalString(obligation.dimension);
-      const referenceBehavior = optionalString(obligation.reference_behavior);
-      const requiredBehavior = optionalString(obligation.required_behavior);
-      const decision = optionalString(obligation.decision);
-      const reason = optionalString(obligation.reason) ?? "";
-      if (!dimension || !referenceBehavior || !requiredBehavior || !decision || evidence.length === 0) continue;
-      applications.push({
-        target_key: targetKey,
-        dimension,
-        target_behavior: requiredBehavior,
-        reference_behavior: referenceBehavior,
-        decision,
-        reason,
-        evidence_refs: evidence
-      });
-    }
-  }
-  handoff.reference_application = applications;
-}
-
 function selectedCapabilityBehaviorDimension(
   session: AgentSession,
   requirementId: string,
@@ -6258,21 +6127,6 @@ function selectedCapabilityBehaviorDimension(
     case "preconditions": return optionalStringArray(output.preconditions);
     case "context": return optionalStringArray(output.context);
     case "side_effects": return optionalStringArray(output.side_effects);
-  }
-}
-
-function candidateBehaviorDimension(
-  candidate: Record<string, unknown> | undefined,
-  dimension: BehaviorDimension
-): unknown {
-  if (!candidate) return "未找到可验证的同功能入口";
-  switch (dimension) {
-    case "destination": return optionalString(candidate.destination) ?? "未观察到目标";
-    case "invocation": return optionalString(candidate.invocation) ?? "未观察到调用方式";
-    case "arguments": return optionalStringArray(candidate.arguments) ?? ["未观察到显式参数"];
-    case "preconditions": return optionalStringArray(candidate.preconditions) ?? ["未观察到静态 guard"];
-    case "context": return optionalStringArray(candidate.context_forwarding) ?? ["未观察到额外上下文"];
-    case "side_effects": return optionalStringArray(candidate.side_effects) ?? ["未观察到额外副作用"];
   }
 }
 
@@ -8099,7 +7953,7 @@ export function hierarchicalValidationCorrection(
     return "这是源码行为差异，修改 verify 的 observed_behavior 不能消除。保留冻结契约和差异证据；若此前为 already_satisfied，退回 prepare，建立 changes_required 的 patch_plan 和 allowed_files；已有修改计划则退回 implement 修复参数、业务 guard 和上下文传递，再重新验证。表达式不同不能直接视为语义不同或相同，别名等价必须有源码绑定证据；不得通过改写报告或删除义务放行。";
   }
   if (/冻结行为契约格式无效/.test(reason)) {
-    return "保留六个维度和参考目标；intentional-difference 的 required_behavior 必须是 schema_version、dimension、targets 完整的对象或 JSON 字符串，并提供差异理由及代码证据。普通文字放入 reason，不能替代可验证的行为值。";
+    return "错误属于 prepare 保存的冻结契约；implement/verify 无法通过修改 observed_behavior 或源码修复，应直接退回 prepare。prepare 保留六个维度和参考目标；intentional-difference 的 required_behavior 必须是 schema_version、dimension、targets 完整的对象或 JSON 字符串，并提供差异理由及代码证据。普通文字放入 reason，不能替代可验证的行为值。";
   }
   const rejectedTarget = /被误裁为 no（candidate_id=([^)）]+)[)）]/.exec(reason)?.[1];
   if (rejectedTarget) {
@@ -8294,7 +8148,7 @@ function countHierarchicalPhaseFailures(
     if (run.phase === "verify" && run.status === "passed") break;
     if (run.status === "failed" && (behaviorMismatch
       ? /最终行为指纹与 prepare 冻结契约不一致/.test(run.failure_reason ?? "")
-      : run.work_unit_id === workUnitId && run.error_fingerprint === fingerprint)) failures += 1;
+      : (fingerprint.startsWith("contract:") || run.work_unit_id === workUnitId) && run.error_fingerprint === fingerprint)) failures += 1;
   }
   return failures;
 }
@@ -8317,6 +8171,9 @@ export function hierarchicalPhaseSelfHealRoute(
   prepareDisposition?: unknown,
   repeatedFailures = 1
 ): "retry" | "investigate" | "prepare" | "implement" {
+  if (/冻结行为契约格式无效/.test(reason)) {
+    return phase === "verify" || phase === "implement" ? "prepare" : "retry";
+  }
   if (phase === "verify" && /最终行为指纹与 prepare 冻结契约不一致/.test(reason)) {
     // Give an existing implementation plan one chance to repair the source.
     // If the same source-derived mismatch survives, rebuild the plan and its

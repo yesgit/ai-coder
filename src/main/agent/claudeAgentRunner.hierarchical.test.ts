@@ -33,9 +33,8 @@ import {
   reconcileHierarchicalInvestigateReferenceHandoff,
   reconcileHierarchicalIntegratorContractResults,
   reconcileHierarchicalPrepareContractHandoff,
-  reconcileHierarchicalPrepareBehaviorFingerprints,
-  reconcileHierarchicalPrepareDerivedBehaviorContract,
-  reconcileHierarchicalPrepareObligationEvidence,
+  compileHierarchicalPrepareBehaviorContract,
+  validateHierarchicalPhaseDependencies,
   recordFeatureCensusReceipt,
   validateHierarchicalBehaviorObligationContinuity,
   validateHierarchicalContractToolEvidence,
@@ -72,6 +71,32 @@ describe("generic frozen contract recovery", () => {
     expect(() => validateFrozenBehaviorObligations(contract().map((item) => ({
       ...item, reference_behavior: "{broken", required_behavior: "{broken"
     })))).toThrow();
+  });
+
+  it("accepts object envelopes and rejects invalid prepare before entry-analysis early returns", () => {
+    const obligations = contract().map((item) => ({
+      ...item,
+      reference_behavior: JSON.parse(item.reference_behavior),
+      required_behavior: JSON.parse(item.required_behavior)
+    }));
+    expect(validateFrozenBehaviorObligations(obligations, true).size).toBe(6);
+    obligations[3]!.required_behavior = "prose delta";
+    expect(() => validateHierarchicalContractToolEvidence(createSession(), {
+      kind: "run_phase", requirement_id: "R1", work_unit_id: "R1:prepare",
+      phase: "prepare", role: "preparer"
+    }, [{
+      type: "phase_passed", work_unit_id: "R1:prepare", summary: "ready",
+      evidence_refs: [], handoff: { behavior_contract_version: 1, behavior_obligations: obligations }
+    }], "hierarchical:R1/prepare")).toThrow("冻结行为契约格式无效");
+  });
+
+  it("routes invalid persisted contracts to their owner regardless of implementation disposition", () => {
+    for (const disposition of ["already_satisfied", "changes_required"]) {
+      for (const phase of ["verify", "implement"] as const) {
+        expect(hierarchicalPhaseSelfHealRoute(phase, "冻结行为契约格式无效", disposition)).toBe("prepare");
+      }
+    }
+    expect(hierarchicalPhaseSelfHealRoute("prepare", "冻结行为契约格式无效")).toBe("retry");
   });
 
   it("keeps one failure identity when dimensions, source lines and diagnostic payload change", () => {
@@ -249,12 +274,12 @@ function handoffFor(
 
 function behaviorObligations(reference: string, target: string) {
   return [
-    ["B-destination", "destination"],
-    ["B-invocation", "invocation"],
-    ["B-arguments", "arguments"],
-    ["B-preconditions", "preconditions"],
-    ["B-context", "context"],
-    ["B-side-effects", "side_effects"]
+    ["B1-destination", "destination"],
+    ["B2-invocation", "invocation"],
+    ["B3-arguments", "arguments"],
+    ["B4-preconditions", "preconditions"],
+    ["B5-context", "context"],
+    ["B6-side_effects", "side_effects"]
   ].map(([id, dimension]) => ({
     id,
     dimension,
@@ -269,12 +294,12 @@ function behaviorObligations(reference: string, target: string) {
 
 function behaviorObligationResults(status: string, evidence: string) {
   return [
-    ["B-destination", "destination"],
-    ["B-invocation", "invocation"],
-    ["B-arguments", "arguments"],
-    ["B-preconditions", "preconditions"],
-    ["B-context", "context"],
-    ["B-side-effects", "side_effects"]
+    ["B1-destination", "destination"],
+    ["B2-invocation", "invocation"],
+    ["B3-arguments", "arguments"],
+    ["B4-preconditions", "preconditions"],
+    ["B5-context", "context"],
+    ["B6-side_effects", "side_effects"]
   ].map(([obligation_id, dimension]) => ({
     obligation_id,
     status,
@@ -294,6 +319,55 @@ function integrationContractResults(requirementIds: string[], evidence: string) 
 }
 
 describe("ClaudeAgentRunner hierarchical mode", () => {
+  it.each(["prepare", "implement"])("repairs a legacy producer after %s before invoking the consumer", async (corruptAfter) => {
+    const session = createSession();
+    const phases: string[] = [];
+    let corrupted = false;
+    let repairPrompt = "";
+    async function* query(params: unknown) {
+      const prompt = String((params as { prompt?: unknown }).prompt ?? "");
+      let structured: Record<string, unknown>;
+      if (prompt.includes("建立一次性、稳定的需求账本")) {
+        structured = { status: "passed", summary: "plan", definition_of_done: ["done"],
+          requirements: [{ id: "R1", source_anchor: "user:1", observable_result: "done", acceptance: ["done"], dependencies: [] }] };
+      } else {
+        const phase = /G1 > R1 > (investigate|prepare|implement|verify) >/.exec(prompt)?.[1];
+        if (phase) {
+          phases.push(phase);
+          if (phase === "prepare" && phases.filter((item) => item === "prepare").length === 2) repairPrompt = prompt;
+          structured = { status: "passed", summary: `${phase} draft`, evidence_refs: ["package.json:1"],
+            handoff: handoffFor(phase, "package.json", "package.json"),
+            ...(phase === "prepare" ? { allowed_files: ["package.json"] } : {}),
+            ...(phase === "verify" ? { acceptance_results: [{ acceptance_id: "R1-A1", status: "pass", evidence_refs: ["package.json:1"] }] } : {}) };
+        } else {
+          structured = { status: "passed", summary: "audit", evidence_refs: ["package.json:1"],
+            covered_requirement_ids: ["R1"], uncovered_acceptance_ids: [], residual_risks: [],
+            contract_results: integrationContractResults(["R1"], "package.json:1") };
+        }
+      }
+      yield { type: "result", subtype: "success", is_error: false, structured_output: structured };
+    }
+    const updated = await new ClaudeAgentRunner({ queryOverride: query, pluginPaths: [path.resolve("plugins/careful-coder")] }).run({
+      session, workflow,
+      onProgress: async (current) => {
+        const prepare = current.hierarchical_state?.phase_artifacts.find((artifact) => artifact.phase === "prepare");
+        if (!corrupted && prepare && current.hierarchical_state?.phase_artifacts.some((artifact) => artifact.phase === corruptAfter)) {
+          delete prepare.handoff.behavior_contract; // Simulate a persisted v1 session at the consumer boundary.
+          corrupted = true;
+        }
+      }
+    });
+    expect(updated.status, updated.error).toBe("completed");
+    expect(phases).toEqual(corruptAfter === "prepare"
+      ? ["investigate", "prepare", "prepare", "implement", "verify"]
+      : ["investigate", "prepare", "implement", "prepare", "implement", "verify"]);
+    expect(repairPrompt).toContain("behavior.artifact.invalid");
+    expect(repairPrompt).toContain("prepare draft");
+    expect(updated.hierarchical_state?.phase_runs.find((run) => run.status === "failed")?.diagnostic)
+      .toMatchObject({ owner_phase: "prepare", code: "behavior.artifact.invalid" });
+    expect(updated.pending_human_questions ?? []).toHaveLength(0);
+  });
+
   it("accumulates feature census batches and lets the latest verdict replace a prior one", () => {
     const merged = mergeFeatureCensusAdjudications(
       [{
@@ -1364,7 +1438,7 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
         structured,
         stageId
       );
-      reconcileHierarchicalPrepareBehaviorFingerprints(
+      compileHierarchicalPrepareBehaviorContract(
         session,
         operation,
         structured,
@@ -1531,19 +1605,12 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
         structured,
         prepareStageId
       );
-      expect(reconcileHierarchicalPrepareBehaviorFingerprints(
+      compileHierarchicalPrepareBehaviorContract(
         session,
         prepareOperation,
         structured,
         prepareStageId
-      )).toEqual(expect.arrayContaining([
-        "destination",
-        "invocation",
-        "arguments",
-        "preconditions",
-        "context",
-        "side_effects"
-      ]));
+      );
       state.phase_artifacts.push({
         id: "R1:prepare:artifact",
         work_unit_id: "R1:prepare",
@@ -1613,8 +1680,7 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       const originalGuard = guardObligation.required_behavior;
       guardObligation.decision = "intentional-difference";
       guardObligation.required_behavior = "reuse the handler without guards";
-      expect(() => validateHierarchicalContractToolEvidence(session, verifyOperation, verifyEvent,
-        "hierarchical:R1/verify")).toThrow("冻结行为契约格式无效");
+      expect(() => validateHierarchicalPhaseDependencies(session, verifyOperation)).toThrow("behavior.artifact.stale");
       guardObligation.required_behavior = originalGuard;
       guardObligation.decision = "reuse";
       expect(() => validateHierarchicalContractToolEvidence(
@@ -1644,8 +1710,10 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
         envelope.targets.NEW = obligation.dimension === "invocation"
           ? { kind: "indirect", callee: "this.props.navigator.push", target_path: "handler" }
           : ["delivers:handler", "indirect:this.props.navigator.push"];
-        obligation.required_behavior = JSON.stringify(envelope);
+        obligation.decision = "intentional-difference";
+        obligation.changes = [{ target_key: "NEW", value: envelope.targets.NEW, evidence_refs: ["routes.ts:5"] }];
       }
+      compileHierarchicalPrepareBehaviorContract(session, prepareOperation, structured, prepareStageId);
       await writeFile(path.join(projectPath, "routes.ts"), forwarded
         + "\nclass Screen { props: any; open() { dispatch('NEW', true, this.props.navigator); } }\n");
       expect(() => validateHierarchicalContractToolEvidence(
@@ -3187,17 +3255,19 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     const handoff = {
       behavior_obligations: [
         "destination", "invocation", "arguments", "preconditions", "context", "side_effects"
-      ].map((dimension) => ({ dimension, decision: "reuse", reason: "same feature" })),
+      ].map((dimension) => ({ dimension, decision: "reuse", reason: "same feature",
+        reference_behavior: "model prose reference", required_behavior: "model prose required"
+      })),
       reference_application: []
     };
 
-    reconcileHierarchicalPrepareDerivedBehaviorContract(session, {
+    compileHierarchicalPrepareBehaviorContract(session, {
       kind: "run_phase",
       requirement_id: "R1",
       work_unit_id: "R1:prepare",
       phase: "prepare",
       role: "implementation-preparer"
-    }, { status: "passed", handoff });
+    }, { status: "passed", handoff }, "hierarchical:R1/prepare");
 
     expect(handoff.reference_application).toHaveLength(6);
     expect(handoff.behavior_obligations).toEqual(expect.arrayContaining([
@@ -3216,9 +3286,9 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       decision: "intentional-difference", reason: "different authorization context evidenced by the caller",
       required_behavior: { schema_version: 1, dimension: "preconditions", targets: { route: ["authorized"] } }
     });
-    reconcileHierarchicalPrepareDerivedBehaviorContract(session, {
+    compileHierarchicalPrepareBehaviorContract(session, {
       kind: "run_phase", requirement_id: "R1", work_unit_id: "R1:prepare", phase: "prepare", role: "preparer"
-    }, { status: "passed", handoff });
+    }, { status: "passed", handoff }, "hierarchical:R1/prepare");
     expect(handoff.behavior_obligations[3]).toMatchObject({
       required_behavior: JSON.stringify({ dimension: "preconditions", schema_version: 1, targets: { route: ["authorized"] } })
     });
@@ -3369,7 +3439,7 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       session,
       prepareOperation,
       [prepareEvent]
-    )).toThrow("already_satisfied 行为义务 B-destination 缺少当前目标代码");
+    )).toThrow("already_satisfied 行为义务 B1-destination 缺少当前目标代码");
     prepareHandoff.change_disposition = "changes_required";
     obligations.forEach((obligation, index) => {
       obligation.evidence_refs = originalObligationEvidence[index];
@@ -3523,14 +3593,14 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       [verifyEvent]
     )).not.toThrow();
 
-    const failedDestination = results.find((item) => item.obligation_id === "B-destination")!;
+    const failedDestination = results.find((item) => item.obligation_id === "B1-destination")!;
     failedDestination.status = "fail";
     failedDestination.observed_behavior = "最终代码跳到了错误组件，见 target.ts:1";
     expect(() => validateHierarchicalBehaviorObligationContinuity(
       session,
       verifyOperation,
       [verifyEvent]
-    )).toThrow("行为义务 B-destination 未通过：fail");
+    )).toThrow("行为义务 B1-destination 未通过：fail");
     failedDestination.status = "pass";
 
     const originalEvidence = failedDestination.evidence_refs;
@@ -3539,7 +3609,7 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       session,
       verifyOperation,
       [verifyEvent]
-    )).toThrow("行为义务 B-destination 缺少 evidence_refs");
+    )).toThrow("行为义务 B1-destination 缺少 evidence_refs");
     failedDestination.evidence_refs = originalEvidence;
 
     failedDestination.evidence_refs = ["destination checked"];
@@ -3547,15 +3617,15 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       session,
       verifyOperation,
       [verifyEvent]
-    )).toThrow("行为义务 B-destination 缺少 path:line 代码证据");
+    )).toThrow("行为义务 B1-destination 缺少 path:line 代码证据");
     failedDestination.evidence_refs = originalEvidence;
 
-    results.splice(results.findIndex((result) => result.obligation_id === "B-preconditions"), 1);
+    results.splice(results.findIndex((result) => result.obligation_id === "B4-preconditions"), 1);
     expect(() => validateHierarchicalBehaviorObligationContinuity(
       session,
       verifyOperation,
       [verifyEvent]
-    )).toThrow("missing=B-preconditions");
+    )).toThrow("missing=B4-preconditions");
 
     verifyHandoff.contract_results = behaviorObligationResults("pass", "target.ts:1");
     state.phase_artifacts.push({
@@ -3652,12 +3722,12 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       structured
     )).toEqual(["R1"]);
     expect(structured.contract_results.map((result) => result.obligation_id)).toEqual([
-      "B-destination",
-      "B-invocation",
-      "B-arguments",
-      "B-preconditions",
-      "B-context",
-      "B-side-effects"
+      "B1-destination",
+      "B2-invocation",
+      "B3-arguments",
+      "B4-preconditions",
+      "B5-context",
+      "B6-side_effects"
     ]);
     expect(structured.contract_results.every((result) => (
       result.evidence_refs.includes("final.ts:9")
@@ -3722,8 +3792,8 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     const obligations = prepareHandoff.behavior_obligations as Array<Record<string, unknown>>;
     // Two obligations drop the reference.ts citation; the other four keep it.
     const dropEvidence = ["target.ts:1"];
-    (obligations.find((obligation) => obligation.id === "B-destination")!).evidence_refs = dropEvidence;
-    (obligations.find((obligation) => obligation.id === "B-arguments")!).evidence_refs = dropEvidence;
+    (obligations.find((obligation) => obligation.id === "B1-destination")!).evidence_refs = dropEvidence;
+    (obligations.find((obligation) => obligation.id === "B3-arguments")!).evidence_refs = dropEvidence;
 
     const prepareEvent = {
       type: "phase_passed" as const,
@@ -3750,10 +3820,10 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     expect(thrown).toBeDefined();
     // Both missing obligations appear in the single rejection, not just the first.
     expect(thrown!.message).toContain("prepare 阶段交接物未通过校验，共 2 处");
-    expect(thrown!.message).toContain("行为义务 B-destination 未引用 route 的选定同功能入口 reference.ts:5");
-    expect(thrown!.message).toContain("行为义务 B-arguments 未引用 route 的选定同功能入口 reference.ts:5");
+    expect(thrown!.message).toContain("行为义务 B1-destination 未引用 route 的选定同功能入口 reference.ts:5");
+    expect(thrown!.message).toContain("行为义务 B3-arguments 未引用 route 的选定同功能入口 reference.ts:5");
     // The four obligations that kept their citation are NOT flagged.
-    expect(thrown!.message).not.toContain("B-invocation");
+    expect(thrown!.message).not.toContain("B2-invocation");
   });
 
   it("prefills investigate-selected entry citations into obligations before validation", () => {
@@ -3807,9 +3877,9 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       role: "implementation-preparer"
     };
 
-    reconcileHierarchicalPrepareObligationEvidence(session, prepareOperation, prepareStructured);
+    compileHierarchicalPrepareBehaviorContract(session, prepareOperation, prepareStructured, "hierarchical:R1/prepare");
 
-    for (const obligation of obligations) {
+    for (const obligation of prepareHandoff.behavior_obligations as Array<Record<string, unknown>>) {
       const evidence = obligation.evidence_refs as string[];
       expect(evidence).toContain("reference.ts:5");
       expect(evidence).toContain("target.ts:1"); // prefill is additive, never drops existing evidence
@@ -3847,10 +3917,10 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       workspace_revision: 0,
       created_at: state.created_at
     }];
-    const before = obligations.map((obligation) => obligation.evidence_refs);
-    reconcileHierarchicalPrepareObligationEvidence(session, prepareOperation, prepareStructured);
-    const after = obligations.map((obligation) => obligation.evidence_refs);
-    expect(after).toEqual(before);
+    compileHierarchicalPrepareBehaviorContract(session, prepareOperation, prepareStructured, "hierarchical:R1/prepare");
+    expect(prepareHandoff.behavior_contract).toMatchObject({
+      version: 2, references: [expect.objectContaining({ verification: "review" })]
+    });
   });
 
   it("derives already-satisfied target evidence and satisfaction rows on the host", () => {
@@ -3905,9 +3975,9 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
       role: "implementation-preparer"
     };
 
-    reconcileHierarchicalPrepareObligationEvidence(session, operation, structured);
+    compileHierarchicalPrepareBehaviorContract(session, operation, structured, "hierarchical:R1/prepare");
 
-    for (const obligation of obligations) {
+    for (const obligation of prepareHandoff.behavior_obligations as Array<Record<string, unknown>>) {
       expect(obligation.evidence_refs).toEqual(expect.arrayContaining([
         "reference.ts:5",
         "target.ts:1"
@@ -3915,8 +3985,8 @@ describe("ClaudeAgentRunner hierarchical mode", () => {
     }
     expect(prepareHandoff.satisfaction_evidence).toHaveLength(6);
     expect(prepareHandoff.satisfaction_evidence).toEqual(expect.arrayContaining([
-      expect.stringContaining("B-destination destination 当前目标待验证证据：target.ts:1"),
-      expect.stringContaining("B-context context 当前目标待验证证据：target.ts:1")
+      expect.stringContaining("B1-destination destination 当前目标待验证证据：target.ts:1"),
+      expect.stringContaining("B5-context context 当前目标待验证证据：target.ts:1")
     ]));
     const events = parseHierarchicalRoleResult(operation, structured);
     expect(() => validateHierarchicalBehaviorObligationContinuity(

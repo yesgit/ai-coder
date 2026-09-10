@@ -1,3 +1,4 @@
+import { behaviorDecisionSchema } from "../workflows/behaviorContract.js";
 import type {
   AgentSession,
   HierarchicalExecutionState,
@@ -285,6 +286,11 @@ function buildPhaseSpec(
             "同一阶段已成功完成的只读工具证据仍由宿主保留。只修复列出的失败点；不要从头重读、不要提前实现、不要向用户申请阶段工具。"
           ]
         : []),
+      ...(workUnit.repair_diagnostic ? [
+        "## 宿主结构化修复任务",
+        JSON.stringify(workUnit.repair_diagnostic),
+        "只修复 owner_phase 所属产物及 issues 点名字段；artifact_id 指向待修复的历史产物，不能通过修改其他阶段报告消除。"
+      ] : []),
       "## 当前需求",
       `来源：${requirement.source_anchor}`,
       `可观察结果：${requirement.observable_result}`,
@@ -1183,13 +1189,13 @@ function phaseInstructions(
         "对每个最终契约和 investigate 选定的入口函数/方法，宿主会把完整调用契约调查拆成独立 capability 节点并在 prepare 前执行；脚本自动覆盖 contract、calls、wrappers、references、effects 全部分页，递归调查公共封装，并把入口内部的 outgoing invocation 单独交给 AI 逐边审查。analyzed_targets 只需准确提交 target_file 与 symbol，宿主会从已通过节点回填定义、输入输出、入向/出向调用、包装层、guard、静态边界和证据；不要手抄报告。若 prepare 发现图中缺少真实入口符号，返回 failed/investigate 补充 investigate 交接物，不要手工重跑调查工具。Read/Grep/Bash 或模型自述均不能替代宿主 capability。",
         "analyzed_targets 只登记函数、方法、类或组件等真实调用契约目标；常量表、路由配置对象、静态数据和样式文件即使列入 allowed_files，也不要为了凑文件覆盖伪造符号契约目标。",
         "宿主能力节点成功时保留其 analysis_method：JS/TS 精确报告为 investigation-script；Java/Python 优先使用 LSP Call Hierarchy，服务器不可用时使用明确标记为非精确的源码词法调用点普查，两者都属于 language-adapter，并必须保留 adapter_id、adapter_report_digest、runtime_verification_required=true 与 unresolved。每个调用点已经拆成独立 callsite-semantic-review AI 节点；宿主会把全部节点输出及守恒账本回填为 callsite_reviews/callsite_accounting，任何调用点缺失或分类账不守恒都会拒绝 prepare。只有没有任何可用适配器时，才使用 manual-static-analysis，并自行提交同样闭合的逐调用点账本。纯静态配置改动直接写入 patch_plan、pre_behavior 和 allowed_files。",
-        "必须把 investigate 的每个 target_key 逐项落实为 reference_application；六类 behavior_obligations 仍按 destination、invocation、arguments、preconditions、context、side_effects 冻结，但每项 target_keys 必须完整覆盖全部目标。",
-        "结构化输出中 destination/invocation/arguments/preconditions/context/side_effects 六类 behavior_obligations 只需逐项提交 dimension、decision、reason；intentional-difference 另提交 required_behavior。id、target_keys、reference_behavior、reuse 的 required_behavior 和 evidence_refs 由宿主按能力图回填。reference_application 可提交空数组，宿主会按逐目标指纹展开，避免重复抄写大段证据。",
+        "必须逐项理解 investigate 的每个 target_key；宿主将六类判断与目标映射编译为完整行为义务和 reference_application，模型不填写派生字段。",
+        "结构化输出中 destination/invocation/arguments/preconditions/context/side_effects 六类 behavior_obligations 只需逐项提交 dimension、decision、reason；intentional-difference 另提交 changes。id、target_keys、reference_behavior、required_behavior 和 evidence_refs 均由宿主契约编译器生成，不要提交这些字段。reference_application 和 satisfaction_evidence 也由宿主生成，不提交这些字段。",
         "changes_required 的 behavior_obligations 是尚待实现的未来契约：每项引用同功能既有入口证据，不得虚构尚不存在的新分支 path:line。目标现状和插入上下文沿用 investigate 已验证证据，实际目标代码证据由 implement、verify 逐项提交；只有 already_satisfied 才必须在 prepare 为每项同时给出当前目标代码证据。",
         "默认逐维度复用同功能入口。任何 intentional-difference 都必须引用用户要求或既有架构证据；不能以‘当前代码已经这样写’作为差异依据。",
-        "intentional-difference 的 required_behavior 提交 {schema_version:1,dimension,targets:{目标键:行为值}} 对象（也兼容 JSON 字符串），不得用文字摘要代替或删除目标。调用名称相似并不证明接收者等价，guard/context 差异也不能因目标组件相同而忽略。",
+        "intentional-difference 只提交 changes:[{target_key,value,evidence_refs}]，列出确需改变的目标，其余目标由宿主保留参考值；不填写 schema_version、targets 信封或 required_behavior。调用名称相似并不证明接收者等价，guard/context 差异也不能因目标组件相同而忽略。",
         "若 already_satisfied 被源码指纹拒绝，不得继续据‘代码存在’声明满足：参考适用则提交 changes_required 的未来契约与修改计划；参考入口可能选错或证据不足则返回 status=failed、failure_route=investigate、failure_reason、summary、evidence_refs，无需成功阶段的 handoff。参考变更必须经过 investigate 重新取证，不能用目标现状反向覆盖参考。",
-        "若六类义务已全部满足，返回 change_disposition=already_satisfied、空 allowed_files、空 patch_plan；satisfaction_evidence 提交空数组即可，宿主会从已确认的目标代码与六类义务逐项生成。否则返回 changes_required、非空 patch_plan 和非空 allowed_files。",
+        "若六类义务已全部满足，返回 change_disposition=already_satisfied、空 allowed_files、空 patch_plan；宿主会从已确认的目标代码与六类义务逐项生成 satisfaction_evidence。否则返回 changes_required、非空 patch_plan 和非空 allowed_files。",
         "prepare 是只读阶段，不需要 Edit。提交合格 handoff 后宿主会自动进入 implement 并授予 allowed_files 的 Edit 权限；不得改用 Bash 写文件，也不得要求用户启用内部工具。"
       ].join("\n");
     case "implement":
@@ -1203,6 +1209,7 @@ function phaseInstructions(
       return [
         "只读独立核对，不信任 executor 自述。",
         `必须返回 ${requirement.acceptance.length} 条 acceptance_results，逐项 PASS/FAIL 并附证据。`,
+        "behavior_contract.references 中 verification=review 或事实值为 null，表示宿主不能自动判定；必须提供独立实现/运行证据，不能把 null 解释为不存在 guard、参数或副作用，也不能直接判定 pass。",
         "还必须逐项核对 prepare 冻结的全部 behavior_obligations，contract_results 的 ID 必须完整一致，并用 observed_behavior + path:line 证据描述最终代码实际行为；文字不要求与 required_behavior 逐字一致。若目标、参数、guard、上下文或副作用实质不符，必须把对应 status 标为 fail；verifier 不得现场发明‘备选方案’或新的 intentional-difference。",
         "任何一项无法确认都返回 failed，并选择回 implement、prepare 或 investigate。",
         "已读过的文件不要重复 Read，使用 Grep 精确定位行号即可；避免对同一文件发起多次 Read。",
@@ -1343,36 +1350,7 @@ function phaseHandoffSchema(
     required: ["target_file", "symbol"],
     additionalProperties: false
   };
-  const behaviorObligationSchema = {
-    type: "object",
-    properties: {
-      id: { type: "string", pattern: "^B[A-Za-z0-9._-]+$" },
-      dimension: { type: "string", enum: [...REQUIRED_BEHAVIOR_DIMENSIONS] },
-      target_keys: stringList(1),
-      reference_behavior: { type: "string", minLength: 1 },
-      required_behavior: { anyOf: [
-        { type: "string", minLength: 1 },
-        {
-          type: "object",
-          properties: {
-            schema_version: { const: 1 },
-            dimension: { type: "string", enum: [...REQUIRED_BEHAVIOR_DIMENSIONS] },
-            targets: { type: "object", minProperties: 1, additionalProperties: true }
-          },
-          required: ["schema_version", "dimension", "targets"],
-          additionalProperties: false
-        }
-      ] },
-      decision: { type: "string", enum: ["reuse", "intentional-difference", "not-applicable"] },
-      reason: { type: "string" },
-      evidence_refs: evidenceList()
-    },
-    // IDs, target coverage, reference fingerprints and citations are derived
-    // from accepted investigate/capability artifacts after the SDK returns.
-    // The model only owns the semantic decision and any intentional delta.
-    required: ["dimension", "decision", "reason"],
-    additionalProperties: false
-  };
+  const behaviorObligationSchema = behaviorDecisionSchema;
   const obligationResultSchema = (statuses: string[]): Record<string, unknown> => strictObjectSchema({
     obligation_id: { type: "string", pattern: "^B[A-Za-z0-9._-]+$" },
     status: { type: "string", enum: statuses },
@@ -1481,18 +1459,6 @@ function phaseHandoffSchema(
             items: analyzedTargetSchema
           }
         }),
-        reference_application: {
-          type: "array",
-          items: strictObjectSchema({
-            target_key: { type: "string", minLength: 1 },
-            dimension: { type: "string", minLength: 1 },
-            target_behavior: { type: "string", minLength: 1 },
-            reference_behavior: { type: "string", minLength: 1 },
-            decision: { type: "string", enum: ["reuse", "intentional-difference", "not-applicable"] },
-            reason: { type: "string", minLength: 1 },
-            evidence_refs: evidenceList()
-          })
-        },
         behavior_obligations: {
           type: "array",
           minItems: REQUIRED_BEHAVIOR_DIMENSIONS.length,
@@ -1503,7 +1469,6 @@ function phaseHandoffSchema(
           type: "string",
           enum: ["changes_required", "already_satisfied"]
         },
-        satisfaction_evidence: stringList(),
         pre_behavior: stringList(1),
         preserve_invariants: stringList(1),
         patch_plan: stringList(),
@@ -1551,7 +1516,7 @@ function phaseHandoffContract(
     case "investigate":
       return "必须提交 confirmed_facts、target_locations、逐 token 的 target_mappings、feature_census、target_investigation、reference_analysis、空的 open_unknowns；业务功能目标必须真实完成全候选普查并逐项给出 yes/no 正反证据，同类参考必须是同一业务功能的既有入口，分开记录调用边 location、入口 entry_symbol@entry_location 与最终 contract_symbol@contract_location，并覆盖目标、调用方式、参数、前置条件、上下文和副作用。";
     case "prepare":
-      return "必须提交结构化 call_contract（每个 analyzed_target 包含闭合的 callsite_reviews/callsite_accounting）、reference_application、六类 behavior_obligations、change_disposition、pre_behavior、preserve_invariants、patch_plan、verification_plan；satisfaction_evidence 提交空数组并由宿主从目标证据生成。changes_required 另行提交非空 allowed_files，already_satisfied 提交空数组。";
+      return "必须提交 call_contract.analyzed_targets（只选 target_file/symbol）、六类 behavior_obligations 判断及 changes、change_disposition、pre_behavior、preserve_invariants、patch_plan、verification_plan。调用点账本、reference_application、satisfaction_evidence 和行为信封由宿主编译生成，不提交这些字段。changes_required 另行提交非空 allowed_files，already_satisfied 提交空数组。";
     case "implement":
       return "必须提交 changes、diff_summary、checks_run、preserved_invariants、obligation_results；obligation ID 必须与 prepare 完全一致。现有文件只允许最小 Edit，不得整文件 Write。";
     case "verify":
@@ -1576,9 +1541,9 @@ function phaseOutputSkeleton(
     case "prepare":
       return [
         "{ status, summary, evidence_refs, allowed_files,",
-        "  handoff: { call_contract: { analyzed_targets（只提交 target_file+symbol，其余由宿主回填） }, reference_application: [],",
-        "    behavior_obligations: [恰好六项：只提交 dimension/decision/reason；intentional-difference 再提交 required_behavior],",
-        "    change_disposition: \"changes_required\" | \"already_satisfied\", satisfaction_evidence: []（宿主生成）,",
+        "  handoff: { call_contract: { analyzed_targets（只提交 target_file+symbol，其余由宿主回填） },",
+        "    behavior_obligations: [恰好六项：只提交 dimension/decision/reason；intentional-difference 再提交 changes],",
+        "    change_disposition: \"changes_required\" | \"already_satisfied\",",
         "    pre_behavior, preserve_invariants, patch_plan, verification_plan } }"
       ].join("\n");
     case "implement":

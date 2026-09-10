@@ -80,6 +80,24 @@ function passCurrentPhase(
 }
 
 describe("hierarchical workflow engine", () => {
+  it("persists typed repair ownership and restores the producer draft across restart", () => {
+    let state = passCurrentPhase(activateR33());
+    state = passCurrentPhase(state, { handoff: { plan: "original prepare", behavior_obligations: [] }, allowed_files: ["route.ts"] });
+    const producer = state.phase_artifacts.find((artifact) => artifact.phase === "prepare")!;
+    state = passCurrentPhase(state, { handoff: { changes: "implementation report" } });
+    state = applyHierarchicalEvent(state, { type: "phase_started", work_unit_id: state.active_work_unit!.id });
+    const diagnostic = { code: "behavior.artifact.invalid", owner_phase: "prepare" as const, artifact_id: producer.id,
+      issues: [{ path: "handoff.behavior_contract", message: "invalid persisted input" }] };
+    state = applyHierarchicalEvent(state, { type: "phase_failed", work_unit_id: state.active_work_unit!.id,
+      route: "prepare", reason: "display text can change", diagnostic, error_fingerprint: "contract:prepare:behavior.artifact.invalid",
+      rejected_output: JSON.stringify({ handoff: { verification_summary: "wrong schema for prepare" } }) });
+    const restarted = JSON.parse(JSON.stringify(state)) as HierarchicalExecutionState;
+    expect(restarted.active_work_unit?.phase).toBe("prepare");
+    expect(restarted.active_work_unit?.repair_diagnostic).toEqual(diagnostic);
+    expect(JSON.parse(restarted.active_work_unit!.last_rejected_output!).handoff).toMatchObject(producer.handoff);
+    expect(restarted.phase_runs.at(-1)?.diagnostic).toEqual(diagnostic);
+  });
+
   it("starts from the goal loop and asks the host to run a planner", () => {
     const state = createHierarchicalExecutionState("完成所有页面跳转", { now: NOW });
 

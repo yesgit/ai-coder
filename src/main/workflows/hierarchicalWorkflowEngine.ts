@@ -1,9 +1,11 @@
+import { behaviorDecisionDraft } from "./behaviorContract.js";
 import type {
   GoalContract,
   HierarchicalAlignmentFinding,
   HierarchicalBlocker,
   HierarchicalCapabilityNode,
   HierarchicalExecutionState,
+  HierarchicalDiagnostic,
   HierarchicalLoopFrame,
   HierarchicalRequirement,
   HierarchicalWorkPhase,
@@ -155,9 +157,10 @@ export type HierarchicalEvent =
       type: "phase_failed";
       work_unit_id: string;
       reason: string;
-      route: "retry" | "investigate" | "prepare" | "implement" | "blocked";
+      route: "retry" | "investigate" | "prepare" | "implement" | "verify" | "blocked";
       error_fingerprint?: string;
       rejected_output?: string;
+      diagnostic?: HierarchicalDiagnostic;
       occurred_at?: string;
     }
   | { type: "requirement_closed"; requirement_id: string; occurred_at?: string }
@@ -858,6 +861,7 @@ function failPhase(
   workUnit.status = event.route === "blocked" ? "blocked" : "failed";
   workUnit.completed_at = now;
   workUnit.failure_reason = event.reason;
+  workUnit.repair_diagnostic = event.diagnostic;
   workUnit.correction_history = unique([
     ...(workUnit.correction_history ?? []),
     event.reason
@@ -867,6 +871,8 @@ function failPhase(
     workUnit.last_rejected_output = event.rejected_output;
   }
   settleCurrentPhaseRun(state, workUnit.id, "failed", now, [], event.error_fingerprint, event.reason);
+  const failedRun = [...state.phase_runs].reverse().find((run) => run.work_unit_id === workUnit.id);
+  if (failedRun && event.diagnostic) failedRun.diagnostic = event.diagnostic;
 
   if (event.route === "blocked") {
     requirement.status = "blocked";
@@ -894,6 +900,17 @@ function failPhase(
   );
   recoveryWorkUnit.failure_reason = `下游 ${workUnit.phase} 未通过：${event.reason}`;
   recoveryWorkUnit.correction_history = [...(workUnit.correction_history ?? [])];
+  recoveryWorkUnit.repair_diagnostic = event.diagnostic;
+  if (event.diagnostic) {
+    const producer = [...state.phase_artifacts].reverse().find((artifact) =>
+      artifact.requirement_id === requirement.id && artifact.phase === event.diagnostic!.owner_phase
+      && (!event.diagnostic!.artifact_id || artifact.id === event.diagnostic!.artifact_id));
+    if (producer) {
+      recoveryWorkUnit.last_rejected_output = JSON.stringify({ status: "passed", summary: producer.summary,
+        evidence_refs: producer.evidence_refs, handoff: event.route === "prepare" ? behaviorDecisionDraft(producer.handoff) : producer.handoff,
+        ...(event.route === "prepare" ? { allowed_files: workUnit.allowed_files } : {}) });
+    }
+  }
   // A rejected verify/implement document is not a prepare/investigate template.
   // Keep the diagnostic history, but only reuse drafts with the same schema.
   if (event.route === workUnit.phase) {

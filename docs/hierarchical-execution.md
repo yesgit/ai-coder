@@ -8,7 +8,7 @@
 2. Requirement Loop：planner 一次建立稳定 R-ID 账本；每个 R-ID 对应一个可独立验收的结果。
 3. Phase Loop：每个 R-ID 纵向经过 `investigate → prepare → implement → verify → close`，关闭后才进入下一个 dependency-ready R-ID。
 4. Action Loop：宿主直接启动当前阶段角色；角色只获得本阶段的 prompt、Skill 契约和工具能力。
-5. Recovery Loop：宿主按错误指纹只修复当前动作/工作单元；重复失败优先退回相邻内阶段自愈。相邻阶段成功后连续计数归零；同一错误跨自愈循环累计六次仍无法校正时升级为宿主故障，避免无限往返。
+5. Recovery Loop：契约错误按结构化诊断中的责任阶段调度，不按报错阶段或中文文案猜测；同一责任阶段/错误代码的累计预算跨阶段保留。尚未迁移的工具与执行错误仍使用兼容恢复规则。累计上限是最后的熔断保护，不承担判断错误归属的职责。
 
 这些层级会投影成宿主持有的 work graph，而不是让模型在文本里模拟流程图。图节点表示 alignment batch、planner、requirement phase、动态 capability、acceptance 和 integration；依赖边决定可运行节点，证据与工作区 revision 决定节点是否仍然有效。现阶段仍按 requirement 纵向串行调度以保持兼容，但调度器已从固定 `if/else` 阶段链切换为 dependency-ready 图选择，后续可以在不改阶段交接契约的前提下安全开放无冲突节点并行。
 
@@ -17,7 +17,7 @@
 
 ## 阶段交接与观察新鲜度
 
-每个阶段在角色启动前就声明必填 handoff 契约，并把同一份 JSON Schema 交给 StructuredOutput。宿主只有在契约完整时才原子提交 `phase_artifact`、推进下一阶段；缺字段会留在当前阶段自愈，不能把不完整结果推给下一角色。连续图片按三个新页面一批读取，并从第二批开始携带上一批末页作为只读衔接上下文；这样跨页表头和续行不会因为批次硬切而被错误地重新编号。planner 必须先利用重叠页和编号连续性裁决附件冲突，不能把互斥页面目标合并成一个需求后转嫁给代码调查。
+每个阶段在角色启动前声明模型需要提交的字段，并把对应 JSON Schema 交给 StructuredOutput。模型输出是待编译的提案，不等于可供下游执行的阶段产物；宿主生成机械字段、验证完整契约后，才原子提交 `phase_artifact`。连续图片按三个新页面一批读取，并从第二批开始携带上一批末页作为只读衔接上下文；这样跨页表头和续行不会因为批次硬切而被错误地重新编号。planner 必须先利用重叠页和编号连续性裁决附件冲突，不能把互斥页面目标合并成一个需求后转嫁给代码调查。
 
 阶段输出被拒绝时，宿主会保留一份有界的结构化草稿和最近几条不同的拒绝原因，下一次角色直接在草稿上定向修正。这样后一个校验的修正不会重新引入前一个校验已经指出的问题，也不需要重新读取已完成的只读证据。第三方模型轻微拼错 `StructuredOutput` 工具名时，只要参数对象仍完整，宿主会恢复该对象并执行同一套语义校验，不会绕过阶段契约。
 
@@ -29,6 +29,48 @@
 - verify：验证摘要、回归检查、未解决风险和逐项 acceptance 结果。
 
 交接物携带 `workspace_revision`。与当前工作区版本一致时标记 fresh，可复用语义结论，但不能跳过 Edit 的旧内容匹配或实时验证；代码提交后旧观察自动降为 historical，只能作为修改前基线。宿主不缓存原始文件内容或任意命令结果，最终 diff、语法检查和测试始终实时执行。
+
+## 行为契约编译与依赖修复（v2）
+
+R33 暴露的根因是职责重叠：同一份 JSON 同时被当作模型答案、宿主回填容器和下游执行契约。prepare 可以保存文字，verify 又要求机器信封；verify 无权修改 prepare 产物，却不断被重试或退回 implement。
+
+现在只有 `compileHierarchicalPrepareBehaviorContract` 一个发布入口。它收集已验收 investigate/capability 的事实，调用纯函数 `compileBehaviorContract`，成功后才写入 handoff。原有三段可互相覆盖的行为回填流程已删除。
+
+```mermaid
+flowchart LR
+  I[已验收调查与能力证据] --> C[宿主契约编译器]
+  M[模型判断与逐目标差异] --> C
+  C -->|所有维度同时通过| A[v2 冻结产物与摘要]
+  C -->|字段问题清单| P[责任阶段修复]
+  A --> G[消费者启动前检查]
+  G -->|依赖有效| V[implement / verify]
+  G -->|损坏、旧格式、依赖过期| P
+```
+
+模型只拥有 `dimension / decision / reason / changes`。例如新增别名所需的前置条件差异提交：
+
+```json
+{
+  "dimension": "preconditions",
+  "decision": "intentional-difference",
+  "reason": "当前需求明确增加该入口别名",
+  "changes": [{
+    "target_key": "route",
+    "value": ["linkType == 'nativeLink'", "pageName == 'YQBhome'"],
+    "evidence_refs": ["routes.js:77"]
+  }]
+}
+```
+
+示例只说明提案格式，实际 `value` 必须基于该目标的参考事实与需求。未列出的目标保留原行为；模型不再复制 ID、版本号、参考信封、完整目标集合。旧 `required_behavior` 只作为历史草稿的输入兼容格式，不能用普通文字替代差异。
+
+编译器一次检查六个维度、目标覆盖、重复项、差异形状和证据，所有问题一并返回。它不修改失败的提案；成功产物包含来源调查 ID、引用证据、宿主生成的义务 ID、参考/期望值和内容摘要。原 `behavior_obligations` 是兼容视图，由产物派生，不再独立写入。摘要用于一致性检查，不是数字签名。
+
+参考事实明确区分 `source` 和 `review`。只有源码分析器实际提供的指纹参与自动源码比对；人工/模型调查的跨语言事实继续由 verifier 审查。`null` 表示未知或未观察到，绝不自动转换为“无 guard”或“无副作用”，也不构成通过证据。
+
+implement/verify 的 SDK 调用和文件快照之前，宿主用同一读取校验器检查产物摘要、来源调查 ID、六维完整性及派生视图一致性。旧格式会交回 prepare 重编译，不能静默迁移为可信机器事实，也不会先启动消费者反复读文件。
+
+契约诊断持久化为 `code / owner_phase / artifact_id / issues[{path,message}]`。错误代码与责任阶段形成稳定失败身份，改文案、换工作单元或产物修订不会清零累计预算。结构错误归 prepare，缺少调查证据归 investigate，源码与已冻结计划不符归 implement；`already_satisfied` 声明不成立时归 prepare。恢复给责任阶段的是生产者自己的提案视图，而非消费者的失败报告。调查和模型语义判断仍可能错误，本设计保证的是协议一致性、证据边界和可终止的恢复路径，不替代业务验收。
 
 ## 修改事务与自愈
 
