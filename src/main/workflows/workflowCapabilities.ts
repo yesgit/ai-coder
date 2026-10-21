@@ -138,6 +138,7 @@ export function buildWorkflowCapabilityAgentSpec(
       "同时核对调用处源码与目标定义源码，逐项总结 destination、invocation、arguments、preconditions、context、side_effects 六个维度。",
       "某维度不存在时写明‘未观察到’并引用 evidence_ref；证据不足时 disposition=unresolved，禁止猜测。",
       "static_facts 来自宿主分析器；review_basis=host-exact+source 时必须保持这些事实，不得用自由推测覆盖。",
+      "target_usage.kind=execution 表示此处执行表达式已确认绑定到目标；value-transfer 只证明传值或注册；possible-execution 表示执行目标存在歧义。certainty=possible 表示连目标值的同一性也未证明。后两者禁止改写为目标已被确定执行；有 unresolved_reason 时必须保留未决问题并返回 disposition=unresolved。call_contexts 保留各调用来源的实参和 guard，不能将不同来源的 guard 合并为必须同时成立。",
       `调查包：${JSON.stringify(packet)}`
     ].join("\n\n"),
     outputFormat: {
@@ -181,6 +182,7 @@ export function validateWorkflowCapabilityAgentResult(
     throw new Error(`调用点调查绑定错误：expected=${callsiteId}`);
   }
   let disposition = requiredString(result.disposition, "disposition");
+  let summary = requiredString(result.summary, "summary");
   if (!["relevant", "irrelevant", "unresolved"].includes(disposition)) {
     throw new Error(`调用点 ${callsiteId} disposition 非法：${disposition}`);
   }
@@ -198,6 +200,7 @@ export function validateWorkflowCapabilityAgentResult(
   }
   const evidenceRef = requiredString(input.evidence_ref, "evidence_ref");
   const evidenceRefs = [evidenceRef];
+  const targetUsage = record(record(input.static_facts)?.target_usage);
   const expectedDigest = optionalString(input.host_fingerprint_digest) ?? "";
   const expectedDefinitionDigest = requiredString(input.definition_digest, "definition_digest");
   let destination = requiredString(result.destination, "destination");
@@ -230,6 +233,24 @@ export function validateWorkflowCapabilityAgentResult(
       }
     }
   }
+  if (targetUsage) {
+    const reason = optionalString(targetUsage.unresolved_reason);
+    if (reason || targetUsage.kind === "possible-execution" || targetUsage.certainty === "possible") {
+      disposition = "unresolved";
+      unresolved = unique([...unresolved, reason ?? "此执行点尚未唯一绑定到目标函数"]);
+    }
+    if (Array.isArray(targetUsage.evidence_refs)) {
+      evidenceRefs.push(...targetUsage.evidence_refs.filter((ref): ref is string => (
+        typeof ref === "string" && !evidenceRefs.includes(ref)
+      )));
+    }
+    if (targetUsage.kind === "value-transfer") summary = `此处记录函数值传递或注册；${reason ?? "实际执行点由独立执行证据说明"}`;
+    else if (targetUsage.kind === "reference" && reason) summary = `此引用的最终使用方式尚未确认；${reason}`;
+    else if (targetUsage.certainty === "possible") summary = `此处执行目标尚未唯一确认；${reason ?? "需要进一步验证函数值来源"}`;
+    if (disposition === "unresolved" && record(input.static_facts)?.side_effects === undefined) {
+      sideEffects = ["函数值的运行时使用和副作用尚未确认"];
+    }
+  }
   return {
     output: {
       schema_version: 1,
@@ -239,7 +260,8 @@ export function validateWorkflowCapabilityAgentResult(
       evidence_ref: evidenceRef,
       review_basis: requiredString(input.review_basis, "review_basis"),
       disposition,
-      summary: result.summary,
+      ...(targetUsage ? { target_usage: targetUsage } : {}),
+      summary,
       destination,
       invocation,
       arguments: argumentsSummary,
@@ -577,6 +599,7 @@ function exactCallsiteInventory(
       static_facts: fingerprint
         ? {
             disposition: card.disposition,
+            target_usage: card.target_usage,
             destination: fingerprint.destination,
             invocation: fingerprint.invocation,
             arguments: fingerprint.arguments,
@@ -586,6 +609,7 @@ function exactCallsiteInventory(
           }
         : {
             disposition: card.disposition,
+            target_usage: card.target_usage,
             invocation: card.invocation,
             arguments: card.arguments,
             preconditions: card.preconditions,
@@ -857,6 +881,9 @@ function symbolContractOutput(report: SymbolInvestigationReport): Record<string,
     symbol: report.target.symbol,
     definitions: report.target.definitions.map((definition) => ({ ...definition })),
     reference_accounting: { ...report.reference_accounting },
+    source_scope: report.analyzer_coverage.source_scope,
+    static_analysis_limits: [...report.static_analysis_limits],
+    runtime_verification_required: report.runtime_verification_required,
     all_pages_consumed: report.all_pages_consumed,
     wrapper_graph_complete: report.wrapper_graph.complete
   };

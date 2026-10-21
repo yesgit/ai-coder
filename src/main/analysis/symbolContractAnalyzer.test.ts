@@ -1,12 +1,14 @@
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import ts from "typescript";
 import { describe, expect, it } from "vitest";
 import {
   analyzeSymbolContract,
   proveForwardedReceiver,
   resolveEnclosingCallableDefinition
 } from "./symbolContractAnalyzer.js";
+import { collectSymbolSourceScope } from "./symbolSourceScope.js";
 
 describe("source-backed receiver forwarding", () => {
   it("proves multi-hop parameters and rejects different origins, methods and reassignment", async () => {
@@ -84,6 +86,22 @@ export const registeredAction = Action;
 }
 
 describe("analyzeSymbolContract", () => {
+  it("reports source scope truncation while preserving the target", async () => {
+    const root = await createFixture();
+    await writeFile(path.join(root, "another.ts"), "import { Action } from './target.js';\nAction({ label: 'extra' });");
+    const scope = collectSymbolSourceScope(root,
+      ["another.ts", "target.tsx", "usage.tsx"].map((file) => path.join(root, file)),
+      path.join(root, "target.tsx"), "Action", {
+        moduleResolution: ts.ModuleResolutionKind.NodeNext,
+        jsx: ts.JsxEmit.ReactJSX
+      }, 1);
+
+    expect(scope.files).toEqual([path.join(root, "target.tsx")]);
+    expect(scope.coverage).toMatchObject({ files_required: 3, files_selected: 1, complete: false });
+    expect(scope.coverage.limitations).toEqual(expect.arrayContaining([
+      expect.stringContaining("模块分析达到最大文件数 1")
+    ]));
+  });
   it("resolves a dispatcher branch to its named owner, including class-field arrows", async () => {
     const root = await createFixture();
     await writeFile(path.join(root, "routes.ts"), `
@@ -407,13 +425,13 @@ class Destination {}
 export default connect(mapState)(Destination);
 `);
     await writeFile(path.join(root, "connected-entry.ts"), `
-import ConnectedDestination from "./connected.js";
+import Panel from "./connected.js";
 declare const navigator: { push(route: unknown): void };
 
-export function openDestination(ready: boolean, title: string) {
+export function openScreen(ready: boolean, title: string) {
   if (!ready) return;
   navigator.push({
-    component: ConnectedDestination,
+    component: Panel,
     params: { title }
   });
 }
@@ -428,7 +446,7 @@ export function openDestination(ready: boolean, title: string) {
     expect(result.calls?.items).toEqual(expect.arrayContaining([
       expect.objectContaining({
         kind: "indirect",
-        enclosing_callable: "openDestination",
+        enclosing_callable: "openScreen",
         invocation: expect.stringContaining("navigator.push"),
         target_path: "component",
         preconditions: ["after guard: NOT (!ready)"]

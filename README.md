@@ -55,6 +55,31 @@ Claude Agent SDK permission loop:
 - paths outside the selected project are blocked
 - approved tool calls can continue the session
 
+## Callsite Investigation
+
+JS/TS symbol investigation indexes project-local module relationships before
+binding references. It follows renamed/default imports, re-export chains and
+JSX uses without requiring callers to contain the original symbol name.
+Dependencies needed for binding are included; unrelated importers of a shared
+utility are excluded.
+
+Reports include `analyzer_coverage.source_scope` with discovered, required and
+selected file counts. The source program is bounded to 500 selected files.
+Unreadable sources, unresolved relative/configured-alias imports, file limits,
+and indirect-reference depth/state limits are retained in
+`static_analysis_limits` and require further verification. A `complete` result
+describes the indexed project-local static scope; runtime dispatch and callers
+outside the project still require separate evidence.
+
+Each reference card also carries `target_usage`: `execution` identifies a
+statically bound execution expression, `value-transfer` identifies passing or
+registering a value, and `possible-execution` retains an ambiguous execution
+candidate. `certainty`, source evidence and unresolved reasons travel with the
+card into semantic review. Const aliases and source-backed callback parameters
+are followed; reassignment, mixed callback sources and unknown factory results
+remain uncertain. Callback call contexts retain their own arguments and guards.
+Candidate relationships are excluded from automatic behavior fingerprints.
+
 ## Claude Agent SDK
 
 The first implementation includes an adapter boundary in `src/main/agent/claudeAgentRunner.ts`.

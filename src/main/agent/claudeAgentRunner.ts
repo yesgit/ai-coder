@@ -6417,6 +6417,7 @@ function analyzedTargetFromInvestigationReport(
     [
       `${call.location.file}:${call.location.line}`,
       call.kind,
+      `target_usage=${call.target_usage.kind};certainty=${call.target_usage.certainty}`,
       call.enclosing_callable ? `caller=${call.enclosing_callable}` : "caller=<module>",
       `invocation=${call.invocation}`,
       call.target_path ? `target_path=${call.target_path}` : "target_path=<direct>",
@@ -6467,7 +6468,8 @@ function analyzedTargetFromInvestigationReport(
         [
           `${reference.location.file}:${reference.location.line}`,
           `${reference.kind} 静态引用`,
-          reference.expression
+          reference.expression,
+          ...(reference.reason ? [reference.reason] : [])
         ].join("；")
       ))
     ]),

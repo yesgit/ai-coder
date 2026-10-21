@@ -3,7 +3,8 @@ import path from "node:path";
 import {
   analyzeSymbolContract,
   type AnalyzeSymbolContractInput,
-  type SymbolContractAnalysis
+  type SymbolContractAnalysis,
+  type TargetValueUsage
 } from "./symbolContractAnalyzer.js";
 import {
   buildBehaviorFingerprint,
@@ -87,6 +88,7 @@ export interface SymbolReferenceCard {
   expression: string | null;
   reference_kind: string | null;
   disposition: "resolved" | "irrelevant" | "blocked";
+  target_usage: TargetValueUsage;
 }
 
 export interface SymbolInvestigationReport extends CollectedSymbolContract {
@@ -212,8 +214,13 @@ export function investigateSymbolContract(
     ...wrapperNodes.flatMap((node) => node.analyzer_coverage.static_analysis_limits)
   ])];
   const referenceCards = buildReferenceCards(primary, wrapperNodes);
+  for (const card of referenceCards) {
+    if (card.kind === "non-call-reference" || !card.target_usage.unresolved_reason) continue;
+    unresolvedDynamicReferences.push({ location: card.location, kind: card.target_usage.kind,
+      expression: `${card.invocation}；${card.target_usage.unresolved_reason}` });
+  }
   const behaviorFingerprints = referenceCards.flatMap((card) => (
-    card.kind === "non-call-reference" || !card.invocation
+    card.kind === "non-call-reference" || !card.invocation || card.target_usage.certainty === "possible"
       ? []
       : [buildBehaviorFingerprint({
           reference_id: card.reference_id,
@@ -223,6 +230,7 @@ export function investigateSymbolContract(
           invocation: card.invocation,
           target_path: card.target_path,
           payload_expression: card.payload_expression,
+          target_usage: card.target_usage,
           arguments: card.arguments,
           preconditions: card.preconditions
         })]
@@ -236,6 +244,7 @@ export function investigateSymbolContract(
   };
   const runtimeVerificationRequired = (
     referenceAccounting.blocked > 0
+    || unresolvedDynamicReferences.length > 0
     || staticAnalysisLimits.length > 0
   );
   const base = {
@@ -369,7 +378,10 @@ function referenceCardForCall(
     call.location.file,
     call.location.line,
     call.location.column,
-    call.kind
+    call.kind,
+    call.target_path,
+    call.payload_expression,
+    call.target_usage.argument_index
   ].join("\0");
   return {
     reference_id: createHash("sha256").update(identity).digest("hex").slice(0, 20),
@@ -386,7 +398,8 @@ function referenceCardForCall(
     payload_expression: call.payload_expression,
     expression: null,
     reference_kind: null,
-    disposition: "resolved"
+    disposition: call.target_usage.certainty === "possible" ? "blocked" : "resolved",
+    target_usage: call.target_usage
   };
 }
 
@@ -418,6 +431,13 @@ function referenceCardForNonCallReference(
     payload_expression: null,
     expression: reference.expression,
     reference_kind: reference.kind,
+    target_usage: {
+      kind: "reference",
+      certainty: reference.kind === "import" || reference.kind === "export" ? "confirmed" : "possible",
+      evidence_refs: [`${reference.location.file}:${reference.location.line}`],
+      unresolved_reason: reference.kind === "import" || reference.kind === "export"
+        ? null : reference.reason ?? "此引用的最终执行或使用方式尚未证明"
+    },
     disposition: reference.kind === "import" || reference.kind === "export"
       ? "irrelevant"
       : "blocked"

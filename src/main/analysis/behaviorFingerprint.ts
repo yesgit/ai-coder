@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import ts from "typescript";
+import type { TargetValueUsage } from "./symbolContractAnalyzer.js";
 
 export const BEHAVIOR_DIMENSIONS = [
   "destination",
@@ -33,6 +34,7 @@ export interface BehaviorFingerprintInput {
     provided: boolean;
   }>;
   preconditions: string[];
+  target_usage?: TargetValueUsage;
 }
 
 export interface BehaviorFingerprint {
@@ -54,6 +56,7 @@ export interface BehaviorFingerprint {
   context: string[];
   side_effects: string[];
   digest: string;
+  target_usage?: TargetValueUsage;
 }
 
 export interface OutgoingBehaviorFingerprintInput {
@@ -110,6 +113,7 @@ export function buildBehaviorFingerprint(input: BehaviorFingerprintInput): Behav
       : [])
   ]);
   const base = {
+    ...(input.target_usage ? { target_usage: input.target_usage } : {}),
     schema_version: 1 as const,
     source_reference_id: input.reference_id,
     source_location: `${input.location.file}:${input.location.line}:${input.location.column}`,

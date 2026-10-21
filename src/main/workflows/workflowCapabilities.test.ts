@@ -236,6 +236,29 @@ describe("workflow capabilities", () => {
     }
   });
 
+  it("carries incomplete source scope into workflow capability output", async () => {
+    const projectPath = await mkdtemp(path.join(os.tmpdir(), "ai-coder-capability-scope-"));
+    try {
+      await writeFile(path.join(projectPath, "tsconfig.json"), "{}");
+      await writeFile(path.join(projectPath, "target.ts"), "export function target() { return 1; }");
+      await writeFile(path.join(projectPath, "usage.ts"), "import value from './missing.js';\nvalue();");
+      const result = await executeWorkflowCapability(SYMBOL_CONTRACT_CAPABILITY, projectPath, {
+        target_file: "target.ts",
+        symbol: "target",
+        adapter_id: "typescript-javascript"
+      });
+
+      expect(result.output).toMatchObject({
+        status: "complete_with_dynamic_unknowns",
+        source_scope: { complete: false },
+        runtime_verification_required: true,
+        static_analysis_limits: [expect.stringContaining("usage.ts → ./missing.js")]
+      });
+    } finally {
+      await rm(projectPath, { recursive: true, force: true });
+    }
+  });
+
   it("keeps destination internals in the report without scheduling each as an AI review", async () => {
     const projectPath = await mkdtemp(path.join(os.tmpdir(), "capability-scope-"));
     try {
@@ -456,4 +479,36 @@ describe("workflow capabilities", () => {
       await rm(projectPath, { recursive: true, force: true });
     }
   });
+
+  it.each(["value-transfer", "possible-execution"])(
+    "prevents a model from promoting %s into a proven execution", (kind) => {
+      const targetUsage = { kind, certainty: kind === "value-transfer" ? "confirmed" : "possible",
+        evidence_refs: ["usage.ts:5", "registration.ts:2"], unresolved_reason: "实际执行目标尚未证明" };
+      const result = validateWorkflowCapabilityAgentResult(CALLSITE_SEMANTIC_REVIEW_CAPABILITY, {
+        callsite_id: "ref:uncertain",
+        target_file: "target.ts",
+        symbol: "target",
+        evidence_ref: "usage.ts:5",
+        definition_digest: "definition",
+        review_basis: "host-exact+source",
+        static_facts: { disposition: "resolved", target_usage: targetUsage }
+      }, {
+        callsite_id: "ref:uncertain",
+        disposition: "relevant",
+        summary: "已确认目标在此执行",
+        destination: "target",
+        invocation: "call",
+        arguments: ["value=42"],
+        preconditions: ["none"],
+        context: ["none"],
+        side_effects: ["执行目标"],
+        unresolved: []
+      });
+
+      expect(result.output).toMatchObject({ disposition: "unresolved", target_usage: targetUsage,
+        unresolved: ["实际执行目标尚未证明"] });
+      expect(result.output.summary).not.toBe("已确认目标在此执行");
+      expect(result.evidence_refs).toEqual(["usage.ts:5", "registration.ts:2"]);
+    }
+  );
 });

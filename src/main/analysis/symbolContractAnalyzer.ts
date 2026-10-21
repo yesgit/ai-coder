@@ -1,7 +1,8 @@
 import path from "node:path";
 import { readFileSync } from "node:fs";
 import ts from "typescript";
-import { createBoundedTypeScriptProgram } from "./boundedTypeScriptProgram.js";
+import { createBoundedTypeScriptProgram, readTypeScriptProjectConfiguration } from "./boundedTypeScriptProgram.js";
+import { collectSymbolSourceScope, type SymbolSourceScope } from "./symbolSourceScope.js";
 
 export type SymbolAnalysisSection = "all" | "contract" | "calls" | "wrappers" | "references" | "effects";
 
@@ -186,6 +187,15 @@ interface CallArgument {
   provided: boolean;
 }
 
+export interface TargetValueUsage {
+  kind: "execution" | "value-transfer" | "possible-execution" | "reference";
+  certainty: "confirmed" | "possible";
+  evidence_refs: string[];
+  unresolved_reason: string | null;
+  argument_index?: number;
+  call_contexts?: Array<{ callsite: string; invocation: string; preconditions: string[] }>;
+}
+
 interface CallSite {
   kind: "call" | "jsx" | "indirect";
   location: SourceLocation;
@@ -197,6 +207,7 @@ interface CallSite {
   invocation: string;
   target_path: string | null;
   payload_expression: string | null;
+  target_usage: TargetValueUsage;
 }
 
 interface OutgoingCall {
@@ -217,6 +228,7 @@ interface PublicWrapper {
     location: SourceLocation;
     argument_mapping: CallArgument[];
     preconditions: string[];
+    target_usage: TargetValueUsage;
   }>;
 }
 
@@ -224,6 +236,7 @@ interface NonCallReference {
   location: SourceLocation;
   kind: string;
   expression: string;
+  reason?: string;
 }
 
 export interface SymbolContractAnalysis {
@@ -238,10 +251,14 @@ export interface SymbolContractAnalysis {
     analysis_mode: "project-config" | "syntax-fallback";
     configuration_warnings: string[];
     files_scanned: number;
+    source_scope: SymbolSourceScope["coverage"];
     total_call_sites: number;
     total_public_wrappers: number;
     total_non_call_references: number;
     total_outgoing_calls: number;
+    total_execution_sites: number;
+    total_value_transfers: number;
+    total_possible_execution_sites: number;
     static_analysis_limits: string[];
     analysis_notes: string[];
   };
@@ -258,6 +275,7 @@ export interface SymbolContractAnalysis {
     items: CallSite[];
     combinations: Array<{
       kind: "call" | "jsx" | "indirect";
+      target_usage: Pick<TargetValueUsage, "kind" | "certainty">;
       provided_parameters: string[];
       count: number;
       locations: SourceLocation[];
@@ -328,7 +346,8 @@ export function analyzeSymbolContract(input: AnalyzeSymbolContractInput): Symbol
   const callSites: CallSite[] = [];
   const wrapperCalls = new Map<ts.Node, CallSite[]>();
   const nonCallReferences: NonCallReference[] = [];
-  const indirectCallKeys = new Set<string>();
+  const indirectCallKeys = new Map<string, CallSite>();
+  const traversalLimits = new Set<string>();
   const projectSources = program.getSourceFiles().filter((file) => (
     !file.isDeclarationFile && isInsideProject(projectPath, file.fileName)
   ));
@@ -362,19 +381,37 @@ export function analyzeSymbolContract(input: AnalyzeSymbolContractInput): Symbol
         if (!isDefinitionName(node, targetDeclarationSet) && !isDirectInvocationReference(node)) {
           const referenceKind = classifyNonCallReference(node);
           const lifted = referenceKind === "import" || referenceKind === "export"
-            ? []
-            : liftReferenceToIndirectCalls(node, checker, projectSources, projectPath);
-          if (lifted.length > 0) {
-            for (const callSite of lifted) {
+            ? { calls: [], unresolved: [] }
+            : liftReferenceToIndirectCalls(node, signatures, contract.inputs, checker, projectSources, projectPath, traversalLimits);
+          nonCallReferences.push(...lifted.unresolved);
+          if (lifted.calls.length > 0) {
+            for (const callSite of lifted.calls) {
               const key = [
                 callSite.location.file,
                 callSite.location.line,
                 callSite.location.column,
                 callSite.target_path,
-                callSite.payload_expression
+                callSite.payload_expression,
+                callSite.target_usage.argument_index
               ].join("\0");
-              if (indirectCallKeys.has(key)) continue;
-              indirectCallKeys.add(key);
+              const previous = indirectCallKeys.get(key);
+              if (previous) {
+                previous.target_usage.evidence_refs = [...new Set([
+                  ...previous.target_usage.evidence_refs, ...callSite.target_usage.evidence_refs
+                ])];
+                previous.target_usage.call_contexts = [...new Map([
+                  ...(previous.target_usage.call_contexts ?? []), ...(callSite.target_usage.call_contexts ?? [])
+                ].map((context) => [JSON.stringify(context), context])).values()];
+                if (callSite.target_usage.certainty === "possible") {
+                  previous.target_usage.certainty = "possible";
+                  if (previous.target_usage.kind === "execution") previous.target_usage.kind = "possible-execution";
+                }
+                previous.target_usage.unresolved_reason = [...new Set([
+                  previous.target_usage.unresolved_reason, callSite.target_usage.unresolved_reason
+                ].filter(Boolean))].join("；") || null;
+                continue;
+              }
+              indirectCallKeys.set(key, callSite);
               callSites.push(callSite);
               const enclosing = findEnclosingCallableAtLocation(
                 projectSources,
@@ -387,7 +424,7 @@ export function analyzeSymbolContract(input: AnalyzeSymbolContractInput): Symbol
                 wrapperCalls.set(enclosing, existing);
               }
             }
-          } else {
+          } else if (lifted.unresolved.length === 0) {
             nonCallReferences.push({
               location: locationOf(node, projectPath),
               kind: referenceKind,
@@ -428,19 +465,26 @@ export function analyzeSymbolContract(input: AnalyzeSymbolContractInput): Symbol
       analysis_mode: programBuild.mode,
       configuration_warnings: programBuild.warnings,
       files_scanned: projectSources.length,
+      source_scope: programBuild.sourceScope,
       total_call_sites: callSites.length,
       total_public_wrappers: wrappers.length,
       total_non_call_references: nonCallReferences.length,
       total_outgoing_calls: outgoingCalls.length,
-      static_analysis_limits: programBuild.mode === "syntax-fallback"
-        ? [
+      total_execution_sites: callSites.filter((site) => site.target_usage.kind === "execution").length,
+      total_value_transfers: callSites.filter((site) => site.target_usage.kind === "value-transfer").length,
+      total_possible_execution_sites: callSites.filter((site) => site.target_usage.kind === "possible-execution").length,
+      static_analysis_limits: [
+        ...programBuild.sourceScope.limitations,
+        ...traversalLimits,
+        ...(programBuild.mode === "syntax-fallback" ? [
             "未加载有效 TypeScript 项目配置，符号解析采用语法回退。",
             ...programBuild.warnings
-          ]
-        : [],
+          ] : [])
+      ],
       analysis_notes: [
+        "调用范围限定为已索引的项目内 JS/TS 源码及静态可解析的模块关系；不包含项目外调用方。",
         "反射、字符串注册、运行时依赖注入和外部包调用无法由静态分析证明完整。",
-        "回调或函数值传递列在 references 中；其最终运行时调用方需要继续追踪。",
+        "target_usage 区分执行、值传递和候选执行；未追通的回调或函数值流向保留在 references 或 unresolved_reason 中。",
         "preconditions 只包含可从局部控制流直接观察到的条件，不等同于完整业务前置条件。"
       ]
     }
@@ -498,95 +542,17 @@ function createProgram(
   program: ts.Program;
   mode: "project-config" | "syntax-fallback";
   warnings: string[];
+  sourceScope: SymbolSourceScope["coverage"];
 } {
   const sourceFiles = discoverProjectSources(projectPath);
-  const evidenceFiles = sourceFiles.filter((file) => {
-    if (path.resolve(file) === path.resolve(targetFile)) return true;
-    if (symbol.length <= 3 || /^(?:fun|callback|sucFun|errFun|render)$/i.test(symbol)) {
-      return false;
-    }
-    try {
-      return readFileSync(file, "utf8").includes(symbol);
-    } catch {
-      return false;
-    }
-  });
-  if (!evidenceFiles.includes(targetFile)) evidenceFiles.push(targetFile);
-  expandEvidenceFilesForAliases(sourceFiles, evidenceFiles, symbol);
-  return createBoundedTypeScriptProgram(projectPath, evidenceFiles);
-}
-
-function expandEvidenceFilesForAliases(
-  sourceFiles: string[],
-  evidenceFiles: string[],
-  initialSymbol: string
-): void {
-  const included = new Set(evidenceFiles.map((file) => path.resolve(file)));
-  let frontier = new Set([initialSymbol]);
-  const seenSymbols = new Set(frontier);
-  const maxRounds = 4;
-  const maxFiles = 500;
-
-  for (let round = 0; round < maxRounds && frontier.size > 0 && included.size < maxFiles; round += 1) {
-    const aliases = new Set<string>();
-    for (const file of [...included]) {
-      let content: string;
-      try {
-        content = readFileSync(file, "utf8");
-      } catch {
-        continue;
-      }
-      if (![...frontier].some((name) => containsIdentifierText(content, name))) continue;
-      const source = ts.createSourceFile(
-        file,
-        content,
-        ts.ScriptTarget.Latest,
-        true,
-        scriptKindForFile(file)
-      );
-      const visit = (node: ts.Node): void => {
-        if (
-          ts.isVariableDeclaration(node)
-          && ts.isIdentifier(node.name)
-          && node.initializer
-          && [...frontier].some((name) => containsIdentifierText(node.initializer!.getText(source), name))
-          && isExportedVariableDeclaration(node)
-        ) {
-          const alias = node.name.text;
-          if (alias.length >= 4 && !seenSymbols.has(alias)) aliases.add(alias);
-        }
-        ts.forEachChild(node, visit);
-      };
-      visit(source);
-    }
-    if (aliases.size === 0) break;
-    for (const alias of aliases) seenSymbols.add(alias);
-    for (const file of sourceFiles) {
-      if (included.has(path.resolve(file))) continue;
-      let content: string;
-      try {
-        content = readFileSync(file, "utf8");
-      } catch {
-        continue;
-      }
-      if (![...aliases].some((alias) => containsIdentifierText(content, alias))) continue;
-      included.add(path.resolve(file));
-      evidenceFiles.push(file);
-      if (included.size >= maxFiles) break;
-    }
-    frontier = aliases;
-  }
-}
-
-function isExportedVariableDeclaration(node: ts.VariableDeclaration): boolean {
-  const statement = node.parent.parent;
-  return ts.isVariableStatement(statement)
-    && hasModifier(statement, ts.SyntaxKind.ExportKeyword);
-}
-
-function containsIdentifierText(content: string, identifier: string): boolean {
-  const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(?<![$\\w])${escaped}(?![$\\w])`, "u").test(content);
+  const configuration = readTypeScriptProjectConfiguration(projectPath);
+  const scope = collectSymbolSourceScope(
+    projectPath, sourceFiles, targetFile, symbol, configuration.options
+  );
+  return {
+    ...createBoundedTypeScriptProgram(projectPath, scope.files),
+    sourceScope: scope.coverage
+  };
 }
 
 function scriptKindForFile(file: string): ts.ScriptKind {
@@ -780,7 +746,8 @@ function buildCallSite(
   projectPath: string
 ): CallSite {
   const resolved = checker.getResolvedSignature(node);
-  const signature = resolved ?? targetSignatures[0];
+  const signature = targetSignatures.find((item) => item.declaration === resolved?.declaration)
+    ?? targetSignatures[0] ?? resolved;
   const parameters = signature?.getParameters() ?? [];
   const args = node.arguments ?? ts.factory.createNodeArray();
   const argumentsList: CallArgument[] = [];
@@ -859,7 +826,8 @@ function buildCallSite(
     preconditions: collectPreconditions(node),
     invocation: node.getText().slice(0, 1_000),
     target_path: null,
-    payload_expression: null
+    payload_expression: null,
+    target_usage: { kind: "execution", certainty: "confirmed", evidence_refs: [evidenceRef(node, projectPath)], unresolved_reason: null }
   };
 }
 
@@ -916,7 +884,8 @@ function buildJsxCallSite(
     preconditions: collectPreconditions(node),
     invocation: node.getText().slice(0, 1_000),
     target_path: null,
-    payload_expression: null
+    payload_expression: null,
+    target_usage: { kind: "execution", certainty: "confirmed", evidence_refs: [evidenceRef(node, projectPath)], unresolved_reason: null }
   };
 }
 
@@ -925,6 +894,18 @@ interface LiftState {
   payloadNode: ts.Expression;
   path: string[];
   depth: number;
+  possible: boolean;
+  reason: string | null;
+  evidence: string[];
+  returns: Array<{ call: ts.CallExpression | ts.NewExpression; owner: SourceCallable; parameter: ts.ParameterDeclaration }>;
+}
+
+type SourceCallable = ts.FunctionDeclaration | ts.FunctionExpression | ts.ArrowFunction
+  | ts.MethodDeclaration | ts.ConstructorDeclaration;
+
+function evidenceRef(node: ts.Node, projectPath: string): string {
+  const location = locationOf(node, projectPath);
+  return `${location.file}:${location.line}`;
 }
 
 /**
@@ -938,62 +919,225 @@ interface LiftState {
  */
 function liftReferenceToIndirectCalls(
   reference: ts.Identifier | ts.PropertyAccessExpression,
+  signatures: readonly ts.Signature[],
+  inputs: ParameterContract[],
   checker: ts.TypeChecker,
   projectSources: ts.SourceFile[],
-  projectPath: string
-): CallSite[] {
+  projectPath: string,
+  traversalLimits: Set<string>
+): { calls: CallSite[]; unresolved: NonCallReference[] } {
   const queue: LiftState[] = [{
     node: reference,
     payloadNode: reference,
     path: [],
-    depth: 0
+    depth: 0,
+    possible: false,
+    reason: null,
+    evidence: [evidenceRef(reference, projectPath)],
+    returns: []
   }];
   const seen = new Set<string>();
   const results: CallSite[] = [];
+  const unresolved: NonCallReference[] = [];
+  const invocations: Array<ts.CallExpression | ts.NewExpression> = [];
+  for (const source of projectSources) {
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node) || ts.isNewExpression(node)) invocations.push(node);
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
+  }
+  const implementation = (call: ts.CallExpression | ts.NewExpression): SourceCallable | undefined => {
+    const stableCallee = (expression: ts.Expression, visited = new Set<ts.Symbol>()): boolean => {
+      expression = unwrapValue(expression);
+      if (ts.isFunctionExpression(expression) || ts.isArrowFunction(expression)) return true;
+      if (ts.isPropertyAccessExpression(expression)) return true; // Method receivers remain uncertain below.
+      if (!ts.isIdentifier(expression)) return false;
+      const symbol = checker.getSymbolAtLocation(expression);
+      if (!symbol || visited.has(symbol) || visited.size >= 12 || reassigned(symbol)) return false;
+      const declaration = resolveAlias(symbol, checker).valueDeclaration;
+      if (declaration && ts.isVariableDeclaration(declaration) && declaration.initializer) {
+        return isConstBinding(declaration) && stableCallee(declaration.initializer, new Set(visited).add(symbol));
+      }
+      return Boolean(declaration && isSourceCallable(declaration));
+    };
+    if (!stableCallee(call.expression)) return undefined;
+    const declaration = checker.getResolvedSignature(call)?.declaration;
+    if (declaration && isSourceCallable(declaration) && declaration.body) return declaration;
+    const callee = ts.isPropertyAccessExpression(call.expression) ? call.expression.name : call.expression;
+    const symbol = checker.getSymbolAtLocation(callee);
+    return symbol && resolveAlias(symbol, checker).declarations?.find((node): node is SourceCallable => (
+      isSourceCallable(node) && Boolean(node.body)
+    ));
+  };
+  const references = (symbol: ts.Symbol): Array<ts.Identifier | ts.PropertyAccessExpression> => (
+    findSymbolReferences(symbol, checker, projectSources)
+  );
+  const reassigned = (symbol: ts.Symbol): boolean => references(symbol).some(isBindingWrite);
+  const rootSymbol = valueSymbol(reference, checker);
+  // This proof is about every statically visible binding of a callback slot,
+  // not just the call which happened to lead this traversal into its body.
+  const definiteValue = (expression: ts.Expression, visited = new Set<ts.Symbol>()): boolean => {
+    expression = unwrapValue(expression);
+    const symbol = valueSymbol(expression, checker);
+    if (!symbol || !rootSymbol || visited.has(symbol) || visited.size >= 12) return false;
+    if (resolveAlias(symbol, checker) === resolveAlias(rootSymbol, checker)) return true;
+    const declaration = resolveAlias(symbol, checker).valueDeclaration;
+    const next = new Set(visited).add(symbol);
+    if (declaration && ts.isVariableDeclaration(declaration) && declaration.initializer
+      && isConstBinding(declaration) && !reassigned(symbol)) {
+      return definiteValue(declaration.initializer, next);
+    }
+    if (declaration && ts.isParameter(declaration) && ts.isIdentifier(declaration.name)
+      && !declaration.dotDotDotToken && isSourceCallable(declaration.parent) && !reassigned(symbol)) {
+      const owner = declaration.parent;
+      const index = owner.parameters.indexOf(declaration);
+      const callers = invocations.filter((call) => implementation(call) === owner);
+      return callers.length > 0 && callers.every((call) => {
+        const argument = call.arguments?.[index];
+        return !call.arguments?.some(ts.isSpreadElement) && Boolean(argument && definiteValue(argument, next));
+      });
+    }
+    return false;
+  };
+  const enqueue = (state: LiftState, node: ts.Node, patch: Partial<LiftState> = {}): void => {
+    queue.push({ ...state, ...patch, node, depth: state.depth + 1,
+      evidence: [...new Set([...state.evidence, ...(patch.evidence ?? []), evidenceRef(node, projectPath)])] });
+  };
+  const followBinding = (state: LiftState, name: ts.Identifier): void => {
+    const symbol = checker.getSymbolAtLocation(name);
+    if (!symbol) return;
+    const declaration = symbol.valueDeclaration;
+    const mutable = reassigned(symbol) || Boolean(declaration && ts.isVariableDeclaration(declaration) && !isConstBinding(declaration));
+    for (const use of references(symbol)) {
+      if (use === name || isBindingWrite(use)) continue;
+      enqueue(state, use, mutable ? {
+        possible: true, reason: "函数值绑定可变或存在重新赋值，无法证明执行时仍为目标函数"
+      } : {});
+    }
+  };
+  const retainUnknown = (state: LiftState, reason: string): void => {
+    unresolved.push({ location: locationOf(state.node, projectPath), kind: "unresolved-value-flow",
+      expression: state.node.getText().slice(0, 300), reason });
+  };
   const maxDepth = 12;
   const maxStates = 100;
 
   while (queue.length > 0 && seen.size < maxStates) {
     const state = queue.shift()!;
-    if (state.depth > maxDepth) continue;
+    if (state.depth > maxDepth) {
+      const location = locationOf(reference, projectPath);
+      traversalLimits.add(`间接引用追踪达到最大深度 ${maxDepth}：${location.file}:${location.line}`);
+      continue;
+    }
     const stateKey = [
       state.node.getSourceFile().fileName,
       state.node.pos,
       state.node.end,
-      state.path.join(".")
+      state.path.join("."),
+      state.possible,
+      state.returns.map((context) => `${context.call.getSourceFile().fileName}:${context.call.pos}`).join("/")
     ].join(":");
     if (seen.has(stateKey)) continue;
     seen.add(stateKey);
     const parent = state.node.parent;
     if (!parent) continue;
 
+    if ((ts.isCallExpression(parent) || ts.isNewExpression(parent))
+      && parent.expression === state.node && state.path.length === 0) {
+      const site = buildCallSite(parent, signatures, checker, projectPath);
+      site.target_usage = {
+        kind: state.possible ? "possible-execution" : "execution",
+        certainty: state.possible ? "possible" : "confirmed",
+        evidence_refs: [...new Set([...state.evidence, evidenceRef(parent, projectPath)])],
+        unresolved_reason: state.possible ? state.reason : null,
+        call_contexts: state.returns.map((context) => ({ callsite: evidenceRef(context.call, projectPath),
+          invocation: context.call.getText().slice(0, 1_000), preconditions: collectPreconditions(context.call) }))
+      };
+      results.push(site);
+      continue;
+    }
+    if ((ts.isJsxOpeningElement(parent) || ts.isJsxSelfClosingElement(parent))
+      && parent.tagName === state.node && state.path.length === 0) {
+      const site = buildJsxCallSite(parent, inputs, checker, projectPath);
+      site.target_usage = { kind: state.possible ? "possible-execution" : "execution",
+        certainty: state.possible ? "possible" : "confirmed",
+        evidence_refs: [...new Set([...state.evidence, evidenceRef(parent, projectPath)])],
+        unresolved_reason: state.possible ? state.reason : null };
+      results.push(site);
+      continue;
+    }
+
     if (
       (ts.isCallExpression(parent) || ts.isNewExpression(parent))
       && Boolean(parent.arguments?.includes(state.node as ts.Expression))
     ) {
-      results.push(buildIndirectCallSite(
+      const transfer = buildIndirectCallSite(
         parent,
         state.payloadNode,
         state.path,
         checker,
         projectPath
-      ));
-      // A value passed to a HOC/factory is often returned as another component
-      // and immediately assigned or exported (React.memo/connect/forwardRef are
-      // common examples). Keep following that result as a possible carrier.
-      // A registration call used only as a statement naturally terminates on
-      // the next iteration, so this remains API agnostic and bounded.
-      queue.push({
-        ...state,
-        node: parent,
-        depth: state.depth + 1
-      });
+      );
+      transfer.target_usage.evidence_refs = [...new Set([...state.evidence, evidenceRef(parent, projectPath)])];
+      transfer.target_usage.certainty = state.possible ? "possible" : "confirmed";
+      if (state.possible) transfer.target_usage.unresolved_reason = state.reason;
+      results.push(transfer);
+      const owner = implementation(parent);
+      const index = parent.arguments?.indexOf(state.node as ts.Expression) ?? -1;
+      transfer.target_usage.argument_index = index;
+      const parameter = owner?.parameters[index];
+      const callee = unwrapValue(parent.expression);
+      const dynamicReceiver = ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)
+        || Boolean(owner && ts.isMethodDeclaration(owner));
+      const dynamicBody = Boolean(owner && hasDynamicParameterAccess(owner));
+      if (owner && parameter && ts.isIdentifier(parameter.name) && !parameter.dotDotDotToken
+        && !parent.arguments?.some(ts.isSpreadElement)) {
+        const parameterSymbol = checker.getSymbolAtLocation(parameter.name);
+        const exact = !state.possible && state.path.length === 0 && definiteValue(parameter.name)
+          && !dynamicReceiver && !dynamicBody;
+        if (!state.possible) transfer.target_usage.unresolved_reason = dynamicReceiver
+          ? "动态接收者可能替换实际实现，参数的最终用途尚未证明"
+          : dynamicBody ? "函数通过 arguments 或 eval 动态访问参数，参数的使用或改写尚未证明" : null;
+        if (dynamicReceiver) enqueue(state, parent, { possible: true,
+          reason: "动态接收者可能返回其他函数值，返回值的同一性尚未证明" });
+        if (parameterSymbol) {
+          for (const use of references(parameterSymbol)) {
+            if (use === parameter.name || isBindingWrite(use)) continue;
+            enqueue(state, use, {
+              possible: !exact,
+              reason: exact ? null : "回调参数存在其他来源、可变状态或动态接收者，执行目标未能唯一确认",
+              returns: [...state.returns, { call: parent, owner, parameter }]
+            });
+          }
+        }
+      } else {
+        // An unknown factory may return a carrier, but passing a value into it
+        // is not proof of what comes back. Preserve HOC/navigation discovery
+        // as a candidate with explicit uncertainty.
+        enqueue(state, parent, { possible: true,
+          reason: "工厂或注册函数的实现不可解析，无法证明返回值仍承载目标函数" });
+      }
+      continue;
+    }
+
+    if ((ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent))
+      && parent.expression === state.node && state.path.length > 0) {
+      const property = ts.isPropertyAccessExpression(parent) ? parent.name.text
+        : parent.argumentExpression && ts.isStringLiteralLike(parent.argumentExpression)
+          ? parent.argumentExpression.text : null;
+      if (property === state.path[0]) {
+        enqueue(state, parent, { path: state.path.slice(1), possible: true,
+          reason: "对象属性中的函数值可能被改写，执行目标需要进一步验证" });
+      } else if (property === null) {
+        retainUnknown(state, "动态属性访问无法确定目标函数的去向");
+      }
       continue;
     }
 
     const lifted = liftThroughContainer(parent, state);
     if (lifted) {
-      queue.push({ ...lifted, depth: state.depth + 1 });
+      enqueue(state, lifted.node, lifted);
       continue;
     }
 
@@ -1003,15 +1147,33 @@ function liftReferenceToIndirectCalls(
       && containsNode(parent.initializer, state.node)
       && ts.isIdentifier(parent.name)
     ) {
-      const alias = checker.getSymbolAtLocation(parent.name);
-      if (!alias) continue;
-      for (const use of findSymbolReferences(alias, checker, projectSources)) {
-        if (use === parent.name) continue;
-        queue.push({
-          ...state,
-          node: use,
-          depth: state.depth + 1
+      followBinding(state, parent.name);
+      continue;
+    }
+
+    if (ts.isBinaryExpression(parent) && parent.operatorToken.kind === ts.SyntaxKind.EqualsToken
+      && parent.right === state.node && ts.isIdentifier(parent.left)) {
+      followBinding({ ...state, possible: true,
+        reason: "目标通过可变赋值传递，执行时的函数值需要进一步验证" }, parent.left);
+      continue;
+    }
+
+    if (ts.isReturnStatement(parent) || (ts.isArrowFunction(parent) && parent.body === state.node)) {
+      const context = state.returns.at(-1);
+      const owner = ts.isArrowFunction(parent) ? parent : findEnclosingCallable(parent);
+      if (context && owner === context.owner) {
+        const body = context.owner.body;
+        const onlyReturn = body && (ts.isBlock(body)
+          ? body.statements.length === 1 && ts.isReturnStatement(body.statements[0]!)
+            && body.statements[0]!.expression === state.node
+          : body === state.node);
+        enqueue(state, context.call, {
+          returns: state.returns.slice(0, -1),
+          possible: state.possible || !onlyReturn,
+          reason: state.reason ?? (onlyReturn ? null : "函数存在其他返回路径，返回值与目标函数的同一性未能证明")
         });
+      } else {
+        retainUnknown(state, "函数值被返回，尚未解析返回值的接收者");
       }
       continue;
     }
@@ -1026,16 +1188,65 @@ function liftReferenceToIndirectCalls(
         checker,
         projectSources
       )) {
-        queue.push({
-          ...state,
-          node: use,
-          path: [],
-          depth: state.depth + 1
-        });
+        enqueue(state, use, { path: [] });
       }
+      continue;
     }
+    if (isReferenceNode(state.node)) {
+      const kind = classifyNonCallReference(state.node);
+      if (kind === "import" || kind === "export") continue;
+    }
+    if (ts.isExpressionStatement(parent)) continue;
+    retainUnknown(state, state.reason ?? "此处函数值的后续流向尚不受静态追踪支持");
   }
-  return results;
+  if (queue.length > 0) {
+    const location = locationOf(reference, projectPath);
+    traversalLimits.add(`间接引用追踪达到最大状态数 ${maxStates}：${location.file}:${location.line}`);
+  }
+  return { calls: results, unresolved };
+}
+
+function isSourceCallable(node: ts.Node): node is SourceCallable {
+  return ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) || ts.isArrowFunction(node)
+    || ts.isMethodDeclaration(node) || ts.isConstructorDeclaration(node);
+}
+
+function isConstBinding(declaration: ts.VariableDeclaration): boolean {
+  return ts.isVariableDeclarationList(declaration.parent)
+    && (declaration.parent.flags & ts.NodeFlags.Const) !== 0;
+}
+
+function hasDynamicParameterAccess(owner: SourceCallable): boolean {
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (found) return;
+    if (ts.isIdentifier(node) && (node.text === "arguments" || node.text === "eval")) found = true;
+    ts.forEachChild(node, visit);
+  };
+  if (owner.body) visit(owner.body);
+  return found;
+}
+
+function unwrapValue(expression: ts.Expression): ts.Expression {
+  while (ts.isParenthesizedExpression(expression) || ts.isAsExpression(expression)
+    || ts.isTypeAssertionExpression(expression) || ts.isNonNullExpression(expression)
+    || ts.isSatisfiesExpression(expression)) expression = expression.expression;
+  return expression;
+}
+
+function isBindingWrite(node: ts.Node): boolean {
+  // Destructuring writes still change the binding, unlike a write to one of
+  // the function object's own properties.
+  while (ts.isParenthesizedExpression(node.parent) || ts.isArrayLiteralExpression(node.parent)
+    || ts.isObjectLiteralExpression(node.parent) || ts.isShorthandPropertyAssignment(node.parent)
+    || ts.isPropertyAssignment(node.parent) || ts.isSpreadElement(node.parent)
+    || ts.isSpreadAssignment(node.parent)) node = node.parent;
+  const parent = node.parent;
+  return (ts.isBinaryExpression(parent) && parent.left === node
+    && parent.operatorToken.kind >= ts.SyntaxKind.FirstAssignment
+    && parent.operatorToken.kind <= ts.SyntaxKind.LastAssignment)
+    || ((ts.isPrefixUnaryExpression(parent) || ts.isPostfixUnaryExpression(parent))
+      && (parent.operator === ts.SyntaxKind.PlusPlusToken || parent.operator === ts.SyntaxKind.MinusMinusToken));
 }
 
 function findDefaultImportReferences(
@@ -1104,7 +1315,8 @@ function liftThroughContainer(parent: ts.Node, state: LiftState): Omit<LiftState
   if (ts.isConditionalExpression(parent) && (
     containsNode(parent.whenTrue, state.node) || containsNode(parent.whenFalse, state.node)
   )) {
-    return { ...state, node: parent, payloadNode: parent };
+    return { ...state, node: parent, payloadNode: parent, possible: true,
+      reason: "条件表达式存在其他函数值，执行目标未能唯一确认" };
   }
   return null;
 }
@@ -1121,6 +1333,7 @@ function findSymbolReferences(
     const visit = (node: ts.Node): void => {
       if (
         isReferenceNode(node)
+        && !(ts.isIdentifier(node) && ts.isPropertyAccessExpression(node.parent) && node.parent.name === node)
         && symbolMatches(node, resolved, declarations, checker)
         && !isDefinitionName(node, declarations)
       ) references.push(node);
@@ -1173,7 +1386,13 @@ function buildIndirectCallSite(
     preconditions: collectPreconditions(carrier),
     invocation: carrier.getText().slice(0, 1_000),
     target_path: pathParts.length > 0 ? pathParts.join(".") : "<argument>",
-    payload_expression: payload.getText().slice(0, 1_000)
+    payload_expression: payload.getText().slice(0, 1_000),
+    target_usage: {
+      kind: "value-transfer",
+      certainty: "confirmed",
+      evidence_refs: [evidenceRef(carrier, projectPath)],
+      unresolved_reason: "只确认函数值已传入，接收者如何使用或执行该值尚未证明"
+    }
   };
 }
 
@@ -1296,7 +1515,8 @@ function buildPublicWrapper(
     target_calls: calls.map((call) => ({
       location: call.location,
       argument_mapping: call.arguments,
-      preconditions: call.preconditions
+      preconditions: call.preconditions,
+      target_usage: call.target_usage
     }))
   };
 }
@@ -1305,7 +1525,7 @@ function groupCombinations(callSites: CallSite[]): NonNullable<SymbolContractAna
   const groups = new Map<string, NonNullable<SymbolContractAnalysis["calls"]>["combinations"][number]>();
   for (const call of callSites) {
     const provided = [...call.provided_parameters].sort();
-    const key = `${call.kind}:${provided.join("|")}`;
+    const key = `${call.kind}:${call.target_usage.kind}:${call.target_usage.certainty}:${provided.join("|")}`;
     const existing = groups.get(key);
     if (existing) {
       existing.count += 1;
@@ -1313,6 +1533,7 @@ function groupCombinations(callSites: CallSite[]): NonNullable<SymbolContractAna
     } else {
       groups.set(key, {
         kind: call.kind,
+        target_usage: { kind: call.target_usage.kind, certainty: call.target_usage.certainty },
         provided_parameters: provided,
         count: 1,
         locations: [call.location]
@@ -1460,12 +1681,18 @@ function symbolMatches(
   targetDeclarations: Set<ts.Declaration>,
   checker: ts.TypeChecker
 ): boolean {
-  const lookup = ts.isPropertyAccessExpression(node) ? node.name : node;
-  const found = checker.getSymbolAtLocation(lookup);
+  const found = valueSymbol(node, checker);
   if (!found) return false;
   const resolved = resolveAlias(found, checker);
   if (resolved === target) return true;
   return Boolean(resolved.declarations?.some((declaration) => targetDeclarations.has(declaration)));
+}
+
+function valueSymbol(node: ts.Node, checker: ts.TypeChecker): ts.Symbol | undefined {
+  const lookup = ts.isPropertyAccessExpression(node) ? node.name : node;
+  return ts.isIdentifier(lookup) && ts.isShorthandPropertyAssignment(lookup.parent)
+    ? checker.getShorthandAssignmentValueSymbol(lookup.parent) ?? checker.getSymbolAtLocation(lookup)
+    : checker.getSymbolAtLocation(lookup);
 }
 
 function resolveAlias(symbol: ts.Symbol, checker: ts.TypeChecker): ts.Symbol {
